@@ -376,6 +376,8 @@ const S = {
   activeBuild:null, buildQty:null,
   // Lookup
   lookupQ:'', lookupSel:null,
+  // Min/Max suggestions
+  mmSuggest:null, mmLoading:false,
 };
 
 // ============================================================
@@ -1832,6 +1834,141 @@ function partDossier(pn){
   </div></div>`;
 }
 
+
+// ============================================================
+// MIN/MAX SUGGESTION ENGINE — statistical + AI
+// ============================================================
+function weeklySeries(pn, weeks){
+  const buckets=new Array(weeks).fill(0);
+  const now=new Date();
+  S.sales.forEach(s=>{
+    if(s.pn!==pn||!s.sale_date)return;
+    const d=new Date(s.sale_date);
+    const wk=Math.floor((now-d)/(7*24*3600*1000));
+    if(wk>=0&&wk<weeks)buckets[wk]+=(s.qty||1);
+  });
+  return buckets;
+}
+
+function statSuggest(p){
+  const weeks=26;
+  const series=weeklySeries(p.pn,weeks);
+  const n=series.length;
+  const avg=series.reduce((a,b)=>a+b,0)/n;
+  const sd=Math.sqrt(series.reduce((a,b)=>a+(b-avg)*(b-avg),0)/n);
+  const L=Math.max(1,p.lead_time_weeks||2);
+  const safety=Math.ceil(1.65*sd*Math.sqrt(L));          // ~95% service level
+  const min=Math.ceil(avg*L+safety);                      // reorder point
+  const max=Math.ceil(min+avg*(S.forecastWeeks||8));      // cover next cycle
+  return{min,max,safety,avg:+avg.toFixed(2),sd:+sd.toFixed(2)};
+}
+
+async function aiSuggestMinMax(singlePn){
+  const tracked=singlePn
+    ? S.parts.filter(p=>p.pn===singlePn)
+    : S.parts.filter(p=>(p.avg_sales_wk||0)>0||weeklySeries(p.pn,12).some(x=>x>0));
+  if(!tracked.length){toast('No items with sales history to analyze');return;}
+
+  // Statistical baseline for every item (always available)
+  const base=tracked.map(p=>{
+    const st=statSuggest(p);
+    return{pn:p.pn,curMin:p.min_qty||0,curMax:p.max_qty||0,curSafety:p.safety_stock||0,
+      lead:p.lead_time_weeks||2,onHand:p.total_unpckgd||0,...st,note:'Statistical: '+st.avg+'/wk avg, σ'+st.sd+', '+(p.lead_time_weeks||2)+'w lead'};
+  });
+
+  const apiKey=S.settings.anthropic_api_key||'';
+  if(!apiKey){
+    S.mmSuggest=base;
+    toast('No API key set — using statistical suggestions (95% service level). Set a key in AI Assistant for AI-refined values.');
+    render();return;
+  }
+
+  toast('Asking Claude to analyze '+tracked.length+' items…');
+  S.mmLoading=true;render();
+  const results=[];
+  const chunkSize=40;
+  try{
+    for(let i=0;i<base.length;i+=chunkSize){
+      const chunk=base.slice(i,i+chunkSize);
+      const lines=chunk.map(b=>b.pn+' | avg/wk:'+b.avg+' | stdev:'+b.sd+' | lead:'+b.lead+'w | onhand:'+b.onHand+' | statMin:'+b.min+' | statMax:'+b.max).join('\n');
+      const prompt='You are an inventory planning expert for a motorsport parts manufacturer. For each part below, recommend min_qty (reorder point) and max_qty (order-up-to level) and safety_stock. The statistical baseline (95% service) is given; adjust it with judgment: round to sensible order quantities, raise mins for volatile items (high stdev vs avg), keep slow movers lean. Respond with ONLY a JSON array, no markdown: [{"pn":"...","min":N,"max":N,"safety":N,"note":"max 8 words"}]\n\nPARTS:\n'+lines;
+      let data=null;
+      for(let attempt=0;attempt<3;attempt++){
+        const res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:4000,messages:[{role:'user',content:prompt}]})});
+        data=await res.json();
+        if(data.error&&data.error.type==='overloaded_error'&&attempt<2){await new Promise(r=>setTimeout(r,(attempt+1)*2000));continue;}
+        break;
+      }
+      if(data&&!data.error){
+        const txt=(data.content&&data.content[0]&&data.content[0].text)||'[]';
+        const clean=txt.replace(/```json|```/g,'').trim();
+        try{
+          const arr=JSON.parse(clean);
+          arr.forEach(a=>{
+            const b=chunk.find(x=>x.pn===a.pn);
+            if(b)results.push({...b,min:Math.max(0,Math.round(a.min)),max:Math.max(0,Math.round(a.max)),safety:Math.max(0,Math.round(a.safety||b.safety)),note:a.note||b.note,ai:true});
+          });
+        }catch(e){chunk.forEach(b=>results.push(b));}
+      }else{
+        chunk.forEach(b=>results.push(b));
+      }
+      if(base.length>chunkSize)toast('Analyzed '+Math.min(i+chunkSize,base.length)+' / '+base.length+'…');
+    }
+  }catch(e){
+    base.forEach(b=>{if(!results.find(r=>r.pn===b.pn))results.push(b);});
+    toast('AI partially unavailable — statistical values used where needed');
+  }
+  S.mmSuggest=results;
+  S.mmLoading=false;
+  toast(results.length+' suggestions ready — review below');
+  render();
+}
+
+async function applyMMSuggestions(onlyPn){
+  const toApply=(S.mmSuggest||[]).filter(s=>!onlyPn||s.pn===onlyPn);
+  if(!toApply.length)return;
+  if(!onlyPn&&!confirm('Apply min/max/safety to '+toApply.length+' parts?'))return;
+  let applied=0;
+  for(const s of toApply){
+    const part=S.parts.find(p=>p.pn===s.pn);
+    if(!part)continue;
+    const prev={...part};
+    const payload={min_qty:s.min,max_qty:s.max,safety_stock:s.safety,updated_at:new Date().toISOString()};
+    const{error}=await db.from('parts').update(payload).eq('id',part.id);
+    if(!error){
+      S.parts=S.parts.map(p=>p.pn===s.pn?{...p,...payload}:p);
+      pushUndo('update','parts',{...part,...payload},prev,'AI min/max: '+s.pn);
+      applied++;
+    }
+  }
+  S.mmSuggest=(S.mmSuggest||[]).filter(s=>onlyPn?s.pn!==onlyPn:false);
+  if(!S.mmSuggest.length)S.mmSuggest=null;
+  toast(applied+' part'+(applied!==1?'s':'')+' updated');
+  render();
+}
+
+function renderMMReview(){
+  const list=S.mmSuggest||[];
+  return '<div class="panel" style="border-left:3px solid var(--teal)">'
+    +'<div class="panel-title"><span>✨ Suggested Min/Max — Review &amp; Apply ('+list.length+')</span>'
+    +'<div style="display:flex;gap:8px"><button class="btn btn-primary btn-sm" onclick="applyMMSuggestions()">Apply All</button>'
+    +'<button class="btn btn-sm" onclick="S.mmSuggest=null;render()">Dismiss</button></div></div>'
+    +'<div class="tbl-wrap" style="max-height:340px;overflow-y:auto"><table><thead><tr><th>Part #</th><th>Avg/Wk</th><th>Min (cur → new)</th><th>Max (cur → new)</th><th>Safety</th><th>Rationale</th><th></th></tr></thead><tbody>'
+    +list.map(function(s){
+      const minChg=s.min!==s.curMin, maxChg=s.max!==s.curMax;
+      return '<tr>'
+      +'<td class="pn">'+s.pn+'</td>'
+      +'<td class="money-neutral">'+s.avg+'</td>'
+      +'<td><span style="color:var(--text3);font-family:var(--mono);font-size:11px">'+s.curMin+'</span> <span style="color:var(--text3)">→</span> <span class="money" style="font-weight:700;color:'+(minChg?'var(--teal)':'var(--text3)')+'">'+s.min+'</span></td>'
+      +'<td><span style="color:var(--text3);font-family:var(--mono);font-size:11px">'+s.curMax+'</span> <span style="color:var(--text3)">→</span> <span class="money" style="font-weight:700;color:'+(maxChg?'var(--teal)':'var(--text3)')+'">'+s.max+'</span></td>'
+      +'<td class="money-neutral">'+s.safety+'</td>'
+      +'<td style="font-size:10px;color:var(--text3);max-width:200px">'+(s.ai?'✨ ':'')+(s.note||'')+'</td>'
+      +'<td><button class="action-btn" onclick="applyMMSuggestions(\''+s.pn+'\')">Apply</button></td>'
+      +'</tr>';
+    }).join('')
+    +'</tbody></table></div></div>';
+}
+
 // ============================================================
 // INVENTORY PLANNING
 // ============================================================
@@ -1888,9 +2025,11 @@ function renderPlanning() {
       <div class="search-wrap"><span class="search-icon">⌕</span><input placeholder="Search…" value="${sf.search||''}" oninput="setFilter('planning','search',this.value)"></div>
       <button class="filter-chip ${sf.status==='reorder'?'on-teal':''}" onclick="setFilter('planning','status',${sf.status==='reorder'?'\'\'':'\'reorder\''})">⚠ Reorder Only</button>
       <button class="filter-chip ${sf.status==='overstock'?'on-teal':''}" onclick="setFilter('planning','status',${sf.status==='overstock'?'\'\'':'\'overstock\''})">↑ Overstock</button>
-      <button class="btn btn-primary btn-sm" onclick="createSuggestedPOs()" style="margin-left:auto">+ Create All Suggested POs (${needsReorder.length})</button>
+      <button class="btn btn-teal btn-sm" style="margin-left:auto" ${S.mmLoading?'disabled':''} onclick="aiSuggestMinMax()">${S.mmLoading?'Analyzing…':'✨ AI Suggest Min/Max'}</button>
+      <button class="btn btn-primary btn-sm" onclick="createSuggestedPOs()">+ Create All Suggested POs (${needsReorder.length})</button>
     </div>
   </div>
+  ${S.mmSuggest?renderMMReview():''}
   <div class="tbl-wrap">
   <table><thead class="sticky-header"><tr>
     <th>Part #</th><th>Description</th><th>On Hand</th><th>Min</th><th>Max</th><th>Safety</th><th>Reorder Pt</th><th>Wk Demand</th><th>Suggested Qty</th><th>Status</th><th>Action</th>
@@ -1916,7 +2055,7 @@ function renderPlanning() {
       <td class="money-neutral">${wkd.toFixed(2)}/wk</td>
       <td class="money-cost" style="font-weight:700">${sq}</td>
       <td><span class="pill ${statusCls}">${status}</span></td>
-      <td>${oh<=rp&&sq>0?`<button class="btn btn-primary btn-sm" onclick='createPOFromSuggestion("${p.pn}","${p.vendor||''}",${sq},${p.unit_cost||0},"${p.description||''}")'>Order ${sq}</button>`:''}</td>
+      <td style="display:flex;gap:4px">${oh<=rp&&sq>0?`<button class="btn btn-primary btn-sm" onclick='createPOFromSuggestion("${p.pn}","${p.vendor||''}",${sq},${p.unit_cost||0},"${p.description||''}")'>Order ${sq}</button>`:''}<button class="action-btn" title="AI suggest min/max for this part" onclick="aiSuggestMinMax('${p.pn}')">✨</button></td>
     </tr>`;
   }).join('')}
   </tbody></table></div>`;
