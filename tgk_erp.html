@@ -321,7 +321,7 @@ thead th.sorted-desc::after{content:' ▼';font-size:8px;color:var(--teal)}
     <div class="topbar-actions">
       <div class="search-wrap" style="max-width:220px">
         <span class="search-icon">⌕</span>
-        <input type="text" placeholder="Search parts, assemblies…" id="gsearch" oninput="onSearch(this.value)">
+        <input type="text" placeholder="Search anything — parts, finished goods…" id="gsearch" oninput="onSearch(this.value)">
       </div>
       <button class="btn btn-sm" id="undo-btn" onclick="undo()" disabled title="Nothing to undo">↩ Undo</button>
       <button class="btn btn-teal btn-sm" onclick="nav('ai')">✦ AI</button>
@@ -391,7 +391,69 @@ const S = {
 const $  = id => document.getElementById(id);
 const fc = (v,d=2) => '$'+Number(v||0).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const fn = v => Number(v||0).toLocaleString();
-const wks = p => p.avg_sales_wk>0 ? Math.round((p.total_unpckgd||0)/p.avg_sales_wk) : null;
+// ── LIVE DEMAND ENGINE ──
+// All weekly averages auto-compute from real sales history.
+// Part demand = direct sales + BOM explosion of finished-goods sales.
+function computeDemand(){
+  const wk4={},wk12={};
+  const now=new Date();
+  S.sales.forEach(s=>{
+    if(!s.pn||!s.sale_date)return;
+    if(s.fulfillment_status==='Cancelled')return;
+    const w=Math.floor((now-new Date(s.sale_date))/(7*24*3600*1000));
+    if(w<0||w>=12)return;
+    const q=s.qty||1;
+    wk12[s.pn]=(wk12[s.pn]||0)+q;
+    if(w<4)wk4[s.pn]=(wk4[s.pn]||0)+q;
+  });
+  const asmCalc={},partCalc={};
+  S.assemblies.forEach(a=>{asmCalc[a.pn]={wk4:(wk4[a.pn]||0)/4,wk12:(wk12[a.pn]||0)/12};});
+  // induced demand on subassemblies (one level)
+  Object.entries(S.boms).forEach(([parent,items])=>{
+    const ad=asmCalc[parent];if(!ad)return;
+    items.forEach(i=>{
+      if(i.item_type==='assembly'&&asmCalc[i.child_pn]){
+        asmCalc[i.child_pn].wk4+=ad.wk4*(i.qty||1);
+        asmCalc[i.child_pn].wk12+=ad.wk12*(i.qty||1);
+      }
+    });
+  });
+  // explode to parts
+  S.parts.forEach(p=>{partCalc[p.pn]={wk4:(wk4[p.pn]||0)/4,wk12:(wk12[p.pn]||0)/12};});
+  Object.entries(S.boms).forEach(([parent,items])=>{
+    const ad=asmCalc[parent];if(!ad)return;
+    items.forEach(i=>{
+      if(i.item_type!=='part')return;
+      if(!partCalc[i.child_pn])partCalc[i.child_pn]={wk4:0,wk12:0};
+      partCalc[i.child_pn].wk4+=ad.wk4*(i.qty||1);
+      partCalc[i.child_pn].wk12+=ad.wk12*(i.qty||1);
+    });
+  });
+  S.calc={asm:asmCalc,part:partCalc,salesLen:S.sales.length,bomLen:Object.keys(S.boms).length};
+}
+
+function avgWk(p){
+  const c=S.calc&&S.calc.part&&S.calc.part[p.pn];
+  if(c&&(c.wk12>0||c.wk4>0))return c.wk12>0?c.wk12:c.wk4;
+  return p.avg_sales_wk||0; // fallback: imported value (no recent sales)
+}
+function avgWk4(p){
+  const c=S.calc&&S.calc.part&&S.calc.part[p.pn];
+  return c?c.wk4:0;
+}
+function asmAvgWk(a){
+  const c=S.calc&&S.calc.asm&&S.calc.asm[a.pn];
+  if(c&&(c.wk12>0||c.wk4>0))return c.wk12>0?c.wk12:c.wk4;
+  return a.avg_sales_wk||0;
+}
+function liveStatus(a){
+  const oh=a.total_on_hand||0;
+  const wk=asmAvgWk(a);
+  if(oh<=0)return 'critical';
+  if(wk>0&&oh<wk*2)return 'low';
+  return 'ok';
+}
+const wks = p => { const w=avgWk(p); return w>0 ? Math.round((p.total_unpckgd||0)/w) : null; };
 const wkColor = w => w===null?'var(--green)':w<2?'var(--red)':w<6?'var(--yellow)':'var(--green)';
 const wkPct  = w => w===null?100:Math.min(100,Math.round(w/12*100));
 
@@ -416,7 +478,7 @@ function setSyncState(state){
 }
 
 function updateBadge(){
-  const cnt=S.parts.filter(p=>p.avg_sales_wk>0&&wks(p)!==null&&wks(p)<4).length;
+  const cnt=S.parts.filter(p=>avgWk(p)>0&&wks(p)!==null&&wks(p)<4).length;
   const b=$('low-badge');
   if(!b)return;
   b.textContent=cnt;b.style.display=cnt?'inline':'none';
@@ -507,7 +569,13 @@ function nav(v){
   $('page-title').textContent=PAGE_TITLES[v]||v;
   render();
 }
-function onSearch(q){S.searchQ=q;render();}
+function onSearch(q){
+  S.searchQ=q;
+  S.lookupQ=q;
+  S.lookupSel=null;
+  if(q.trim().length>=2&&S.view!=='lookup'){nav('lookup');}
+  else{render();}
+}
 function rowClick(e,fn){if(e.target.closest('button,input,select,a,label'))return;fn();}
 function setFilter(ns,k,val){if(!S.filters[ns])S.filters[ns]={};S.filters[ns][k]=val;render();}
 function addAction(){const m={parts:'addPart',assemblies:'addAsm',purchases:'addPO',dealers:'addDealer',sales:'addSale'};if(m[S.view])openModal(m[S.view],{});}
@@ -516,8 +584,8 @@ function addAction(){const m={parts:'addPart',assemblies:'addAsm',purchases:'add
 // DASHBOARD
 // ============================================================
 function renderDashboard(){
-  const critical=S.assemblies.filter(a=>a.status==='critical').length;
-  const needsReorder=S.parts.filter(p=>!p.discontinued&&(p.avg_sales_wk>0||calcForecast(p.pn)>0)&&(p.total_unpckgd||0)<=calcReorderPoint(p)).length;
+  const critical=S.assemblies.filter(a=>!a.discontinued&&liveStatus(a)==='critical').length;
+  const needsReorder=S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||calcForecast(p.pn)>0)&&(p.total_unpckgd||0)<=calcReorderPoint(p)).length;
   const invVal=S.parts.reduce((s,p)=>s+Math.max(0,p.total_unpckgd||0)*(p.unit_cost||0),0);
   const openOrders=S.sales.filter(s=>!s.fulfillment_status||s.fulfillment_status==='Open');
   const packedOrders=S.sales.filter(s=>s.fulfillment_status==='Packed');
@@ -560,7 +628,7 @@ function renderDashboard(){
       <div class="panel-title"><span class="panel-title-left">⚠ Reorder Queue</span><button class="btn btn-sm" onclick="nav('planning')">Planning →</button></div>
       <div class="tbl-wrap">
       <table><thead><tr><th>Part #</th><th>On Hand</th><th>Reorder Pt</th><th></th></tr></thead><tbody>
-      ${S.parts.filter(p=>!p.discontinued&&(p.avg_sales_wk>0)&&(p.total_unpckgd||0)<=calcReorderPoint(p)).sort((a,b)=>(a.total_unpckgd||0)-(b.total_unpckgd||0)).slice(0,7).map(p=>{
+      ${S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0)&&(p.total_unpckgd||0)<=calcReorderPoint(p)).sort((a,b)=>(a.total_unpckgd||0)-(b.total_unpckgd||0)).slice(0,7).map(p=>{
         const sq=calcSuggestedQty(p);
         return `<tr><td class="pn">${p.pn}</td>
         <td class="money" style="color:var(--red);font-weight:700">${p.total_unpckgd||0}</td>
@@ -631,7 +699,7 @@ function renderParts(){
       <td style="font-size:11px;color:var(--text3)">${p.vendor||''}</td>
       <td class="money-cost">${fc(p.unit_cost||0,4)}</td>
       <td class="money" style="color:${(p.total_unpckgd||0)<0?'var(--red)':'var(--text)'};font-weight:700">${fn(p.total_unpckgd||0)}</td>
-      <td class="money-neutral">${p.avg_sales_wk>0?p.avg_sales_wk.toFixed(1):'-'}</td>
+      <td class="money-neutral" title="auto from sales">${avgWk(p)>0?avgWk(p).toFixed(1):'-'}</td>
       <td><div class="stock-bar-wrap"><div class="stock-bar"><div class="stock-fill" style="width:${pct}%;background:${col}"></div></div><span class="wk-label" style="color:${col}">${w!==null?w+'w':'N/A'}</span></div></td>
       <td style="font-size:11px;color:var(--text3)">${p.lead_time_weeks||1}w</td>
       <td style="display:flex;gap:4px">
@@ -652,7 +720,7 @@ function renderAssemblies(){
   const q=(sf.search||S.searchQ||'').toLowerCase();
   if(q)list=list.filter(a=>a.pn.toLowerCase().includes(q)||((a.description||'').toLowerCase().includes(q)));
   if(sf.cat)list=list.filter(a=>a.category===sf.cat);
-  if(sf.status)list=list.filter(a=>a.status===sf.status);
+  if(sf.status)list=list.filter(a=>liveStatus(a)===sf.status);
   return `
   <div class="filter-bar">
     <div class="search-wrap"><span class="search-icon">⌕</span>
@@ -678,8 +746,8 @@ function renderAssemblies(){
     <td class="money-retail">${fc(a.msrp||0)}</td>
     <td class="money-vendor">${fc((a.msrp||0)*(1-(a.discount_t1||0.1)))}</td>
     <td class="money" style="color:${(a.total_on_hand||0)<=0?'var(--red)':(a.total_on_hand||0)<3?'var(--yellow)':'var(--text)'};font-weight:700">${a.total_on_hand||0}</td>
-    <td class="money-neutral">${a.avg_sales_wk>0?a.avg_sales_wk.toFixed(2)+'/wk':'-'}</td>
-    <td>${statusPill(a.status||'ok')}</td>
+    <td class="money-neutral" title="auto from sales">${asmAvgWk(a)>0?asmAvgWk(a).toFixed(2)+'/wk':'-'}</td>
+    <td>${statusPill(liveStatus(a))}</td>
     <td style="display:flex;gap:4px">
       ${S.boms[a.pn]?`<button class="action-btn" onclick="S.selBOM='${a.pn}';nav('boms')">BOM</button>`:''}
       <button class="action-btn" onclick='openModal("editAsm",${JSON.stringify(a)})'>Edit</button>
@@ -786,8 +854,8 @@ function renderInventory(){
   const sf=S.filters.inv||{};
   const q=(sf.search||S.searchQ||'').toLowerCase();
   if(q)list=list.filter(p=>p.pn.toLowerCase().includes(q)||((p.description||'').toLowerCase().includes(q)));
-  if(sf.reorder)list=list.filter(p=>p.avg_sales_wk>0&&wks(p)!==null&&wks(p)<(p.lead_time_weeks+2));
-  const reorderCnt=S.parts.filter(p=>p.avg_sales_wk>0&&wks(p)!==null&&wks(p)<(p.lead_time_weeks+2)).length;
+  if(sf.reorder)list=list.filter(p=>avgWk(p)>0&&wks(p)!==null&&wks(p)<(p.lead_time_weeks+2));
+  const reorderCnt=S.parts.filter(p=>avgWk(p)>0&&wks(p)!==null&&wks(p)<(p.lead_time_weeks+2)).length;
   return `
   <div class="kpi-grid kpi-grid-3">
     <div class="kpi"><div class="kpi-label">Total Part SKUs</div><div class="kpi-value">${S.parts.length}</div></div>
@@ -814,7 +882,7 @@ function renderInventory(){
       <td class="main-col" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.description||''}</td>
       <td><input class="inline-edit" style="width:80px;font-size:10px;font-family:var(--mono)" value="${p.location||''}" placeholder="Bin…" onchange="savePlanField('${p.id}','location',this.value,'${p.pn}')"></td>
       <td class="money" style="color:${(p.total_unpckgd||0)<0?'var(--red)':(p.total_unpckgd||0)<(p.min_qty||0)?'var(--yellow)':'var(--text)'};font-weight:700">${fn(p.total_unpckgd||0)}</td>
-      <td class="money-neutral">${p.avg_sales_wk>0?p.avg_sales_wk.toFixed(1):'-'}</td>
+      <td class="money-neutral" title="auto from sales">${avgWk(p)>0?avgWk(p).toFixed(1):'-'}</td>
       <td><div class="stock-bar-wrap"><div class="stock-bar"><div class="stock-fill" style="width:${wkPct(w)}%;background:${wkColor(w)}"></div></div><span class="wk-label" style="color:${wkColor(w)}">${w!==null?w+'w':'—'}</span></div></td>
       <td class="money-neutral">${p.min_qty>0?fn(p.min_qty):'—'}</td>
       <td style="font-size:11px;color:var(--text3)">${p.lead_time_weeks||1}w</td>
@@ -1259,8 +1327,8 @@ async function sendAI(){
   S.aiHistory.push({role:'user',text:msg});
   S.aiLoading=true;render();
   const c=$('ai-chat');if(c)c.scrollTop=c.scrollHeight;
-  const lowParts=S.parts.filter(p=>p.avg_sales_wk>0&&wks(p)!==null&&wks(p)<4).map(p=>`${p.pn}(${wks(p)}wk)`).join(', ');
-  const critAsm=S.assemblies.filter(a=>a.status==='critical').map(a=>`${a.pn}(${a.total_on_hand||0}oh)`).join(', ');
+  const lowParts=S.parts.filter(p=>avgWk(p)>0&&wks(p)!==null&&wks(p)<4).map(p=>`${p.pn}(${wks(p)}wk)`).join(', ');
+  const critAsm=S.assemblies.filter(a=>!a.discontinued&&liveStatus(a)==='critical').map(a=>`${a.pn}(${a.total_on_hand||0}oh)`).join(', ');
   const openPOs=S.purchases.filter(p=>p.status!=='Received').map(p=>`${p.pn}@${p.vendor}(${p.status})`).join(', ');
   const ctx=`You are the AI assistant for TGK Motorsport ERP. TGK builds performance Audi/Tesla parts. Live Supabase data: ${S.parts.length} parts, ${S.assemblies.length} assemblies. Low stock (under 4wks): ${lowParts||'none'}. Critical (zero/negative stock): ${critAsm||'none'}. Open POs: ${openPOs||'none'}. 7-day orders: ${S.sales.filter(s=>s.sale_date>=daysAgo(7)).length}. Be specific, actionable, concise.`;
   try{
@@ -1917,7 +1985,7 @@ function partDossier(pn){
   </div>
   <div class="kpi-grid kpi-grid-4">
     <div class="kpi ${(p.total_unpckgd||0)<=rp?'kpi-red':'kpi-teal'}"><div class="kpi-label">On Hand</div><div class="kpi-value">${fn(p.total_unpckgd||0)}</div><div class="kpi-sub">Bin: ${p.location||'unassigned'}</div></div>
-    <div class="kpi"><div class="kpi-label">Weeks of Stock</div><div class="kpi-value" style="color:${wkColor(w)}">${w!==null?w+'w':'—'}</div><div class="kpi-sub">${(p.avg_sales_wk||0).toFixed(1)}/wk demand</div></div>
+    <div class="kpi"><div class="kpi-label">Weeks of Stock</div><div class="kpi-value" style="color:${wkColor(w)}">${w!==null?w+'w':'—'}</div><div class="kpi-sub">${avgWk(p).toFixed(1)}/wk · live from sales</div></div>
     <div class="kpi kpi-orange"><div class="kpi-label">Reorder Pt / Min / Max</div><div class="kpi-value" style="font-size:15px">${rp}<span style="font-size:11px;color:var(--text3)"> / ${p.min_qty||0} / ${p.max_qty||0}</span></div></div>
     <div class="kpi"><div class="kpi-label">Unit Cost</div><div class="kpi-value" style="font-size:16px">${fc(p.unit_cost||0,4)}</div><div class="kpi-sub">${p.vendor||'no vendor'} · ${p.lead_time_weeks||1}w lead</div></div>
   </div>
@@ -1979,7 +2047,7 @@ function statSuggest(p){
 async function aiSuggestMinMax(singlePn){
   const tracked=singlePn
     ? S.parts.filter(p=>p.pn===singlePn)
-    : S.parts.filter(p=>!p.discontinued&&((p.avg_sales_wk||0)>0||weeklySeries(p.pn,12).some(x=>x>0)));
+    : S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||weeklySeries(p.pn,12).some(x=>x>0)));
   if(!tracked.length){toast('No items with sales history to analyze');return;}
 
   // Statistical baseline for every item (always available)
@@ -2104,7 +2172,7 @@ function costForQty(p, qty){
 }
 
 function calcReorderPoint(p) {
-  const wkDemand = p.avg_sales_wk || calcForecast(p.pn);
+  const wkDemand = avgWk(p) || calcForecast(p.pn);
   const lt = p.lead_time_weeks || 1;
   const safety = p.safety_stock || 0;
   return Math.ceil(wkDemand * lt + safety);
@@ -2114,13 +2182,13 @@ function calcSuggestedQty(p) {
   const max = p.max_qty || 0;
   const curr = p.total_unpckgd || 0;
   if(max > 0) return Math.max(0, Math.ceil(max - curr));
-  const wkDemand = p.avg_sales_wk || calcForecast(p.pn);
+  const wkDemand = avgWk(p) || calcForecast(p.pn);
   return Math.ceil(wkDemand * S.forecastWeeks);
 }
 
 function renderPlanning() {
   const weeks = S.forecastWeeks;
-  let parts = S.parts.filter(p=>!p.discontinued&&(p.avg_sales_wk>0||calcForecast(p.pn)>0));
+  let parts = S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||calcForecast(p.pn)>0));
   const sf = S.filters.planning||{};
   const q=(sf.search||'').toLowerCase();
   const vendors=[...new Set(parts.map(p=>p.vendor||'').filter(Boolean))].sort();
@@ -2169,7 +2237,7 @@ function renderPlanning() {
     const sq=calcSuggestedQty(p);
     const moq=p.moq||0;
     const orderQty=Math.max(sq,moq);
-    const wkd=(p.avg_sales_wk||calcForecast(p.pn));
+    const wkd=(avgWk(p)||calcForecast(p.pn));
     let status,statusCls;
     if(oh<=0){status='Critical';statusCls='pill-red';}
     else if(oh<=rp&&moq>0&&sq<moq){status='OK · below MOQ';statusCls='pill-muted';}
@@ -2186,7 +2254,7 @@ function renderPlanning() {
       <td><input class="inline-edit" style="width:55px" type="number" value="${p.safety_stock||0}" onchange="savePlanField('${p.id}','safety_stock',+this.value,'${p.pn}')"></td>
       <td><input class="inline-edit" style="width:55px" type="number" value="${moq}" title="Minimum order qty — won't flag unless suggested ≥ MOQ" onchange="savePlanField('${p.id}','moq',+this.value,'${p.pn}')"></td>
       <td class="money-neutral">${rp}</td>
-      <td class="money-neutral">${wkd.toFixed(2)}/wk</td>
+      <td class="money-neutral" title="12-wk avg · 4-wk: ${avgWk4(p).toFixed(2)}/wk — auto from sales">${wkd.toFixed(2)}/wk</td>
       <td class="money-cost" style="font-weight:700" title="Order ${orderQty} @ ${fc(costForQty(p,orderQty),4)}/ea">${sq}${moq>sq?'<span style="color:var(--text3);font-size:9px"> →'+moq+'</span>':''}</td>
       <td><span class="pill ${statusCls}">${status}</span></td>
       <td style="display:flex;gap:4px">${oh<=rp&&orderQty>0&&!(moq>0&&sq<moq)?`<button class="btn btn-primary btn-sm" onclick='createPOFromSuggestion("${p.pn}","${p.vendor||''}",${orderQty},${costForQty(p,orderQty)},"${p.description||''}")'>Order ${orderQty}</button>`:''}<button class="action-btn" title="AI suggest min/max" onclick="aiSuggestMinMax('${p.pn}')">✨</button></td>
@@ -2539,7 +2607,7 @@ function renderPackQueue(){
   const rows=S.assemblies.filter(a=>!a.discontinued).map(a=>{
     const b=buildability(a.pn);
     const demand=openOrderDemand(a.pn);
-    const fcDemand=Math.ceil((a.avg_sales_wk||0)*cov);
+    const fcDemand=Math.ceil(asmAvgWk(a)*cov);
     const suggested=Math.max(0,Math.max(demand,fcDemand)-(a.total_on_hand||0));
     return{...a,b,demand,fcDemand,suggested,
       canCover:(b.maxBuild===Infinity||b.maxBuild>=suggested)};
@@ -2593,7 +2661,7 @@ function renderBuildPlanner(asm){
   const b=buildability(asm.pn);
   const demand=openOrderDemand(asm.pn);
   const cov=S.buildCoverage||4;
-  const want=S.buildQty||Math.max(1,Math.max(demand,Math.ceil((asm.avg_sales_wk||0)*cov))-(asm.total_on_hand||0))||1;
+  const want=S.buildQty||Math.max(1,Math.max(demand,Math.ceil(asmAvgWk(asm)*cov))-(asm.total_on_hand||0))||1;
   const feasible=b.maxBuild===Infinity?want:Math.min(want,b.maxBuild);
   return `
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
@@ -2659,8 +2727,62 @@ function renderBuildPlanner(asm){
         </tr>`;}).join('')}
       </tbody></table>
     </div>
+    ${(function(){
+      const shorts=b.checks.map(c=>({...c,short:Math.max(0,c.need*want-c.avail)})).filter(c=>c.short>0);
+      if(!shorts.length)return '';
+      let out='<div class="panel" style="padding:0;border-left:3px solid var(--yellow)"><div class="section-header">🔁 Free parts by unpacking other products</div>';
+      let any=false;
+      shorts.forEach(c=>{
+        const donors=donorOptions(c.pn,c.short,asm.pn);
+        if(!donors.length)return;
+        any=true;
+        out+='<div style="padding:8px 14px 2px;font-size:11px;color:var(--text2)">Need <b style="color:var(--red)">'+c.short+'× '+c.pn+'</b> more:</div>';
+        donors.forEach(d=>{
+          out+='<div class="check-row">'
+            +'<span class="pn" style="color:var(--teal)">'+d.pn+'</span>'
+            +'<span style="font-size:10px;color:var(--text3);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+d.desc+'</span>'
+            +'<span style="font-size:10px;color:var(--text3)">'+d.onHand+' on hand · '+d.perUnit+'/unit · '+(d.wkDemand>0?d.wkDemand.toFixed(1)+'/wk sales':'no recent sales')+'</span>'
+            +'<span style="flex:1"></span>'
+            +'<span style="font-size:11px;color:'+(d.covers?'var(--green)':'var(--yellow)')+';font-weight:600">frees '+d.frees+(d.covers?' ✓':' (partial)')+'</span>'
+            +'<button class="btn btn-sm" style="margin-left:8px" data-dpn="'+d.pn+'" data-did="'+d.id+'" data-du="'+d.units+'" onclick="unpackPlanned(this.dataset.dpn,this.dataset.did,+this.dataset.du)">↩ Unpack '+d.units+'</button>'
+            +'</div>';
+        });
+      });
+      if(!any)out+='<div class="section-empty">No other in-stock products contain the missing parts</div>';
+      out+='</div>';
+      return out;
+    })()}
   </div>
   </div>`;
+}
+
+function donorOptions(partPn, shortQty, excludePn){
+  // Which in-stock assemblies could be unpacked to free this part?
+  const donors=[];
+  Object.entries(S.boms).forEach(([parent,items])=>{
+    if(parent===excludePn)return;
+    const line=items.find(i=>i.item_type==='part'&&i.child_pn===partPn);
+    if(!line)return;
+    const asm=S.assemblies.find(a=>a.pn===parent&&!a.discontinued);
+    if(!asm||(asm.total_on_hand||0)<=0)return;
+    const perUnit=line.qty||1;
+    const unitsNeeded=Math.ceil(shortQty/perUnit);
+    const unitsAvail=asm.total_on_hand||0;
+    const units=Math.min(unitsNeeded,unitsAvail);
+    const frees=units*perUnit;
+    const demand=asmAvgWk(asm);
+    donors.push({pn:parent,id:asm.id,desc:asm.description||'',onHand:unitsAvail,perUnit,units,frees,covers:frees>=shortQty,wkDemand:demand});
+  });
+  // best donors first: covers the shortage, then lowest sales demand (least painful to unpack)
+  donors.sort((a,b)=>(b.covers-a.covers)||(a.wkDemand-b.wkDemand));
+  return donors.slice(0,4);
+}
+
+async function unpackPlanned(pn,asmId,qty){
+  const fakeInput=document.createElement('input');fakeInput.id='unpack-qty-'+asmId;fakeInput.value=qty;
+  document.body.appendChild(fakeInput);
+  await packUnits(pn,asmId,true);
+  fakeInput.remove();
 }
 
 async function packPlanned(pn,asmId,qty){
@@ -3086,6 +3208,7 @@ function exportTable(table) {
 // ============================================================
 function render(){
   const views={dashboard:renderDashboard,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport};
+  if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length)computeDemand();
   // Preserve focused input + caret across re-render
   const active=document.activeElement;
   let fkey=null,selS=0,selE=0;
@@ -3104,7 +3227,7 @@ function render(){
 }
 
 // ── INIT ─────────────────────────────────────────────────────
-loadAll().then(()=>{setupRealtime();loadBackups();startAutoBackup();});
+loadAll().then(()=>{computeDemand();setupRealtime();loadBackups();startAutoBackup();render();});
 </script>
 </body>
 </html>
