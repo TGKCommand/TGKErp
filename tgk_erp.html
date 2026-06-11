@@ -965,7 +965,8 @@ function renderSales(){
     </div>
     <button class="filter-chip ${!sf.fstatus?'on-teal':''}" onclick="setFilter('sales','fstatus','')">All</button>
     ${fstats.map(s=>`<button class="filter-chip ${sf.fstatus===s?'on-teal':''}" onclick="setFilter('sales','fstatus','${s}')">${s}</button>`).join('')}
-    <button class="btn btn-sm" style="margin-left:auto" title="Mark pre-system Open orders as Delivered" onclick="closeHistoricalOrders()">🧹 Close pre-system orders</button>
+    <button class="btn btn-sm" style="margin-left:auto" title="Remove duplicate order lines (same order # + SKU)" onclick="dedupeOrders()">🧽 Dedupe</button>
+    <button class="btn btn-sm" title="Mark pre-system Open orders as Delivered" onclick="closeHistoricalOrders()">🧹 Close pre-system orders</button>
     <button class="btn btn-primary btn-sm" onclick='openModal("addSale",{})'>+ Manual Order</button>
     <span class="filter-count">${list.length} orders</span>
   </div>
@@ -1001,7 +1002,7 @@ function renderSaleDetail(s){
   const asm=S.assemblies.find(a=>a.pn===s.pn);
   const stock=asm?(asm.total_on_hand||0):null;
   const canFill=stock!==null&&stock>=(s.qty||1);
-  const siblings=S.sales.filter(x=>x.order_number===s.order_number&&x.id!==s.id);
+  const siblings=S.sales.filter(x=>x.order_number===s.order_number&&x.id!==s.id&&s.order_number);
   const fsMap={'Open':'pill-red','Packed':'pill-yellow','Shipped':'pill-teal','Delivered':'pill-green','Cancelled':'pill-muted'};
   const moves=S.corrections.filter(c=>c.pn===s.pn).slice(0,5);
   return `
@@ -1032,6 +1033,32 @@ function renderSaleDetail(s){
     ${moves.length===0?'<div class="section-empty">None</div>':moves.map(c=>`<div class="check-row"><span style="font-size:10px;font-family:var(--mono);color:var(--text3)">${new Date(c.created_at).toLocaleDateString()}</span><span class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700;min-width:40px">${c.adjustment>0?'+':''}${c.adjustment}</span><span style="flex:1;font-size:11px;color:var(--text2)">${c.reason||c.source}</span></div>`).join('')}</div>
   </div>
   </div>`;
+}
+
+async function dedupeOrders(){
+  const rank={'Delivered':4,'Shipped':3,'Packed':2,'Open':1,'Cancelled':0};
+  const groups={};
+  S.sales.forEach(s=>{
+    if(!s.order_number)return;
+    const k=s.order_number+'||'+s.pn;
+    (groups[k]=groups[k]||[]).push(s);
+  });
+  const toDelete=[];
+  Object.values(groups).forEach(g=>{
+    if(g.length<2)return;
+    g.sort((a,b)=>(rank[b.fulfillment_status||'Open']||0)-(rank[a.fulfillment_status||'Open']||0));
+    toDelete.push(...g.slice(1)); // keep the most-progressed row
+  });
+  if(!toDelete.length){toast('No duplicate order lines found ✓');return;}
+  if(!confirm('Found '+toDelete.length+' duplicate order line'+(toDelete.length>1?'s':'')+' (same order # + SKU). Delete them, keeping the most-progressed copy of each?'))return;
+  const undoOps=[];
+  for(const s of toDelete){
+    await db.from('sales').delete().eq('id',s.id);
+    undoOps.push({action:'delete',table:'sales',data:s});
+  }
+  S.sales=S.sales.filter(s=>!toDelete.find(d=>d.id===s.id));
+  pushUndoMulti('Dedupe '+toDelete.length+' order lines',undoOps);
+  toast(toDelete.length+' duplicates removed');render();
 }
 
 async function closeHistoricalOrders(){
