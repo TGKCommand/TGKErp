@@ -2733,9 +2733,9 @@ function renderPODetail(po) {
       ${!done?`<div class="check-row">
         <div style="font-size:11px;color:var(--text3);width:100px">Check In</div>
         <input class="qty-input" id="checkin-${line.id}" type="number" min="0" value="${remaining}" placeholder="Qty">
-        <span style="font-size:11px;color:var(--text3);margin:0 6px">of ${remaining} remaining · over = surplus to stock</span>
+        <span style="font-size:11px;color:var(--text3);margin:0 6px">expecting ${remaining} · enter what actually arrived</span>
         <button class="btn btn-teal btn-sm" onclick="checkInLine('${line.id}','${po.id}','${line.pn}',${line.qty_ordered},${line.qty_received||0})">✓ Receive</button>
-        <button class="btn btn-sm" title="Receive entered qty, close this line short, and create a backorder PO for the remainder" onclick="closeShortBackorder('${line.id}','${po.id}','${line.pn}',${line.qty_ordered},${line.qty_received||0})">Short → Backorder</button>
+        <span style="font-size:9.5px;color:var(--text3)">less → auto-backorder · more → surplus to stock</span>
         <input class="inline-edit" id="checkin-note-${line.id}" placeholder="Note (optional)" style="flex:1;margin-left:8px">
       </div>`:'<div class="check-row" style="color:var(--teal);font-size:11px">✓ Fully received — stock updated</div>'}
     </div>`;
@@ -2749,36 +2749,49 @@ async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
   if(qty<=0){toast('Enter a quantity');return;}
   const note = noteInp?noteInp.value.trim():'';
   const newReceived = qtyAlreadyReceived + qty;
+  const remaining = Math.max(0, qtyOrdered - newReceived);
+  const surplus = Math.max(0, newReceived - qtyOrdered);
 
-  // Update po_line
-  await db.from('po_lines').update({
-    qty_received:newReceived,
-    status:newReceived>=qtyOrdered?'Complete':'Partial',
-    updated_at:new Date().toISOString()
-  }).eq('id',lineId);
-
-  // Update part inventory
+  // Receive into stock (whatever arrived — surplus included)
   const part = S.parts.find(p=>p.pn===pn);
   if(part){
     const newQty = (part.total_unpckgd||0) + qty;
     await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
     S.parts = S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
-    // Log correction
-    const surplus=Math.max(0,newReceived-qtyOrdered);
-    await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason:'PO Receipt'+(surplus>0?' (+'+surplus+' surplus)':'')+(note?' — '+note:''),source:'po_receipt'});
-    S.corrections = [{pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason:'PO Receipt',source:'po_receipt',created_at:new Date().toISOString()},...S.corrections];
+    const reason='PO Receipt'+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' ('+remaining+' auto-backordered)':'')+(note?' — '+note:'');
+    await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,source:'po_receipt'});
+    S.corrections = [{pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,source:'po_receipt',created_at:new Date().toISOString()},...S.corrections];
   }
 
-  // Refresh lines
+  if(remaining>0){
+    // SHORT: close this line and auto-create a backorder PO for the remainder
+    await db.from('po_lines').update({qty_received:newReceived,status:'Backordered',notes:remaining+' backordered',updated_at:new Date().toISOString()}).eq('id',lineId);
+    const po=S.purchases.find(p=>p.id===poId);
+    const line=(S.poLines[poId]||[]).find(l=>l.id===lineId);
+    const {data:newPO,error}=await db.from('purchases').insert({
+      vendor:po?.vendor||'TBD',pn,description:'BACKORDER — '+(line?.description||pn),
+      qty:remaining,unit_cost:line?.unit_cost||0,status:'Ordered',
+      order_date:new Date().toISOString().slice(0,10),updated_at:new Date().toISOString()
+    }).select().single();
+    if(!error&&newPO){
+      await db.from('po_lines').insert({po_id:newPO.id,pn,description:'BACKORDER — '+(line?.description||''),qty_ordered:remaining,unit_cost:line?.unit_cost||0,qty_received:0,status:'Pending'});
+      S.purchases=[newPO,...S.purchases];
+    }
+    toast('Received '+qty+'× '+pn+' — short '+remaining+' → backorder PO created automatically');
+  } else {
+    // EXACT or SURPLUS: line complete
+    await db.from('po_lines').update({qty_received:newReceived,status:'Complete',updated_at:new Date().toISOString()}).eq('id',lineId);
+    toast('Received '+qty+'× '+pn+(surplus>0?' (+'+surplus+' surplus into stock)':'')+' ✓');
+  }
+
+  // Refresh + auto-close PO when every line is settled
   await loadPOLines(poId);
-  // Check if all lines complete → mark PO received
   const lines = S.poLines[poId]||[];
-  if(lines.every(l=>l.qty_received>=l.qty_ordered)){
+  if(lines.every(l=>l.qty_received>=l.qty_ordered||l.status==='Backordered')){
     await db.from('purchases').update({status:'Received',updated_at:new Date().toISOString()}).eq('id',poId);
     S.purchases = S.purchases.map(p=>p.id===poId?{...p,status:'Received'}:p);
   }
   updateBadge();
-  toast('Received '+qty+' × '+pn+' → stock updated');
   render();
 }
 
