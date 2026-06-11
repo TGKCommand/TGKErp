@@ -499,59 +499,76 @@ function addAction(){const m={parts:'addPart',assemblies:'addAsm',purchases:'add
 // ============================================================
 function renderDashboard(){
   const critical=S.assemblies.filter(a=>a.status==='critical').length;
-  const lowStock=S.parts.filter(p=>p.avg_sales_wk>0&&wks(p)!==null&&wks(p)<4).length;
+  const needsReorder=S.parts.filter(p=>(p.avg_sales_wk>0||calcForecast(p.pn)>0)&&(p.total_unpckgd||0)<=calcReorderPoint(p)).length;
   const invVal=S.parts.reduce((s,p)=>s+Math.max(0,p.total_unpckgd||0)*(p.unit_cost||0),0);
-  const weekOrds=S.sales.filter(s=>s.sale_date>='2026-06-02').length;
-  const openPOAmt=S.purchases.filter(p=>p.status!=='Received').reduce((s,p)=>s+(p.unit_cost||0)*(p.qty||0),0);
+  const openOrders=S.sales.filter(s=>!s.fulfillment_status||s.fulfillment_status==='Open');
+  const packedOrders=S.sales.filter(s=>s.fulfillment_status==='Packed');
+  const openWarranty=S.warrantyClaims.filter(w=>w.status==='Open').length;
+  const openCounts=S.cycleCounts.filter(c=>c.status==='Open').length;
+  const weekOrds=S.sales.filter(s=>s.sale_date>=daysAgo(7)).length;
+  const openPOs=S.purchases.filter(p=>p.status!=='Received');
+  const openPOAmt=openPOs.reduce((s,p)=>s+(p.unit_cost||0)*(p.qty||0),0);
+  const feed=buildActivityFeed(12);
   return `
   <div class="kpi-grid kpi-grid-4">
-    <div class="kpi kpi-orange"><div class="kpi-label">Orders — 7 days</div><div class="kpi-value">${weekOrds}</div></div>
-    <div class="kpi kpi-red"><div class="kpi-label">Critical SKUs</div><div class="kpi-value">${critical}</div><div class="kpi-sub">Need immediate action</div></div>
-    <div class="kpi kpi-yellow"><div class="kpi-label">Low Stock Parts</div><div class="kpi-value">${lowStock}</div><div class="kpi-sub">Under 4 wk supply</div></div>
-    <div class="kpi kpi-teal"><div class="kpi-label">Parts Inventory Value</div><div class="kpi-value" style="font-size:17px">${fc(invVal)}</div></div>
+    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','Open');nav('sales')"><div class="kpi-label">Orders to Fulfill</div><div class="kpi-value">${openOrders.length}</div><div class="kpi-sub">${packedOrders.length} packed & ready to ship</div></div>
+    <div class="kpi kpi-orange" style="cursor:pointer" onclick="nav('planning')"><div class="kpi-label">Parts Need Reorder</div><div class="kpi-value">${needsReorder}</div><div class="kpi-sub">Below reorder point</div></div>
+    <div class="kpi kpi-yellow" style="cursor:pointer" onclick="nav('assemblies')"><div class="kpi-label">Critical Assemblies</div><div class="kpi-value">${critical}</div></div>
+    <div class="kpi kpi-teal"><div class="kpi-label">Parts Inventory Value</div><div class="kpi-value" style="font-size:17px">${fc(invVal)}</div><div class="kpi-sub">${weekOrds} orders this week</div></div>
   </div>
+  ${openWarranty>0||openCounts>0?`<div class="panel" style="padding:10px 18px;display:flex;gap:18px;align-items:center;border-left:3px solid var(--yellow)">
+    <span style="font-size:11px;color:var(--text2)">⚑ Pending tasks:</span>
+    ${openWarranty>0?`<button class="filter-chip" onclick="nav('warranty')">${openWarranty} open warranty claim${openWarranty>1?'s':''}</button>`:''}
+    ${openCounts>0?`<button class="filter-chip" onclick="nav('cyclecounts')">${openCounts} cycle count${openCounts>1?'s':''} in progress</button>`:''}
+  </div>`:''}
   <div class="grid-2">
   <div>
     <div class="panel">
-      <div class="panel-title"><span class="panel-title-left">⚠ Assembly Alerts</span><button class="btn btn-sm" onclick="nav('assemblies')">View All</button></div>
-      ${S.assemblies.filter(a=>a.status==='critical'||a.status==='low').slice(0,6).map(a=>`
-        <div class="alert-row ${a.status==='critical'?'alert-row-red':'alert-row-yellow'}">
-          <div style="flex:1"><b>${a.pn}</b> — ${a.description||''}</div>
-          ${statusPill(a.status)}
-        </div>`).join('')||'<div class="section-empty">All assemblies in stock ✓</div>'}
+      <div class="panel-title"><span class="panel-title-left">🚚 Fulfillment Queue</span><button class="btn btn-sm" onclick="nav('sales')">All Orders →</button></div>
+      ${openOrders.length===0&&packedOrders.length===0?'<div class="section-empty">All orders fulfilled ✓</div>':
+      [...openOrders.slice(0,4),...packedOrders.slice(0,3)].map(s=>{
+        const asm=S.assemblies.find(a=>a.pn===s.pn);
+        const stock=asm?(asm.total_on_hand||0):null;
+        const canFill=stock!==null&&stock>=(s.qty||1);
+        const fs=s.fulfillment_status||'Open';
+        return `<div class="alert-row ${fs==='Open'?(canFill?'alert-row-yellow':'alert-row-red'):''}" style="${fs==='Packed'?'border-left-color:var(--teal)':''}">
+          <div style="flex:1"><b>${s.order_number||''}</b> — ${s.pn} ×${s.qty||1}
+            <span style="font-size:10px;color:${canFill?'var(--green)':'var(--red)'};margin-left:6px">${stock!==null?'stock: '+stock:''}</span></div>
+          ${fs==='Open'?`<button class="btn btn-teal btn-sm" ${canFill?'':'disabled'} onclick="markPacked('${s.id}','${s.pn}',${s.qty||1})">Pack</button>`:
+          `<button class="btn btn-primary btn-sm" onclick="openShipModal('${s.id}','${s.pn}',${s.qty||1})">Ship</button>`}
+        </div>`;}).join('')}
     </div>
     <div class="panel">
-      <div class="panel-title"><span class="panel-title-left">Parts Reorder Queue</span><button class="btn btn-sm" onclick="nav('inventory')">Inventory →</button></div>
+      <div class="panel-title"><span class="panel-title-left">⚠ Reorder Queue</span><button class="btn btn-sm" onclick="nav('planning')">Planning →</button></div>
       <div class="tbl-wrap">
-      <table><thead><tr><th>Part #</th><th>Wks Left</th><th>Avg / Wk</th><th></th></tr></thead><tbody>
-      ${S.parts.filter(p=>p.avg_sales_wk>0).sort((a,b)=>(wks(a)||99)-(wks(b)||99)).slice(0,7).map(p=>{
-        const w=wks(p);
+      <table><thead><tr><th>Part #</th><th>On Hand</th><th>Reorder Pt</th><th></th></tr></thead><tbody>
+      ${S.parts.filter(p=>(p.avg_sales_wk>0)&&(p.total_unpckgd||0)<=calcReorderPoint(p)).sort((a,b)=>(a.total_unpckgd||0)-(b.total_unpckgd||0)).slice(0,7).map(p=>{
+        const sq=calcSuggestedQty(p);
         return `<tr><td class="pn">${p.pn}</td>
-        <td><span class="wk-label" style="color:${wkColor(w)}">${w!==null?w+'w':'—'}</span></td>
-        <td class="money-neutral">${p.avg_sales_wk.toFixed(1)}/wk</td>
-        <td><button class="action-btn" onclick='openModal("addPO",{item:"${p.pn}",desc:${JSON.stringify(p.description||'')},vendor:"${p.vendor||''}",qty:${Math.ceil((p.avg_sales_wk||1)*12)},unitCost:${p.unit_cost||0}})'>Order</button></td></tr>`;
-      }).join('')}
+        <td class="money" style="color:var(--red);font-weight:700">${p.total_unpckgd||0}</td>
+        <td class="money-neutral">${calcReorderPoint(p)}</td>
+        <td><button class="action-btn" onclick='createPOFromSuggestion("${p.pn}","${p.vendor||''}",${sq},${p.unit_cost||0},"")'>Order ${sq}</button></td></tr>`;
+      }).join('')||'<tr><td colspan="4" class="section-empty">Nothing needs reordering ✓</td></tr>'}
       </tbody></table></div>
     </div>
   </div>
   <div>
     <div class="panel">
-      <div class="panel-title"><span class="panel-title-left">Recent Sales</span><button class="btn btn-sm" onclick="nav('sales')">All Orders →</button></div>
-      <div class="tbl-wrap">
-      <table><thead><tr><th>Date</th><th>Order</th><th>SKU</th><th>Status</th></tr></thead><tbody>
-      ${S.sales.slice(0,10).map(s=>`<tr>
-        <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${s.sale_date?s.sale_date.slice(0,10):''}</td>
-        <td class="pn">${s.order_number||''}</td>
-        <td class="pn" style="color:var(--teal)">${s.pn}</td>
-        <td><span class="pill pill-teal">${s.status}</span></td>
-      </tr>`).join('')}
-      </tbody></table></div>
+      <div class="panel-title"><span class="panel-title-left">📋 Activity Feed</span><button class="btn btn-sm" onclick="nav('corrections')">Full Log →</button></div>
+      ${feed.map(e=>`<div class="margin-analysis-row" style="padding:7px 0">
+        <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:0">
+          <span style="flex-shrink:0">${e.icon}</span>
+          <span style="font-size:11px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${e.text}</span>
+        </div>
+        <span style="font-size:9px;color:var(--text3);font-family:var(--mono);flex-shrink:0">${e.ts?new Date(e.ts).toLocaleDateString():''}</span>
+      </div>`).join('')||'<div class="section-empty">No recent activity</div>'}
     </div>
     <div class="panel">
       <div class="panel-title"><span class="panel-title-left">Open Purchase Orders</span><button class="btn btn-sm" onclick="nav('purchases')">All POs →</button></div>
+      <div class="inline-stat" style="margin-bottom:8px"><span style="color:var(--text3)">Open PO Value</span><span class="money-cost" style="font-weight:700">${fc(openPOAmt)}</span></div>
       <div class="tbl-wrap">
       <table><thead><tr><th>Vendor</th><th>Part #</th><th>Amount</th><th>Status</th></tr></thead><tbody>
-      ${S.purchases.filter(p=>p.status!=='Received').slice(0,6).map(p=>`<tr>
+      ${openPOs.slice(0,6).map(p=>`<tr style="cursor:pointer" onclick="openPODetail('${p.id}');nav('purchases')">
         <td class="main-col">${p.vendor}</td>
         <td class="pn">${p.pn}</td>
         <td class="money-cost">${fc((p.unit_cost||0)*(p.qty||0))}</td>
@@ -768,20 +785,20 @@ function renderInventory(){
     <span class="filter-count">${list.length} parts</span>
   </div>
   <div class="tbl-wrap">
-  <table><thead><tr><th>Part #</th><th>Description</th><th>Vendor</th><th>On Hand</th><th>Avg / Wk</th><th>Wks Stock</th><th>Min Qty</th><th>Lead</th><th>Action</th></tr></thead><tbody>
+  <table><thead class="sticky-header"><tr><th>Part #</th><th>Description</th><th>Location</th><th>On Hand</th><th>Avg / Wk</th><th>Wks Stock</th><th>Min Qty</th><th>Lead</th><th>Action</th></tr></thead><tbody>
   ${list.map(p=>{
     const w=wks(p);const needsOrder=w!==null&&w<(p.lead_time_weeks+2)&&p.avg_sales_wk>0;
     const oq=p.avg_sales_wk>0?Math.ceil(p.avg_sales_wk*12):0;
     return `<tr style="${needsOrder?'background:rgba(224,123,40,.04)':''}">
       <td class="pn" style="color:var(--text)">${p.pn}</td>
       <td class="main-col" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.description||''}</td>
-      <td style="font-size:11px;color:var(--text3)">${p.vendor||''}</td>
+      <td><input class="inline-edit" style="width:80px;font-size:10px;font-family:var(--mono)" value="${p.location||''}" placeholder="Bin…" onchange="savePlanField('${p.id}','location',this.value,'${p.pn}')"></td>
       <td class="money" style="color:${(p.total_unpckgd||0)<0?'var(--red)':(p.total_unpckgd||0)<(p.min_qty||0)?'var(--yellow)':'var(--text)'};font-weight:700">${fn(p.total_unpckgd||0)}</td>
       <td class="money-neutral">${p.avg_sales_wk>0?p.avg_sales_wk.toFixed(1):'-'}</td>
       <td><div class="stock-bar-wrap"><div class="stock-bar"><div class="stock-fill" style="width:${wkPct(w)}%;background:${wkColor(w)}"></div></div><span class="wk-label" style="color:${wkColor(w)}">${w!==null?w+'w':'—'}</span></div></td>
       <td class="money-neutral">${p.min_qty>0?fn(p.min_qty):'—'}</td>
       <td style="font-size:11px;color:var(--text3)">${p.lead_time_weeks||1}w</td>
-      <td>${needsOrder?`<button class="btn btn-primary btn-sm" onclick='openModal("addPO",{item:"${p.pn}",desc:${JSON.stringify(p.description||'')},vendor:"${p.vendor||''}",qty:${oq},unitCost:${p.unit_cost||0}})'>Order ${oq}</button>`:'<span style="font-size:10px;color:var(--text3)">OK</span>'}</td>
+      <td style="display:flex;gap:4px">${needsOrder?`<button class="btn btn-primary btn-sm" onclick='openModal("addPO",{item:"${p.pn}",desc:${JSON.stringify(p.description||'')},vendor:"${p.vendor||''}",qty:${oq},unitCost:${p.unit_cost||0}})'>Order ${oq}</button>`:''}<button class="action-btn" title="Adjust stock" onclick="openModal('manualCorrection',{})">±</button></td>
     </tr>`;}).join('')}
   </tbody></table></div>`;
 }
@@ -835,71 +852,109 @@ function renderSales(){
   const sf=S.filters.sales||{};
   const q=(sf.search||S.searchQ||'').toLowerCase();
   if(q)list=list.filter(s=>s.pn.toLowerCase().includes(q)||(s.order_number||'').toLowerCase().includes(q)||(s.source||'').toLowerCase().includes(q));
+  if(sf.fstatus)list=list.filter(s=>(s.fulfillment_status||'Open')===sf.fstatus);
+  const open=S.sales.filter(s=>!s.fulfillment_status||s.fulfillment_status==='Open');
+  const packed=S.sales.filter(s=>s.fulfillment_status==='Packed');
+  const shipped7=S.sales.filter(s=>s.fulfillment_status==='Shipped'&&s.shipped_at&&s.shipped_at.slice(0,10)>=daysAgo(7));
+  const rev7=S.sales.filter(s=>s.sale_date>=daysAgo(7)).reduce((t,s)=>{const a=S.assemblies.find(x=>x.pn===s.pn);return t+((a?.msrp||0)*(s.qty||1));},0);
+  const fstats=['Open','Packed','Shipped','Delivered','Cancelled'];
   return `
-  <div class="kpi-grid kpi-grid-3">
-    <div class="kpi kpi-orange"><div class="kpi-label">Orders — 7 Days</div><div class="kpi-value">${S.sales.filter(s=>s.sale_date>='2026-06-02').length}</div></div>
-    <div class="kpi"><div class="kpi-label">Total Orders</div><div class="kpi-value">${fn(S.sales.length)}</div></div>
-    <div class="kpi"><div class="kpi-label">Latest Order</div><div class="kpi-value" style="font-size:15px;font-family:var(--mono)">${S.sales[0]?.order_number||'—'}</div></div>
+  <div class="kpi-grid kpi-grid-4">
+    <div class="kpi kpi-red"><div class="kpi-label">Awaiting Fulfillment</div><div class="kpi-value">${open.length}</div><div class="kpi-sub">Open orders to pack</div></div>
+    <div class="kpi kpi-yellow"><div class="kpi-label">Packed — Ready to Ship</div><div class="kpi-value">${packed.length}</div></div>
+    <div class="kpi kpi-teal"><div class="kpi-label">Shipped — 7 Days</div><div class="kpi-value">${shipped7.length}</div></div>
+    <div class="kpi kpi-green"><div class="kpi-label">Est. Revenue — 7 Days</div><div class="kpi-value" style="font-size:17px">${fc(rev7)}</div></div>
   </div>
   <div class="shopify-bar">
     <div class="shopify-icon">S</div>
     <div style="flex:1"><div style="font-size:12px;font-weight:700;color:var(--text)">Shopify Order Sync</div><div style="font-size:11px;color:var(--text3)">Real-time via webhook. Configure in Integrations.</div></div>
     <button class="btn btn-sm" onclick="nav('integrations')">Configure</button>
-    <button class="btn btn-teal btn-sm" onclick="toast('Syncing orders from Shopify…')">↻ Sync Now</button>
   </div>
   <div class="filter-bar">
     <div class="search-wrap"><span class="search-icon">⌕</span>
       <input placeholder="Order # or SKU…" value="${sf.search||''}" oninput="setFilter('sales','search',this.value)">
     </div>
+    <button class="filter-chip ${!sf.fstatus?'on-teal':''}" onclick="setFilter('sales','fstatus','')">All</button>
+    ${fstats.map(s=>`<button class="filter-chip ${sf.fstatus===s?'on-teal':''}" onclick="setFilter('sales','fstatus','${s}')">${s}</button>`).join('')}
+    <button class="btn btn-primary btn-sm" style="margin-left:auto" onclick='openModal("addSale",{})'>+ Manual Order</button>
     <span class="filter-count">${list.length} orders</span>
   </div>
   <div class="tbl-wrap">
-  <table><thead><tr><th>Date</th><th>Source</th><th>Order #</th><th>SKU</th><th>Qty</th><th>Rev</th><th>Status</th><th></th></tr></thead><tbody>
-  ${list.map(s=>`<tr>
+  <table><thead class="sticky-header"><tr><th>Date</th><th>Order #</th><th>SKU</th><th>Qty</th><th>Stock</th><th>Fulfillment</th><th>Tracking</th><th>Actions</th></tr></thead><tbody>
+  ${list.map(s=>{
+    const fs=s.fulfillment_status||'Open';
+    const asm=S.assemblies.find(a=>a.pn===s.pn);
+    const stock=asm?(asm.total_on_hand||0):null;
+    const canFill=stock!==null&&stock>=(s.qty||1);
+    const fsMap={'Open':'pill-red','Packed':'pill-yellow','Shipped':'pill-teal','Delivered':'pill-green','Cancelled':'pill-muted'};
+    return `<tr>
     <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${s.sale_date?s.sale_date.slice(0,10):''}</td>
-    <td style="font-size:11px;color:var(--text2)">${s.source||''}</td>
     <td class="pn">${s.order_number||''}</td>
     <td class="pn" style="color:var(--teal)">${s.pn}</td>
-    <td class="money-neutral">${s.qty}</td>
-    <td class="money-neutral">${s.rev_number||0}</td>
-    <td><span class="pill pill-teal">${s.status}</span></td>
-    <td><button class="action-btn del" onclick="deleteSale('${s.id}')">×</button></td>
-  </tr>`).join('')}
+    <td class="money-neutral" style="font-weight:700">${s.qty||1}</td>
+    <td>${stock===null?'<span style="font-size:10px;color:var(--text3)">n/a</span>':`<span class="money" style="color:${canFill?'var(--green)':'var(--red)'};font-weight:700">${stock}</span>`}</td>
+    <td><span class="pill ${fsMap[fs]||'pill-muted'}">${fs}</span></td>
+    <td style="font-size:10px;font-family:var(--mono);color:var(--text3)">${s.tracking_number?(s.carrier?s.carrier+' ':'')+s.tracking_number:'—'}</td>
+    <td style="display:flex;gap:4px">
+      ${fs==='Open'?`<button class="btn btn-teal btn-sm" ${canFill?'':'disabled title="Insufficient stock"'} onclick="markPacked('${s.id}','${s.pn}',${s.qty||1})">Pack</button>`:''}
+      ${fs==='Packed'?`<button class="btn btn-primary btn-sm" onclick="openShipModal('${s.id}','${s.pn}',${s.qty||1})">🚚 Ship</button>`:''}
+      ${fs==='Shipped'?`<button class="action-btn" onclick="markDelivered('${s.id}')">✓ Delivered</button>`:''}
+      ${fs==='Open'||fs==='Packed'?`<button class="action-btn" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
+      <button class="action-btn del" onclick="deleteSale('${s.id}')">×</button>
+    </td>
+  </tr>`;}).join('')}
   </tbody></table></div>`;
 }
 
-// ============================================================
-// PACK QUEUE
-// ============================================================
-function renderPackQueue(){
-  const queue=S.assemblies.filter(a=>(a.avg_sales_wk||0)>0).map(a=>({
-    pn:a.pn,desc:a.description,onHand:a.total_on_hand||0,
-    toPack:Number((a.avg_sales_wk||0)*4).toFixed(1),avgWk:a.avg_sales_wk||0,
-    hasBOM:!!S.boms[a.pn],status:a.status,id:a.id
-  })).sort((a,b)=>a.onHand-b.onHand);
-  const ready=queue.filter(q=>q.onHand>0&&q.hasBOM).length;
-  return `
-  <div class="kpi-grid kpi-grid-3">
-    <div class="kpi kpi-orange"><div class="kpi-label">In Queue</div><div class="kpi-value">${queue.length}</div></div>
-    <div class="kpi kpi-green"><div class="kpi-label">Ready to Pack</div><div class="kpi-value">${ready}</div><div class="kpi-sub">BOM + stock available</div></div>
-    <div class="kpi kpi-red"><div class="kpi-label">Zero / Negative</div><div class="kpi-value">${queue.filter(q=>q.onHand<=0).length}</div></div>
-  </div>
-  <div class="tbl-wrap">
-  <table><thead><tr><th>SKU</th><th>Description</th><th>4-Wk Target</th><th>On Hand</th><th>Avg / Wk</th><th>BOM</th><th>Action</th></tr></thead><tbody>
-  ${queue.map(q=>`<tr style="${q.onHand>0&&q.hasBOM?'background:rgba(76,175,125,.04)':''}">
-    <td class="pn" style="color:var(--teal)">${q.pn}</td>
-    <td class="main-col" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${q.desc||''}</td>
-    <td class="money-neutral">${q.toPack} units</td>
-    <td class="money" style="color:${q.onHand<0?'var(--red)':q.onHand===0?'var(--yellow)':'var(--green)'};font-weight:700">${q.onHand}</td>
-    <td class="money-neutral">${q.avgWk.toFixed(2)}/wk</td>
-    <td>${q.hasBOM?'<span class="pill pill-teal">Yes</span>':'<span class="pill pill-muted">No</span>'}</td>
-    <td style="display:flex;gap:4px">
-      ${q.hasBOM?`<button class="btn btn-teal btn-sm" onclick="recordPack('${q.pn}','${q.id}')">Pack 1</button>`:''}
-      ${q.hasBOM?`<button class="action-btn" onclick="S.selBOM='${q.pn}';nav('boms')">BOM</button>`:''}
-    </td>
-  </tr>`).join('')}
-  </tbody></table></div>`;
+// ── Fulfillment actions ──
+async function markPacked(saleId,pn,qty){
+  const asm=S.assemblies.find(a=>a.pn===pn);
+  if(asm&&(asm.total_on_hand||0)<qty){toast('Insufficient assembly stock — pack more first');return;}
+  await db.from('sales').update({fulfillment_status:'Packed'}).eq('id',saleId);
+  S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Packed'}:s);
+  toast('Order marked Packed — ready to ship');render();
 }
+
+function openShipModal(saleId,pn,qty){openModal('shipOrder',{saleId,pn,qty});}
+
+async function submitShipment(saleId,pn,qty){
+  const tracking=document.getElementById('ship-tracking').value.trim();
+  const carrier=document.getElementById('ship-carrier').value;
+  const asm=S.assemblies.find(a=>a.pn===pn);
+  if(!asm){toast('Assembly not found — cannot deduct stock');return;}
+  const prev=asm.total_on_hand||0;
+  const newOh=prev-qty;
+  // Deduct assembly inventory
+  await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
+  S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
+  // Log correction
+  await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newOh,adjustment:-qty,reason:'Shipped order'+(tracking?' — '+tracking:''),source:'shipment',});
+  S.corrections=[{pn,previous_qty:prev,new_qty:newOh,adjustment:-qty,reason:'Shipped order',source:'shipment',created_at:new Date().toISOString()},...S.corrections];
+  // Update sale
+  await db.from('sales').update({fulfillment_status:'Shipped',tracking_number:tracking,carrier,shipped_at:new Date().toISOString()}).eq('id',saleId);
+  S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Shipped',tracking_number:tracking,carrier,shipped_at:new Date().toISOString()}:s);
+  pushUndo('update','assemblies',{...asm,total_on_hand:newOh},{...asm,total_on_hand:prev},'Ship '+qty+'×'+pn);
+  updateBadge();closeModal();
+  toast('Shipped '+qty+'× '+pn+' — stock deducted'+(tracking?' · '+tracking:''));
+  render();
+}
+
+async function markDelivered(saleId){
+  await db.from('sales').update({fulfillment_status:'Delivered'}).eq('id',saleId);
+  S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Delivered'}:s);
+  toast('Order delivered ✓');render();
+}
+
+async function cancelOrder(saleId){
+  if(!confirm('Cancel this order?'))return;
+  await db.from('sales').update({fulfillment_status:'Cancelled'}).eq('id',saleId);
+  S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Cancelled'}:s);
+  toast('Order cancelled');render();
+}
+
+// ============================================================
+// PACK QUEUE — see enhanced version below
+// ============================================================
 
 // ============================================================
 // DEALERS
@@ -1037,7 +1092,7 @@ async function sendAI(){
   const lowParts=S.parts.filter(p=>p.avg_sales_wk>0&&wks(p)!==null&&wks(p)<4).map(p=>`${p.pn}(${wks(p)}wk)`).join(', ');
   const critAsm=S.assemblies.filter(a=>a.status==='critical').map(a=>`${a.pn}(${a.total_on_hand||0}oh)`).join(', ');
   const openPOs=S.purchases.filter(p=>p.status!=='Received').map(p=>`${p.pn}@${p.vendor}(${p.status})`).join(', ');
-  const ctx=`You are the AI assistant for TGK Motorsport ERP. TGK builds performance Audi/Tesla parts. Live Supabase data: ${S.parts.length} parts, ${S.assemblies.length} assemblies. Low stock (under 4wks): ${lowParts||'none'}. Critical (zero/negative stock): ${critAsm||'none'}. Open POs: ${openPOs||'none'}. 7-day orders: ${S.sales.filter(s=>s.sale_date>='2026-06-02').length}. Be specific, actionable, concise.`;
+  const ctx=`You are the AI assistant for TGK Motorsport ERP. TGK builds performance Audi/Tesla parts. Live Supabase data: ${S.parts.length} parts, ${S.assemblies.length} assemblies. Low stock (under 4wks): ${lowParts||'none'}. Critical (zero/negative stock): ${critAsm||'none'}. Open POs: ${openPOs||'none'}. 7-day orders: ${S.sales.filter(s=>s.sale_date>=daysAgo(7)).length}. Be specific, actionable, concise.`;
   try{
     const res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:800,system:ctx,messages:S.aiHistory.map(m=>({role:m.role==='user'?'user':'assistant',content:m.text}))})});
     const data=await res.json();
@@ -1175,6 +1230,28 @@ function openModal(type,data){
     <div class="form-row">${fi('m-avg','Avg Sales / Wk',data.avg_sales_wk||0,'type="number" step="0.01"')}</div>
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitAsm('${data.id||''}')">Save Assembly</button></div>`;
   }
+  else if(type==='shipOrder'){
+    title='Ship Order — '+data.pn;
+    body=`<div style="font-size:12px;color:var(--text2);margin-bottom:14px">Shipping <b style="color:var(--teal)">${data.qty}× ${data.pn}</b>. Assembly stock will be deducted and logged automatically.</div>
+    <div class="form-row cols-2">
+      <div class="form-group"><label class="form-label">Carrier</label><select id="ship-carrier" class="form-input"><option>USPS</option><option>UPS</option><option>FedEx</option><option>DHL</option><option>Other</option></select></div>
+      ${fi('ship-tracking','Tracking #','','placeholder="1Z999AA10123456784"')}
+    </div>
+    <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitShipment('${data.saleId}','${data.pn}',${data.qty})">🚚 Confirm Shipment</button></div>`;
+  }
+  else if(type==='addSale'){
+    const skus=S.assemblies.map(a=>a.pn).sort();
+    title='Manual Order Entry';
+    body=`<div class="form-row cols-2">
+      <div class="form-group"><label class="form-label">SKU</label><select id="ms-pn" class="form-input"><option value="">Select…</option>${skus.map(p=>`<option value="${p}">${p}</option>`).join('')}</select></div>
+      ${fi('ms-order','Order #','','placeholder="MANUAL-001"')}
+    </div>
+    <div class="form-row cols-2">
+      ${fi('ms-qty','Qty',1,'type="number" min="1"')}
+      <div class="form-group"><label class="form-label">Source</label><select id="ms-source" class="form-input"><option>Manual</option><option>Phone</option><option>Email</option><option>Dealer</option><option>Shopify</option></select></div>
+    </div>
+    <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitManualSale()">Create Order</button></div>`;
+  }
   else if(type==='addPOLine'){
     title='Add Line Item';
     body=`<div class="form-row cols-2">${fi('pol-pn','Part #','','placeholder="TGK-PART-XX"')} ${fi('pol-qty','Qty',1,'type="number" min="0.001" step="0.001"')}</div>
@@ -1248,6 +1325,17 @@ async function submitPart(eid){
   if(data)S.parts=[...S.parts,data].sort((a,b)=>a.pn.localeCompare(b.pn));
   else S.parts=S.parts.map(p=>p.id===eid?{...p,...payload}:p);
   closeModal();updateBadge();toast('Part saved');render();
+}
+async function submitManualSale(){
+  const pn=document.getElementById('ms-pn').value;
+  const orderNum=document.getElementById('ms-order').value.trim()||('MANUAL-'+Date.now().toString().slice(-6));
+  const qty=parseInt(document.getElementById('ms-qty').value)||1;
+  const source=document.getElementById('ms-source').value;
+  if(!pn){toast('Select a SKU');return;}
+  const{data,error}=await db.from('sales').insert({pn,order_number:orderNum,qty,source,status:'Open',fulfillment_status:'Open',sale_date:new Date().toISOString().slice(0,10)}).select().single();
+  if(error){toast('Error: '+error.message);return;}
+  S.sales=[data,...S.sales];
+  closeModal();toast('Order '+orderNum+' created');render();
 }
 async function submitWarranty(){
   const pn=document.getElementById('wty-pn').value;
@@ -1442,6 +1530,21 @@ function renderBackups() {
 }
 
 
+
+// ── Date helpers (no hardcoded dates) ──
+function daysAgo(n){const d=new Date();d.setDate(d.getDate()-n);return d.toISOString().slice(0,10);}
+function fmtDT(ts){if(!ts)return'—';const d=new Date(ts);return d.toLocaleDateString()+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
+
+// ── Unified activity feed ──
+function buildActivityFeed(limit){
+  const events=[];
+  S.corrections.slice(0,30).forEach(c=>events.push({ts:c.created_at,icon:c.source==='po_receipt'?'📦':c.source==='pack'?'🔧':c.source==='unpack'?'↩':c.source==='cycle_count'?'📋':c.source==='shipment'?'🚚':'✎',
+    text:c.pn+' '+(c.adjustment>0?'+':'')+c.adjustment+' — '+(c.reason||c.source),cls:c.adjustment>0?'var(--green)':'var(--red)'}));
+  S.sales.slice(0,15).forEach(s=>events.push({ts:s.sale_date,icon:'🛒',text:'Order '+(s.order_number||'')+' — '+s.pn+' ×'+(s.qty||1),cls:'var(--teal)'}));
+  S.purchases.slice(0,10).forEach(p=>events.push({ts:p.order_date,icon:'📄',text:'PO '+(p.vendor||'')+' — '+p.pn,cls:'var(--orange)'}));
+  events.sort((a,b)=>new Date(b.ts||0)-new Date(a.ts||0));
+  return events.slice(0,limit||12);
+}
 // ============================================================
 // INVENTORY PLANNING
 // ============================================================
@@ -1534,6 +1637,7 @@ function renderPlanning() {
 
 async function savePlanField(id, field, value, pn) {
   const prev = S.parts.find(p=>p.id===id);
+  if(typeof value==='number'&&isNaN(value))value=0;
   const {error} = await db.from('parts').update({[field]:value, updated_at:new Date().toISOString()}).eq('id',id);
   if(error){toast('Error: '+error.message);return;}
   S.parts = S.parts.map(p=>p.id===id?{...p,[field]:value}:p);
