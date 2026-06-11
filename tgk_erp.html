@@ -256,6 +256,7 @@ select.form-input{cursor:pointer}
     <div class="sidebar-section">Tools</div>
     <button class="nav-item" id="nav-ai" onclick="nav('ai')"><span class="nav-dot"></span>AI Assistant</button>
     <button class="nav-item" id="nav-integrations" onclick="nav('integrations')"><span class="nav-dot"></span>Integrations</button>
+    <button class="nav-item" id="nav-backups" onclick="nav('backups')"><span class="nav-dot"></span>Backups</button>
   </div>
 
   <div class="sidebar-footer">
@@ -280,6 +281,7 @@ select.form-input{cursor:pointer}
         <span class="search-icon">⌕</span>
         <input type="text" placeholder="Search parts, assemblies…" id="gsearch" oninput="onSearch(this.value)">
       </div>
+      <button class="btn btn-sm" id="undo-btn" onclick="undo()" disabled title="Nothing to undo">↩ Undo</button>
       <button class="btn btn-teal btn-sm" onclick="nav('ai')">✦ AI</button>
       <button class="btn btn-primary btn-sm" id="add-btn" onclick="addAction()">+ Add</button>
     </div>
@@ -319,6 +321,10 @@ const S = {
   shipstation:{connected:false,key:'',secret:''},
   aiHistory:[{role:'assistant',text:'Hi — I\'m your TGK ERP assistant. Ask me about inventory levels, what needs reordering, BOM analysis, or pack planning.'}],
   aiLoading:false,
+  undoStack:[], // [{action,table,data,prev,desc,ts}]
+  backups:[],
+  lastBackup:null,
+  autoBackupTimer:null,
 };
 
 // ============================================================
@@ -428,7 +434,7 @@ function setupRealtime(){
 // ============================================================
 // NAV
 // ============================================================
-const PAGE_TITLES={dashboard:'Dashboard',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',purchases:'Purchase Orders',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',packqueue:'Pack Queue',integrations:'Integrations'};
+const PAGE_TITLES={dashboard:'Dashboard',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',purchases:'Purchase Orders',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',packqueue:'Pack Queue',integrations:'Integrations',backups:'Backups & Undo'};
 
 function nav(v){
   S.view=v;
@@ -1005,28 +1011,36 @@ async function updatePOStatus(id,ns){
 }
 async function deletePO(id){
   if(!confirm('Delete this PO?'))return;
+  const item=S.purchases.find(p=>p.id===id);
   const{error}=await db.from('purchases').delete().eq('id',id);
   if(error){toast('Error: '+error.message);return;}
+  if(item) pushUndo('delete','purchases',item,null,'Delete PO: '+item.pn+' @ '+item.vendor);
   S.purchases=S.purchases.filter(p=>p.id!==id);
   toast('PO deleted');render();
 }
 async function deleteSale(id){
   if(!confirm('Delete this sale?'))return;
+  const item=S.sales.find(s=>s.id===id);
   const{error}=await db.from('sales').delete().eq('id',id);
   if(error){toast('Error: '+error.message);return;}
+  if(item) pushUndo('delete','sales',item,null,'Delete sale: '+item.pn+' #'+item.order_number);
   S.sales=S.sales.filter(s=>s.id!==id);
   toast('Sale deleted');render();
 }
 async function deleteDealer(id){
   if(!confirm('Delete this dealer?'))return;
+  const item=S.dealers.find(d=>d.id===id);
   const{error}=await db.from('dealers').delete().eq('id',id);
   if(error){toast('Error: '+error.message);return;}
+  if(item) pushUndo('delete','dealers',item,null,'Delete dealer: '+item.name);
   S.dealers=S.dealers.filter(d=>d.id!==id);
   toast('Dealer deleted');render();
 }
 async function delBOMItem(id,parentPn){
+  const item=S.boms[parentPn]?.find(i=>i.id===id);
   const{error}=await db.from('bom_items').delete().eq('id',id);
   if(error){toast('Error: '+error.message);return;}
+  if(item) pushUndo('bom_delete','bom_items',item,null,'Remove BOM item: '+item.child_pn+' from '+parentPn);
   if(S.boms[parentPn])S.boms[parentPn]=S.boms[parentPn].filter(i=>i.id!==id);
   toast('BOM item removed');render();
 }
@@ -1156,7 +1170,7 @@ async function submitPart(eid){
   const pn=$('m-pn').value.trim();if(!pn){toast('Part # required');return;}
   const payload={pn,vendor:$('m-vendor').value.trim(),description:$('m-desc').value.trim(),category:$('m-cat').value.trim(),unit_cost:parseFloat($('m-cost').value)||0,lead_time_weeks:parseInt($('m-lead').value)||1,avg_sales_wk:parseFloat($('m-avg').value)||0,total_unpckgd:parseInt($('m-unpckgd').value)||0,min_qty:parseFloat($('m-min').value)||0,updated_at:new Date().toISOString()};
   let error,data;
-  if(eid){({error}=await db.from('parts').update(payload).eq('id',eid));}
+  if(eid){const prev=S.parts.find(p=>p.id===eid);({error}=await db.from('parts').update(payload).eq('id',eid));if(!error&&prev)pushUndo('update','parts',{...prev,...payload},prev,'Edit part: '+payload.pn);}
   else{({data,error}=await db.from('parts').insert(payload).select().single());}
   if(error){toast('Error: '+error.message);return;}
   if(data)S.parts=[...S.parts,data].sort((a,b)=>a.pn.localeCompare(b.pn));
@@ -1167,7 +1181,7 @@ async function submitAsm(eid){
   const pn=$('m-pn').value.trim();if(!pn){toast('SKU required');return;}
   const payload={pn,description:$('m-desc').value.trim(),category:$('m-cat').value.trim(),msrp:parseFloat($('m-msrp').value)||0,shipping_cost:parseFloat($('m-ship').value)||10,total_on_hand:parseInt($('m-oh').value)||0,status:$('m-status').value,avg_sales_wk:parseFloat($('m-avg').value)||0,updated_at:new Date().toISOString()};
   let error,data;
-  if(eid){({error}=await db.from('assemblies').update(payload).eq('id',eid));}
+  if(eid){const prev=S.assemblies.find(a=>a.id===eid);({error}=await db.from('assemblies').update(payload).eq('id',eid));if(!error&&prev)pushUndo('update','assemblies',{...prev,...payload},prev,'Edit assembly: '+payload.pn);}
   else{({data,error}=await db.from('assemblies').insert(payload).select().single());}
   if(error){toast('Error: '+error.message);return;}
   if(data)S.assemblies=[...S.assemblies,data].sort((a,b)=>a.pn.localeCompare(b.pn));
@@ -1175,17 +1189,187 @@ async function submitAsm(eid){
   closeModal();toast('Assembly saved');render();
 }
 
+
+// ============================================================
+// UNDO SYSTEM
+// ============================================================
+function pushUndo(action, table, data, prev, desc) {
+  S.undoStack.push({action, table, data, prev, desc, ts:new Date()});
+  if(S.undoStack.length > 50) S.undoStack.shift();
+  updateUndoBtn();
+}
+
+function updateUndoBtn() {
+  const btn = document.getElementById('undo-btn');
+  if(!btn) return;
+  if(S.undoStack.length) {
+    btn.disabled = false;
+    btn.title = 'Undo: ' + S.undoStack[S.undoStack.length-1].desc;
+    btn.textContent = '↩ Undo (' + S.undoStack.length + ')';
+  } else {
+    btn.disabled = true;
+    btn.title = 'Nothing to undo';
+    btn.textContent = '↩ Undo';
+  }
+}
+
+async function undo() {
+  const last = S.undoStack.pop();
+  if(!last) return;
+  updateUndoBtn();
+  try {
+    if(last.action === 'delete') {
+      await db.from(last.table).insert(last.data);
+    } else if(last.action === 'insert') {
+      await db.from(last.table).delete().eq('id', last.data.id);
+    } else if(last.action === 'update') {
+      await db.from(last.table).update(last.prev).eq('id', last.data.id);
+    } else if(last.action === 'bom_delete') {
+      await db.from('bom_items').insert(last.data);
+    }
+    await loadAll();
+    toast('Undone: ' + last.desc);
+  } catch(e) {
+    toast('Undo failed: ' + e.message);
+    S.undoStack.push(last); // put it back
+    updateUndoBtn();
+  }
+}
+
+// ============================================================
+// BACKUP SYSTEM
+// ============================================================
+async function createBackup(label) {
+  const data = {
+    parts: S.parts,
+    assemblies: S.assemblies,
+    dealers: S.dealers,
+    purchases: S.purchases,
+    sales: S.sales.slice(0,200),
+    boms: S.boms,
+    ts: new Date().toISOString()
+  };
+  const lbl = label || ('Auto ' + new Date().toLocaleString());
+  const {error} = await db.from('backups').insert({label:lbl, data});
+  if(!error) {
+    S.lastBackup = new Date();
+    toast('Backup saved: ' + lbl);
+    if(S.view==='backups') loadBackups().then(render);
+  } else {
+    toast('Backup failed — run the backups SQL first');
+  }
+}
+
+async function loadBackups() {
+  const {data,error} = await db.from('backups').select('id,label,created_at').order('created_at',{ascending:false}).limit(20);
+  if(!error) S.backups = data||[];
+}
+
+async function restoreBackup(id) {
+  if(!confirm('Restore this backup? Current data will be overwritten.')) return;
+  const {data,error} = await db.from('backups').select('data').eq('id',id).single();
+  if(error){toast('Failed to load backup');return;}
+  const d = data.data;
+  // Restore parts, assemblies, dealers
+  setSyncState('busy');
+  try {
+    if(d.parts?.length){await db.from('parts').delete().neq('id','00000000-0000-0000-0000-000000000000');await db.from('parts').insert(d.parts);}
+    if(d.assemblies?.length){await db.from('assemblies').delete().neq('id','00000000-0000-0000-0000-000000000000');await db.from('assemblies').insert(d.assemblies);}
+    if(d.dealers?.length){await db.from('dealers').delete().neq('id','00000000-0000-0000-0000-000000000000');await db.from('dealers').insert(d.dealers);}
+    await loadAll();
+    toast('Backup restored successfully');
+  } catch(e) {
+    toast('Restore error: ' + e.message);
+    setSyncState('err');
+  }
+}
+
+function downloadBackup() {
+  const data = {
+    parts: S.parts, assemblies: S.assemblies, dealers: S.dealers,
+    purchases: S.purchases, sales: S.sales, boms: S.boms,
+    exported: new Date().toISOString()
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'tgk_backup_' + new Date().toISOString().slice(0,10) + '.json';
+  a.click();
+  toast('Backup downloaded');
+}
+
+function startAutoBackup() {
+  if(S.autoBackupTimer) clearInterval(S.autoBackupTimer);
+  S.autoBackupTimer = setInterval(()=>createBackup('Auto'), 30*60*1000);
+}
+
+function renderBackups() {
+  const last = S.lastBackup ? S.lastBackup.toLocaleString() : 'Never this session';
+  let undoRows = '';
+  if(S.undoStack.length===0) {
+    undoRows = '<div class="section-empty">No actions to undo</div>';
+  } else {
+    const rev = [...S.undoStack].reverse();
+    rev.forEach(function(u,i){
+      const btn = i===0 ? '<button class="btn btn-sm" onclick="undo()">&#8617; Undo</button>' : '<span style="font-size:10px;color:var(--text3)">#'+(S.undoStack.length-i)+'</span>';
+      undoRows += '<div class="margin-analysis-row"><div><span style="font-size:11px;color:var(--text2)">'+u.desc+'</span><span style="font-size:10px;color:var(--text3);display:block">'+u.ts.toLocaleTimeString()+'</span></div>'+btn+'</div>';
+    });
+  }
+  let backupRows = '';
+  if(S.backups.length===0) {
+    backupRows = '<div class="section-empty">No backups yet — create one above</div>';
+  } else {
+    S.backups.forEach(function(b){
+      backupRows += '<div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">'
+        + '<div style="flex:1"><div style="font-size:12px;color:var(--text);font-weight:500">'+escHtml(b.label)+'</div>'
+        + '<div style="font-size:10px;color:var(--text3);font-family:var(--mono)">'+new Date(b.created_at).toLocaleString()+'</div></div>'
+        + '<button class="action-btn" data-bid="'+b.id+'" onclick="restoreBackup(this.dataset.bid)">Restore</button></div>';
+    });
+  }
+  return `
+  <div class="kpi-grid kpi-grid-3">
+    <div class="kpi kpi-teal"><div class="kpi-label">Backups Stored</div><div class="kpi-value">${S.backups.length}</div></div>
+    <div class="kpi"><div class="kpi-label">Last Auto-Backup</div><div class="kpi-value" style="font-size:13px;font-family:var(--mono)">${last}</div></div>
+    <div class="kpi"><div class="kpi-label">Undo Stack</div><div class="kpi-value">${S.undoStack.length}<span style="font-size:12px;color:var(--text3)"> actions</span></div></div>
+  </div>
+  <div class="grid-2">
+  <div>
+    <div class="panel">
+      <div class="panel-title"><span>Backup Actions</span></div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <button class="btn btn-primary" onclick="createBackup('Manual ' + new Date().toLocaleString())">&#128190; Save Backup to Supabase</button>
+        <button class="btn btn-teal" onclick="downloadBackup()">&#8595; Download as JSON</button>
+        <div class="divider"></div>
+        <div style="font-size:11px;color:var(--text3)">Auto-backup runs every 30 min while open. Up to 20 backups stored in Supabase.</div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title"><span>Undo History</span></div>
+      ${undoRows}
+    </div>
+  </div>
+  <div>
+    <div class="panel" style="padding:0">
+      <div style="padding:14px 18px;border-bottom:1px solid var(--border)">
+        <div class="panel-title" style="margin:0;padding:0;border:none">Backup History</div>
+      </div>
+      ${backupRows}
+    </div>
+  </div>
+  </div>`;
+}
+
 // ============================================================
 // RENDER
 // ============================================================
 function render(){
-  const views={dashboard:renderDashboard,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,purchases:renderPurchases,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI};
+  const views={dashboard:renderDashboard,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,purchases:renderPurchases,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,backups:renderBackups};
   $('content').innerHTML=(views[S.view]||renderDashboard)();
   updateBadge();
 }
 
 // ── INIT ─────────────────────────────────────────────────────
-loadAll().then(()=>setupRealtime());
+loadAll().then(()=>{setupRealtime();loadBackups();startAutoBackup();});
 </script>
 </body>
 </html>
