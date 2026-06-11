@@ -336,6 +336,7 @@ input:focus-visible,select:focus-visible,button:focus-visible{outline:2px solid 
     <button class="nav-item" id="nav-inventory" onclick="nav('inventory')"><span class="nav-dot"></span>Inventory<span class="nav-badge" id="low-badge" style="display:none">0</span></button>
     <button class="nav-item" id="nav-packqueue" onclick="nav('packqueue')"><span class="nav-dot"></span>Production</button>
     <button class="nav-item" id="nav-purchases" onclick="nav('purchases')"><span class="nav-dot"></span>Purchase Orders</button>
+    <button class="nav-item" id="nav-pobuilder" onclick="nav('pobuilder')"><span class="nav-dot"></span>PO Builder</button>
     <button class="nav-item" id="nav-cyclecounts" onclick="nav('cyclecounts')"><span class="nav-dot"></span>Cycle Counts</button>
     <button class="nav-item" id="nav-corrections" onclick="nav('corrections')"><span class="nav-dot"></span>Corrections Log</button>
 
@@ -429,6 +430,7 @@ const S = {
   // Lookup
   lookupQ:'', lookupSel:null,
   activeSale:null,
+  poCart:[], // [{pn,qty}]
   // Min/Max suggestions
   mmSuggest:null, mmLoading:false,
   // Edge function live status
@@ -610,7 +612,7 @@ function setupRealtime(){
 // ============================================================
 // NAV
 // ============================================================
-const PAGE_TITLES={dashboard:'Dashboard',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',planning:'Inventory Planning',purchases:'Purchase Orders',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Corrections Log',warranty:'Warranty Claims',import:'Import Data'};
+const PAGE_TITLES={dashboard:'Dashboard',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',planning:'Inventory Planning',purchases:'Purchase Orders',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Corrections Log',warranty:'Warranty Claims',import:'Import Data',pobuilder:'PO Builder'};
 
 function nav(v){
   if(v!==S.view){S.activePO=null;S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.activeCount=null;}
@@ -2238,6 +2240,163 @@ function renderMMReview(){
     +'</tbody></table></div></div>';
 }
 
+
+// ============================================================
+// PO BUILDER — cart-style multi-vendor purchasing
+// ============================================================
+function nextBreakHint(p, qty){
+  const breaks=(Array.isArray(p.price_breaks)?p.price_breaks:[]).filter(b=>b&&b.qty&&b.price>0).sort((a,b)=>a.qty-b.qty);
+  const nxt=breaks.find(b=>b.qty>qty);
+  if(!nxt)return '';
+  const cur=costForQty(p,qty);
+  if(nxt.price>=cur)return '';
+  return '+'+(nxt.qty-qty)+' more → '+fc(nxt.price,4)+'/ea';
+}
+
+function addToCart(pn, qty){
+  qty=Math.max(1,parseInt(qty)||1);
+  const ex=S.poCart.find(c=>c.pn===pn);
+  if(ex)ex.qty+=qty; else S.poCart.push({pn,qty});
+  toast(qty+'× '+pn+' added to PO cart');
+  render();
+}
+function setCartQty(pn, qty){
+  qty=parseInt(qty)||0;
+  if(qty<=0){S.poCart=S.poCart.filter(c=>c.pn!==pn);}
+  else{const ex=S.poCart.find(c=>c.pn===pn);if(ex)ex.qty=qty;}
+  render();
+}
+function addAllReorder(vendorFilter){
+  let added=0;
+  S.parts.forEach(p=>{
+    if(p.discontinued)return;
+    if(vendorFilter&&(p.vendor||'')!==vendorFilter)return;
+    const rp=calcReorderPoint(p);
+    if((p.total_unpckgd||0)>rp)return;
+    const sq=calcSuggestedQty(p);const moq=p.moq||0;
+    if(moq>0&&sq<moq)return;
+    const oq=Math.max(sq,moq);
+    if(oq<=0)return;
+    if(!S.poCart.find(c=>c.pn===p.pn)){S.poCart.push({pn:p.pn,qty:oq});added++;}
+  });
+  toast(added?added+' parts added to cart':'Nothing new to add');
+  render();
+}
+
+async function submitPOCart(){
+  if(!S.poCart.length)return;
+  const pm={};S.parts.forEach(p=>pm[p.pn]=p);
+  const groups={};
+  S.poCart.forEach(c=>{
+    const v=(pm[c.pn]?.vendor)||'TBD';
+    (groups[v]=groups[v]||[]).push(c);
+  });
+  const vendors=Object.keys(groups);
+  const summary=vendors.map(v=>v+' ('+groups[v].length+' line'+(groups[v].length>1?'s':'')+')').join(', ');
+  if(!confirm('Create '+vendors.length+' PO'+(vendors.length>1?'s':'')+': '+summary+'?'))return;
+  for(const v of vendors){
+    const items=groups[v];
+    const total=items.reduce((t,c)=>t+c.qty*costForQty(pm[c.pn]||{},c.qty),0);
+    const {data:po,error}=await db.from('purchases').insert({
+      vendor:v,pn:items[0].pn+(items.length>1?' +'+(items.length-1)+' more':''),
+      description:items.length+'-line PO',qty:items.reduce((t,c)=>t+c.qty,0),
+      unit_cost:0,status:'Draft',order_date:new Date().toISOString().slice(0,10),updated_at:new Date().toISOString()
+    }).select().single();
+    if(error){toast('Error on '+v+': '+error.message);continue;}
+    const lines=items.map(c=>({po_id:po.id,pn:c.pn,description:pm[c.pn]?.description||'',qty_ordered:c.qty,unit_cost:costForQty(pm[c.pn]||{},c.qty),qty_received:0,status:'Pending'}));
+    await db.from('po_lines').insert(lines);
+    S.purchases=[po,...S.purchases];
+  }
+  S.poCart=[];
+  toast(vendors.length+' PO'+(vendors.length>1?'s':'')+' created');
+  nav('purchases');
+}
+
+function renderPOBuilder(){
+  const sf=S.filters.pob||{};
+  const q=(sf.search||'').toLowerCase();
+  const vendors=[...new Set(S.parts.filter(p=>!p.discontinued).map(p=>p.vendor||'').filter(Boolean))].sort();
+  let list=S.parts.filter(p=>!p.discontinued);
+  if(q)list=list.filter(p=>p.pn.toLowerCase().includes(q)||(p.description||'').toLowerCase().includes(q));
+  if(sf.vendor)list=list.filter(p=>(p.vendor||'')===sf.vendor);
+  if(sf.reorder)list=list.filter(p=>(p.total_unpckgd||0)<=calcReorderPoint(p));
+  list=list.slice(0,200);
+  const pm={};S.parts.forEach(p=>pm[p.pn]=p);
+  const cartTotal=S.poCart.reduce((t,c)=>t+c.qty*costForQty(pm[c.pn]||{},c.qty),0);
+  const cartVendors={};
+  S.poCart.forEach(c=>{const v=(pm[c.pn]?.vendor)||'TBD';(cartVendors[v]=cartVendors[v]||[]).push(c);});
+
+  let cartHtml='';
+  if(!S.poCart.length){
+    cartHtml='<div class="section-empty">Cart is empty — add parts from the left.<br><span style="font-size:10px">One PO is created per vendor.</span></div>';
+  }else{
+    Object.entries(cartVendors).forEach(([v,items])=>{
+      const vt=items.reduce((t,c)=>t+c.qty*costForQty(pm[c.pn]||{},c.qty),0);
+      cartHtml+='<div class="section-header" style="display:flex;justify-content:space-between"><span>'+escHtml(v)+' — '+items.length+' line'+(items.length>1?'s':'')+'</span><span style="color:var(--orange)">'+fc(vt)+'</span></div>';
+      items.forEach(c=>{
+        const p=pm[c.pn]||{};
+        const cost=costForQty(p,c.qty);
+        const hint=nextBreakHint(p,c.qty);
+        cartHtml+='<div class="check-row">'
+          +'<div style="flex:1;min-width:0"><div class="pn" style="color:var(--teal)">'+c.pn+'</div>'
+          +(hint?'<div style="font-size:9.5px;color:var(--yellow)">💡 '+hint+'</div>':'')
+          +'</div>'
+          +'<input class="qty-input" style="width:62px" type="number" min="0" value="'+c.qty+'" data-pn="'+c.pn+'" onchange="setCartQty(this.dataset.pn,this.value)">'
+          +'<span class="money-cost" style="min-width:84px;text-align:right">'+fc(cost,4)+'/ea</span>'
+          +'<span class="money" style="min-width:74px;text-align:right;font-weight:700">'+fc(c.qty*cost)+'</span>'
+          +'<button class="action-btn del" data-pn="'+c.pn+'" onclick="setCartQty(this.dataset.pn,0)">×</button>'
+          +'</div>';
+      });
+    });
+  }
+
+  return `
+  <div class="grid-2" style="grid-template-columns:1.4fr 1fr;align-items:start">
+  <div>
+    <div class="panel" style="padding:12px 16px">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <div class="search-wrap" style="flex:1;min-width:160px"><span class="search-icon">⌕</span><input placeholder="Search parts…" value="${sf.search||''}" oninput="setFilter('pob','search',this.value)"></div>
+        <select class="form-input" style="width:auto;padding:7px 10px;font-size:11.5px" onchange="setFilter('pob','vendor',this.value)">
+          <option value="">All Vendors</option>
+          ${vendors.map(v=>`<option value="${v}" ${sf.vendor===v?'selected':''}>${v}</option>`).join('')}
+        </select>
+        <button class="filter-chip ${sf.reorder?'on-teal':''}" onclick="setFilter('pob','reorder',${sf.reorder?'false':'true'})">⚠ Needs reorder</button>
+        <button class="btn btn-teal btn-sm" onclick="addAllReorder('${sf.vendor||''}')">+ Add all reorder${sf.vendor?' ('+sf.vendor+')':''}</button>
+      </div>
+    </div>
+    <div class="tbl-wrap" style="max-height:65vh">
+    <table><thead class="sticky-header"><tr><th>Part #</th><th>Description</th><th>Vendor</th><th>On Hand</th><th>Sugg.</th><th>$/ea @ sugg</th><th>Qty</th><th></th></tr></thead><tbody>
+    ${list.map(p=>{
+      const rp=calcReorderPoint(p);const oh=p.total_unpckgd||0;
+      const sq=Math.max(calcSuggestedQty(p),p.moq||0)||1;
+      const inCart=S.poCart.find(c=>c.pn===p.pn);
+      return `<tr style="${oh<=rp?'background:rgba(224,123,40,.05)':''}">
+        <td class="pn" style="color:var(--text)">${p.pn}${inCart?' <span style="color:var(--teal)">✓</span>':''}</td>
+        <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${p.description||''}</td>
+        <td style="font-size:10.5px;color:var(--text3)">${p.vendor||'—'}</td>
+        <td class="money" style="color:${oh<=rp?'var(--red)':'var(--text)'};font-weight:700">${oh}</td>
+        <td class="money-neutral">${sq}</td>
+        <td class="money-cost">${fc(costForQty(p,sq),4)}</td>
+        <td><input class="qty-input" style="width:60px" id="pob-${p.id}" type="number" min="1" value="${sq}"></td>
+        <td><button class="btn btn-teal btn-sm" data-pn="${p.pn}" data-id="${p.id}" onclick="addToCart(this.dataset.pn,document.getElementById('pob-'+this.dataset.id).value)">+ Add</button></td>
+      </tr>`;}).join('')}
+    </tbody></table></div>
+  </div>
+  <div>
+    <div class="panel" style="padding:0;position:sticky;top:12px">
+      <div style="padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
+        <div><div style="font-size:13px;font-weight:700">🛒 PO Cart</div><div style="font-size:10.5px;color:var(--text3)">${S.poCart.length} line${S.poCart.length!==1?'s':''} · ${Object.keys(cartVendors).length||0} vendor${Object.keys(cartVendors).length!==1?'s':''}</div></div>
+        <div class="money" style="font-size:17px;font-weight:700;color:var(--orange)">${fc(cartTotal)}</div>
+      </div>
+      <div style="max-height:52vh;overflow-y:auto">${cartHtml}</div>
+      <div style="padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:8px">
+        <button class="btn btn-primary" style="flex:1" ${S.poCart.length?'':'disabled'} onclick="submitPOCart()">Create ${Object.keys(cartVendors).length||''} PO${Object.keys(cartVendors).length!==1?'s':''} →</button>
+        ${S.poCart.length?'<button class="btn" onclick="S.poCart=[];render()">Clear</button>':''}
+      </div>
+    </div>
+  </div>
+  </div>`;
+}
 // ============================================================
 // INVENTORY PLANNING
 // ============================================================
@@ -2310,6 +2469,7 @@ function renderPlanning() {
         ${vendors.map(v=>`<option value="${v}" ${sf.vendor===v?'selected':''}>${v}</option>`).join('')}
       </select>
       ${sf.vendor?`<button class="btn btn-teal btn-sm" onclick="createVendorPO('${sf.vendor}')">📄 One PO for ${sf.vendor}</button>`:''}
+      <button class="btn btn-sm" onclick="nav('pobuilder')">🛒 PO Builder</button>
       <button class="btn btn-teal btn-sm" style="margin-left:auto" ${S.mmLoading?'disabled':''} onclick="aiSuggestMinMax()">${S.mmLoading?'Analyzing…':'✨ AI Suggest Min/Max'}</button>
       <button class="btn btn-primary btn-sm" onclick="createSuggestedPOs()">+ Create All Suggested POs (${needsReorder.length})</button>
     </div>
@@ -3306,7 +3466,7 @@ function exportTable(table) {
 // RENDER
 // ============================================================
 function render(){
-  const views={dashboard:renderDashboard,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport};
+  const views={dashboard:renderDashboard,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder};
   if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length)computeDemand();
   // Preserve focused input + caret across re-render
   const active=document.activeElement;
