@@ -3188,18 +3188,29 @@ async function packUnits(pn, asmId, isUnpack) {
 // CYCLE COUNTS
 // ============================================================
 async function createCycleCount(cat) {
-  const parts = cat==='all' ? S.parts : S.parts.filter(p=>p.category===cat);
-  if(!parts.length){toast('No parts in selection');return;}
+  // cat: 'all' (all parts) | 'fg' | 'sub' | 'everything' | a part category name
+  let items=[];
+  const liveParts=S.parts.filter(p=>!p.discontinued);
+  const liveAsm=S.assemblies.filter(a=>!a.discontinued);
+  if(cat==='all') items=liveParts.map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}));
+  else if(cat==='fg') items=liveAsm.filter(a=>!a.is_subassembly).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
+  else if(cat==='sub') items=liveAsm.filter(a=>a.is_subassembly).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
+  else if(cat==='everything') items=[
+    ...liveAsm.map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'})),
+    ...liveParts.map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}))
+  ];
+  else items=liveParts.filter(p=>(p.category||'Uncategorized')===cat).map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}));
+  if(!items.length){toast('Nothing in that selection');return;}
   const {data,error}=await db.from('cycle_counts').insert({status:'Open',notes:'',category_filter:cat}).select().single();
   if(error){toast('Error: '+error.message);return;}
-  const lines = parts.map(p=>({count_id:data.id,pn:p.pn,description:p.description||'',expected_qty:p.total_unpckgd||0}));
+  const lines = items.map(i=>({count_id:data.id,pn:i.pn,description:i.desc,expected_qty:i.exp,item_type:i.type}));
   await db.from('cycle_count_lines').insert(lines);
   S.cycleCounts=[data,...S.cycleCounts];
   S.activeCount=data.id;
   S.countLines=lines.map((l,i)=>({...l,id:'temp-'+i,actual_qty:null}));
   await loadCountLines(data.id);
   render();
-  toast('Cycle count created — '+parts.length+' items');
+  toast('Cycle count created — '+items.length+' items');
 }
 
 async function loadCountLines(countId) {
@@ -3221,7 +3232,10 @@ function renderCycleCounts() {
     <div class="panel">
       <div class="panel-title"><span>Start New Count</span></div>
       <div style="display:flex;flex-direction:column;gap:8px">
-        <button class="btn btn-primary" onclick="createCycleCount('all')">Count All Parts (${S.parts.length} SKUs)</button>
+        <button class="btn btn-primary" onclick="createCycleCount('everything')">Count EVERYTHING (${S.parts.filter(p=>!p.discontinued).length+S.assemblies.filter(a=>!a.discontinued).length} SKUs)</button>
+        <button class="btn btn-teal" onclick="createCycleCount('fg')">🏁 Finished Goods (${S.assemblies.filter(a=>!a.is_subassembly&&!a.discontinued).length})</button>
+        <button class="btn btn-teal" onclick="createCycleCount('sub')">🟠 Subassemblies (${S.assemblies.filter(a=>a.is_subassembly&&!a.discontinued).length})</button>
+        <button class="btn" onclick="createCycleCount('all')">Raw Parts Only (${S.parts.filter(p=>!p.discontinued).length})</button>
         <div class="divider"></div>
         <div style="font-size:11px;color:var(--text3);margin-bottom:4px">Count by Category:</div>
         ${cats.map(c=>`<button class="btn btn-sm" onclick="createCycleCount('${c}')">${c} (${S.parts.filter(p=>(p.category||'Uncategorized')===c).length})</button>`).join('')}
@@ -3233,14 +3247,14 @@ function renderCycleCounts() {
       <div class="section-header">Open Counts (${openCounts.length})</div>
       ${openCounts.length===0?'<div class="section-empty">No open counts</div>':openCounts.map(c=>`
       <div class="check-row">
-        <div style="flex:1"><div style="font-size:12px;font-weight:500;color:var(--text)">${new Date(c.created_at).toLocaleDateString()} — ${c.category_filter==='all'?'All Parts':c.category_filter}</div></div>
+        <div style="flex:1"><div style="font-size:12px;font-weight:500;color:var(--text)">${new Date(c.created_at).toLocaleDateString()} — ${({all:'Raw Parts',fg:'Finished Goods',sub:'Subassemblies',everything:'Everything'})[c.category_filter]||c.category_filter}</div></div>
         <span class="pill pill-orange">Open</span>
         <button class="btn btn-teal btn-sm" style="margin-left:8px" onclick="openCount('${c.id}')">Continue →</button>
       </div>`).join('')}
       <div class="section-header" style="margin-top:0">Completed (${doneCounts.length})</div>
       ${doneCounts.length===0?'<div class="section-empty">No completed counts</div>':doneCounts.slice(0,5).map(c=>`
       <div class="check-row">
-        <div style="flex:1"><div style="font-size:12px;color:var(--text2)">${new Date(c.created_at).toLocaleDateString()} — ${c.category_filter==='all'?'All Parts':c.category_filter}</div></div>
+        <div style="flex:1"><div style="font-size:12px;color:var(--text2)">${new Date(c.created_at).toLocaleDateString()} — ${({all:'Raw Parts',fg:'Finished Goods',sub:'Subassemblies',everything:'Everything'})[c.category_filter]||c.category_filter}</div></div>
         <span class="pill pill-teal">Done</span>
         <button class="action-btn" style="margin-left:8px" onclick="openCount('${c.id}')">View</button>
       </div>`).join('')}
@@ -3265,7 +3279,7 @@ function renderCountDetail(count) {
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
     <button class="btn btn-sm" onclick="S.activeCount=null;render()">← Back</button>
     <div style="flex:1">
-      <div style="font-size:14px;font-weight:700">Cycle Count — ${count.category_filter==='all'?'All Parts':count.category_filter}</div>
+      <div style="font-size:14px;font-weight:700">Cycle Count — ${({all:'Raw Parts',fg:'Finished Goods',sub:'Subassemblies',everything:'Everything'})[count.category_filter]||count.category_filter}</div>
       <div style="font-size:11px;color:var(--text3)">${new Date(count.created_at).toLocaleString()} · ${counted.length}/${lines.length} counted</div>
     </div>
     ${!isDone?`<button class="btn btn-teal" onclick="applyCountCorrections('${count.id}')">✓ Apply ${variances.length} Corrections</button>`:
@@ -3283,7 +3297,7 @@ function renderCountDetail(count) {
     const variance = line.actual_qty!=null ? (line.actual_qty-(line.expected_qty||0)) : null;
     const varClass = variance===null?'':variance>0?'variance-pos':variance<0?'variance-neg':'variance-zero';
     return `<tr>
-      <td class="pn">${line.pn}</td>
+      <td class="pn">${line.pn}<br>${line.item_type==='assembly'?bomTag(line.pn,'assembly'):''}</td>
       <td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${line.description||''}</td>
       <td class="money-neutral">${line.expected_qty||0}</td>
       <td>${isDone?`<span class="money-neutral">${line.actual_qty??'—'}</span>`:`<input class="qty-input" value="${line.actual_qty??''}" type="number" placeholder="Enter qty" onchange="updateCountLine('${line.id}',+this.value)" style="width:80px">`}</td>
@@ -3313,14 +3327,26 @@ async function applyCountCorrections(countId) {
   }
   if(!confirm('Apply '+variances.length+' inventory corrections?')) return;
   for(const line of variances){
-    const part=S.parts.find(p=>p.pn===line.pn);
-    if(!part) continue;
-    const prev=part.total_unpckgd||0;
     const newQty=line.actual_qty;
-    await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
-    S.parts=S.parts.map(p=>p.pn===line.pn?{...p,total_unpckgd:newQty}:p);
-    await db.from('inv_corrections').insert({pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count '+(line.notes?'— '+line.notes:''),source:'cycle_count',reference_id:countId});
-    S.corrections=[{pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count',source:'cycle_count',created_at:new Date().toISOString()},...S.corrections];
+    if(line.item_type==='assembly'){
+      // Counting a finished good / subassembly adjusts ONLY that item.
+      // BOM components are NEVER touched by a count — only Unpack returns components.
+      const asm=S.assemblies.find(a=>a.pn===line.pn);
+      if(!asm) continue;
+      const prev=asm.total_on_hand||0;
+      await db.from('assemblies').update({total_on_hand:newQty,updated_at:new Date().toISOString()}).eq('id',asm.id);
+      S.assemblies=S.assemblies.map(a=>a.pn===line.pn?{...a,total_on_hand:newQty}:a);
+      await db.from('inv_corrections').insert({pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count (finished/sub — components untouched)'+(line.notes?' — '+line.notes:''),source:'cycle_count',reference_id:countId});
+      S.corrections=[{pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count',source:'cycle_count',created_at:new Date().toISOString()},...S.corrections];
+    } else {
+      const part=S.parts.find(p=>p.pn===line.pn);
+      if(!part) continue;
+      const prev=part.total_unpckgd||0;
+      await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
+      S.parts=S.parts.map(p=>p.pn===line.pn?{...p,total_unpckgd:newQty}:p);
+      await db.from('inv_corrections').insert({pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count '+(line.notes?'— '+line.notes:''),source:'cycle_count',reference_id:countId});
+      S.corrections=[{pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count',source:'cycle_count',created_at:new Date().toISOString()},...S.corrections];
+    }
   }
   await db.from('cycle_counts').update({status:'Complete',completed_at:new Date().toISOString()}).eq('id',countId);
   S.cycleCounts=S.cycleCounts.map(c=>c.id===countId?{...c,status:'Complete'}:c);
