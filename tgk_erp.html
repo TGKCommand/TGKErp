@@ -610,7 +610,7 @@ function updateBadge(){
 // ============================================================
 async function loadAll(){
   try{
-    const [parts,assemblies,sales,purchases,dealers,settings,bomItems,warrantyClaims,corrections,cycleCounts]=await Promise.all([
+    const [parts,assemblies,sales,purchases,dealers,settings,bomItems,warrantyClaims,corrections,cycleCounts,poLinesAll]=await Promise.all([
       db.from('parts').select('*').order('pn'),
       db.from('assemblies').select('*').order('pn'),
       db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000),
@@ -621,6 +621,7 @@ async function loadAll(){
       db.from('warranty_claims').select('*').order('created_at',{ascending:false}).limit(100),
       db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
       db.from('cycle_counts').select('*').order('created_at',{ascending:false}).limit(50),
+      db.from('po_lines').select('*').order('po_id'),
     ]);
     if(parts.error)throw parts.error;
     S.parts=parts.data||[];
@@ -636,6 +637,9 @@ async function loadAll(){
     S.warrantyClaims=warrantyClaims.data||[];
     S.corrections=corrections.data||[];
     S.cycleCounts=cycleCounts.data||[];
+    // Index all PO lines by po_id (bulk-loaded so list view can compute real costs)
+    S.poLines={};
+    (poLinesAll.data||[]).forEach(l=>{if(!S.poLines[l.po_id])S.poLines[l.po_id]=[];S.poLines[l.po_id].push(l);});
     if(!S.selBOM&&Object.keys(S.boms).length)S.selBOM=Object.keys(S.boms)[0];
     setSyncState('ok');
     updateBadge();
@@ -794,7 +798,7 @@ function renderDashboard(){
   const openCounts=S.cycleCounts.filter(c=>c.status==='Open').length;
   const weekOrds=S.sales.filter(s=>s.sale_date>=daysAgo(7)).length;
   const openPOs=S.purchases.filter(p=>p.status!=='Received');
-  const openPOAmt=openPOs.reduce((s,p)=>s+(p.unit_cost||0)*(p.qty||0),0);
+  const openPOAmt=openPOs.reduce((s,p)=>{const ls=S.poLines[p.id]||[];return s+(ls.length?ls.reduce((t,l)=>t+(l.qty_ordered||0)*(l.unit_cost||0),0):(p.unit_cost||0)*(p.qty||0));},0);
   const feed=buildActivityFeed(12);
   return `
   <div class="kpi-grid kpi-grid-4">
@@ -1102,12 +1106,38 @@ function renderInventory(){
 // PURCHASES
 // ============================================================
 function renderPurchases(){
+  // Helper: compute display values from po_lines if available, else fall back to header
+  function poDisplayData(p){
+    const lines=S.poLines[p.id]||[];
+    if(!lines.length){
+      // Legacy / header-only PO
+      return{pn:p.pn,desc:p.description||'',qty:p.qty||0,unitCostHtml:fc(p.unit_cost||0,4),extended:(p.unit_cost||0)*(p.qty||0),tooltip:''};
+    }
+    const ext=lines.reduce((s,l)=>s+(l.qty_ordered||0)*(l.unit_cost||0),0);
+    const totalQty=lines.reduce((s,l)=>s+(l.qty_ordered||0),0);
+    if(lines.length===1){
+      return{pn:lines[0].pn,desc:lines[0].description||p.description||'',qty:totalQty,unitCostHtml:fc(lines[0].unit_cost||0,4),extended:ext,tooltip:''};
+    }
+    const tip=lines.map(l=>`${l.pn} ×${l.qty_ordered} @ ${fc(l.unit_cost||0,4)}`).join('\n');
+    return{pn:'Multiple',desc:lines.length+' items',qty:totalQty,unitCostHtml:'—',extended:ext,tooltip:tip};
+  }
+
   let list=S.purchases;
   const sf=S.filters.po||{};
   const q=(sf.search||S.searchQ||'').toLowerCase();
-  if(q)list=list.filter(p=>p.pn.toLowerCase().includes(q)||p.vendor.toLowerCase().includes(q)||((p.description||'').toLowerCase().includes(q)));
+  if(q){
+    list=list.filter(p=>{
+      const d=poDisplayData(p);
+      return d.pn.toLowerCase().includes(q)||p.vendor.toLowerCase().includes(q)||d.desc.toLowerCase().includes(q);
+    });
+  }
   if(sf.status)list=list.filter(p=>p.status===sf.status);
-  const onOrderAmt=S.purchases.filter(p=>p.status==='On Order').reduce((s,p)=>s+(p.unit_cost||0)*(p.qty||0),0);
+
+  // On-Order KPI: sum from lines where available
+  const onOrderAmt=S.purchases.filter(p=>p.status==='On Order').reduce((s,p)=>{
+    const lines=S.poLines[p.id]||[];
+    return s+(lines.length?lines.reduce((t,l)=>t+(l.qty_ordered||0)*(l.unit_cost||0),0):(p.unit_cost||0)*(p.qty||0));
+  },0);
   return `
   <div class="kpi-grid kpi-grid-3">
     <div class="kpi"><div class="kpi-label">Total POs</div><div class="kpi-value">${S.purchases.length}</div></div>
@@ -1124,20 +1154,23 @@ function renderPurchases(){
   </div>
   <div class="tbl-wrap">
   <table><thead><tr><th>Date</th><th>Vendor</th><th>Part #</th><th>Description</th><th>Qty</th><th>Unit Cost</th><th>Extended</th><th>Status</th><th></th></tr></thead><tbody>
-  ${list.map(p=>`<tr class="rowlink" onclick="rowClick(event,function(){openPODetail('${p.id}')})">
+  ${list.map(p=>{
+    const d=poDisplayData(p);
+    const isMulti=d.pn==='Multiple';
+    return `<tr class="rowlink" onclick="rowClick(event,function(){openPODetail('${p.id}')})">
     <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${p.order_date||''}</td>
     <td class="main-col">${p.vendor}</td>
-    <td class="pn" style="color:var(--text)">${p.pn}</td>
-    <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${p.description||''}</td>
-    <td class="money-neutral">${fn(p.qty)}</td>
-    <td class="money-cost">${fc(p.unit_cost||0,4)}</td>
-    <td class="money-cost" style="font-weight:700">${fc((p.unit_cost||0)*(p.qty||0))}</td>
+    <td class="pn"${d.tooltip?` title="${d.tooltip.replace(/"/g,'&quot;')}" style="color:var(--orange);cursor:help"`:' style="color:var(--text)"'}>${isMulti?`<span style="font-size:9px;background:var(--orange-dim);color:var(--orange);border:1px solid rgba(234,88,12,.25);border-radius:4px;padding:1px 6px;font-weight:700">⊞ Multiple</span>`:d.pn}</td>
+    <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${d.desc}</td>
+    <td class="money-neutral">${fn(d.qty)}</td>
+    <td class="money-cost">${d.unitCostHtml}</td>
+    <td class="money-cost" style="font-weight:700">${fc(d.extended)}</td>
     <td>${poPill(p.status)}</td>
     <td style="display:flex;gap:4px">
       ${p.status!=='Received'&&p.status!=='Cancelled'?`<button class="action-btn" onclick="updatePOStatus('${p.id}','${p.status==='On Order'?'In Transit':'Received'}')">→ ${p.status==='On Order'?'Transit':'Received'}</button>`:''}
       <button class="action-btn del" onclick="deletePO('${p.id}')">×</button>
     </td>
-  </tr>`).join('')}
+  </tr>`;}).join('')}
   </tbody></table></div>`;
 }
 
@@ -2419,8 +2452,18 @@ async function submitPO(eid){
   if(eid){({error}=await db.from('purchases').update(payload).eq('id',eid));}
   else{({data,error}=await db.from('purchases').insert({...payload,order_date:new Date().toISOString().slice(0,10)}).select().single());}
   if(error){toast('Error: '+error.message);return;}
-  if(data)S.purchases=[data,...S.purchases];
-  else S.purchases=S.purchases.map(p=>p.id===eid?{...p,...payload}:p);
+  if(data){
+    S.purchases=[data,...S.purchases];
+    // Create a po_line so the list view shows correct cost/pn
+    if(!(S.poLines[data.id]||[]).length){
+      const {data:ld}=await db.from('po_lines').insert({po_id:data.id,pn,description:desc,qty_ordered:qty,unit_cost,qty_received:0,status:'Pending'}).select().single();
+      S.poLines[data.id]=ld?[ld]:[{po_id:data.id,pn,description:desc,qty_ordered:qty,unit_cost,qty_received:0,status:'Pending'}];
+    }
+  } else {
+    S.purchases=S.purchases.map(p=>p.id===eid?{...p,...payload}:p);
+    // Update existing line if present
+    if(S.poLines[eid]?.length===1){S.poLines[eid]=[{...S.poLines[eid][0],pn,description:desc,qty_ordered:qty,unit_cost}];}
+  }
   closeModal();toast('PO saved');render();
 }
 async function submitSale(){
@@ -3084,7 +3127,8 @@ async function submitPOCart(){
     }).select().single();
     if(error){toast('Error on '+v+': '+error.message);continue;}
     const lines=items.map(c=>({po_id:po.id,pn:c.pn,description:pm[c.pn]?.description||'',qty_ordered:c.qty,unit_cost:costForQty(pm[c.pn]||{},c.qty),qty_received:0,status:'Pending'}));
-    await db.from('po_lines').insert(lines);
+    const {data:insertedLines}=await db.from('po_lines').insert(lines).select();
+    S.poLines[po.id]=insertedLines||lines;
     S.purchases=[po,...S.purchases];
   }
   S.poCart=[];
@@ -3346,8 +3390,9 @@ async function createPOFromSuggestion(pn, vendor, qty, cost, desc) {
     updated_at:new Date().toISOString()
   }).select().single();
   if(error){toast('Error: '+error.message);return;}
-  // Add PO line
-  await db.from('po_lines').insert({po_id:data.id,pn,description:desc,qty_ordered:qty,unit_cost:cost,qty_received:0,status:'Pending'});
+  // Add PO line and cache locally
+  const {data:lineData}=await db.from('po_lines').insert({po_id:data.id,pn,description:desc,qty_ordered:qty,unit_cost:cost,qty_received:0,status:'Pending'}).select().single();
+  S.poLines[data.id]=lineData?[lineData]:[{po_id:data.id,pn,description:desc,qty_ordered:qty,unit_cost:cost,qty_received:0,status:'Pending'}];
   S.purchases=[data,...S.purchases];
   toast('PO created for '+pn);
 }
@@ -4087,6 +4132,7 @@ async function createCycleCount(cat) {
   if(cat==='all') items=liveParts.map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}));
   else if(cat==='fg') items=liveAsm.filter(a=>!a.is_subassembly).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
   else if(cat==='sub') items=liveAsm.filter(a=>a.is_subassembly).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
+  else if(cat==='hwp') items=liveAsm.filter(a=>isHWPack(a.pn)).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
   else if(cat==='everything') items=[
     ...liveAsm.map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'})),
     ...liveParts.map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}))
