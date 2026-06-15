@@ -1849,7 +1849,10 @@ async function checkEdgeFunctions(){
   const test=async(name)=>{
     try{
       const r=await fetch(SUPA_URL+'/functions/v1/'+name,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ping:true})});
-      return (await r.text())==='pong';
+      if(!r.ok)return false;
+      const txt=await r.text();
+      if(txt==='pong')return true;
+      try{return JSON.parse(txt).pong===true;}catch(e){return false;}
     }catch(e){return false;}
   };
   S.fnStatus={shopify:await test('shopify-orders'),shipstation:await test('shipstation-ship'),holdSync:await test('shipstation-hold-sync'),deliverySync:await test('shipstation-delivery-sync')};
@@ -1927,6 +1930,7 @@ function renderIntegrations(){
           <input id="ss-test-order" class="form-input" style="width:140px;padding:5px 9px;font-size:12px" placeholder="Order # e.g. 9135">
           <button class="btn btn-teal btn-sm" onclick="ssTestOrder()">🔍 Diagnose Order</button>
           <button class="btn btn-primary btn-sm" onclick="ssReplayWebhook()">↺ Replay Webhook</button>
+          <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="ssBulkSync()">📦 Bulk Sync Shipments</button>
           <button class="btn btn-sm" onclick="ssCheckSecrets()">🔑 Check Secrets</button>
           <button class="btn btn-sm" onclick="ssManualShipPrompt()">✈ Manual Ship Override</button>
         <button class="btn btn-sm" onclick="importOrdersFromShopify()">📥 Import All Shopify Orders</button>
@@ -2048,7 +2052,7 @@ Deno.serve(async (req) => {
 
   const body = await req.json().catch(() => ({})) as any
 
-  if (req.method === 'GET' || body.ping) return json({ pong: true })
+  if (req.method === 'GET' || body.ping) return new Response('pong', { headers: CORS })
 
   // Secrets diagnostic - never exposes values, only confirms they're loaded
   if (body.check_secrets) {
@@ -2158,6 +2162,69 @@ Deno.serve(async (req) => {
     await db.from('sales')
       .update({ fulfillment_status: 'Open' })
       .eq('order_number', resolvedNum)
+  }
+
+  // Bulk sync: fetch all shipments from ShipStation since a date and apply to ERP
+  if (body.action === 'bulk_sync') {
+    const bKey = Deno.env.get('SS_KEY') || ''
+    const bSec = Deno.env.get('SS_SECRET') || ''
+    if (!bKey || !bSec) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
+    const bAuth = btoa(bKey + ':' + bSec)
+    const since = body.since || new Date(Date.now() - 30*24*60*60*1000).toISOString().slice(0,10)
+    let page = 1, totalPages = 1, synced = 0, skipped = 0, notFound = 0
+
+    while (page <= totalPages) {
+      const url = 'https://ssapi.shipstation.com/shipments?shipDateStart=' + since
+        + '&pageSize=500&page=' + page + '&includeShipmentItems=true'
+      const bRes = await fetch(url, { headers: { Authorization: 'Basic ' + bAuth } })
+      if (!bRes.ok) return json({ error: 'ShipStation error ' + bRes.status }, 502)
+      const bData = await bRes.json()
+      totalPages = bData.pages || 1
+
+      for (const ship of (bData.shipments || [])) {
+        if (ship.voided) { skipped++; continue }
+        const rawNum = ship.orderNumber
+        const tracking = ship.trackingNumber
+        if (!tracking) { skipped++; continue }
+        const carrier = ship.carrierCode?.toUpperCase() || ''
+        const shippedAt = ship.shipDate ? new Date(ship.shipDate).toISOString() : new Date().toISOString()
+
+        // Resolve order number - try with and without # prefix
+        let { data: lines } = await db.from('sales')
+          .select('id,pn,fulfillment_status').eq('order_number', rawNum)
+        let resolvedNum = rawNum
+        if (!lines?.length) {
+          const r2 = await db.from('sales')
+            .select('id,pn,fulfillment_status').eq('order_number', '#' + rawNum)
+          if (r2.data?.length) { lines = r2.data; resolvedNum = '#' + rawNum }
+        }
+        if (!lines?.length) { notFound++; continue }
+
+        // Match SKUs - fuzzy contains match same as webhook
+        const rawSkus = (ship.shipmentItems || []).flatMap((i: any) =>
+          [i.sku, i.name].filter(Boolean)
+        )
+        const norm = (s: string) => s.trim().toUpperCase()
+        const allPns = lines.map((l: any) => l.pn as string)
+        const matched = rawSkus.length > 0
+          ? allPns.filter(p => rawSkus.some((s: string) => { const e=norm(p),k=norm(s); return e===k||e.includes(k)||k.includes(e) }))
+          : allPns
+
+        for (const pn of matched) {
+          await db.from('sales').update({
+            fulfillment_status: 'Shipped',
+            tracking_number: tracking,
+            carrier: carrier,
+            shipped_at: shippedAt
+          }).eq('order_number', resolvedNum).eq('pn', pn)
+            .in('fulfillment_status', ['Open', 'Packed', 'Partial'])
+        }
+        synced++
+      }
+      page++
+    }
+    return json({ synced, skipped, notFound, pages: totalPages,
+      message: 'Synced ' + synced + ' shipments (' + skipped + ' skipped, ' + notFound + ' order not in ERP)' })
   }
 
   return ok('ok')
@@ -2885,6 +2952,53 @@ async function ssManualSync(orderNum,tracking,carrier){
   pushUndoMulti('Manual ship order '+orderNum,undoOps);
   toast('✓ Order '+orderNum+' marked Shipped · tracking: '+tracking);
   render();
+}
+
+async function ssBulkSync(){
+  const el=document.getElementById('ss-diag-result');
+  el.style.display='block';
+
+  // Ask for date range
+  const defaultSince=new Date(Date.now()-30*24*60*60*1000).toISOString().slice(0,10);
+  const since=prompt('Pull all ShipStation shipments from this date onwards:\n(Format: YYYY-MM-DD)',defaultSince);
+  if(!since)return;
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(since.trim())){toast('Use YYYY-MM-DD format');return;}
+
+  el.textContent='Fetching shipments from ShipStation since '+since+'...\nThis may take a moment for large date ranges.';
+  const edgeUrl=SUPA_URL+'/functions/v1/shipstation-ship';
+
+  try{
+    const res=await fetch(edgeUrl,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'bulk_sync',since:since.trim()})
+    });
+    const data=await res.json().catch(()=>({}));
+
+    if(!res.ok){
+      el.textContent='Error '+res.status+':\n'+(data.error||JSON.stringify(data))+'\n\nMake sure:\n· Edge function is deployed with the latest code\n· SS_KEY and SS_SECRET secrets are set';
+      return;
+    }
+
+    let out='BULK SYNC COMPLETE\n'+'─'.repeat(44)+'\n\n';
+    out+='Shipments synced:  '+data.synced+'\n';
+    out+='Skipped (voided/no tracking): '+data.skipped+'\n';
+    out+='Order not in ERP:  '+data.notFound+'\n';
+    out+='Pages fetched:     '+(data.pages||1)+'\n\n';
+    out+=data.message+'\n';
+    if(data.notFound>0){
+      out+='\nNote: "Order not in ERP" means ShipStation has shipments for orders\n';
+      out+='that don\'t exist in the ERP yet. Run "Sync Orders" (Sales page) first\n';
+      out+='to import those orders from Shopify, then run Bulk Sync again.\n';
+    }
+    el.textContent=out;
+
+    await refreshSales();
+    render();
+    toast('✓ Bulk sync done — '+data.synced+' shipments applied');
+  }catch(e){
+    el.textContent='Network error: '+e.message+'\n\nRedeploy the edge function and try again.';
+  }
 }
 
 async function ssCheckSecrets(){
