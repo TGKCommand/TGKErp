@@ -1925,7 +1925,8 @@ function renderIntegrations(){
         <div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">🔧 Diagnostics</div>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
           <input id="ss-test-order" class="form-input" style="width:140px;padding:5px 9px;font-size:12px" placeholder="Order # e.g. 9135">
-          <button class="btn btn-teal btn-sm" onclick="ssTestOrder()">🔍 Test Order Sync</button>
+          <button class="btn btn-teal btn-sm" onclick="ssTestOrder()">🔍 Diagnose Order</button>
+          <button class="btn btn-primary btn-sm" onclick="ssReplayWebhook()">↺ Replay Webhook</button>
           <button class="btn btn-sm" onclick="ssManualShipPrompt()">✈ Manual Ship Override</button>
         <button class="btn btn-sm" onclick="importOrdersFromShopify()">📥 Import All Shopify Orders</button>
         </div>
@@ -2029,24 +2030,36 @@ Deno.serve(async (req) => {
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto;max-height:280px">import { createClient } from 'npm:@supabase/supabase-js@2'
 const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
 
-Deno.serve(async (req) => {
-  if (req.method === 'GET' || (await req.clone().json().catch(()=>({}))).ping)
-    return new Response(JSON.stringify({pong:true}), {headers:{'Content-Type':'application/json'}})
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+}
 
-  const body = await req.json()
+function ok(body: string) {
+  return new Response(body, { headers: CORS })
+}
+function json(data: unknown, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers: { ...CORS, 'Content-Type': 'application/json' } })
+}
+
+Deno.serve(async (req) => {
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
+
+  const body = await req.json().catch(() => ({})) as any
+
+  if (req.method === 'GET' || body.ping) return json({ pong: true })
+
   const { resource_url, resource_type } = body
   console.log('[SS]', resource_type, resource_url)
 
-  if (!resource_url) return new Response('no resource_url', {status:400})
+  if (!resource_url) return new Response('no resource_url', { status: 400, headers: CORS })
 
-  // Fetch the actual shipment/order from ShipStation
   const ssKey = Deno.env.get('SS_KEY')!, ssSec = Deno.env.get('SS_SECRET')!
   const auth = btoa(ssKey + ':' + ssSec)
-  const ssRes = await fetch(resource_url, {headers:{Authorization:'Basic '+auth}})
-  if (!ssRes.ok) return new Response('SS fetch failed: '+ssRes.status, {status:502})
+  const ssRes = await fetch(resource_url, { headers: { Authorization: 'Basic ' + auth } })
+  if (!ssRes.ok) return new Response('SS fetch failed: ' + ssRes.status, { status: 502, headers: CORS })
   const data = await ssRes.json()
 
-  // --- SHIPPED ---
   if (resource_type === 'SHIP_NOTIFY' || resource_type === 'ORDER_SHIPPED') {
     const shipments = data.shipments ?? [data]
     for (const ship of shipments) {
@@ -2055,24 +2068,22 @@ Deno.serve(async (req) => {
       const carrier = ship.carrierCode?.toUpperCase() || ''
       const shippedAt = new Date().toISOString()
 
-      // Which SKUs were in THIS shipment?
-      // ShipStation may send sku, name, or lineItemKey — try all.
-      const rawSkus = (ship.shipmentItems ?? []).flatMap((i:any) =>
+      const rawSkus = (ship.shipmentItems ?? []).flatMap((i: any) =>
         [i.sku, i.name, i.lineItemKey].filter(Boolean)
       )
       console.log('[SS] order', orderNum, 'tracking', tracking, 'rawSkus', JSON.stringify(rawSkus))
 
-      // Fetch all ERP lines for this order so we can do SKU matching
       const { data: orderLines } = await db.from('sales')
         .select('id,pn,fulfillment_status').eq('order_number', orderNum)
-      const erpLines = orderLines ?? []
-      const allErpPns = erpLines.map((l:any) => l.pn as string)
+      // ShipStation may omit the # prefix - try both formats
+      const erpLines = orderLines?.length ? orderLines
+        : (await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', '#' + orderNum)).data ?? []
+      const resolvedOrderNum = erpLines.length && !orderLines?.length ? '#' + orderNum : orderNum
+      const allErpPns = erpLines.map((l: any) => l.pn as string)
 
-      // Match ShipStation SKUs → ERP pns (case-insensitive, strip spaces)
-      // A ShipStation SKU matches an ERP pn if either contains the other (handles prefix diffs)
-      const norm = (s:string) => s.trim().toUpperCase()
+      const norm = (s: string) => s.trim().toUpperCase()
       const matchedPns = allErpPns.filter(erpPn =>
-        rawSkus.some(ssSku => {
+        rawSkus.some((ssSku: string) => {
           const e = norm(erpPn), s = norm(ssSku)
           return e === s || e.includes(s) || s.includes(e)
         })
@@ -2082,56 +2093,59 @@ Deno.serve(async (req) => {
       const isSplit = matchedPns.length > 0 && matchedPns.length < allErpPns.length
 
       if (matchedPns.length > 0) {
-        // Update ONLY the matched lines — do NOT touch the rest
         for (const pn of matchedPns) {
           await db.from('sales').update({
             fulfillment_status: 'Shipped', tracking_number: tracking, carrier,
             shipped_at: shippedAt, is_split_shipment: isSplit
-          }).eq('order_number', orderNum).eq('pn', pn)
+          }).eq('order_number', resolvedOrderNum).eq('pn', pn)
         }
-        // Remaining open lines → Partial (they're on a split order)
         if (isSplit) {
-          const unshippedPns = allErpPns.filter(p => !matchedPns.includes(p))
+          const unshippedPns = allErpPns.filter((p: string) => !matchedPns.includes(p))
           for (const pn of unshippedPns) {
-            const line = erpLines.find((l:any) => l.pn === pn)
-            // Only update if still Open/Packed — don't overwrite On Hold or already Shipped
-            if (line && ['Open','Packed'].includes(line.fulfillment_status)) {
+            const line = erpLines.find((l: any) => l.pn === pn)
+            if (line && ['Open', 'Packed'].includes(line.fulfillment_status)) {
               await db.from('sales').update({ fulfillment_status: 'Partial', is_split_shipment: true })
-                .eq('order_number', orderNum).eq('pn', pn)
+                .eq('order_number', resolvedOrderNum).eq('pn', pn)
             }
           }
         }
       } else {
-        // No SKU match at all — this is the dangerous fallback that caused the bug.
-        // Log a warning and update ALL open lines (but skip On Hold lines).
-        console.warn('[SS] WARNING: no SKU match for order', orderNum,
-          '— updating all Open/Packed lines. Fix SKUs in ShipStation to match ERP pns.')
+        console.warn('[SS] WARNING: no SKU match for order', resolvedOrderNum, '- updating all Open/Packed lines')
         await db.from('sales').update({
           fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt
-        }).eq('order_number', orderNum).in('fulfillment_status', ['Open','Packed','Partial'])
-        // NOTE: lines in 'On Hold' status are intentionally NOT updated here
+        }).eq('order_number', resolvedOrderNum).in('fulfillment_status', ['Open', 'Packed', 'Partial'])
       }
     }
   }
 
-  // --- CANCELLED ---
   if (resource_type === 'ORDER_CANCELLED') {
-    const orderNum = data.orderNumber
-    await db.from('sales').update({ fulfillment_status: 'Cancelled',
-      cancelled_at: new Date().toISOString() }).eq('order_number', orderNum)
+    const rawNum = data.orderNumber
+    const { data: existing } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
+    const resolvedNum = existing?.length ? rawNum : '#' + rawNum
+    await db.from('sales')
+      .update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() })
+      .eq('order_number', resolvedNum)
   }
 
-  // --- ON HOLD ---
   if (resource_type === 'ORDER_ON_HOLD') {
-    await db.from('sales').update({ on_hold: true, fulfillment_status: 'On Hold' })
-      .eq('order_number', data.orderNumber)
-  }
-  if (resource_type === 'ORDER_HOLD_RELEASED') {
-    await db.from('sales').update({ on_hold: false, fulfillment_status: 'Open' })
-      .eq('order_number', data.orderNumber)
+    const rawNum = data.orderNumber
+    const { data: existing } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
+    const resolvedNum = existing?.length ? rawNum : '#' + rawNum
+    await db.from('sales')
+      .update({ fulfillment_status: 'On Hold' })
+      .eq('order_number', resolvedNum)
   }
 
-  return new Response('ok')
+  if (resource_type === 'ORDER_HOLD_RELEASED') {
+    const rawNum = data.orderNumber
+    const { data: existing } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
+    const resolvedNum = existing?.length ? rawNum : '#' + rawNum
+    await db.from('sales')
+      .update({ fulfillment_status: 'Open' })
+      .eq('order_number', resolvedNum)
+  }
+
+  return ok('ok')
 })</pre>
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">4 — Set ShipStation env vars in Supabase</div>
@@ -2172,78 +2186,114 @@ async function testShopify(){
 
 async function ssTestOrder(){
   const orderNum=(document.getElementById('ss-test-order')?.value||'').trim();
-  if(!orderNum){toast('Enter an order number to test');return;}
+  if(!orderNum){toast('Enter an order number first');return;}
   const el=document.getElementById('ss-diag-result');
   el.style.display='block';
-  el.textContent='⏳ Checking ERP database for order '+orderNum+'…';
+  el.textContent='Diagnosing order '+orderNum+'…';
 
-  // Query Supabase directly (avoids CORS — no edge function call needed)
+  const edgeUrl=SUPA_URL+'/functions/v1/shipstation-ship';
+  let out='ORDER DIAGNOSTIC: '+orderNum+'\n'+'─'.repeat(44)+'\n\n';
+
+  // 1. ERP database check
+  out+='[1] ERP DATABASE:\n';
   const nums=[orderNum,'#'+orderNum,orderNum.replace(/^#/,'')];
-  let erpRows=[];
-  let matchedFmt='';
+  let erpRows=[],matchedFmt='';
   for(const n of nums){
     const{data}=await db.from('sales').select('id,order_number,pn,fulfillment_status,qty,tracking_number,shipped_at').eq('order_number',n);
     if(data?.length){erpRows=data;matchedFmt=n;break;}
   }
-
-  let out='ORDER DIAGNOSTIC: '+orderNum+'\n'+'─'.repeat(44)+'\n\n';
-
-  // ERP check
-  out+='ERP DATABASE:\n';
   if(erpRows.length){
-    out+='  ✓ Found '+erpRows.length+' line(s) matching "'+matchedFmt+'":\n';
+    out+='  ✓ Found '+erpRows.length+' line(s) as "'+matchedFmt+'":\n';
     erpRows.forEach(r=>{
-      out+='    · '+r.pn+' ×'+(r.qty||1)+' — '+r.fulfillment_status;
-      if(r.tracking_number)out+=' — tracking: '+r.tracking_number;
-      out+='\n';
+      out+='    '+r.pn+' ×'+(r.qty||1)+' — '+r.fulfillment_status+(r.tracking_number?' — '+r.tracking_number:' — no tracking')+'\n';
     });
   }else{
-    out+='  ✗ NO ORDER FOUND in ERP for:\n';
-    nums.forEach(n=>out+='    tried: "'+n+'"\n');
-    out+='  → Either the order hasn\'t synced from Shopify yet,\n';
-    out+='    or the order number format differs.\n';
-    out+='  → All order numbers in ERP (recent 5):\n';
+    out+='  ✗ NOT FOUND in ERP (tried: '+nums.join(', ')+')\n';
     const{data:recent}=await db.from('sales').select('order_number').order('created_at',{ascending:false}).limit(5);
-    (recent||[]).forEach(r=>out+='      '+r.order_number+'\n');
+    out+='  Recent ERP order numbers: '+(recent||[]).map(r=>r.order_number).join(', ')+'\n';
+    out+='  → Order number format in ShipStation must match ERP exactly\n';
   }
 
-  // Function reachability check via ping
-  out+='\nEDGE FUNCTION (shipstation-ship):\n';
+  // 2. Edge function ping
+  out+='\n[2] EDGE FUNCTION PING:\n';
   try{
-    const res=await fetch('https://piamamighqiielfztgic.supabase.co/functions/v1/shipstation-ship',{
-      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ping:true})
-    });
-    if(res.ok){
-      const d=await res.json().catch(()=>({}));
-      out+='  ✓ Responding (pong received)\n';
-      out+='  → Function is deployed and JWT is OFF\n';
-      out+='  → Webhook URL: https://piamamighqiielfztgic.supabase.co/functions/v1/shipstation-ship\n';
-    }else{
-      out+='  ✗ HTTP '+res.status+' — JWT may still be ON\n';
-      out+='  → Dashboard → Edge Functions → shipstation-ship → toggle JWT OFF\n';
-    }
-  }catch(e){
-    out+='  ✗ Network error (CORS blocks browser→function calls)\n';
-    out+='  → This is normal — ShipStation calls it server-to-server (no CORS issue)\n';
-    out+='  → Test with PowerShell instead:\n';
-    out+='  (use PowerShell to test: send ping:true to the function URL)\n';
-    out+='  → Expected response: true (you already confirmed this ✓)\n';
+    const res=await fetch(edgeUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ping:true})});
+    if(res.ok){out+='  ✓ Responding (deployed, JWT off)\n';out+='  Webhook URL: '+edgeUrl+'\n';}
+    else{out+='  ✗ HTTP '+res.status+' — redeploy or toggle JWT off\n';}
+  }catch(e){out+='  ! Network error — normal from browser (ShipStation calls server-to-server, no CORS issue)\n';}
+
+  // 3. What ShipStation would send
+  out+='\n[3] WHAT SHIPSTATION SENDS:\n';
+  out+='  resource_type: SHIP_NOTIFY\n';
+  out+='  resource_url:  https://ssapi.shipstation.com/shipments?orderNumber='+orderNum.replace(/^#/,'')+'\n';
+  out+='  The edge function fetches that URL using SS_KEY + SS_SECRET secrets\n';
+  out+='  Then matches shipmentItems[].sku → ERP pn (fuzzy: contains match)\n';
+
+  // 4. Common failure reasons
+  out+='\n[4] COMMON REASONS WEBHOOKS FAIL:\n';
+  if(erpRows.length&&erpRows.every(r=>r.fulfillment_status==='Shipped'||r.fulfillment_status==='Delivered')){
+    out+='  ✓ Order already Shipped/Delivered — webhook worked!\n';
+  }else if(!erpRows.length){
+    out+='  ✗ Order not in ERP — ShipStation sends webhooks using its own order number.\n';
+    out+='    Check that the order number format matches (e.g. #9231 vs 9231)\n';
+  }else{
+    out+='  · SKU mismatch: ShipStation item SKU must contain or be contained by ERP pn\n';
+    out+='    ERP pns on this order: '+erpRows.map(r=>r.pn).join(', ')+'\n';
+    out+='    → In ShipStation, check the SKU field on each item matches the above\n';
+    out+='  · SS_KEY / SS_SECRET secrets not set in edge function\n';
+    out+='    → Supabase Dashboard → Edge Functions → shipstation-ship → Secrets\n';
+    out+='  · SHIP_NOTIFY not registered\n';
+    out+='    → ShipStation → Account Settings → Webhooks → must have SHIP_NOTIFY\n';
+    out+='  · Logs: Supabase Dashboard → Edge Functions → shipstation-ship → Logs\n';
   }
 
-  out+='\nNEXT STEPS:\n';
-  if(!erpRows.length){
-    out+='  1. Check Shopify webhook is configured (Integrations → Setup Guide)\n';
-    out+='  2. Place a test order in Shopify and see if it appears in Sales\n';
-    out+='  3. The order number in ERP must match what ShipStation uses\n';
-  }else if(erpRows.some(r=>r.fulfillment_status==='Shipped')){
-    out+='  ✓ Order is already marked Shipped — webhook worked!\n';
-  }else{
-    out+='  1. Ship this order in ShipStation (print a label)\n';
-    out+='  2. Wait 5-10 seconds, then refresh ERP\n';
-    out+='  3. Check Supabase: Dashboard → Edge Functions → shipstation-ship → Logs\n';
-  }
+  out+='\n[5] TO FORCE-UPDATE NOW:\n';
+  out+='  Click "↺ Replay Webhook" above to manually trigger the edge function\n';
+  out+='  for this order as if ShipStation had just fired the webhook.\n';
 
   el.textContent=out;
+}
+
+// Manually replay the ShipStation SHIP_NOTIFY webhook for an order
+// Constructs the resource_url the same way ShipStation would and calls the edge function
+async function ssReplayWebhook(){
+  const rawNum=(document.getElementById('ss-test-order')?.value||'').trim();
+  if(!rawNum){toast('Enter an order number first');return;}
+  const orderNum=rawNum.replace(/^#/,''); // ShipStation uses numbers without #
+
+  const el=document.getElementById('ss-diag-result');
+  el.style.display='block';
+  el.textContent='Replaying SHIP_NOTIFY for order '+rawNum+'…';
+
+  const edgeUrl=SUPA_URL+'/functions/v1/shipstation-ship';
+  const resourceUrl='https://ssapi.shipstation.com/shipments?orderNumber='+encodeURIComponent(orderNum)+'&pageSize=5&sortBy=ShipDate&sortDir=DESC';
+
+  try{
+    const res=await fetch(edgeUrl,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({resource_type:'SHIP_NOTIFY',resource_url:resourceUrl})
+    });
+    const txt=await res.text().catch(()=>'');
+    if(res.ok){
+      el.textContent='✓ Webhook replayed for order '+rawNum+'\n\nEdge function responded: '+txt+'\n\nRefreshing orders…';
+      await refreshSales();
+      render();
+      const lines=S.sales.filter(s=>s.order_number===rawNum||s.order_number===(rawNum.startsWith('#')?rawNum:'#'+rawNum));
+      if(lines.length){
+        el.textContent+= '\n\nOrder status now:\n'+lines.map(l=>'  '+l.pn+' — '+l.fulfillment_status+(l.tracking_number?' ('+l.tracking_number+')':' (no tracking)')).join('\n');
+        if(lines.some(l=>l.fulfillment_status==='Shipped')){
+          el.textContent+='\n\n✓ SUCCESS — lines are now Shipped!';
+        }else{
+          el.textContent+='\n\n⚠ Status unchanged. Check edge function logs in Supabase for details.\nLikely causes: SKU mismatch, or SS_KEY/SS_SECRET secrets not set.';
+        }
+      }
+    }else{
+      el.textContent='✗ Edge function returned '+res.status+':\n'+txt+'\n\nMake sure:\n· Function is deployed (shipstation-ship)\n· JWT verification is OFF\n· SS_KEY and SS_SECRET are set as secrets';
+    }
+  }catch(e){
+    el.textContent='✗ Could not reach edge function: '+e.message+'\n\nThis may be a CORS block from the browser.\nShipStation calls this server-to-server which works fine.\nTry using the ↺ Replay via PowerShell approach instead.';
+  }
 }
 
 async function checkDelivery(orderNum, saleId){
