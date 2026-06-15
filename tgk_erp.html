@@ -1927,6 +1927,7 @@ function renderIntegrations(){
           <input id="ss-test-order" class="form-input" style="width:140px;padding:5px 9px;font-size:12px" placeholder="Order # e.g. 9135">
           <button class="btn btn-teal btn-sm" onclick="ssTestOrder()">🔍 Diagnose Order</button>
           <button class="btn btn-primary btn-sm" onclick="ssReplayWebhook()">↺ Replay Webhook</button>
+          <button class="btn btn-sm" onclick="ssCheckSecrets()">🔑 Check Secrets</button>
           <button class="btn btn-sm" onclick="ssManualShipPrompt()">✈ Manual Ship Override</button>
         <button class="btn btn-sm" onclick="importOrdersFromShopify()">📥 Import All Shopify Orders</button>
         </div>
@@ -2048,6 +2049,20 @@ Deno.serve(async (req) => {
   const body = await req.json().catch(() => ({})) as any
 
   if (req.method === 'GET' || body.ping) return json({ pong: true })
+
+  // Secrets diagnostic - never exposes values, only confirms they're loaded
+  if (body.check_secrets) {
+    const k = Deno.env.get('SS_KEY') || ''
+    const s = Deno.env.get('SS_SECRET') || ''
+    return json({
+      ss_key_set: k.length > 0,
+      ss_key_length: k.length,
+      ss_key_preview: k.length > 4 ? k.slice(0,2)+'...'+k.slice(-2) : '(empty)',
+      ss_secret_set: s.length > 0,
+      ss_secret_length: s.length,
+      ss_secret_preview: s.length > 4 ? s.slice(0,2)+'...'+s.slice(-2) : '(empty)',
+    })
+  }
 
   const { resource_url, resource_type } = body
   console.log('[SS]', resource_type, resource_url)
@@ -2870,6 +2885,39 @@ async function ssManualSync(orderNum,tracking,carrier){
   pushUndoMulti('Manual ship order '+orderNum,undoOps);
   toast('✓ Order '+orderNum+' marked Shipped · tracking: '+tracking);
   render();
+}
+
+async function ssCheckSecrets(){
+  const el=document.getElementById('ss-diag-result');
+  el.style.display='block';
+  el.textContent='Checking edge function secrets…';
+  const edgeUrl=SUPA_URL+'/functions/v1/shipstation-ship';
+  try{
+    const res=await fetch(edgeUrl,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({check_secrets:true})
+    });
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok){el.textContent='Edge function error '+res.status+' — redeploy the function first';return;}
+    let out='SECRETS DIAGNOSTIC\n'+'─'.repeat(44)+'\n\n';
+    out+='SS_KEY:    '+(data.ss_key_set?'✓ SET ('+data.ss_key_length+' chars, preview: '+data.ss_key_preview+')':'✗ NOT SET — go to Supabase → Edge Functions → shipstation-ship → Secrets')+'\n';
+    out+='SS_SECRET: '+(data.ss_secret_set?'✓ SET ('+data.ss_secret_length+' chars, preview: '+data.ss_secret_preview+')':'✗ NOT SET — go to Supabase → Edge Functions → shipstation-ship → Secrets')+'\n';
+    if(data.ss_key_set&&data.ss_secret_set){
+      out+='\n✓ Both secrets are loaded.\n';
+      out+='If you\'re still getting 401, the values may have extra whitespace.\n';
+      out+='Delete both secrets and re-add them — paste carefully with no leading/trailing spaces.\n';
+      out+='\nExpected key length: typically 32 chars\nExpected secret length: typically 32 chars\nYours: key='+data.ss_key_length+', secret='+data.ss_secret_length;
+    }else{
+      out+='\nFIX: Supabase Dashboard → Edge Functions → shipstation-ship → Secrets tab\n';
+      out+='Add: SS_KEY = your ShipStation API Key\n';
+      out+='Add: SS_SECRET = your ShipStation API Secret\n';
+      out+='(Found in ShipStation → Account Settings → API Settings)';
+    }
+    el.textContent=out;
+  }catch(e){
+    el.textContent='Could not reach edge function: '+e.message+'\n\nMake sure the function is deployed and JWT is OFF.';
+  }
 }
 
 async function testShipStation(){
