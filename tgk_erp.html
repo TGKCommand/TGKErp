@@ -683,8 +683,8 @@ async function loadAll(){
     render();
   }catch(e){
     setSyncState('err');
-    $('content').innerHTML=`<div class="loading-state" style="color:var(--red)">⚠ Database error: ${e.message}. Run the SQL migration first.</div>`;
-    console.error(e);
+    console.error('loadAll error:',e);
+    throw e; // rethrow so the caller (startTGK) can auto-retry
   }
 }
 
@@ -5851,25 +5851,36 @@ async function refreshAssemblies(){
   function setMsg(t){if(msg)msg.textContent=t;}
   function showRetry(){if(retry)retry.style.display='';if(dots)dots.style.opacity='.25';}
 
-  // Show retry after 12s; hard-reload after 30s if still stuck
-  const t1=setTimeout(()=>{setMsg('Taking longer than expected…');showRetry();},12000);
-  const t2=setTimeout(()=>location.reload(),30000);
+  // Auto-reload safety net — if still stuck after 60s something is seriously wrong
+  const tHard=setTimeout(()=>location.reload(),60000);
 
-  let attempts=0;
+  let sdkAttempts=0;
   function waitForSupabase(){
-    attempts++;
+    sdkAttempts++;
     if(typeof supabase==='undefined'||typeof supabase.createClient==='undefined'){
-      if(attempts>100){clearTimeout(t1);clearTimeout(t2);setMsg('Could not load Supabase library — check internet connection.');showRetry();return;}
-      if(attempts===1)setMsg('Loading libraries…');
+      if(sdkAttempts>150){
+        clearTimeout(tHard);
+        setMsg('Could not load Supabase library — check internet connection.');
+        showRetry();
+        return;
+      }
+      if(sdkAttempts===1)setMsg('Loading libraries…');
       setTimeout(waitForSupabase,100);
       return;
     }
-    // Create client now that library is confirmed loaded
-    if(!db) db = supabase.createClient(SUPA_URL, SUPA_KEY);
-    setMsg('Connecting to database…');
+    if(!db)db=supabase.createClient(SUPA_URL,SUPA_KEY);
+    tryConnect(1);
+  }
+
+  // Auto-retry up to 4 times with increasing delays (handles Supabase cold-start wakeup)
+  // Delays: immediate, 3s, 6s, 10s  → total ~19s before giving up
+  const RETRY_DELAYS=[0,3000,6000,10000];
+  function tryConnect(attempt){
+    const label=attempt>1?` (attempt ${attempt} of ${RETRY_DELAYS.length})`:'' ;
+    setMsg('Connecting to database…'+label);
     loadAll()
       .then(()=>{
-        clearTimeout(t1);clearTimeout(t2);
+        clearTimeout(tHard);
         computeDemand();setupRealtime();loadBackups();startAutoBackup();
         try{history.replaceState(snapState(),'','#dashboard');}catch(e){}
         const loader=document.getElementById('tgk-loader');
@@ -5879,9 +5890,16 @@ async function refreshAssemblies(){
         render();
       })
       .catch(err=>{
-        clearTimeout(t1);clearTimeout(t2);
-        setMsg('Database error: '+err.message);
-        showRetry();
+        console.warn(`DB connect attempt ${attempt} failed:`,err.message);
+        if(attempt<RETRY_DELAYS.length){
+          const delay=RETRY_DELAYS[attempt];
+          setMsg(`Database waking up — retrying in ${delay/1000}s… (${attempt}/${RETRY_DELAYS.length})`);
+          setTimeout(()=>tryConnect(attempt+1),delay);
+        } else {
+          clearTimeout(tHard);
+          setMsg('Could not connect: '+err.message);
+          showRetry();
+        }
       });
   }
 
