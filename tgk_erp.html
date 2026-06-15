@@ -463,38 +463,6 @@ const fn = v => Number(v||0).toLocaleString();
 // ── LIVE DEMAND ENGINE ──
 // All weekly averages auto-compute from real sales history.
 // Part demand = direct sales + BOM explosion of finished-goods sales.
-// ── ORDER STATISTICS: per-SKU calculated metrics ──
-function orderStats(pn){
-  const now=new Date();
-  const sales=S.sales.filter(s=>s.pn===pn&&s.fulfillment_status!=='Cancelled'&&s.sale_date);
-  const wkSales=(weeks)=>{
-    const cutoff=new Date(now-weeks*7*24*3600*1000);
-    return sales.filter(s=>new Date(s.sale_date)>=cutoff).reduce((t,s)=>t+(s.qty||1),0);
-  };
-  const s4=wkSales(4), s12=wkSales(12), s52=wkSales(52);
-  const avg4=s4/4, avg12=s12/12, avg52=s52/52;
-  // Trend: compare last 4wk to prior 4wk
-  const prior4Start=new Date(now-8*7*24*3600*1000);
-  const prior4End=new Date(now-4*7*24*3600*1000);
-  const sPrior4=sales.filter(s=>{const d=new Date(s.sale_date);return d>=prior4Start&&d<prior4End;}).reduce((t,s)=>t+(s.qty||1),0);
-  const trend=sPrior4>0?((s4-sPrior4)/sPrior4*100):0;
-  // Best/worst month
-  const byMonth={};
-  sales.forEach(s=>{const m=s.sale_date.slice(0,7);byMonth[m]=(byMonth[m]||0)+(s.qty||1);});
-  const months=Object.values(byMonth);
-  return {avg4,avg12,avg52,s4,s12,s52,trend,totalOrders:sales.length,byMonth};
-}
-
-// Calculated min/max from demand + lead time
-function calcMinMax(a){
-  const avg=asmAvgWk(a);
-  const lead=2; // default 2wk lead time (TODO: per-product)
-  const safety=Math.ceil(avg*1.5);
-  const min=Math.ceil(avg*lead+safety);
-  const max=Math.ceil(avg*8+safety);
-  return{min:Math.max(min,a.min_qty||0),max:Math.max(max,a.max_qty||0),safety,lead};
-}
-
 function computeDemand(){
   const wk4={},wk12={};
   const now=new Date();
@@ -646,13 +614,7 @@ function setupRealtime(){
       toast('Assemblies updated');
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'sales'},p=>{
-      if(p.eventType==='INSERT'){
-    S.sales=[p.new,...S.sales];
-    // Flash alert for new incoming order
-    const orderNum=p.new.order_number||'';
-    const pn=p.new.pn||'';
-    showOrderAlert(orderNum,pn);
-  }
+      if(p.eventType==='INSERT')S.sales=[p.new,...S.sales];
       if(['sales','dashboard'].includes(S.view))render();
       toast('New sale recorded');
     })
@@ -706,38 +668,6 @@ window.addEventListener('popstate',function(e){
 function openSaleDetail(id){S.activeSale=id;pushHist();render();}
 function openBuild(pn){S.activeBuild=pn;S.buildQty=null;if(S.view!=='packqueue')nav('packqueue');else{pushHist();render();}}
 function lookupGo(type,pn){S.lookupSel={type,pn};S.lookupQ=pn;if(S.view!=='lookup')nav('lookup');else{pushHist();render();}}
-
-let _alertTimeout=null;
-function showOrderAlert(orderNum,pn){
-  // Remove existing alert if any
-  const ex=document.getElementById('order-alert-bar');
-  if(ex)ex.remove();
-  if(_alertTimeout)clearTimeout(_alertTimeout);
-  const bar=document.createElement('div');
-  bar.id='order-alert-bar';
-  bar.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;background:var(--teal);color:#fff;padding:10px 18px;display:flex;align-items:center;gap:12px;font-size:13px;font-weight:600;box-shadow:0 2px 12px rgba(0,0,0,.18);cursor:pointer;animation:slideDown .25s ease';
-  bar.innerHTML='🛒 New order received'+(orderNum?' — #'+orderNum:'')+(pn&&pn!=='Multiple'?' · '+pn:'')+'<span style="margin-left:auto;font-size:11px;opacity:.85">Click to view → </span>';
-  bar.onclick=()=>{nav('sales');bar.remove();};
-  // Add animation
-  const style=document.createElement('style');
-  style.textContent='@keyframes slideDown{from{transform:translateY(-100%)}to{transform:translateY(0)}}';
-  document.head.appendChild(style);
-  document.body.appendChild(bar);
-  // Also flash the topbar title
-  const tb=document.querySelector('.topbar-title');
-  if(tb){tb.style.color='var(--teal)';setTimeout(()=>tb.style.color='',2000);}
-  // Try browser notification if permitted
-  if(Notification.permission==='granted'){
-    new Notification('TGK — New Order',{body:'Order'+(orderNum?' #'+orderNum:'')+(pn&&pn!=='Multiple'?' · '+pn:''),icon:'/favicon.ico'});
-  }
-  // Auto-dismiss after 8 seconds
-  _alertTimeout=setTimeout(()=>{if(bar.parentNode)bar.remove();},8000);
-}
-
-// Request notification permission on load (user must interact first)
-function requestNotifPermission(){
-  if(Notification.permission==='default')Notification.requestPermission();
-}
 
 function escHtml(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function rowClick(e,fn){if(e.target.closest('button,input,select,a,label'))return;fn();}
@@ -880,9 +810,8 @@ function renderParts(){
 function renderAssemblies(){
   const sf=S.filters.asm||{};
   let list=sf.showDisc?S.assemblies.filter(a=>a.discontinued):S.assemblies.filter(a=>!a.discontinued);
-  if(sf.kind==='fg')list=list.filter(a=>!a.is_subassembly&&!isHWPack(a.pn));
-  if(sf.kind==='sub')list=list.filter(a=>a.is_subassembly&&!isHWPack(a.pn));
-  if(sf.kind==='hwp')list=list.filter(a=>isHWPack(a.pn));
+  if(sf.kind==='fg')list=list.filter(a=>!a.is_subassembly);
+  if(sf.kind==='sub')list=list.filter(a=>a.is_subassembly);
   const cats=[...new Set(S.assemblies.map(a=>a.category||'').filter(Boolean))].sort();
   const q=(sf.search||S.searchQ||'').toLowerCase();
   if(q)list=list.filter(a=>a.pn.toLowerCase().includes(q)||((a.description||'').toLowerCase().includes(q)));
@@ -902,8 +831,7 @@ function renderAssemblies(){
       <option value="critical">Critical</option><option value="low">Low</option><option value="ok">In Stock</option>
     </select>
     <button class="filter-chip ${sf.kind==='fg'?'on-teal':''}" onclick="setFilter('asm','kind',${sf.kind==='fg'?"''":"'fg'"})">Finished Goods (${S.assemblies.filter(a=>!a.is_subassembly&&!a.discontinued).length})</button>
-    <button class="filter-chip ${sf.kind==='sub'?'on-teal':''}" onclick="setFilter('asm','kind',${sf.kind==='sub'?"''":"'sub'"})">Subassemblies (${S.assemblies.filter(a=>a.is_subassembly&&!isHWPack(a.pn)&&!a.discontinued).length})</button>
-    <button class="filter-chip ${sf.kind==='hwp'?'on-teal':''}" onclick="setFilter('asm','kind',${sf.kind==='hwp'?"''":"'hwp'"})">🟣 Hardware Packs (${S.assemblies.filter(a=>isHWPack(a.pn)&&!a.discontinued).length})</button>
+    <button class="filter-chip ${sf.kind==='sub'?'on-teal':''}" onclick="setFilter('asm','kind',${sf.kind==='sub'?"''":"'sub'"})">Subassemblies (${S.assemblies.filter(a=>a.is_subassembly&&!a.discontinued).length})</button>
     <button class="filter-chip ${sf.showDisc?'on-teal':''}" onclick="setFilter('asm','showDisc',${sf.showDisc?'false':'true'})">🗄 Discontinued (${S.assemblies.filter(a=>a.discontinued).length})</button>
     <span class="filter-count">${list.length} assemblies</span>
   </div>
@@ -1108,7 +1036,27 @@ function renderPurchases(){
 // ============================================================
 function renderSales(){
   if(S.activeSale){const s=S.sales.find(x=>x.id===S.activeSale);if(s)return renderSaleDetail(s);}
-  let list=S.sales;
+
+  // Group multi-line orders → one row per order number
+  function groupSales(rows){
+    const groups={},noNum=[];
+    rows.forEach(s=>{
+      if(!s.order_number){noNum.push(s);return;}
+      (groups[s.order_number]=groups[s.order_number]||[]).push(s);
+    });
+    const rank={'Shipped':5,'Delivered':4,'Packed':3,'On Hold':2,'Open':1,'Cancelled':0};
+    return [
+      ...Object.values(groups).map(lines=>{
+        if(lines.length===1)return lines[0];
+        const lead=lines.reduce((a,b)=>(rank[b.fulfillment_status||'Open']||0)>(rank[a.fulfillment_status||'Open']||0)?b:a,lines[0]);
+        const totalQty=lines.reduce((t,s)=>t+(s.qty||1),0);
+        return{...lead,_grouped:true,_lineCount:lines.length,_allLines:lines,qty:totalQty,pn:'Multiple'};
+      }),
+      ...noNum
+    ].sort((a,b)=>new Date(b.sale_date||0)-new Date(a.sale_date||0));
+  }
+
+  let list=groupSales(S.sales);
   const sf=S.filters.sales||{};
   const q=(sf.search||S.searchQ||'').toLowerCase();
   if(q)list=list.filter(s=>s.pn.toLowerCase().includes(q)||(s.order_number||'').toLowerCase().includes(q)||(s.source||'').toLowerCase().includes(q));
@@ -1149,11 +1097,11 @@ function renderSales(){
     const stock=asm?(asm.total_on_hand||0):null;
     const canFill=stock!==null&&stock>=(s.qty||1);
     const fsMap={'Open':'pill-red','Packed':'pill-yellow','Shipped':'pill-teal','Delivered':'pill-green','Cancelled':'pill-muted'};
-    return `<tr class="rowlink" onclick="rowClick(event,function(){openSaleDetail('${s.id}')})">
+    return `<tr class="rowlink" onclick="rowClick(event,function(){S.activeSale='${s.id}';pushHist();render()})">
     <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${s.sale_date?s.sale_date.slice(0,10):''}</td>
-    <td class="pn">${s.order_number||''}</td>
-    <td class="pn" style="color:var(--teal)">${s.pn}</td>
-    <td class="money-neutral" style="font-weight:700">${s.qty||1}</td>
+    <td class="pn">${s.order_number||''}${s._grouped?` <span style="font-size:9px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 5px;border-radius:8px;font-family:var(--mono);font-weight:600">${s._lineCount} items</span>`:''}</td>
+    <td class="pn" style="color:${s._grouped?'var(--text3)':'var(--teal)'}">${s._grouped?'Multiple SKUs':s.pn}</td>
+    <td class="money-neutral" style="font-weight:700">${s._grouped?s.qty+' total':(s.qty||1)}</td>
     <td>${stock===null?'<span style="font-size:10px;color:var(--text3)">n/a</span>':`<span class="money" style="color:${canFill?'var(--green)':'var(--red)'};font-weight:700">${stock}</span>`}</td>
     <td><span class="pill ${fsMap[fs]||'pill-muted'}">${fs}</span></td>
     <td style="font-size:10px;font-family:var(--mono);color:var(--text3)">${s.tracking_number?(s.carrier?s.carrier+' ':'')+s.tracking_number:'—'}</td>
@@ -1184,7 +1132,6 @@ function renderSaleDetail(s){
       <div style="font-size:11px;color:var(--text3)">${s.sale_date?s.sale_date.slice(0,10):''} · ${s.source||'—'}</div>
     </div>
     ${fs==='Open'?`<button class="btn btn-teal" ${canFill?'':'disabled title="Insufficient stock"'} onclick="markPacked('${s.id}','${s.pn}',${s.qty||1})">Pack</button>`:''}
-    ${fs==='Packed'?`<button class="btn btn-sm" style="color:var(--orange)" title="Undo this pack — returns stock" onclick="unpackSaleOrder('${s.id}','${s.pn}',${s.qty||1})">↩ Unpack</button>`:''}
     ${fs==='Packed'?`<button class="btn btn-primary" onclick="openShipModal('${s.id}','${s.pn}',${s.qty||1})">🚚 Ship</button>`:''}
     ${fs==='Shipped'?`<button class="btn btn-teal" onclick="markDelivered('${s.id}')">✓ Delivered</button>`:''}
     ${fs==='Open'||fs==='Packed'?`<button class="btn" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
@@ -1205,26 +1152,6 @@ function renderSaleDetail(s){
     ${moves.length===0?'<div class="section-empty">None</div>':moves.map(c=>`<div class="check-row"><span style="font-size:10px;font-family:var(--mono);color:var(--text3)">${new Date(c.created_at).toLocaleDateString()}</span><span class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700;min-width:40px">${c.adjustment>0?'+':''}${c.adjustment}</span><span style="flex:1;font-size:11px;color:var(--text2)">${c.reason||c.source}</span></div>`).join('')}</div>
   </div>
   </div>`;
-}
-
-async function unpackSaleOrder(saleId, pn, qty){
-  if(!confirm('Unpack '+qty+'× '+pn+'?\nThis returns the finished goods stock and resets the order to Open.'))return;
-  const sale=S.sales.find(s=>s.id===saleId);
-  const asm=S.assemblies.find(a=>a.pn===pn);
-  const undoOps=[];
-  if(asm){
-    const newOh=(asm.total_on_hand||0)+qty;
-    undoOps.push({action:'update',table:'assemblies',data:{...asm,total_on_hand:newOh},prev:{...asm}});
-    await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
-    S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
-    const{data:corrRow}=await db.from('inv_corrections').insert({pn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:qty,reason:'Order unpacked — '+(sale?.order_number||saleId),source:'unpack'}).select().single();
-    if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
-  }
-  if(sale)undoOps.push({action:'update',table:'sales',data:{...sale,fulfillment_status:'Open'},prev:{...sale}});
-  await db.from('sales').update({fulfillment_status:'Open',updated_at:new Date().toISOString()}).eq('id',saleId);
-  S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Open'}:s);
-  pushUndoMulti('Unpack order '+(sale?.order_number||''),undoOps);
-  toast('Unpacked — stock returned, order reset to Open');render();
 }
 
 async function dedupeOrders(){
@@ -1444,6 +1371,15 @@ function renderIntegrations(){
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span style="font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.06em;font-size:9px">Integration status</span><button class="btn btn-sm" onclick="checkEdgeFunctions()">↻ Check Live Status</button></div>
       <div style="padding:3px 0">✓ Manual tracking entry on Ship — working</div>
       <div style="padding:3px 0">Ship-notify webhook function (shipstation-ship): ${fnPill(S.fnStatus?.shipstation)}</div>
+      <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+        <div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">🔧 Diagnostics</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+          <input id="ss-test-order" class="form-input" style="width:140px;padding:5px 9px;font-size:12px" placeholder="Order # e.g. 9135">
+          <button class="btn btn-teal btn-sm" onclick="ssTestOrder()">🔍 Test Order Sync</button>
+          <button class="btn btn-sm" onclick="ssManualShipPrompt()">✈ Manual Ship Override</button>
+        </div>
+        <div id="ss-diag-result" style="display:none;font-size:10px;font-family:var(--mono);background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px;max-height:280px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;color:var(--text2)"></div>
+      </div>
     </div>
   </div>`:''}
   ${t==='setup'?`<div class="int-card">
@@ -1491,6 +1427,76 @@ async function testShopify(){
   }catch(e){
     toast('✕ Could not reach '+store+' — check the URL');
   }
+}
+
+async function ssTestOrder(){
+  const orderNum=(document.getElementById('ss-test-order')?.value||'').trim();
+  if(!orderNum){toast('Enter an order number to test');return;}
+  const el=document.getElementById('ss-diag-result');
+  el.style.display='block'; el.textContent='⏳ Testing order '+orderNum+' against ShipStation + ERP…';
+  try{
+    const res=await fetch('https://piamamighqiielfztgic.supabase.co/functions/v1/shipstation-ship',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA'},
+      body:JSON.stringify({test_order:orderNum})
+    });
+    const data=await res.json();
+    if(!res.ok&&data.error==='secrets_missing'){
+      el.textContent='❌ SHIPSTATION_KEY or SHIPSTATION_SECRET not set in Edge Function secrets.\n\nFix: Dashboard → Edge Functions → shipstation-ship → Secrets → add both keys.';
+      return;
+    }
+    let out='ORDER '+orderNum+'\n'+'─'.repeat(40)+'\n\n';
+    out+='SHIPSTATION:\n';
+    const ss=data.shipstation;
+    if(ss){
+      out+='  API status: '+ss.status+'\n';
+      if(ss.orders?.length){ss.orders.forEach(o=>{out+='  Found: "'+o.orderNumber+'" status='+o.orderStatus+' shipments='+o.shipments+'\n';});}
+      else out+='  ⚠ NO ORDER FOUND in ShipStation with number "'+orderNum+'"\n     (check it matches exactly what ShipStation stores)\n';
+    }
+    out+='\nERP DATABASE:\n';
+    if(data.erp_rows?.length){data.erp_rows.forEach(r=>{out+='  ✓ '+r.order_number+' · '+r.pn+' · '+r.fulfillment_status+'\n';});}
+    else out+='  ⚠ NO MATCH in ERP sales table\n     (tried "'+orderNum+'", "#'+orderNum+'")\n     → Check how Shopify stored the order number\n';
+    out+='\nLOG:\n'+(data.log||[]).map(l=>'  '+l).join('\n');
+    el.textContent=out;
+  }catch(e){
+    el.textContent='❌ Cannot reach edge function\n\nMake sure:\n1. Function "shipstation-ship" is deployed\n2. JWT Verification is OFF\n3. Error: '+e.message;
+  }
+}
+
+async function ssManualShipPrompt(){
+  const orderNum=prompt('Order number to mark as Shipped:');
+  if(!orderNum)return;
+  const tracking=prompt('Tracking number:');
+  if(!tracking)return;
+  const carrier=prompt('Carrier (UPS/USPS/FedEx etc):','UPS');
+  await ssManualSync(orderNum,tracking,carrier||'');
+}
+
+async function ssManualSync(orderNum,tracking,carrier){
+  if(!orderNum||!tracking){toast('Need order # and tracking');return;}
+  const nums=[orderNum,'#'+orderNum,orderNum.replace(/^#/,'')];
+  let rows=null;
+  for(const n of nums){
+    const{data}=await db.from('sales').select('*').eq('order_number',n).neq('fulfillment_status','Cancelled');
+    if(data?.length){rows=data;break;}
+  }
+  if(!rows?.length){toast('Order '+orderNum+' not found in ERP');return;}
+  const undoOps=[];
+  for(const sale of rows){
+    undoOps.push({action:'update',table:'sales',data:{...sale,fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier},prev:{...sale}});
+    await db.from('sales').update({fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier||'',shipped_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq('id',sale.id);
+    S.sales=S.sales.map(s=>s.id===sale.id?{...s,fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier||''}:s);
+    const{data:asms}=await db.from('assemblies').select('*').eq('pn',sale.pn);
+    if(asms?.[0]){
+      const newOh=Math.max(0,(asms[0].total_on_hand||0)-(sale.qty||1));
+      await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asms[0].id);
+      S.assemblies=S.assemblies.map(a=>a.pn===sale.pn?{...a,total_on_hand:newOh}:a);
+      await db.from('inv_corrections').insert({pn:sale.pn,previous_qty:asms[0].total_on_hand||0,new_qty:newOh,adjustment:-(sale.qty||1),reason:'Manual ship — order '+orderNum+' tracking '+tracking,source:'shipment'});
+    }
+  }
+  pushUndoMulti('Manual ship order '+orderNum,undoOps);
+  toast('✓ Order '+orderNum+' marked Shipped · tracking: '+tracking);
+  render();
 }
 
 async function testShipStation(){
@@ -2107,7 +2113,7 @@ function renderLookup(){
     ${q.length>=2&&!sel?`<div style="margin-top:10px;max-height:300px;overflow-y:auto">
       ${matches.length===0?'<div class="section-empty">No matches</div>':matches.map(m=>`
       <div class="check-row" style="cursor:pointer" onclick="lookupGo('${m.type}','${m.item.pn}')">
-        <span class="pill ${m.type==='assembly'?(isHWPack(m.item.pn)?'pill-purple':m.item.is_subassembly?'pill-orange':'pill-teal'):'pill-muted'}" style="min-width:72px;justify-content:center">${m.type==='assembly'?(isHWPack(m.item.pn)?'HW PACK':m.item.is_subassembly?'SUB-ASSY':'FINISHED'):'PART'}</span>
+        <span class="pill ${m.type==='assembly'?(m.item.is_subassembly?'pill-orange':'pill-teal'):'pill-muted'}" style="min-width:72px;justify-content:center">${m.type==='assembly'?(m.item.is_subassembly?'SUB-ASSY':'FINISHED'):'PART'}</span>
         <span class="pn" style="color:${m.type==='assembly'?'var(--teal)':'var(--text)'}">${m.item.pn}</span>
         <span style="font-size:11px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${m.item.description||''}</span>
       </div>`).join('')}
@@ -2144,7 +2150,7 @@ function assemblyDossier(pn){
   const margin=a.msrp>0?((a.msrp-bomCost)/a.msrp*100):null;
   return `
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
-    <div style="flex:1"><div style="font-size:16px;font-weight:700;color:var(--teal)">${a.pn} ${isHWPack(a.pn)?'<span class="pill pill-purple" style="font-size:9px;vertical-align:middle">HARDWARE PACK</span>':a.is_subassembly?'<span class="pill pill-orange" style="font-size:9px;vertical-align:middle">SUBASSEMBLY</span>':''} ${a.discontinued?'<span class="pill pill-red" style="font-size:9px;vertical-align:middle">DISCONTINUED</span>':''}</div>
+    <div style="flex:1"><div style="font-size:16px;font-weight:700;color:var(--teal)">${a.pn} ${a.is_subassembly?'<span class="pill pill-orange" style="font-size:9px;vertical-align:middle">SUBASSEMBLY</span>':''} ${a.discontinued?'<span class="pill pill-red" style="font-size:9px;vertical-align:middle">DISCONTINUED</span>':''}</div>
     <div style="font-size:12px;color:var(--text2)">${a.description||''}</div></div>
     ${a.drawing_url?`<a href="${a.drawing_url}" target="_blank" class="btn btn-sm">📐 Drawing</a>`:''}
     <button class="btn btn-teal btn-sm" onclick="openBuild('${pn}')">Build Planner</button>
@@ -2562,8 +2568,6 @@ function lineCost(item){
   const p=S.parts.find(x=>x.pn===item.child_pn);
   return (p?(p.unit_cost||0):0)*(item.qty||1);
 }
-
-function isHWPack(pn){return /^TGK-P\d/i.test(pn||'');}
 
 function bomBucket(childPn,itemType){
   const pnU=(childPn||'').toUpperCase();
@@ -3090,87 +3094,58 @@ function openOrderDemand(pn){
 function renderPackQueue(){
   if(S.activeBuild){const asm=S.assemblies.find(a=>a.pn===S.activeBuild);if(asm)return renderBuildPlanner(asm);}
   const cov=S.buildCoverage||4;
-  const rows=S.assemblies.filter(a=>!a.discontinued&&!isHWPack(a.pn)).map(a=>{
+  const rows=S.assemblies.filter(a=>!a.discontinued).map(a=>{
     const b=buildability(a.pn);
-    const st=orderStats(a.pn);
-    const mm=calcMinMax(a);
-    const oh=a.total_on_hand||0;
     const demand=openOrderDemand(a.pn);
-    const avg=asmAvgWk(a);
-    const fcDemand=Math.ceil(avg*cov);
-    const suggested=Math.max(0,Math.max(demand,Math.max(mm.min,fcDemand))-oh);
-    const wksSupply=avg>0?Math.round(oh/avg):null;
-    return{...a,b,st,mm,demand,fcDemand,suggested,avg,oh,wksSupply,canBuild:b.maxBuild===Infinity||b.maxBuild>0};
-  }).sort((x,y)=>{
-    // Priority: open orders first, then by weeks of supply
-    if(x.demand>0&&y.demand===0)return -1; if(y.demand>0&&x.demand===0)return 1;
-    return (x.wksSupply??999)-(y.wksSupply??999);
-  });
+    const fcDemand=Math.ceil(asmAvgWk(a)*cov);
+    const suggested=Math.max(0,Math.max(demand,fcDemand)-(a.total_on_hand||0));
+    return{...a,b,demand,fcDemand,suggested,
+      canCover:(b.maxBuild===Infinity||b.maxBuild>=suggested)};
+  }).sort((x,y)=>(y.suggested-x.suggested)||((x.total_on_hand||0)-(y.total_on_hand||0)));
+
   const needBuild=rows.filter(r=>r.suggested>0);
-  const openOrderTotal=rows.reduce((t,r)=>t+r.demand,0);
-  const blocked=needBuild.filter(r=>r.b.hasBOM&&r.b.maxBuild<1);
+  const blocked=needBuild.filter(r=>r.b.hasBOM&&r.b.maxBuild<r.suggested);
+  const ready=needBuild.filter(r=>!r.b.hasBOM||r.b.maxBuild>=r.suggested);
+
   return `
-  <div class="kpi-grid kpi-grid-4" style="margin-bottom:14px">
-    <div class="kpi"><div class="kpi-label">Need Building</div><div class="kpi-value" style="color:var(--orange)">${needBuild.length}</div><div class="kpi-sub">${cov}-wk coverage target</div></div>
-    <div class="kpi"><div class="kpi-label">Open Order Demand</div><div class="kpi-value" style="color:var(--red)">${openOrderTotal}</div><div class="kpi-sub">units across ${rows.filter(r=>r.demand>0).length} SKUs</div></div>
-    <div class="kpi"><div class="kpi-label">Buildable Now</div><div class="kpi-value" style="color:var(--green)">${needBuild.filter(r=>r.canBuild).length}</div></div>
-    <div class="kpi"><div class="kpi-label">Component Blocked</div><div class="kpi-value" style="color:var(--red)">${blocked.length}</div></div>
+  <div class="kpi-grid kpi-grid-4">
+    <div class="kpi kpi-orange"><div class="kpi-label">Need Building</div><div class="kpi-value">${needBuild.length}</div><div class="kpi-sub">vs ${cov}-wk coverage</div></div>
+    <div class="kpi kpi-green"><div class="kpi-label">Buildable Now</div><div class="kpi-value">${ready.length}</div></div>
+    <div class="kpi kpi-red"><div class="kpi-label">Component Blocked</div><div class="kpi-value">${blocked.length}</div></div>
+    <div class="kpi kpi-teal"><div class="kpi-label">Open Order Demand</div><div class="kpi-value">${rows.reduce((t,r)=>t+r.demand,0)}</div><div class="kpi-sub">units</div></div>
   </div>
-  <div class="panel" style="padding:10px 16px;margin-bottom:10px">
+  <div class="panel" style="padding:12px 18px">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-      <span style="font-size:11px;color:var(--text3);font-weight:600">BUILD TARGET COVERS:</span>
-      ${[2,4,8,12].map(w=>`<button class="filter-chip ${cov===w?'on-teal':''}" onclick="S.buildCoverage=${w};render()">${w} wks</button>`).join('')}
-      <span style="font-size:10px;color:var(--text3);margin-left:auto">Sorted by urgency · Click row to open Build Planner</span>
+      <span style="font-size:11px;color:var(--text3)">Suggested build covers:</span>
+      ${[2,4,8,12].map(w=>`<button class="filter-chip ${cov===w?'on-teal':''}" onclick="S.buildCoverage=${w};render()">${w} wks of sales</button>`).join('')}
+      <span style="font-size:10px;color:var(--text3);margin-left:auto">Suggested = max(open orders, ${cov}-wk sales forecast) − on hand. Click any row for the Build Planner.</span>
     </div>
   </div>
   <div class="tbl-wrap">
-  <table><thead class="sticky-header"><tr>
-    <th>SKU</th><th>Description</th>
-    <th title="Currently on hand">On Hand</th>
-    <th title="Weeks of supply at current demand">Wks Supply</th>
-    <th title="Open unfulfilled orders">Open Orders</th>
-    <th title="4-week weekly average sales">4-Wk Avg</th>
-    <th title="12-week weekly average sales">12-Wk Avg</th>
-    <th title="Calculated minimum stock level">Calc Min</th>
-    <th title="Calculated maximum stock level">Calc Max</th>
-    <th title="Suggested build quantity">Suggested</th>
-    <th title="Max units buildable from current components">Can Build</th>
-    <th>Status</th>
-    <th>Quick Pack</th>
-  </tr></thead><tbody>
+  <table><thead class="sticky-header"><tr><th>SKU</th><th>Description</th><th>On Hand</th><th>Open Orders</th><th>${cov}-Wk Fcst</th><th>Suggested</th><th>Max Buildable</th><th>Status</th><th>Quick Pack</th></tr></thead><tbody>
   ${rows.map(r=>{
-    const wkCol=r.wksSupply===null?'<span style="color:var(--text3)">—</span>':
-      `<span style="color:${r.wksSupply<2?'var(--red)':r.wksSupply<4?'var(--orange)':'var(--green)'};font-weight:700">${r.wksSupply}w</span>`;
-    const trendArr=r.st.trend>10?'↑':r.st.trend<-10?'↓':'→';
-    const trendCol=r.st.trend>10?'var(--green)':r.st.trend<-10?'var(--red)':'var(--text3)';
-    let stLabel,stCls;
-    if(r.demand>0&&r.suggested>0){stLabel='⚡ Order + Build';stCls='pill-red';}
-    else if(r.demand>0){stLabel='Order Pending';stCls='pill-orange';}
-    else if(r.suggested>0&&r.canBuild){stLabel='Build '+r.suggested;stCls='pill-green';}
-    else if(r.suggested>0){stLabel='Blocked';stCls='pill-red';}
-    else{stLabel='Covered';stCls='pill-teal';}
-    const defQty=r.suggested>0?Math.min(r.suggested,r.b.maxBuild===Infinity?r.suggested:r.b.maxBuild)||1:1;
-    return `<tr class="rowlink" onclick="rowClick(event,function(){S.activeBuild='${r.pn}';pushHist();render()})">
+    let st,stCls;
+    if(r.suggested<=0){st='Covered';stCls='pill-teal';}
+    else if(!r.b.hasBOM){st='Build '+r.suggested;stCls='pill-green';}
+    else if(r.b.maxBuild>=r.suggested){st='Build '+r.suggested;stCls='pill-green';}
+    else if(r.b.maxBuild>0){st='Partial — max '+r.b.maxBuild;stCls='pill-yellow';}
+    else{st='Blocked';stCls='pill-red';}
+    return `<tr class="rowlink" onclick="rowClick(event,function(){openBuild('${r.pn}')})">
       <td class="pn" style="color:var(--teal)">${r.pn}</td>
-      <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${r.description||''}</td>
-      <td class="money" style="color:${r.oh<=0?'var(--red)':r.oh<(r.mm.min||1)?'var(--orange)':'var(--text)'};font-weight:700">${r.oh}</td>
-      <td style="text-align:center">${wkCol}</td>
-      <td class="money" style="color:${r.demand>0?'var(--red)':'var(--text3)'};font-weight:${r.demand>0?700:400}">${r.demand||'—'}</td>
-      <td class="money-neutral"><span style="color:${trendCol}">${trendArr}</span> ${r.st.avg4.toFixed(1)}</td>
-      <td class="money-neutral">${r.st.avg12.toFixed(1)}</td>
-      <td class="money-neutral">${r.mm.min||'—'}</td>
-      <td class="money-neutral">${r.mm.max||'—'}</td>
+      <td style="max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${r.description||''}${r.b.hasBOM?'':' <span style="font-size:8px;color:var(--text3)">(no BOM)</span>'}</td>
+      <td class="money" style="color:${(r.total_on_hand||0)<=0?'var(--red)':'var(--text)'};font-weight:700">${r.total_on_hand||0}</td>
+      <td class="money-neutral">${r.demand||'—'}</td>
+      <td class="money-neutral">${r.fcDemand||'—'}</td>
       <td class="money" style="color:${r.suggested>0?'var(--orange)':'var(--text3)'};font-weight:700">${r.suggested||'—'}</td>
-      <td class="money" style="color:${r.b.maxBuild>0?'var(--green)':'var(--red)'}">${r.b.hasBOM?(r.b.maxBuild===Infinity?'∞':r.b.maxBuild):'∞'}</td>
-      <td><span class="pill ${stCls}" style="white-space:nowrap">${stLabel}</span></td>
-      <td style="white-space:nowrap" onclick="event.stopPropagation()">
-        <input class="qty-input" id="pq-${r.id}" value="${defQty}" type="number" min="1" style="width:52px">
-        <button class="btn btn-teal btn-sm" data-pn="${r.pn}" data-id="${r.id}" onclick="packUnits(this.dataset.pn,this.dataset.id,false)">Pack</button>
+      <td class="money" style="color:${r.b.maxBuild>0?'var(--green)':'var(--red)'};font-weight:700">${r.b.hasBOM?(r.b.maxBuild===Infinity?'∞':r.b.maxBuild):'∞'}</td>
+      <td><span class="pill ${stCls}">${st}</span></td>
+      <td style="white-space:nowrap">
+        <input class="qty-input" id="pack-qty-${r.id}" value="${r.suggested>0?Math.min(r.suggested,r.b.maxBuild===Infinity?r.suggested:r.b.maxBuild)||1:1}" type="number" min="1" style="width:55px">
+        <button class="btn btn-teal btn-sm" style="margin-left:4px" onclick="packUnits('${r.pn}','${r.id}',false)">Pack</button>
       </td>
     </tr>`;}).join('')}
   </tbody></table></div>`;
 }
-
 
 function renderBuildPlanner(asm){
   const b=buildability(asm.pn);
@@ -3401,8 +3376,7 @@ async function createCycleCount(cat) {
   const liveAsm=S.assemblies.filter(a=>!a.discontinued);
   if(cat==='all') items=liveParts.map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}));
   else if(cat==='fg') items=liveAsm.filter(a=>!a.is_subassembly).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
-  else if(cat==='sub') items=liveAsm.filter(a=>a.is_subassembly&&!isHWPack(a.pn)).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
-  else if(cat==='hwp') items=liveAsm.filter(a=>isHWPack(a.pn)).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
+  else if(cat==='sub') items=liveAsm.filter(a=>a.is_subassembly).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
   else if(cat==='everything') items=[
     ...liveAsm.map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'})),
     ...liveParts.map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}))
@@ -3442,8 +3416,7 @@ function renderCycleCounts() {
       <div style="display:flex;flex-direction:column;gap:8px">
         <button class="btn btn-primary" onclick="createCycleCount('everything')">Count EVERYTHING (${S.parts.filter(p=>!p.discontinued).length+S.assemblies.filter(a=>!a.discontinued).length} SKUs)</button>
         <button class="btn btn-teal" onclick="createCycleCount('fg')">🏁 Finished Goods (${S.assemblies.filter(a=>!a.is_subassembly&&!a.discontinued).length})</button>
-        <button class="btn btn-teal" onclick="createCycleCount('sub')">🟠 Subassemblies (${S.assemblies.filter(a=>a.is_subassembly&&!isHWPack(a.pn)&&!a.discontinued).length})</button>
-        <button class="btn" onclick="createCycleCount('hwp')" style="border-color:var(--purple);color:var(--purple)">🟣 Hardware Packs (${S.assemblies.filter(a=>isHWPack(a.pn)&&!a.discontinued).length})</button>
+        <button class="btn btn-teal" onclick="createCycleCount('sub')">🟠 Subassemblies (${S.assemblies.filter(a=>a.is_subassembly&&!a.discontinued).length})</button>
         <button class="btn" onclick="createCycleCount('all')">Raw Parts Only (${S.parts.filter(p=>!p.discontinued).length})</button>
         <div class="divider"></div>
         <div style="font-size:11px;color:var(--text3);margin-bottom:4px">Count by Category:</div>
