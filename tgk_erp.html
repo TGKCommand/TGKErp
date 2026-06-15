@@ -5147,8 +5147,221 @@ async function deleteWarranty(id) {
 // ============================================================
 // IMPORT DATA
 // ============================================================
+// ============================================================
+// TRACKING RECOVERY
+// ============================================================
+async function diagnoseTracking(){
+  const el=document.getElementById('tracking-diag-result');
+  if(el){el.style.display='block';el.innerHTML='<div style="color:var(--text3);font-size:12px">⏳ Scanning database…</div>';}
+  toast('Scanning all order rows…');
+
+  // Query full DB for tracking status
+  const {data:allRows,error}=await db.from('sales')
+    .select('id,order_number,pn,fulfillment_status,tracking_number,carrier,shipped_at')
+    .not('order_number','is',null)
+    .order('order_number').order('pn');
+  if(error){if(el)el.innerHTML=`<div style="color:var(--red);font-size:12px">Error: ${error.message}</div>`;return;}
+
+  const rows=allRows||[];
+  const withTracking=rows.filter(r=>r.tracking_number);
+  const withoutTracking=rows.filter(r=>!r.tracking_number&&(r.fulfillment_status==='Shipped'||r.fulfillment_status==='Delivered'));
+
+  // Find duplicates
+  const groups={};
+  rows.forEach(r=>{const k=(r.order_number||'')+'||'+(r.pn||'');(groups[k]=groups[k]||[]).push(r);});
+  const dupGroups=Object.values(groups).filter(g=>g.length>1);
+  const dupCount=dupGroups.reduce((t,g)=>t+g.length-1,0);
+
+  // Of duplicates, how many groups have tracking on at least one row?
+  const rescuable=dupGroups.filter(g=>g.some(r=>r.tracking_number)).length;
+  const trackingOnlyInDupe=dupGroups.filter(g=>{
+    // The "winner" (highest status) lacks tracking but a duplicate has it
+    const ranked=[...g].sort((a,b)=>(({'Delivered':5,'Shipped':4,'Packed':3,'Open':1})[b.fulfillment_status||'Open']||0)-(({'Delivered':5,'Shipped':4,'Packed':3,'Open':1})[a.fulfillment_status||'Open']||0));
+    return !ranked[0].tracking_number && ranked.some(r=>r.tracking_number);
+  }).length;
+
+  // Sample of orders missing tracking
+  const missingOrders=[...new Set(withoutTracking.map(r=>r.order_number))].slice(0,5);
+
+  let html='';
+  if(withTracking.length>0){
+    html+=`<div class="panel" style="padding:12px 16px;margin-bottom:8px;border-left:3px solid var(--green)">
+      <div style="font-size:13px;font-weight:700;color:var(--green)">✓ ${withTracking.length} rows in DB still have tracking numbers</div>
+      <div style="font-size:11px;color:var(--text2);margin-top:4px">Your tracking data is NOT gone. It's in the database — it just may be on duplicate rows that aren't showing up correctly.</div>
+    </div>`;
+  } else {
+    html+=`<div class="panel" style="padding:12px 16px;margin-bottom:8px;border-left:3px solid var(--red)">
+      <div style="font-size:13px;font-weight:700;color:var(--red)">✗ No rows with tracking numbers found in DB</div>
+      <div style="font-size:11px;color:var(--text2);margin-top:4px">Tracking was fully removed. Use "Restore from ShipStation" below to recover it.</div>
+    </div>`;
+  }
+
+  html+=`<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px">
+    <div class="kpi"><div class="kpi-label">Total order rows</div><div class="kpi-value">${rows.length}</div></div>
+    <div class="kpi ${withTracking.length>0?'kpi-green':'kpi-red'}"><div class="kpi-label">Rows with tracking</div><div class="kpi-value">${withTracking.length}</div></div>
+    <div class="kpi ${dupCount>0?'kpi-orange':'kpi-teal'}"><div class="kpi-label">Duplicate rows</div><div class="kpi-value">${dupCount}</div></div>
+  </div>`;
+
+  if(dupCount>0&&rescuable>0){
+    html+=`<div class="panel" style="padding:12px 16px;margin-bottom:8px;border-left:3px solid var(--orange)">
+      <div style="font-size:13px;font-weight:700;color:var(--orange)">⚡ ${rescuable} order+SKU groups have tracking on a duplicate row</div>
+      <div style="font-size:11px;color:var(--text2);margin-top:4px">${trackingOnlyInDupe>0?`<b>${trackingOnlyInDupe} groups</b> where the "winning" row lacks tracking but a duplicate has it — the Dedupe step will copy tracking to the winner first.`:'Dedupe will clean these up safely.'}</div>
+      <div style="margin-top:10px">
+        <button class="btn btn-primary" onclick="dedupeOrders()">🧽 Run Dedupe &amp; Rescue Tracking Now</button>
+      </div>
+    </div>`;
+  }
+
+  if(withoutTracking.length>0&&dupCount===0){
+    html+=`<div class="panel" style="padding:12px 16px;margin-bottom:8px;border-left:3px solid var(--yellow)">
+      <div style="font-size:13px;font-weight:700;color:var(--yellow)">⚠ ${withoutTracking.length} Shipped/Delivered rows have no tracking</div>
+      <div style="font-size:11px;color:var(--text2);margin-top:4px">No duplicates found — these rows never had tracking in the ERP. Restore from ShipStation to fill them in.</div>
+      ${missingOrders.length?`<div style="font-size:10px;color:var(--text3);margin-top:6px;font-family:var(--mono)">Sample: ${missingOrders.join(', ')}…</div>`:''}
+      <div style="margin-top:10px">
+        <button class="btn btn-teal" onclick="restoreTrackingFromShipStation()">⬇ Restore from ShipStation</button>
+      </div>
+    </div>`;
+  }
+
+  if(withTracking.length>0&&dupCount===0&&withoutTracking.length===0){
+    html+=`<div class="panel" style="padding:12px 16px;border-left:3px solid var(--teal)">
+      <div style="font-size:13px;font-weight:700;color:var(--teal)">✓ Everything looks good — no action needed</div>
+    </div>`;
+  }
+
+  if(el){el.innerHTML=html;}
+}
+
+async function restoreTrackingFromShipStation(){
+  const key=S.shipstation?.key, secret=S.shipstation?.secret;
+  if(!key||!secret){
+    toast('ShipStation credentials not saved — go to Integrations → ShipStation first');
+    return;
+  }
+  const el=document.getElementById('tracking-diag-result');
+  if(el){el.style.display='block';el.innerHTML='<div style="color:var(--text3);font-size:12px;padding:10px">⏳ Fetching shipments from ShipStation… this may take a minute.</div>';}
+
+  try{
+    // Fetch via edge function (direct ShipStation API is CORS-blocked from browser)
+    const res=await fetch('https://piamamighqiielfztgic.supabase.co/functions/v1/shipstation-ship',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'restore_tracking',ssKey:key,ssSecret:secret})
+    });
+    const data=await res.json().catch(()=>({}));
+    if(data.restored!==undefined){
+      await refreshSales();
+      render();
+      if(el)el.innerHTML=`<div style="color:var(--green);font-size:12px;padding:10px">✓ Restored tracking on ${data.restored} orders${data.skipped?', '+data.skipped+' already had tracking':''}.</div>`;
+      toast('✓ Restored tracking on '+data.restored+' orders');
+      return;
+    }
+  }catch(e){}
+
+  // Edge function not available or doesn't support restore — show manual SQL approach
+  if(el){el.innerHTML=`
+    <div class="panel" style="padding:14px 16px;border-left:3px solid var(--yellow)">
+      <div style="font-size:13px;font-weight:700;color:var(--yellow)">Edge Function doesn't support bulk restore yet</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:6px;line-height:1.7">
+        <b>Option A — ShipStation CSV:</b><br>
+        In ShipStation: <b>Reports → Shipment Summary → Export CSV</b><br>
+        Then paste it below to bulk-restore tracking numbers.
+      </div>
+      <div class="divider" style="margin:12px 0"></div>
+      <div style="font-size:12px;font-weight:700;color:var(--text);margin-bottom:6px">Paste ShipStation Shipments CSV</div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:8px">Needs columns: Order Number, Tracking Number, Carrier — one row per shipment</div>
+      <textarea id="ss-tracking-csv" class="form-input" rows="6" style="font-family:var(--mono);font-size:11px;resize:vertical" placeholder="Order #,Carrier,Tracking Number,Ship Date&#10;#1001,UPS,1Z999AA10123456784,2024-01-15&#10;#1002,USPS,9400111899223397657336,2024-01-16"></textarea>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <button class="btn btn-primary" onclick="applyTrackingCSV()">Apply Tracking from CSV</button>
+        <span style="font-size:11px;color:var(--text3)">Only updates rows that currently have no tracking — won't overwrite anything</span>
+      </div>
+      <div id="ss-csv-result" style="display:none;margin-top:8px"></div>
+    </div>`;}
+}
+
+async function applyTrackingCSV(){
+  const raw=document.getElementById('ss-tracking-csv')?.value?.trim();
+  const resEl=document.getElementById('ss-csv-result');
+  if(!raw){toast('Paste the CSV first');return;}
+
+  // Parse CSV
+  const lines=raw.split('\n').map(l=>l.trim()).filter(Boolean);
+  if(lines.length<2){toast('Need at least a header row and one data row');return;}
+
+  // Detect columns (flexible — just need order number and tracking number)
+  const headers=lines[0].split(',').map(h=>h.toLowerCase().replace(/[^a-z0-9]/g,''));
+  const findCol=(...names)=>{for(const n of names){const i=headers.findIndex(h=>h.includes(n));if(i>=0)return i;}return -1;};
+  const orderCol=findCol('order','ordernumber','ordernum');
+  const trackCol=findCol('tracking','trackingnumber','trackingnum','tracknumber');
+  const carrierCol=findCol('carrier','carriername','shippingcarrier');
+  const dateCol=findCol('shipdate','shippeddate','date');
+
+  if(orderCol<0||trackCol<0){
+    toast('Could not find Order Number and Tracking Number columns');
+    if(resEl){resEl.style.display='block';resEl.innerHTML='<div style="color:var(--red);font-size:12px">Could not find required columns. Need: Order Number, Tracking Number (and optionally Carrier, Ship Date).<br>Found headers: '+headers.join(', ')+'</div>';}
+    return;
+  }
+
+  const shipments=[];
+  for(let i=1;i<lines.length;i++){
+    const cols=lines[i].split(',').map(c=>c.trim().replace(/^"|"$/g,''));
+    const orderNum=cols[orderCol]?.trim();
+    const tracking=cols[trackCol]?.trim();
+    if(!orderNum||!tracking)continue;
+    const carrier=carrierCol>=0?(cols[carrierCol]||''):'';
+    const shipDate=dateCol>=0?(cols[dateCol]||''):'';
+    shipments.push({orderNum,tracking,carrier,shipDate});
+  }
+
+  if(!shipments.length){toast('No valid shipment rows found');return;}
+  if(resEl){resEl.style.display='block';resEl.innerHTML=`<div style="font-size:11px;color:var(--text3)">⏳ Updating ${shipments.length} shipments…</div>`;}
+
+  let updated=0,skipped=0,notFound=0;
+  for(const ship of shipments){
+    // Find all ERP rows for this order number (try with and without #)
+    const nums=[ship.orderNum, '#'+ship.orderNum.replace(/^#/,''), ship.orderNum.replace(/^#/,'')];
+    let erpRows=[];
+    for(const n of nums){
+      const {data}=await db.from('sales').select('id,tracking_number').eq('order_number',n).in('fulfillment_status',['Shipped','Delivered']);
+      if(data?.length){erpRows=data;break;}
+    }
+    if(!erpRows.length){notFound++;continue;}
+
+    for(const row of erpRows){
+      if(row.tracking_number){skipped++;continue;} // already has tracking — never overwrite
+      const patch={tracking_number:ship.tracking,carrier:ship.carrier||null};
+      if(ship.shipDate)patch.shipped_at=new Date(ship.shipDate).toISOString();
+      await db.from('sales').update(patch).eq('id',row.id);
+      updated++;
+    }
+  }
+
+  await refreshSales();
+  render();
+  const msg=`✓ Restored ${updated} tracking entries · ${skipped} already had tracking (skipped) · ${notFound} order numbers not matched`;
+  if(resEl){resEl.innerHTML=`<div style="color:var(--green);font-size:12px">${msg}</div>`;}
+  toast(msg);
+}
+
 function renderImport() {
   return `
+  <!-- ── TRACKING RECOVERY ── -->
+  <div class="panel" style="border-left:4px solid var(--red);margin-bottom:18px" id="tracking-recovery-panel">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+      <div style="font-size:22px">📦</div>
+      <div>
+        <div style="font-size:14px;font-weight:700;color:var(--text)">Tracking Recovery</div>
+        <div style="font-size:11px;color:var(--text3)">Lost tracking numbers after an import? Run a diagnosis first — tracking is often still in the database.</div>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="diagnoseTracking()">🔍 Diagnose — Check What's in DB</button>
+      <button class="btn btn-teal" onclick="dedupeOrders()">🧽 Dedupe &amp; Rescue Tracking</button>
+      <button class="btn" onclick="restoreTrackingFromShipStation()">⬇ Restore from ShipStation</button>
+    </div>
+    <div id="tracking-diag-result" style="display:none;margin-top:12px"></div>
+  </div>
+
   <div class="grid-2">
   <div>
     <div class="panel">
