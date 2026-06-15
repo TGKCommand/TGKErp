@@ -1253,7 +1253,7 @@ function renderSales(){
     </div>
     <button class="filter-chip ${!sf.fstatus?'on-teal':''}" onclick="setFilter('sales','fstatus','')">All</button>
     ${fstats.map(s=>`<button class="filter-chip ${sf.fstatus===s?'on-teal':''}" onclick="setFilter('sales','fstatus','${s}')">${s}</button>`).join('')}
-    <button class="btn btn-sm" style="margin-left:auto" title="Remove duplicate order lines (same order # + SKU)" onclick="dedupeOrders()">🧽 Dedupe</button>
+    <button class="btn btn-sm" style="margin-left:auto" title="Remove duplicate order lines (same order # + SKU). Tracking numbers on surviving rows are always preserved — tracking is rescued from duplicates before they are deleted." onclick="dedupeOrders()">🧽 Dedupe & Recover Tracking</button>
     <button class="btn btn-sm" title="Mark pre-system Open orders as Delivered" onclick="closeHistoricalOrders()">🧹 Close pre-system orders</button>
     <button class="btn btn-primary btn-sm" onclick='openModal("addSale",{})'>+ Manual Order</button>
     <span class="filter-count">${list.length} orders</span>
@@ -1491,30 +1491,77 @@ async function unpackSaleOrder(saleId, pn, qty){
 }
 
 async function dedupeOrders(){
-  const rank={'Delivered':4,'Shipped':3,'Packed':2,'Open':1,'Cancelled':0};
+  toast('Scanning all orders in database…');
+
+  // Query the full DB — S.sales is capped at 5000 rows and would miss duplicates outside that window
+  const {data:allRows,error}=await db.from('sales')
+    .select('id,order_number,pn,fulfillment_status,tracking_number,carrier,shipped_at,sale_date,created_at')
+    .not('order_number','is',null)
+    .order('order_number').order('pn');
+  if(error){toast('Error scanning orders: '+error.message);return;}
+
+  const rank={'Delivered':5,'Shipped':4,'Packed':3,'On Hold':2,'Open':1,'Refunded':0,'Cancelled':0};
   const groups={};
-  S.sales.forEach(s=>{
-    if(!s.order_number)return;
-    const k=s.order_number+'||'+s.pn;
+  (allRows||[]).forEach(s=>{
+    const k=(s.order_number||'')+'||'+(s.pn||'');
     (groups[k]=groups[k]||[]).push(s);
   });
-  const toDelete=[];
-  Object.values(groups).forEach(g=>{
-    if(g.length<2)return;
-    g.sort((a,b)=>(rank[b.fulfillment_status||'Open']||0)-(rank[a.fulfillment_status||'Open']||0));
-    toDelete.push(...g.slice(1)); // keep the most-progressed row
-  });
-  if(!toDelete.length){toast('No duplicate order lines found ✓');return;}
-  if(!confirm('Found '+toDelete.length+' duplicate order line'+(toDelete.length>1?'s':'')+' (same order # + SKU). Delete them, keeping the most-progressed copy of each?'))return;
+
+  const dupes=Object.values(groups).filter(g=>g.length>1);
+  if(!dupes.length){toast('No duplicate order lines found ✓');return;}
+
+  const totalExtra=dupes.reduce((t,g)=>t+g.length-1,0);
+  const trackingGroups=dupes.filter(g=>g.some(r=>r.tracking_number)).length;
+  const noTrackingWinner=dupes.filter(g=>{
+    // Would the naïve winner (highest status) lack tracking while a loser has it?
+    const sorted=[...g].sort((a,b)=>(rank[b.fulfillment_status||'Open']||0)-(rank[a.fulfillment_status||'Open']||0));
+    return !sorted[0].tracking_number&&sorted.slice(1).some(l=>l.tracking_number);
+  }).length;
+
+  const msg=`Found ${totalExtra} duplicate line${totalExtra>1?'s':''} across ${dupes.length} order+SKU combos.\n\n`+
+    (trackingGroups>0?`📦 ${trackingGroups} groups have tracking info — tracking will be rescued to the surviving row before duplicates are deleted.\n`+
+    (noTrackingWinner>0?`⚡ ${noTrackingWinner} groups: the highest-status row lacks tracking; tracking will be copied from a duplicate before it's deleted.\n`:'')+'\n':'')+
+    'Proceed? This cannot be undone (but can be undone with the Undo button).';
+  if(!confirm(msg))return;
+
+  let deleted=0,rescued=0;
   const undoOps=[];
-  for(const s of toDelete){
-    await db.from('sales').delete().eq('id',s.id);
-    undoOps.push({action:'delete',table:'sales',data:s});
+
+  for(const g of dupes){
+    // Sort: rows with tracking always win over rows without; then by status rank
+    g.sort((a,b)=>{
+      const ta=a.tracking_number?1:0, tb=b.tracking_number?1:0;
+      if(tb!==ta) return tb-ta;                                                    // tracking > no-tracking
+      return (rank[b.fulfillment_status||'Open']||0)-(rank[a.fulfillment_status||'Open']||0); // higher status
+    });
+
+    const winner=g[0];
+    const losers=g.slice(1);
+
+    // If winner has no tracking but a loser does, rescue it first
+    if(!winner.tracking_number){
+      const donor=losers.find(l=>l.tracking_number);
+      if(donor){
+        const patch={tracking_number:donor.tracking_number,carrier:donor.carrier||null,shipped_at:donor.shipped_at||winner.shipped_at};
+        undoOps.push({action:'update',table:'sales',data:{id:winner.id},prev:{id:winner.id,tracking_number:null,carrier:null,shipped_at:winner.shipped_at}});
+        await db.from('sales').update(patch).eq('id',winner.id);
+        Object.assign(winner,patch);
+        rescued++;
+      }
+    }
+
+    // Delete all losers
+    for(const loser of losers){
+      undoOps.push({action:'delete',table:'sales',data:loser}); // undo a deletion = re-insert
+      await db.from('sales').delete().eq('id',loser.id);
+      deleted++;
+    }
   }
-  S.sales=S.sales.filter(s=>!toDelete.find(d=>d.id===s.id));
-  pushUndoMulti('Dedupe '+toDelete.length+' order lines',undoOps);
-  toast(toDelete.length+' duplicates removed');render();
-}
+
+  pushUndoMulti('Dedupe '+deleted+' order lines',undoOps);
+  await refreshSales();
+  render();
+  toast(`✓ Removed ${deleted} duplicate${deleted>1?'s':''}${rescued>0?' · tracking rescued on '+rescued+' order'+(rescued>1?'s':''):''}`);
 
 async function closeHistoricalOrders(){
   const cutoff=prompt('Mark all Open orders BEFORE this date as Delivered (pre-system orders).\nFormat: YYYY-MM-DD','2026-06-01');
@@ -2313,6 +2360,7 @@ async function executeShopifyImport(){
           qty:csv.qty,
           sale_date:csv.date,
           shipped_at:csv.fulfilledAt?new Date(csv.fulfilledAt).toISOString():erp.shipped_at,
+          // tracking_number and carrier are intentionally excluded — never overwrite with CSV data (CSV has no tracking)
         }).eq('id',erp.id);
         if(error)errors++;
         else updated++;
@@ -2325,7 +2373,8 @@ async function executeShopifyImport(){
   render();
   const msg=`✓ Import done — ${imported} new, ${updated} updated, ${skipped} skipped${errors?', ⚠ '+errors+' errors (see console)':''}`;
   toast(msg,3500);
-  if(el)el.innerHTML=`<div style="color:var(--green);font-size:12px;padding:10px">${msg}</div>`;
+  const dedupeTip=imported>0?'<div style="font-size:11px;color:var(--text3);margin-top:6px">If any orders have duplicate lines (from a previous import), click <b>🧽 Dedupe &amp; Recover Tracking</b> in the filter bar above to clean them up — tracking numbers are automatically rescued before duplicates are removed.</div>':'';
+  if(el)el.innerHTML=`<div style="color:var(--green);font-size:12px;padding:10px">${msg}</div>${dedupeTip}`;
 }
 
 async function importOrdersFromShopify(){
