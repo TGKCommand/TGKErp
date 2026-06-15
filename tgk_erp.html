@@ -330,6 +330,19 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 </head>
 <body>
 
+<div id="tgk-loader" style="position:fixed;inset:0;background:var(--bg,#f5f6f7);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;z-index:9999;font-family:'DM Sans',sans-serif">
+  <div style="font-size:11px;font-weight:800;color:#0d9488;letter-spacing:.18em;text-transform:uppercase">TGK MOTORSPORT</div>
+  <div id="tgk-dots" style="display:flex;gap:7px">
+    <div style="width:8px;height:8px;border-radius:50%;background:#0d9488;animation:tgkpulse 1.1s 0s ease-in-out infinite"></div>
+    <div style="width:8px;height:8px;border-radius:50%;background:#0d9488;animation:tgkpulse 1.1s .2s ease-in-out infinite"></div>
+    <div style="width:8px;height:8px;border-radius:50%;background:#0d9488;animation:tgkpulse 1.1s .4s ease-in-out infinite"></div>
+  </div>
+  <div id="tgk-msg" style="font-size:11px;color:#6b7280">Loading…</div>
+  <button id="tgk-retry" onclick="location.reload()" style="display:none;margin-top:8px;padding:8px 22px;background:#0d9488;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">↺ Retry</button>
+</div>
+<style>@keyframes tgkpulse{0%,100%{opacity:.2;transform:scale(.7)}50%{opacity:1;transform:scale(1)}}</style>
+
+<div id="tgk-app" style="display:none;height:100%;width:100%;overflow:hidden">
 <div class="shell">
 
 <!-- ── SIDEBAR ── -->
@@ -409,16 +422,37 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 <div id="toast"></div>
 <div class="overlay hidden" id="modal-overlay">
   <div class="modal" id="modal-box"></div>
-</div>
+</div></div><!-- /tgk-app -->
 
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script>
+// Supabase loader with fallback CDN — tries jsdelivr first, then unpkg
+(function(){
+  function loadScript(src, onOk, onErr){
+    var s=document.createElement('script');
+    s.src=src; s.onload=onOk;
+    s.onerror=onErr; document.head.appendChild(s);
+  }
+  var PRIMARY='https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js';
+  var FALLBACK='https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.min.js';
+  loadScript(PRIMARY, null, function(){
+    console.warn('jsdelivr failed, trying unpkg…');
+    loadScript(FALLBACK, null, function(){
+      var el=document.getElementById('tgk-msg');
+      if(el){el.textContent='Failed to load Supabase library. Check internet connection.';el.style.color='#dc2626';}
+      var r=document.getElementById('tgk-retry');
+      if(r)r.style.display='';
+    });
+  });
+})();
+</script>
 <script>
 // ============================================================
 // SUPABASE
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const db = supabase.createClient(SUPA_URL, SUPA_KEY);
+// db is set lazily in startTGK() after Supabase CDN is confirmed loaded
+let db = null;
 
 // ============================================================
 // STATE
@@ -448,6 +482,7 @@ const S = {
   lookupQ:'', lookupSel:null,
   activeSale:null,
   poCart:[], // [{pn,qty}]
+  _shopifyImport:null,
   // Min/Max suggestions
   mmSuggest:null, mmLoading:false,
   // Edge function live status
@@ -616,14 +651,52 @@ function setupRealtime(){
       toast('Assemblies updated');
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'sales'},p=>{
-      if(p.eventType==='INSERT')S.sales=[p.new,...S.sales];
+      if(p.eventType==='INSERT'){
+        // Only add if not already present (webhook dedup guard)
+        if(!S.sales.find(s=>s.id===p.new.id)){
+          S.sales=[p.new,...S.sales];
+          showOrderAlert(p.new.order_number||'',p.new.pn||'');
+        }
+      }
+      // UPDATE handled below by the second subscription
       if(['sales','dashboard'].includes(S.view))render();
-      toast('New sale recorded');
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'purchases'},p=>{
       if(p.eventType==='INSERT')S.purchases=[p.new,...S.purchases];
       else if(p.eventType==='UPDATE')S.purchases=S.purchases.map(x=>x.id===p.new.id?p.new:x);
       if(['purchases','dashboard'].includes(S.view))render();
+    })
+    .on('postgres_changes',{event:'*',schema:'public',table:'po_lines'},p=>{
+      // Another user received a PO line — refresh the open PO detail if visible
+      if(p.eventType==='UPDATE'||p.eventType==='INSERT'){
+        const poId=p.new?.po_id;
+        if(poId){
+          if(!S.poLines[poId])S.poLines[poId]=[];
+          if(p.eventType==='INSERT')S.poLines[poId]=[...S.poLines[poId],p.new];
+          else S.poLines[poId]=S.poLines[poId].map(l=>l.id===p.new.id?p.new:l);
+        }
+        if(S.view==='purchases'&&S.activePO===poId)render();
+      }
+    })
+    .on('postgres_changes',{event:'*',schema:'public',table:'inv_corrections'},p=>{
+      if(p.eventType==='INSERT'){
+        S.corrections=[p.new,...S.corrections].slice(0,1000);
+        if(S.view==='corrections')render();
+        // Silent — don't toast for every correction (too noisy with multiple users)
+      }
+    })
+    .on('postgres_changes',{event:'*',schema:'public',table:'sales'},p=>{
+      // Catch updates from other users (ShipStation webhook, other browser)
+      if(p.eventType==='UPDATE'){
+        S.sales=S.sales.map(s=>s.id===p.new.id?p.new:s);
+        if(['sales','dashboard'].includes(S.view))render();
+      }
+    })
+    .on('postgres_changes',{event:'*',schema:'public',table:'cycle_count_lines'},p=>{
+      if(p.eventType==='UPDATE'&&S.activeCount){
+        S.countLines=S.countLines.map(l=>l.id===p.new.id?p.new:l);
+        if(S.view==='cyclecounts')render();
+      }
     })
     .subscribe((status)=>{
       _rtStatus=status;
@@ -1529,6 +1602,7 @@ function renderIntegrations(){
           <input id="ss-test-order" class="form-input" style="width:140px;padding:5px 9px;font-size:12px" placeholder="Order # e.g. 9135">
           <button class="btn btn-teal btn-sm" onclick="ssTestOrder()">🔍 Test Order Sync</button>
           <button class="btn btn-sm" onclick="ssManualShipPrompt()">✈ Manual Ship Override</button>
+        <button class="btn btn-sm" onclick="importOrdersFromShopify()">📥 Import All Shopify Orders</button>
         </div>
         <div id="ss-diag-result" style="display:none;font-size:10px;font-family:var(--mono);background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px;max-height:280px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;color:var(--text2)"></div>
       </div>
@@ -1691,6 +1765,308 @@ async function runDeliverySync(){
       toast('Delivery sync done — '+data.delivered+' delivered, '+data.updated+' tracking updates');
     }else toast('Error: '+(data.error||'unknown'));
   }catch(e){toast('CORS blocks browser call — sync runs automatically every hour via cron');}
+}
+
+// ──────────────────────────────────────────────────────────────
+// SHOPIFY CSV IMPORT
+// ──────────────────────────────────────────────────────────────
+function handleShopifyDrop(e){
+  e.preventDefault();
+  const file=e.dataTransfer.files[0];
+  if(file)handleShopifyFile(file);
+}
+
+function handleShopifyFile(file){
+  if(!file){return;}
+  const reader=new FileReader();
+  reader.onload=e=>parseShopifyCSV(e.target.result);
+  reader.readAsText(file);
+}
+
+function parseShopifyCSV(text){
+  const el=document.getElementById('shopify-import-status');
+  if(el){el.style.display='block';el.innerHTML='<div style="color:var(--text3);font-size:12px">Parsing CSV…</div>';}
+  
+  // Parse CSV respecting quoted fields
+  function parseRow(line){
+    const cols=[]; let cur='', inQ=false;
+    for(let i=0;i<line.length;i++){
+      const c=line[i];
+      if(c==='"'&&!inQ){inQ=true;}
+      else if(c==='"'&&inQ&&line[i+1]==='"'){cur+='"';i++;}
+      else if(c==='"'&&inQ){inQ=false;}
+      else if(c===','&&!inQ){cols.push(cur.trim());cur='';}
+      else cur+=c;
+    }
+    cols.push(cur.trim());
+    return cols;
+  }
+
+  const lines=text.split('\n');
+  if(lines.length<2){toast('CSV appears empty');return;}
+  
+  const headers=parseRow(lines[0]).map(h=>h.toLowerCase().trim());
+  
+  // Find key column indices — handle slight variations in Shopify export format
+  const col=n=>{
+    const idx=headers.indexOf(n.toLowerCase());
+    return idx>=0?idx:null;
+  };
+  const C={
+    name:       col('name'),
+    created:    col('created at'),
+    financial:  col('financial status'),
+    fulfilled:  col('fulfillment status'),
+    fulfilledAt:col('fulfilled at'),
+    cancelledAt:col('cancelled at'),
+    sku:        col('lineitem sku'),
+    itemName:   col('lineitem name'),
+    itemQty:    col('lineitem quantity'),
+    itemStatus: col('lineitem fulfillment status'),
+    total:      col('total'),
+    email:      col('email'),
+  };
+
+  if(C.name===null||C.sku===null){
+    if(el)el.innerHTML='<div style="color:var(--red);font-size:12px">❌ Could not find required columns (Name, Lineitem sku). Make sure this is a Shopify orders export.</div>';
+    return;
+  }
+
+  // Parse rows — each Shopify row is one line item, orders span multiple rows
+  const parsed=[]; // [{orderNum, pn, qty, status, date, fulfilledAt, cancelledAt, email}]
+  for(let i=1;i<lines.length;i++){
+    if(!lines[i].trim())continue;
+    const r=parseRow(lines[i]);
+    const pn=(r[C.sku]||'').trim();
+    const orderNum=(r[C.name]||'').trim();
+    if(!orderNum||!pn)continue;
+    
+    // Map Shopify status to ERP status
+    const shopifyFs=(r[C.fulfilled]||r[C.itemStatus]||'').toLowerCase();
+    const financial=(r[C.financial]||'').toLowerCase();
+    const cancelled=(r[C.cancelledAt]||'').trim();
+    let erpStatus='Open';
+    if(cancelled) erpStatus='Cancelled';
+    else if(financial==='refunded'||financial==='voided') erpStatus='Cancelled';
+    else if(shopifyFs==='fulfilled') erpStatus='Delivered';
+    else if(shopifyFs==='partial') erpStatus='Shipped';
+    
+    parsed.push({
+      orderNum, pn,
+      qty:parseInt(r[C.itemQty]||'1')||1,
+      status:erpStatus,
+      date:(r[C.created]||'').slice(0,10)||new Date().toISOString().slice(0,10),
+      fulfilledAt:(r[C.fulfilledAt]||'').slice(0,10)||null,
+      email:(r[C.email]||'').trim(),
+    });
+  }
+
+  if(!parsed.length){
+    if(el)el.innerHTML='<div style="color:var(--red);font-size:12px">❌ No valid order lines found in CSV.</div>';
+    return;
+  }
+
+  // Check against existing ERP orders
+  const existing=new Set(S.sales.map(s=>s.order_number+'||'+s.pn));
+  const newLines=parsed.filter(p=>!existing.has(p.orderNum+'||'+p.pn));
+  const conflicts=parsed.filter(p=>existing.has(p.orderNum+'||'+p.pn));
+
+  // Group conflicts by order for display
+  const conflictOrders={};
+  conflicts.forEach(c=>{
+    const erpLine=S.sales.find(s=>s.order_number===c.orderNum&&s.pn===c.pn);
+    (conflictOrders[c.orderNum]=conflictOrders[c.orderNum]||[]).push({csv:c,erp:erpLine});
+  });
+
+  S._shopifyImport={parsed,newLines,conflicts,conflictOrders,decisions:{}};
+  renderShopifyImportPreview();
+}
+
+function renderShopifyImportPreview(){
+  const el=document.getElementById('shopify-import-status');
+  if(!el||!S._shopifyImport)return;
+  const{parsed,newLines,conflicts,conflictOrders,decisions}=S._shopifyImport;
+  const conflictOrderNums=Object.keys(conflictOrders);
+
+  // Status legend
+  const statusColor={'Open':'var(--red)','Shipped':'var(--teal)','Delivered':'var(--green)','Cancelled':'var(--text3)'};
+
+  let html=`
+  <div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:14px;margin-top:4px">
+    <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:14px">
+      <div style="font-size:12px"><b style="color:var(--green);font-size:18px">${newLines.length}</b><br><span style="color:var(--text3)">New lines to add</span></div>
+      <div style="font-size:12px"><b style="color:var(--orange);font-size:18px">${conflicts.length}</b><br><span style="color:var(--text3)">Already in ERP</span></div>
+      <div style="font-size:12px"><b style="color:var(--text2);font-size:18px">${parsed.length}</b><br><span style="color:var(--text3)">Total CSV lines</span></div>
+    </div>`;
+
+  if(conflictOrderNums.length){
+    html+=`<div style="font-size:11px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">
+      Conflicts — choose action per order:
+    </div>`;
+    
+    // Bulk actions
+    html+=`<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+      <button class="btn btn-sm" onclick="setAllConflictDecisions('keep')">Keep all existing</button>
+      <button class="btn btn-sm" onclick="setAllConflictDecisions('update')">Update all from CSV</button>
+      <button class="btn btn-sm" onclick="setAllConflictDecisions('skip')">Skip all conflicts</button>
+    </div>`;
+
+    conflictOrderNums.forEach(orderNum=>{
+      const lines=conflictOrders[orderNum];
+      const dec=decisions[orderNum]||'keep';
+      html+=`<div style="border:1px solid var(--border);border-radius:6px;margin-bottom:8px;overflow:hidden">
+        <div style="background:var(--bg4);padding:8px 12px;display:flex;align-items:center;gap:10px">
+          <span class="pn">Order ${orderNum}</span>
+          <span style="font-size:10px;color:var(--text3)">${lines.length} line${lines.length>1?'s':''}</span>
+          <span style="flex:1"></span>
+          <select style="font-size:11px;padding:3px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg2)" 
+            data-order="${orderNum}" onchange="S._shopifyImport.decisions['${orderNum}']=this.value;renderShopifyImportPreview()">
+            <option value="keep" ${dec==='keep'?'selected':''}>Keep existing</option>
+            <option value="update" ${dec==='update'?'selected':''}>Update from CSV</option>
+            <option value="skip" ${dec==='skip'?'selected':''}>Skip this order</option>
+          </select>
+        </div>
+        <div style="padding:8px 12px;font-size:11px">
+          ${lines.map(({csv,erp})=>`
+            <div style="display:grid;grid-template-columns:120px 80px 80px 80px;gap:8px;padding:3px 0;border-bottom:1px solid var(--border)">
+              <span class="pn" style="color:var(--teal)">${csv.pn}</span>
+              <span style="color:var(--text3)">qty: ${csv.qty}</span>
+              <span>CSV: <b style="color:${statusColor[csv.status]||'var(--text)'}">${csv.status}</b></span>
+              <span>ERP: <b style="color:${statusColor[erp?.fulfillment_status||'Open']||'var(--text)'}">${erp?.fulfillment_status||'Open'}</b></span>
+            </div>`).join('')}
+        </div>
+      </div>`;
+    });
+  }
+
+  const readyToImport=newLines.length+Object.entries(decisions).filter(([,v])=>v==='update').length;
+  html+=`<div style="margin-top:12px;display:flex;gap:8px;align-items:center">
+    <button class="btn btn-primary" onclick="executeShopifyImport()" ${readyToImport===0&&!newLines.length?'disabled':''}>
+      ✓ Import ${readyToImport} order line${readyToImport!==1?'s':''}
+    </button>
+    <button class="btn" onclick="S._shopifyImport=null;document.getElementById('shopify-import-status').style.display='none'">Cancel</button>
+    <span style="font-size:11px;color:var(--text3)">Existing orders with "Keep existing" are untouched</span>
+  </div>
+  </div>`;
+
+  el.innerHTML=html;
+}
+
+function setAllConflictDecisions(decision){
+  if(!S._shopifyImport)return;
+  Object.keys(S._shopifyImport.conflictOrders).forEach(orderNum=>{
+    S._shopifyImport.decisions[orderNum]=decision;
+  });
+  renderShopifyImportPreview();
+}
+
+async function executeShopifyImport(){
+  if(!S._shopifyImport)return;
+  const{newLines,conflictOrders,decisions}=S._shopifyImport;
+  const el=document.getElementById('shopify-import-status');
+  let imported=0,updated=0,skipped=0,errors=0;
+
+  // Insert new lines
+  const toInsert=newLines.map(l=>({
+    order_number:l.orderNum, pn:l.pn, qty:l.qty,
+    fulfillment_status:l.status, source:'Shopify CSV',
+    sale_date:l.date,
+    shipped_at:l.fulfilledAt?new Date(l.fulfilledAt).toISOString():null,
+  }));
+
+  // Chunk inserts
+  for(let i=0;i<toInsert.length;i+=100){
+    const chunk=toInsert.slice(i,i+100);
+    const{error}=await db.from('sales').insert(chunk);
+    if(error){errors++;console.warn('Insert error:',error);}
+    else imported+=chunk.length;
+    if(el)el.querySelector('button')&&(el.querySelector('button').textContent=`Importing… ${imported}/${toInsert.length}`);
+  }
+
+  // Handle conflict decisions
+  for(const[orderNum,decision] of Object.entries(decisions)){
+    if(decision==='skip'){skipped++;continue;}
+    if(decision==='keep'){continue;}
+    if(decision==='update'){
+      const lines=conflictOrders[orderNum]||[];
+      for(const{csv,erp} of lines){
+        if(!erp){continue;}
+        const{error}=await db.from('sales').update({
+          fulfillment_status:csv.status,
+          qty:csv.qty,
+          sale_date:csv.date,
+          shipped_at:csv.fulfilledAt?new Date(csv.fulfilledAt).toISOString():erp.shipped_at,
+        }).eq('id',erp.id);
+        if(error)errors++;
+        else updated++;
+      }
+    }
+  }
+
+  S._shopifyImport=null;
+  await loadAll();
+  render();
+  const msg=`✓ Shopify import done — ${imported} new, ${updated} updated, ${skipped} skipped${errors?', '+errors+' errors':''}`;
+  toast(msg);
+  if(el)el.innerHTML=`<div style="color:var(--green);font-size:12px;padding:10px">${msg}</div>`;
+}
+
+async function importOrdersFromShopify(){
+  const token=prompt('Paste your Shopify Admin API token (Settings → Apps → Private apps or API credentials):\nNeeded one-time to pull historical orders.');
+  if(!token)return;
+  const store=S.shopify?.store||prompt('Your store URL (e.g. mystore.myshopify.com):');
+  if(!store)return;
+  toast('Fetching orders from Shopify… this may take a moment');
+  let imported=0,skipped=0,page=1,keepGoing=true;
+  while(keepGoing){
+    try{
+      const res=await fetch(`https://${store.replace(/^https?:\/\//,'')}/admin/api/2024-01/orders.json?status=any&limit=250&page=${page}`,{
+        headers:{'X-Shopify-Access-Token':token,'Content-Type':'application/json'}
+      });
+      if(!res.ok){toast('Shopify error '+res.status+' — check token and store URL');break;}
+      const {orders=[]}=await res.json();
+      if(!orders.length){keepGoing=false;break;}
+      for(const order of orders){
+        const orderNum=order.name;
+        for(const li of (order.line_items||[])){
+          const pn=li.sku||li.title;
+          if(!pn)continue;
+          // Check if already exists
+          const exists=S.sales.some(s=>s.order_number===orderNum&&s.pn===pn);
+          if(exists){skipped++;continue;}
+          const fs=order.financial_status==='refunded'?'Cancelled':
+            order.fulfillment_status==='fulfilled'?'Delivered':
+            order.fulfillment_status==='partial'?'Shipped':'Open';
+          const{data}=await db.from('sales').insert({
+            order_number:orderNum,pn,qty:li.quantity||1,
+            source:'Shopify Import',fulfillment_status:fs,
+            sale_date:(order.created_at||new Date().toISOString()).slice(0,10)
+          }).select().single();
+          if(data){S.sales=[data,...S.sales];imported++;}
+        }
+      }
+      page++;
+      if(orders.length<250)keepGoing=false;
+      toast(`Importing… ${imported} orders pulled so far (page ${page-1})`);
+    }catch(e){toast('Error: '+e.message);keepGoing=false;}
+  }
+  await loadAll();render();
+  toast(`✓ Shopify import done — ${imported} new orders, ${skipped} already existed`);
+}
+
+async function verifyOrdersWithShipStation(){
+  const token=document.getElementById('ss-test-order')?.value?.trim();
+  const msg=`Paste a ShipStation order number in the "Test Order Sync" box above and click 🔍 — it will show whether that order exists in both ShipStation and the ERP, and what status each thinks it's in.
+
+For a bulk comparison:
+1. Go to ShipStation → Orders → export your orders as CSV
+2. Paste the CSV into the Import Data page (coming soon)
+3. The ERP will highlight any order numbers that are missing
+
+For now, you can manually check individual orders using the diagnostic tool above.`;
+  const el=document.getElementById('ss-diag-result');
+  if(el){el.style.display='block';el.textContent=msg;}
+  else toast(msg);
 }
 
 async function ssManualShipPrompt(){
@@ -3333,31 +3709,64 @@ function openOrderDemand(pn){
 function renderPackQueue(){
   if(S.activeBuild){const asm=S.assemblies.find(a=>a.pn===S.activeBuild);if(asm)return renderBuildPlanner(asm);}
   const cov=S.buildCoverage||4;
-  const rows=S.assemblies.filter(a=>!a.discontinued).map(a=>{
+  const sf=S.filters.production||{};
+  const qSearch=(sf.search||'').toLowerCase();
+
+  const allRows=S.assemblies.filter(a=>!a.discontinued).map(a=>{
     const b=buildability(a.pn);
     const demand=openOrderDemand(a.pn);
     const fcDemand=Math.ceil(asmAvgWk(a)*cov);
     const suggested=Math.max(0,Math.max(demand,fcDemand)-(a.total_on_hand||0));
-    return{...a,b,demand,fcDemand,suggested,
+    // Compute status label for filtering
+    let st,stCls;
+    if(suggested<=0){st='covered';stCls='pill-teal';}
+    else if(!b.hasBOM){st='build';stCls='pill-green';}
+    else if(b.maxBuild>=suggested){st='build';stCls='pill-green';}
+    else if(b.maxBuild>0){st='partial';stCls='pill-yellow';}
+    else{st='blocked';stCls='pill-red';}
+    if(demand>0&&suggested>0) st='orders';
+    return{...a,b,demand,fcDemand,suggested,st,stCls,
       canCover:(b.maxBuild===Infinity||b.maxBuild>=suggested)};
   }).sort((x,y)=>(y.suggested-x.suggested)||((x.total_on_hand||0)-(y.total_on_hand||0)));
 
-  const needBuild=rows.filter(r=>r.suggested>0);
-  const blocked=needBuild.filter(r=>r.b.hasBOM&&r.b.maxBuild<r.suggested);
+  // Apply filters
+  let rows=allRows;
+  if(qSearch) rows=rows.filter(r=>r.pn.toLowerCase().includes(qSearch)||(r.description||'').toLowerCase().includes(qSearch));
+  if(sf.status) rows=rows.filter(r=>r.st===sf.status);
+
+  const needBuild=allRows.filter(r=>r.suggested>0);
+  const blocked=needBuild.filter(r=>r.b.hasBOM&&r.b.maxBuild<1);
   const ready=needBuild.filter(r=>!r.b.hasBOM||r.b.maxBuild>=r.suggested);
+  const withOrders=allRows.filter(r=>r.demand>0);
+
+  // Status counts for chips
+  const counts={
+    orders:allRows.filter(r=>r.st==='orders').length,
+    build:allRows.filter(r=>r.st==='build').length,
+    partial:allRows.filter(r=>r.st==='partial').length,
+    blocked:allRows.filter(r=>r.st==='blocked').length,
+    covered:allRows.filter(r=>r.st==='covered').length,
+  };
 
   return `
-  <div class="kpi-grid kpi-grid-4">
-    <div class="kpi kpi-orange"><div class="kpi-label">Need Building</div><div class="kpi-value">${needBuild.length}</div><div class="kpi-sub">vs ${cov}-wk coverage</div></div>
-    <div class="kpi kpi-green"><div class="kpi-label">Buildable Now</div><div class="kpi-value">${ready.length}</div></div>
-    <div class="kpi kpi-red"><div class="kpi-label">Component Blocked</div><div class="kpi-value">${blocked.length}</div></div>
-    <div class="kpi kpi-teal"><div class="kpi-label">Open Order Demand</div><div class="kpi-value">${rows.reduce((t,r)=>t+r.demand,0)}</div><div class="kpi-sub">units</div></div>
+  <div class="kpi-grid kpi-grid-4" style="cursor:pointer">
+    <div class="kpi kpi-red" onclick="setFilter('production','status',${sf.status==='orders'?"''":"'orders'"})"><div class="kpi-label">Open Order Demand</div><div class="kpi-value">${withOrders.length}</div><div class="kpi-sub">${allRows.reduce((t,r)=>t+r.demand,0)} units</div></div>
+    <div class="kpi kpi-orange" onclick="setFilter('production','status',${sf.status==='build'?"''":"'build'"})"><div class="kpi-label">Buildable Now</div><div class="kpi-value">${ready.length}</div><div class="kpi-sub">click to filter</div></div>
+    <div class="kpi kpi-yellow" onclick="setFilter('production','status',${sf.status==='partial'?"''":"'partial'"})"><div class="kpi-label">Partial / Blocked</div><div class="kpi-value">${allRows.filter(r=>r.st==='partial').length+blocked.length}</div></div>
+    <div class="kpi kpi-teal" onclick="setFilter('production','status',${sf.status==='covered'?"''":"'covered'"})"><div class="kpi-label">Covered</div><div class="kpi-value">${counts.covered}</div></div>
   </div>
-  <div class="panel" style="padding:12px 18px">
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-      <span style="font-size:11px;color:var(--text3)">Suggested build covers:</span>
-      ${[2,4,8,12].map(w=>`<button class="filter-chip ${cov===w?'on-teal':''}" onclick="S.buildCoverage=${w};render()">${w} wks of sales</button>`).join('')}
-      <span style="font-size:10px;color:var(--text3);margin-left:auto">Suggested = max(open orders, ${cov}-wk sales forecast) − on hand. Click any row for the Build Planner.</span>
+  <div class="panel" style="padding:10px 16px">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <div class="search-wrap" style="flex:1;min-width:160px"><span class="search-icon">⌕</span><input placeholder="Search SKU or description…" value="${sf.search||''}" oninput="setFilter('production','search',this.value)"></div>
+      <span style="font-size:11px;color:var(--text3)">Status:</span>
+      <button class="filter-chip ${!sf.status?'on-teal':''}" onclick="setFilter('production','status','')">All (${allRows.length})</button>
+      <button class="filter-chip ${sf.status==='orders'?'on-teal':''}" style="${sf.status==='orders'?'':'color:var(--red)'}" onclick="setFilter('production','status',${sf.status==='orders'?"''":"'orders'"})">⚡ Open Orders (${counts.orders})</button>
+      <button class="filter-chip ${sf.status==='build'?'on-teal':''}" style="${sf.status==='build'?'':'color:var(--green)'}" onclick="setFilter('production','status',${sf.status==='build'?"''":"'build'"})">✓ Build Now (${counts.build})</button>
+      <button class="filter-chip ${sf.status==='partial'?'on-teal':''}" style="${sf.status==='partial'?'':'color:var(--yellow)'}" onclick="setFilter('production','status',${sf.status==='partial'?"''":"'partial'"})">⚠ Partial (${counts.partial})</button>
+      <button class="filter-chip ${sf.status==='blocked'?'on-teal':''}" style="${sf.status==='blocked'?'':'color:var(--red)'}" onclick="setFilter('production','status',${sf.status==='blocked'?"''":"'blocked'"})">✕ Blocked (${counts.blocked})</button>
+      <button class="filter-chip ${sf.status==='covered'?'on-teal':''}" onclick="setFilter('production','status',${sf.status==='covered'?"''":"'covered'"})">Covered (${counts.covered})</button>
+      <span style="font-size:10px;color:var(--text3);margin-left:auto">Build target:</span>
+      ${[2,4,8,12].map(w=>`<button class="filter-chip ${cov===w?'on-teal':''}" onclick="S.buildCoverage=${w};render()">${w}w</button>`).join('')}
     </div>
   </div>
   <div class="tbl-wrap">
@@ -3608,6 +4017,19 @@ async function packUnits(pn, asmId, isUnpack) {
 // ============================================================
 // CYCLE COUNTS
 // ============================================================
+function renderBOMCountSearch(q){
+  const el=document.getElementById('bom-count-results');
+  if(!el)return;
+  if(!q||q.length<2){el.innerHTML='<span style="font-size:11px;color:var(--text3)">Type a product name or SKU…</span>';return;}
+  const ql=q.toLowerCase();
+  const matches=S.assemblies.filter(a=>!a.discontinued&&!a.is_subassembly&&(a.pn.toLowerCase().includes(ql)||(a.description||'').toLowerCase().includes(ql))).slice(0,10);
+  if(!matches.length){el.innerHTML='<span style="font-size:11px;color:var(--text3)">No products found</span>';return;}
+  el.innerHTML=matches.map(a=>{
+    const bomCount=(S.boms[a.pn]||[]).length;
+    return `<button class="filter-chip" onclick="createCycleCount('bom:${a.pn}')">${a.pn} <span style="font-size:9px;opacity:.7">${bomCount} components</span></button>`;
+  }).join('');
+}
+
 async function createCycleCount(cat) {
   // cat: 'all' (all parts) | 'fg' | 'sub' | 'everything' | a part category name
   let items=[];
@@ -3620,11 +4042,28 @@ async function createCycleCount(cat) {
     ...liveAsm.map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'})),
     ...liveParts.map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}))
   ];
+  else if(cat&&cat.startsWith('bom:')){
+    // BOM-based: count the FG + every component in its BOM
+    const bomPn=cat.slice(4);
+    const fgAsm=S.assemblies.find(a=>a.pn===bomPn);
+    if(fgAsm) items.push({pn:bomPn,desc:fgAsm.description||'',exp:fgAsm.total_on_hand||0,type:'assembly',section:'Finished Good'});
+    const bomLines=S.boms[bomPn]||[];
+    bomLines.forEach(line=>{
+      if(line.item_type==='assembly'){
+        const sa=S.assemblies.find(a=>a.pn===line.child_pn);
+        if(sa) items.push({pn:line.child_pn,desc:sa.description||'',exp:sa.total_on_hand||0,type:'assembly',section:'Subassemblies',bomQty:line.qty});
+      } else {
+        const p=S.parts.find(x=>x.pn===line.child_pn);
+        items.push({pn:line.child_pn,desc:p?.description||'',exp:p?.total_unpckgd||0,type:'part',section:'Components',bomQty:line.qty});
+      }
+    });
+    const seen=new Set(); items=items.filter(i=>{if(seen.has(i.pn))return false;seen.add(i.pn);return true;});
+  }
   else items=liveParts.filter(p=>(p.category||'Uncategorized')===cat).map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}));
   if(!items.length){toast('Nothing in that selection');return;}
   const {data,error}=await db.from('cycle_counts').insert({status:'Open',notes:'',category_filter:cat}).select().single();
   if(error){toast('Error: '+error.message);return;}
-  const lines = items.map(i=>({count_id:data.id,pn:i.pn,description:i.desc,expected_qty:i.exp,item_type:i.type}));
+  const lines = items.map(i=>({count_id:data.id,pn:i.pn,description:i.desc,expected_qty:i.exp,item_type:i.type,notes:i.bomQty?'BOM qty/unit: '+i.bomQty:''}));
   await db.from('cycle_count_lines').insert(lines);
   S.cycleCounts=[data,...S.cycleCounts];
   S.activeCount=data.id;
@@ -3660,6 +4099,12 @@ function renderCycleCounts() {
         <div class="divider"></div>
         <div style="font-size:11px;color:var(--text3);margin-bottom:4px">Count by Category:</div>
         ${cats.map(c=>`<button class="btn btn-sm" onclick="createCycleCount('${c}')">${c} (${S.parts.filter(p=>(p.category||'Uncategorized')===c).length})</button>`).join('')}
+        <div class="divider"></div>
+        <div style="font-size:11px;font-weight:700;color:var(--text2);margin-bottom:6px">Count by Product + All Its BOM Components</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <div class="search-wrap" style="flex:1"><span class="search-icon">⌕</span><input id="bom-count-search" placeholder="Search finished good…" oninput="renderBOMCountSearch(this.value)" style="font-size:12px"></div>
+        </div>
+        <div id="bom-count-results" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
       </div>
     </div>
   </div>
@@ -3668,20 +4113,138 @@ function renderCycleCounts() {
       <div class="section-header">Open Counts (${openCounts.length})</div>
       ${openCounts.length===0?'<div class="section-empty">No open counts</div>':openCounts.map(c=>`
       <div class="check-row">
-        <div style="flex:1"><div style="font-size:12px;font-weight:500;color:var(--text)">${new Date(c.created_at).toLocaleDateString()} — ${({all:'Raw Parts',fg:'Finished Goods',sub:'Subassemblies',everything:'Everything'})[c.category_filter]||c.category_filter}</div></div>
+        <div style="flex:1">
+          <div style="font-size:12px;font-weight:500;color:var(--text)">${new Date(c.created_at).toLocaleDateString()} — ${({all:'Raw Parts',fg:'Finished Goods',sub:'Subassemblies',everything:'Everything'})[c.category_filter]||(c.category_filter?.startsWith('bom:')?'BOM: '+c.category_filter.slice(4):c.category_filter)}</div>
+        </div>
         <span class="pill pill-orange">Open</span>
         <button class="btn btn-teal btn-sm" style="margin-left:8px" onclick="openCount('${c.id}')">Continue →</button>
+        <button class="action-btn del" title="Delete this count" onclick="deleteCycleCount('${c.id}')">×</button>
       </div>`).join('')}
-      <div class="section-header" style="margin-top:0">Completed (${doneCounts.length})</div>
-      ${doneCounts.length===0?'<div class="section-empty">No completed counts</div>':doneCounts.slice(0,5).map(c=>`
+      <div class="section-header" style="margin-top:0;display:flex;justify-content:space-between;align-items:center">
+        <span>Completed (${doneCounts.length})</span>
+        ${doneCounts.length>3?`<button class="btn btn-sm" style="font-size:10px;margin-right:8px" onclick="deleteAllCompletedCounts()">🗑 Clear completed</button>`:''}
+      </div>
+      ${doneCounts.length===0?'<div class="section-empty">No completed counts</div>':doneCounts.map(c=>`
       <div class="check-row">
-        <div style="flex:1"><div style="font-size:12px;color:var(--text2)">${new Date(c.created_at).toLocaleDateString()} — ${({all:'Raw Parts',fg:'Finished Goods',sub:'Subassemblies',everything:'Everything'})[c.category_filter]||c.category_filter}</div></div>
+        <div style="flex:1">
+          <div style="font-size:12px;color:var(--text2)">${new Date(c.created_at).toLocaleDateString()} — ${({all:'Raw Parts',fg:'Finished Goods',sub:'Subassemblies',everything:'Everything'})[c.category_filter]||(c.category_filter?.startsWith('bom:')?'BOM: '+c.category_filter.slice(4):c.category_filter)}</div>
+          ${c.completed_at?`<div style="font-size:10px;color:var(--text3)">Completed ${new Date(c.completed_at).toLocaleDateString()}</div>`:''}
+        </div>
         <span class="pill pill-teal">Done</span>
         <button class="action-btn" style="margin-left:8px" onclick="openCount('${c.id}')">View</button>
+        <button class="action-btn del" title="Delete this count" onclick="deleteCycleCount('${c.id}')">×</button>
       </div>`).join('')}
     </div>
   </div>
   </div>`;
+}
+
+function printCycleCount(countId){
+  const count=S.cycleCounts.find(c=>c.id===countId);
+  const lines=S.countLines;
+  if(!lines.length){toast('No lines to print');return;}
+  const label=({all:'Raw Parts',fg:'Finished Goods',sub:'Subassemblies',everything:'Everything'})[count?.category_filter]||(count?.category_filter?.startsWith('bom:')?'BOM Count — '+count.category_filter.slice(4):count?.category_filter||'Count');
+
+  // Group lines by section if BOM count, else by type
+  const groups={};
+  lines.forEach(l=>{
+    const sec=l.section||(l.item_type==='assembly'?'Assemblies':'Parts');
+    (groups[sec]=groups[sec]||[]).push(l);
+  });
+
+  const rows=Object.entries(groups).map(([sec,ls])=>`
+    <tr class="section-row"><td colspan="6">${sec.toUpperCase()}</td></tr>
+    ${ls.map(l=>`<tr>
+      <td class="pn-cell">${l.pn}</td>
+      <td class="desc-cell">${l.description||''}</td>
+      ${l.bomQty?`<td class="num-cell">${l.bomQty}/unit</td>`:'<td></td>'}
+      <td class="num-cell">${l.expected_qty||0}</td>
+      <td class="count-cell"></td>
+      <td class="notes-cell"></td>
+    </tr>`).join('')}`).join('');
+
+  const win=window.open('','_blank','width=900,height=700');
+  win.document.write(`<!DOCTYPE html><html><head><title>Cycle Count — ${label}</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Segoe UI',Arial,sans-serif;font-size:11px;color:#111;background:#fff;padding:20px}
+    .header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:18px;padding-bottom:12px;border-bottom:2px solid #111}
+    .header-left h1{font-size:18px;font-weight:800;letter-spacing:.05em;color:#0d9488}
+    .header-left h2{font-size:13px;font-weight:600;margin-top:2px}
+    .header-right{text-align:right;font-size:11px;color:#555}
+    .meta{display:flex;gap:24px;margin-bottom:14px;font-size:11px}
+    .meta-box{border:1px solid #ddd;border-radius:4px;padding:6px 12px;min-width:100px}
+    .meta-box label{font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:#888;display:block}
+    .meta-box span{font-size:14px;font-weight:700}
+    table{width:100%;border-collapse:collapse;font-size:11px}
+    th{background:#f0f0f0;border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.07em;font-weight:700}
+    td{border:1px solid #ddd;padding:6px 8px;vertical-align:middle}
+    tr:nth-child(even) td{background:#fafafa}
+    .section-row td{background:#0d9488;color:#fff;font-weight:700;font-size:10px;letter-spacing:.1em;padding:4px 8px}
+    .pn-cell{font-family:monospace;font-size:11px;font-weight:600;white-space:nowrap;width:140px}
+    .desc-cell{max-width:220px}
+    .num-cell{width:70px;text-align:center;font-weight:600}
+    .count-cell{width:90px;background:#fffde7;border:1px dashed #aaa}
+    .notes-cell{width:140px;background:#f9f9f9}
+    .footer{margin-top:16px;font-size:10px;color:#888;border-top:1px solid #ddd;padding-top:8px;display:flex;justify-content:space-between}
+    @media print{
+      body{padding:10px}
+      .no-print{display:none}
+      thead{display:table-header-group}
+      tr{page-break-inside:avoid}
+    }
+  </style></head><body>
+  <div class="header">
+    <div class="header-left">
+      <h1>TGK MOTORSPORT</h1>
+      <h2>Cycle Count Sheet — ${label}</h2>
+    </div>
+    <div class="header-right">
+      Date: ${new Date().toLocaleDateString()}<br>
+      Counted by: ___________________<br>
+      Verified by: ___________________
+    </div>
+  </div>
+  <div class="meta">
+    <div class="meta-box"><label>Total SKUs</label><span>${lines.length}</span></div>
+    <div class="meta-box"><label>Count Date</label><span>${new Date().toLocaleDateString()}</span></div>
+    <div class="meta-box"><label>Count ID</label><span style="font-size:10px;font-family:monospace">${countId.slice(0,8)}</span></div>
+  </div>
+  <table>
+    <thead><tr><th>Part / SKU #</th><th>Description</th><th>BOM Qty/Unit</th><th>System Qty</th><th>Counted Qty ✏</th><th>Notes</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  <div class="footer">
+    <span>TGK Motorsport ERP · Printed ${new Date().toLocaleString()}</span>
+    <span>Page <span class="pagenum"></span></span>
+  </div>
+  <div class="no-print" style="margin-top:16px;text-align:center">
+    <button onclick="window.print()" style="padding:10px 28px;background:#0d9488;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">🖨 Print</button>
+    <button onclick="window.close()" style="padding:10px 20px;background:#eee;border:none;border-radius:6px;font-size:13px;cursor:pointer;margin-left:8px">Close</button>
+  </div>
+  </body></html>`);
+  win.document.close();
+}
+
+async function deleteCycleCount(countId){
+  if(!confirm('Delete this cycle count and all its lines? This cannot be undone.'))return;
+  if(S.activeCount===countId){S.activeCount=null;S.countLines=[];}
+  await db.from('cycle_count_lines').delete().eq('count_id',countId);
+  await db.from('cycle_counts').delete().eq('id',countId);
+  S.cycleCounts=S.cycleCounts.filter(c=>c.id!==countId);
+  toast('Cycle count deleted');render();
+}
+
+async function deleteAllCompletedCounts(){
+  const done=S.cycleCounts.filter(c=>c.status==='Complete');
+  if(!done.length){toast('No completed counts to clear');return;}
+  if(!confirm('Delete all '+done.length+' completed counts and their lines? Corrections already applied are not affected.'))return;
+  for(const c of done){
+    await db.from('cycle_count_lines').delete().eq('count_id',c.id);
+    await db.from('cycle_counts').delete().eq('id',c.id);
+  }
+  S.cycleCounts=S.cycleCounts.filter(c=>c.status!=='Complete');
+  toast(done.length+' completed counts cleared');render();
 }
 
 async function openCount(id) {
@@ -3706,6 +4269,7 @@ function renderCountDetail(count) {
     </div>
     ${!isDone?`<button class="btn btn-teal" onclick="applyCountCorrections('${count.id}')">✓ Apply ${variances.length} Corrections</button>`:
     '<span class="pill pill-teal">Completed</span>'}
+    <button class="btn btn-sm" onclick="printCycleCount('${count.id}')" title="Print count sheet for manual counting">🖨 Print Sheet</button>
   </div>
   <div class="kpi-grid kpi-grid-4" style="margin-bottom:16px">
     <div class="kpi"><div class="kpi-label">Total SKUs</div><div class="kpi-value">${lines.length}</div></div>
@@ -3910,6 +4474,22 @@ function renderImport() {
       <div class="divider"></div>
       <div style="font-size:11px;color:var(--text3)">To bulk-import new spreadsheet data, ask Claude to generate SQL import files from your xlsx — paste them into the Supabase SQL Editor.</div>
     </div>
+    <div class="panel" style="border-left:3px solid var(--teal)">
+      <div class="panel-title"><span>📦 Shopify Order Import (CSV)</span></div>
+      <div style="font-size:11px;color:var(--text2);margin-bottom:10px;line-height:1.6">
+        Export from Shopify: <b>Admin → Orders → Export → All orders → CSV for Excel</b><br>
+        Then drag or paste the file below. Conflicts show individually so you choose what to do.
+      </div>
+      <div id="shopify-drop-zone" ondragover="event.preventDefault();this.style.borderColor='var(--teal)'" ondragleave="this.style.borderColor=''" ondrop="handleShopifyDrop(event)"
+        style="border:2px dashed var(--border2);border-radius:8px;padding:20px;text-align:center;cursor:pointer;transition:border-color .15s;margin-bottom:10px"
+        onclick="document.getElementById('shopify-file-input').click()">
+        <div style="font-size:22px;margin-bottom:6px">📂</div>
+        <div style="font-size:12px;font-weight:600;color:var(--text2)">Drop Shopify orders.csv here</div>
+        <div style="font-size:11px;color:var(--text3);margin-top:3px">or click to browse</div>
+        <input type="file" id="shopify-file-input" accept=".csv" style="display:none" onchange="handleShopifyFile(this.files[0])">
+      </div>
+      <div id="shopify-import-status" style="display:none"></div>
+    </div>
     <div class="panel">
       <div class="panel-title"><span>Manual CSV Import</span></div>
       <div class="form-group" style="margin-bottom:10px">
@@ -3985,9 +4565,7 @@ function exportTable(table) {
 // RENDER
 // ============================================================
 function render(){
-  // Hide loader on first render
-  const _ld=document.getElementById('app-loading'),_sh=document.getElementById('app-shell');
-  if(_ld&&_ld.style.display!=='none'){_ld.style.display='none';if(_sh)_sh.style.display='flex';}
+  // Hide loader on first render  if(_sh)_sh.style.display='flex';}
   const views={dashboard:renderDashboard,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder};
   if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length)computeDemand();
   // Preserve focused input + caret across re-render
@@ -4008,7 +4586,50 @@ function render(){
 }
 
 // ── INIT ─────────────────────────────────────────────────────
-loadAll().then(()=>{computeDemand();setupRealtime();loadBackups();startAutoBackup();try{history.replaceState(snapState(),'','#dashboard');}catch(e){}render();});
+(function startTGK(){
+  const msg=document.getElementById('tgk-msg');
+  const retry=document.getElementById('tgk-retry');
+  const dots=document.getElementById('tgk-dots');
+  function setMsg(t){if(msg)msg.textContent=t;}
+  function showRetry(){if(retry)retry.style.display='';if(dots)dots.style.opacity='.25';}
+
+  // Show retry after 12s; hard-reload after 30s if still stuck
+  const t1=setTimeout(()=>{setMsg('Taking longer than expected…');showRetry();},12000);
+  const t2=setTimeout(()=>location.reload(),30000);
+
+  let attempts=0;
+  function waitForSupabase(){
+    attempts++;
+    if(typeof supabase==='undefined'||typeof supabase.createClient==='undefined'){
+      if(attempts>100){clearTimeout(t1);clearTimeout(t2);setMsg('Could not load Supabase library — check internet connection.');showRetry();return;}
+      if(attempts===1)setMsg('Loading libraries…');
+      setTimeout(waitForSupabase,100);
+      return;
+    }
+    // Create client now that library is confirmed loaded
+    if(!db) db = supabase.createClient(SUPA_URL, SUPA_KEY);
+    setMsg('Connecting to database…');
+    loadAll()
+      .then(()=>{
+        clearTimeout(t1);clearTimeout(t2);
+        computeDemand();setupRealtime();loadBackups();startAutoBackup();
+        try{history.replaceState(snapState(),'','#dashboard');}catch(e){}
+        const loader=document.getElementById('tgk-loader');
+        const app=document.getElementById('tgk-app');
+        if(loader)loader.style.display='none';
+        if(app)app.style.display='';
+        render();
+      })
+      .catch(err=>{
+        clearTimeout(t1);clearTimeout(t2);
+        setMsg('Database error: '+err.message);
+        showRetry();
+      });
+  }
+
+  if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',waitForSupabase);}
+  else{waitForSupabase();}
+})();
 </script>
 </body>
 </html>
