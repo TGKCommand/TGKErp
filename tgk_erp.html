@@ -1961,10 +1961,29 @@ const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SE
 
 Deno.serve(async (req) => {
   if (req.method === 'GET') return new Response(JSON.stringify({pong:true}), {headers:{'Content-Type':'application/json'}})
-  const topic = req.headers.get('x-shopify-topic') || ''
-  const order = await req.json()
 
-  // Map Shopify financial/fulfillment status → ERP
+  const body = await req.json().catch(() => ({}))
+
+  // ── SYNC ACTION: browser calls this to pull recent orders (bypasses Shopify CORS) ──
+  if (body.action === 'sync') {
+    const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace(/^https?:\/\//, '')
+    const key   = body.key  || Deno.env.get('SHOPIFY_KEY')   || ''
+    if (!store || !key) return new Response(JSON.stringify({error:'Missing Shopify credentials'}), {status:400, headers:{'Content-Type':'application/json'}})
+
+    const since = body.since || new Date(Date.now() - 30*24*60*60*1000).toISOString()
+    const page  = body.page  || 1
+    const url   = 'https://' + store + '/admin/api/2024-01/orders.json?status=any&limit=250&updated_at_min=' + since + '&page=' + page
+
+    const ssRes = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
+    if (!ssRes.ok) return new Response(JSON.stringify({error:'Shopify '+ssRes.status}), {status:ssRes.status, headers:{'Content-Type':'application/json'}})
+    const data = await ssRes.json()
+    return new Response(JSON.stringify(data), {headers:{'Content-Type':'application/json'}})
+  }
+
+  // ── WEBHOOK: orders/create, orders/cancelled, orders/updated ──
+  const topic = req.headers.get('x-shopify-topic') || ''
+  const order = body
+
   const finStatus = (order.financial_status||'').toLowerCase()
   const fs = order.cancel_reason ? 'Cancelled'
     : finStatus === 'refunded' || finStatus === 'voided' ? 'Refunded'
@@ -2599,68 +2618,77 @@ async function syncOrdersNow(){
     return;
   }
 
+  const edgeBase=SUPA_URL+'/functions/v1';
+
   // ── Step 1: Query FULL DB for existing (order_number, pn) keys ──
-  // S.sales is capped at 5000 rows — using it directly causes duplicates for older orders
-  toast('🔄 Checking existing orders in database…');
+  toast('🔄 Checking existing orders…');
   let existingKeys=new Set();
   try{
     const{data:existingRows,error}=await db.from('sales').select('order_number,pn').limit(500000);
     if(!error&&existingRows)existingKeys=new Set(existingRows.map(s=>(s.order_number||'')+'||'+(s.pn||'')));
     else existingKeys=new Set(S.sales.map(s=>(s.order_number||'')+'||'+(s.pn||'')));
-  }catch(e){
-    existingKeys=new Set(S.sales.map(s=>(s.order_number||'')+'||'+(s.pn||'')));
-  }
+  }catch(e){existingKeys=new Set(S.sales.map(s=>(s.order_number||'')+'||'+(s.pn||'')));}
 
-  // ── Step 2: Fetch recent Shopify orders ──
-  toast('🔄 Syncing from Shopify…');
+  // ── Step 2: Fetch orders via edge function (avoids browser CORS block on Shopify API) ──
+  toast('🔄 Fetching from Shopify via edge function…');
   const cutoff=new Date(Date.now()-30*24*60*60*1000).toISOString();
   let newCount=0,updatedCount=0,page=1,keepGoing=true;
 
   while(keepGoing){
+    let resp,orders=[];
     try{
-      const url=`https://${store.replace(/^https?:\/\//,'')}/admin/api/2024-01/orders.json?status=any&limit=250&updated_at_min=${cutoff}&page=${page}`;
-      const res=await fetch(url,{headers:{'X-Shopify-Access-Token':key,'Content-Type':'application/json'}});
-      if(!res.ok){toast('Shopify error '+res.status+' — check credentials in Integrations');break;}
-      const{orders=[]}=await res.json();
-      if(!orders.length){keepGoing=false;break;}
+      resp=await fetch(edgeBase+'/shopify-orders',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+        body:JSON.stringify({action:'sync',store,key,since:cutoff,page})
+      });
+      if(!resp.ok){
+        const txt=await resp.text().catch(()=>'');
+        // Edge function not yet updated? Fall back with a clear message
+        if(resp.status===400&&txt.includes('Missing action')||resp.status===404){
+          toast('⚠ Edge function needs updating — copy the new shopify-orders code from Integrations → Setup Guide and redeploy',6000);
+          return;
+        }
+        toast('Sync error '+resp.status+': '+txt);
+        break;
+      }
+      const json=await resp.json();
+      if(json.error){toast('Shopify error: '+json.error);break;}
+      orders=json.orders||[];
+    }catch(e){toast('Network error calling edge function: '+e.message);break;}
 
-      for(const order of orders){
-        const orderNum=order.name;
-        for(const li of (order.line_items||[])){
-          const pn=li.sku||li.title;
-          if(!pn)continue;
-          const key2=(orderNum||'')+'||'+(pn||'');
-          const fs=order.financial_status==='refunded'?'Cancelled':
-            order.fulfillment_status==='fulfilled'?'Delivered':
-            order.fulfillment_status==='partial'?'Partial':'Open';
+    if(!orders.length){keepGoing=false;break;}
 
-          if(!existingKeys.has(key2)){
-            // Genuinely new — insert and add to set immediately to prevent within-run dupes
-            const{data}=await db.from('sales').insert({
-              order_number:orderNum,pn,qty:li.quantity||1,
-              fulfillment_status:fs,source:'Shopify Sync',
-              sale_date:(order.created_at||new Date().toISOString()).slice(0,10)
-            }).select().single();
-            if(data){
-              existingKeys.add(key2); // prevent re-insertion if Shopify returns this order again
-              S.sales=[data,...S.sales];
-              newCount++;
-              if(S.view!=='sales')showOrderAlert(orderNum,pn);
-            }
-          } else {
-            // Exists — update status only if it changed on Shopify and ERP still shows Open/Partial
-            const mem=S.sales.find(s=>s.order_number===orderNum&&s.pn===pn);
-            if(mem&&mem.fulfillment_status!==fs&&['Open','Partial'].includes(mem.fulfillment_status)){
-              await db.from('sales').update({fulfillment_status:fs}).eq('id',mem.id);
-              S.sales=S.sales.map(s=>s.id===mem.id?{...s,fulfillment_status:fs}:s);
-              updatedCount++;
-            }
+    for(const order of orders){
+      const orderNum=order.name;
+      for(const li of (order.line_items||[])){
+        const pn=li.sku||li.title;
+        if(!pn)continue;
+        const k=(orderNum||'')+'||'+(pn||'');
+        const fs=order.financial_status==='refunded'?'Cancelled':
+          order.fulfillment_status==='fulfilled'?'Delivered':
+          order.fulfillment_status==='partial'?'Partial':'Open';
+
+        if(!existingKeys.has(k)){
+          const{data}=await db.from('sales').insert({
+            order_number:orderNum,pn,qty:li.quantity||1,
+            fulfillment_status:fs,source:'Shopify Sync',
+            sale_date:(order.created_at||new Date().toISOString()).slice(0,10)
+          }).select().single();
+          if(data){existingKeys.add(k);S.sales=[data,...S.sales];newCount++;if(S.view!=='sales')showOrderAlert(orderNum,pn);}
+        } else {
+          const mem=S.sales.find(s=>s.order_number===orderNum&&s.pn===pn);
+          if(mem&&mem.fulfillment_status!==fs&&['Open','Partial'].includes(mem.fulfillment_status)){
+            await db.from('sales').update({fulfillment_status:fs}).eq('id',mem.id);
+            S.sales=S.sales.map(s=>s.id===mem.id?{...s,fulfillment_status:fs}:s);
+            updatedCount++;
           }
         }
       }
-      page++;
-      if(orders.length<250)keepGoing=false;
-    }catch(e){toast('Sync error: '+e.message);break;}
+    }
+    page++;
+    if(orders.length<250)keepGoing=false;
+    if(newCount+updatedCount>0)toast(`🔄 ${newCount} new, ${updatedCount} updated so far…`,1500);
   }
 
   // ── Step 3: Check ShipStation for held orders ──
@@ -2674,8 +2702,7 @@ async function syncOrdersNow(){
       if(ssRes.ok){
         const{orders:held=[]}=await ssRes.json();
         for(const ho of held){
-          const num=ho.orderNumber;
-          const erpLines=S.sales.filter(s=>s.order_number===num&&s.fulfillment_status==='Open');
+          const erpLines=S.sales.filter(s=>s.order_number===ho.orderNumber&&s.fulfillment_status==='Open');
           for(const line of erpLines){
             await db.from('sales').update({fulfillment_status:'On Hold'}).eq('id',line.id);
             S.sales=S.sales.map(s=>s.id===line.id?{...s,fulfillment_status:'On Hold'}:s);
