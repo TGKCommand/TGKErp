@@ -585,6 +585,20 @@ function poPill(s){
   const m={'On Order':'pill-orange','In Transit':'pill-yellow','Received':'pill-teal','Cancelled':'pill-red'};
   return `<span class="pill ${m[s]||'pill-muted'}">${s}</span>`;
 }
+// Global fulfillment-status pill map — used by renderSales & renderSaleDetail
+const FS_MAP={
+  'Open':'pill-red',
+  'On Hold':'pill-orange',
+  'Packed':'pill-yellow',
+  'Partial':'pill-yellow',
+  'Shipped':'pill-teal',
+  'Delivered':'pill-green',
+  'Refunded':'pill-purple',
+  'Cancelled':'pill-muted',
+};
+function fsPill(fs){
+  return `<span class="pill ${FS_MAP[fs]||'pill-muted'}">${fs||'Open'}</span>`;
+}
 
 function toast(msg){
   const el=$('toast');el.textContent=msg;el.classList.add('show');
@@ -1208,7 +1222,18 @@ function renderSales(){
   const packed=S.sales.filter(s=>s.fulfillment_status==='Packed');
   const shipped7=S.sales.filter(s=>s.fulfillment_status==='Shipped'&&s.shipped_at&&s.shipped_at.slice(0,10)>=daysAgo(7));
   const rev7=S.sales.filter(s=>s.sale_date>=daysAgo(7)).reduce((t,s)=>{const a=S.assemblies.find(x=>x.pn===s.pn);return t+((a?.msrp||0)*(s.qty||1));},0);
-  const fstats=['Open','Packed','Shipped','Delivered','Cancelled'];
+  const fstats=['Open','On Hold','Packed','Partial','Shipped','Delivered','Refunded','Cancelled'];
+
+  // Detect split-shipped orders: any grouped order that has lines in different shipment states
+  function isSplitOrder(orderNum){
+    if(!orderNum)return false;
+    const lines=S.sales.filter(x=>x.order_number===orderNum);
+    if(lines.length<2)return false;
+    const shipped=lines.some(x=>x.fulfillment_status==='Shipped'||x.fulfillment_status==='Delivered');
+    const open=lines.some(x=>!x.fulfillment_status||x.fulfillment_status==='Open');
+    return shipped&&open;
+  }
+
   return `
   <div class="kpi-grid kpi-grid-4">
     <div class="kpi kpi-red"><div class="kpi-label">Awaiting Fulfillment</div><div class="kpi-value">${open.length}</div><div class="kpi-sub">Open orders to pack</div></div>
@@ -1240,21 +1265,26 @@ function renderSales(){
     const asm=S.assemblies.find(a=>a.pn===s.pn);
     const stock=asm?(asm.total_on_hand||0):null;
     const canFill=stock!==null&&stock>=(s.qty||1);
-    const fsMap={'Open':'pill-red','Packed':'pill-yellow','Shipped':'pill-teal','Delivered':'pill-green','Cancelled':'pill-muted'};
+    const split=s._grouped&&isSplitOrder(s.order_number);
+    // Determine representative tracking — first non-empty tracking across grouped lines
+    const allOrderLines=s._grouped?S.sales.filter(x=>x.order_number===s.order_number):[];
+    const repTracking=s.tracking_number||(allOrderLines.find(x=>x.tracking_number)?.tracking_number)||'';
+    const repCarrier=s.carrier||(allOrderLines.find(x=>x.tracking_number)?.carrier)||'';
+    const multiTrack=s._grouped&&allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length>1;
     return `<tr class="rowlink" onclick="rowClick(event,function(){S.activeSale='${s.id}';pushHist();render()})">
     <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${s.sale_date?s.sale_date.slice(0,10):''}</td>
-    <td class="pn">${s.order_number||''}${s._grouped?` <span style="font-size:9px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 5px;border-radius:8px;font-family:var(--mono);font-weight:600">${s._lineCount} items</span>`:''}</td>
+    <td class="pn">${s.order_number||''}${s._grouped?` <span style="font-size:9px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 5px;border-radius:8px;font-family:var(--mono);font-weight:600">${s._lineCount} items</span>`:''}${split?` <span style="font-size:9px;background:var(--yellow-dim);color:var(--yellow);border:1px solid rgba(217,119,6,.25);border-radius:4px;padding:1px 5px;font-weight:700">🔀 Split</span>`:''}</td>
     <td class="pn" style="color:${s._grouped?'var(--text3)':'var(--teal)'}">${s._grouped?'Multiple SKUs':s.pn}</td>
     <td class="money-neutral" style="font-weight:700">${s._grouped?s.qty+' total':(s.qty||1)}</td>
     <td>${stock===null?'<span style="font-size:10px;color:var(--text3)">n/a</span>':`<span class="money" style="color:${canFill?'var(--green)':'var(--red)'};font-weight:700">${stock}</span>`}</td>
-    <td><span class="pill ${fsMap[fs]||'pill-muted'}">${fs}</span></td>
-    <td style="font-size:10px;font-family:var(--mono)">${s.tracking_number?`<a href="${trackingUrl(s.carrier,s.tracking_number)}" target="_blank" style="color:var(--teal);text-decoration:none" title="Track ${s.carrier||''} ${s.tracking_number}">${s.carrier?s.carrier+' ':''}${s.tracking_number} ↗</a>`:'<span style="color:var(--text3)">—</span>'}</td>
+    <td>${fsPill(fs)}${s.on_hold?` <span style="font-size:9px;color:var(--orange);font-weight:700">⏸ Hold</span>`:''}</td>
+    <td style="font-size:10px;font-family:var(--mono)">${multiTrack?`<span style="color:var(--yellow)" title="${allOrderLines.filter(x=>x.tracking_number).map(x=>(x.carrier?x.carrier+' ':'')+x.tracking_number).join('\n')}">🔀 ${allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length} shipments</span>`:repTracking?`<a href="${trackingUrl(repCarrier,repTracking)}" target="_blank" style="color:var(--teal);text-decoration:none" title="Track ${repCarrier} ${repTracking}">${repCarrier?repCarrier+' ':''}${repTracking} ↗</a>`:'<span style="color:var(--text3)">—</span>'}</td>
     <td style="display:flex;gap:4px">
       ${fs==='Open'?`<button class="btn btn-teal btn-sm" ${canFill?'':'disabled title="Insufficient stock"'} onclick="markPacked('${s.id}','${s.pn}',${s.qty||1})">Pack</button>`:''}
       ${fs==='Packed'?`<button class="btn btn-primary btn-sm" onclick="openShipModal('${s.id}','${s.pn}',${s.qty||1})">🚚 Ship</button>`:''}
       ${fs==='Packed'?`<button class="action-btn" title="Undo pack — return stock, reset to Open" onclick="unpackSaleOrder('${s.id}','${s.pn}',${s.qty||1})">↩ Unpack</button>`:''}
       ${fs==='Shipped'?`<button class="action-btn" onclick="markDelivered('${s.id}')">✓ Delivered</button>`:''}
-      ${fs==='Open'||fs==='Packed'?`<button class="action-btn" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
+      ${fs==='Open'||fs==='On Hold'?`<button class="action-btn" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
       <button class="action-btn del" onclick="deleteSale('${s.id}')">×</button>
     </td>
   </tr>`;}).join('')}
@@ -1279,24 +1309,38 @@ function renderSaleDetail(s){
     : [s];
   const isMulti=allLines.length>1;
   const fsMap=FS_MAP;
-  const rank={'Delivered':5,'Shipped':4,'Packed':3,'On Hold':2,'Open':1,'Cancelled':0};
+  const rank={'Delivered':5,'Shipped':4,'Packed':3,'On Hold':2,'Partial':2,'Open':1,'Refunded':0,'Cancelled':0};
 
   // Order-level status = most progressed line
   const orderFs=allLines.reduce((best,x)=>
     (rank[x.fulfillment_status||'Open']||0)>(rank[best]||0)?x.fulfillment_status:best,
     allLines[0].fulfillment_status||'Open');
 
+  // Split shipment: at least one line shipped AND at least one still open
+  const shippedLines=allLines.filter(x=>x.fulfillment_status==='Shipped'||x.fulfillment_status==='Delivered');
+  const openLines=allLines.filter(x=>(x.fulfillment_status||'Open')==='Open');
+  const packedLines=allLines.filter(x=>x.fulfillment_status==='Packed');
+  const isSplit=shippedLines.length>0&&openLines.length>0;
+
+  // Multiple distinct tracking numbers = split shipment
+  const uniqueTrackings=[...new Set(allLines.filter(x=>x.tracking_number).map(x=>x.tracking_number))];
+  const uniqueCarriers=[...new Set(allLines.filter(x=>x.tracking_number).map(x=>x.carrier||''))];
+
   // Order-level: can we pack ALL open lines?
   const allCanPack=allLines.every(x=>{
-    if((x.fulfillment_status||'Open')!=='Open')return true; // already done
+    if((x.fulfillment_status||'Open')!=='Open')return true;
     const a=S.assemblies.find(a=>a.pn===x.pn);
     return a&&(a.total_on_hand||0)>=(x.qty||1);
   });
-  const openLines=allLines.filter(x=>(x.fulfillment_status||'Open')==='Open');
-  const packedLines=allLines.filter(x=>x.fulfillment_status==='Packed');
 
-  // Tracking from any shipped line
-  const shipLine=allLines.find(x=>x.tracking_number)||s;
+  // Financial / cancel info (from any line that has it set)
+  const finLine=allLines.find(x=>x.financial_status)||allLines[0];
+  const financial=finLine?.financial_status||'';
+  const cancelledAt=allLines.find(x=>x.cancelled_at)?.cancelled_at;
+  const cancelReason=allLines.find(x=>x.cancel_reason)?.cancel_reason;
+  const refundAmt=allLines.reduce((t,x)=>t+(x.refund_amount||0),0);
+  const onHold=allLines.some(x=>x.on_hold);
+
   const moves=S.corrections.filter(c=>allLines.some(l=>l.pn===c.pn)).slice(0,8);
 
   return `
@@ -1305,32 +1349,61 @@ function renderSaleDetail(s){
     <div style="flex:1">
       <div style="font-size:15px;font-weight:700;color:var(--text)">
         Order ${s.order_number||'(no #)'}
-        <span class="pill ${fsMap[orderFs]||'pill-muted'}" style="vertical-align:middle;margin-left:6px">${orderFs}</span>
+        ${fsPill(orderFs)}
         ${isMulti?`<span style="font-size:10px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 7px;border-radius:8px;margin-left:6px;font-family:var(--mono)">${allLines.length} items</span>`:''}
+        ${isSplit?`<span style="font-size:10px;background:var(--yellow-dim);color:var(--yellow);border:1px solid rgba(217,119,6,.25);padding:1px 7px;border-radius:8px;margin-left:4px;font-weight:700">🔀 Split Shipment</span>`:''}
+        ${onHold?`<span style="font-size:10px;background:var(--orange-dim);color:var(--orange);border:1px solid rgba(234,88,12,.25);padding:1px 7px;border-radius:8px;margin-left:4px;font-weight:700">⏸ On Hold</span>`:''}
       </div>
-      <div style="font-size:11px;color:var(--text3)">${s.sale_date?s.sale_date.slice(0,10):''} · ${s.source||'—'}</div>
+      <div style="font-size:11px;color:var(--text3)">${s.sale_date?s.sale_date.slice(0,10):''} · ${s.source||'—'}${financial?' · <span style="color:var(--text2)">'+financial+'</span>':''}</div>
     </div>
     ${openLines.length?`<button class="btn btn-teal" ${allCanPack?'':'disabled title="Insufficient stock on one or more items"'} onclick="packAllLines('${s.order_number||s.id}')">Pack All (${openLines.length})</button>`:''}
     ${packedLines.length?`<button class="btn btn-primary" onclick="openShipModal('${packedLines[0].id}','${packedLines[0].pn}',${packedLines[0].qty||1})">🚚 Ship</button>`:''}
     ${packedLines.length?`<button class="btn btn-sm" style="color:var(--orange)" onclick="unpackSaleOrder('${s.id}','${s.pn==='Multiple'?'':s.pn}',${s.qty||1})">↩ Unpack</button>`:''}
     ${orderFs==='Shipped'?`<button class="btn btn-teal" onclick="markDelivered('${s.id}')">✓ Delivered</button>`:''}
     ${orderFs==='Shipped'?`<button class="btn btn-sm" onclick="checkDelivery('${s.order_number||''}','${s.id}')">🔄 Check Delivery</button>`:''}
-    ${['Open','Packed','On Hold'].includes(orderFs)?`<button class="btn" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
+    ${['Open','Packed','On Hold','Partial'].includes(orderFs)?`<button class="btn" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
   </div>
 
-  ${shipLine.tracking_number?`
-  <div class="panel" style="padding:10px 16px;margin-bottom:10px;display:flex;align-items:center;gap:12px;cursor:pointer" onclick="window.open(trackingUrl('${shipLine.carrier||''}','${shipLine.tracking_number}'),'_blank')">
-    <div style="font-size:18px">📦</div>
-    <div style="flex:1">
-      <div style="font-size:12px;font-weight:700;color:var(--teal)">${shipLine.carrier||''} ${shipLine.tracking_number} ↗</div>
-      <div style="font-size:11px;color:var(--text3)">${shipLine.shipped_at?'Shipped '+new Date(shipLine.shipped_at).toLocaleDateString():''}${shipLine.delivered_at?' · ✓ Delivered '+new Date(shipLine.delivered_at).toLocaleDateString():''}</div>
+  ${(cancelledAt||financial==='refunded'||financial==='partially_refunded')?`
+  <div class="panel" style="padding:10px 16px;margin-bottom:10px;border-left:3px solid ${financial==='refunded'?'var(--purple)':'var(--red)'}">
+    <div style="display:flex;align-items:center;gap:12px">
+      <div style="font-size:16px">${financial==='refunded'||financial==='partially_refunded'?'↩':'🚫'}</div>
+      <div>
+        <div style="font-size:12px;font-weight:700;color:var(--text)">${financial==='refunded'?'Order Refunded':financial==='partially_refunded'?'Partially Refunded':'Order Cancelled'}</div>
+        <div style="font-size:11px;color:var(--text3)">${cancelledAt?'Cancelled '+new Date(cancelledAt).toLocaleDateString():''}${cancelReason?' · Reason: '+cancelReason:''}${refundAmt>0?' · Refund: '+fc(refundAmt):''}</div>
+      </div>
     </div>
-  </div>`:'' }
+  </div>`:''}
+
+  ${uniqueTrackings.length>0?`
+  <div class="panel" style="padding:0;margin-bottom:10px">
+    <div class="section-header">📦 Shipments${uniqueTrackings.length>1?' — Split ('+uniqueTrackings.length+' packages)':''}</div>
+    ${uniqueTrackings.map((tn,i)=>{
+      const tLine=allLines.find(x=>x.tracking_number===tn);
+      const cr=tLine?.carrier||uniqueCarriers[i]||'';
+      // Which SKUs in this shipment?
+      const skusInShipment=allLines.filter(x=>x.tracking_number===tn).map(x=>x.pn);
+      return `<div class="check-row" style="cursor:pointer" onclick="window.open(trackingUrl('${cr}','${tn}'),'_blank')">
+        <span class="pill pill-muted" style="min-width:52px;justify-content:center">${cr||'?'}</span>
+        <div style="flex:1">
+          <div style="font-size:12px;font-weight:700;color:var(--teal)">${tn} ↗</div>
+          ${skusInShipment.length?`<div style="font-size:10px;color:var(--text3)">${skusInShipment.join(', ')}</div>`:''}
+        </div>
+        ${tLine?.shipped_at?`<span style="font-size:10px;color:var(--text3)">${new Date(tLine.shipped_at).toLocaleDateString()}</span>`:''}
+        ${tLine?.delivered_at?`<span class="pill pill-teal" style="font-size:9px">✓ Delivered</span>`:''}
+      </div>`;
+    }).join('')}
+  </div>`:''}
+
+  ${isSplit?`<div class="panel" style="padding:8px 14px;margin-bottom:10px;border-left:3px solid var(--yellow);background:var(--yellow-dim)">
+    <div style="font-size:12px;font-weight:700;color:var(--yellow)">🔀 Split Shipment</div>
+    <div style="font-size:11px;color:var(--text2);margin-top:2px">${shippedLines.length} item${shippedLines.length>1?'s':''} shipped · ${openLines.length} still awaiting fulfillment</div>
+  </div>`:''}
 
   <div class="tbl-wrap" style="margin-bottom:14px">
   <table><thead class="sticky-header"><tr>
-    <th>SKU</th><th>Description</th><th>Ordered</th>
-    <th>In Stock</th><th>Status</th><th>Actions</th>
+    <th>SKU</th><th>Description</th><th>Qty</th>
+    <th>In Stock</th><th>Status</th><th>Tracking</th><th>Actions</th>
   </tr></thead><tbody>
   ${allLines.map(line=>{
     const la=S.assemblies.find(a=>a.pn===line.pn);
@@ -1339,13 +1412,14 @@ function renderSaleDetail(s){
     const lcanFill=lstock!==null&&lstock>=(line.qty||1);
     return `<tr>
       <td class="pn rowlink" style="color:var(--teal)" onclick="lookupGo('assembly','${line.pn}')">${line.pn} ↗</td>
-      <td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${la?.description||''}</td>
+      <td style="font-size:11px;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${la?.description||''}</td>
       <td class="money-neutral" style="font-weight:700">${line.qty||1}</td>
       <td class="money" style="color:${lstock===null?'var(--text3)':lcanFill?'var(--green)':'var(--red)'};font-weight:700">
         ${lstock===null?'n/a':lstock}
         ${lstock!==null&&!lcanFill?`<span style="font-size:9px;color:var(--red)"> (need ${(line.qty||1)-lstock} more)</span>`:''}
       </td>
-      <td><span class="pill ${fsMap[lfs]||'pill-muted'}">${lfs}</span></td>
+      <td>${fsPill(lfs)}</td>
+      <td style="font-size:10px;font-family:var(--mono)">${line.tracking_number?`<a href="${trackingUrl(line.carrier||'',line.tracking_number)}" target="_blank" style="color:var(--teal);text-decoration:none">${line.carrier?line.carrier+' ':''}${line.tracking_number} ↗</a>`:'<span style="color:var(--text3)">—</span>'}</td>
       <td style="white-space:nowrap;display:flex;gap:4px">
         ${lfs==='Open'?`<button class="btn btn-teal btn-sm" ${lcanFill?'':'disabled'} onclick="markPacked('${line.id}','${line.pn}',${line.qty||1})">Pack</button>`:''}
         ${lfs==='Packed'?`<button class="btn btn-primary btn-sm" onclick="openShipModal('${line.id}','${line.pn}',${line.qty||1})">Ship</button>`:''}
@@ -1667,36 +1741,169 @@ function renderIntegrations(){
     </div>
   </div>`:''}
   ${t==='setup'?`<div class="int-card">
-    <div class="int-title" style="margin-bottom:4px">One-time Edge Function setup (~10 min)</div>
-    <div class="int-sub" style="margin-bottom:14px">This makes Shopify orders flow into your ERP automatically. Run these in order.</div>
-    <div class="section-header" style="background:transparent;border:none;padding-left:0">1 — Install Supabase CLI & login (on your computer)</div>
+    <div class="int-title" style="margin-bottom:4px">Edge Function Setup + SQL Migration</div>
+    <div class="int-sub" style="margin-bottom:14px">Run the SQL migration first, then deploy the edge functions. One-time setup (~15 min).</div>
+
+    <div class="section-header" style="background:transparent;border:none;padding-left:0">0 — Run SQL migration in Supabase (Dashboard → SQL Editor)</div>
+    <div style="font-size:11px;color:var(--text3);margin:4px 0 6px">Adds columns for financial status, split shipments, holds, refunds, and cancellations:</div>
+    <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto;max-height:160px">ALTER TABLE sales
+  ADD COLUMN IF NOT EXISTS financial_status text,
+  ADD COLUMN IF NOT EXISTS cancelled_at timestamptz,
+  ADD COLUMN IF NOT EXISTS cancel_reason text,
+  ADD COLUMN IF NOT EXISTS refund_amount numeric(10,2),
+  ADD COLUMN IF NOT EXISTS is_split_shipment boolean DEFAULT false,
+  ADD COLUMN IF NOT EXISTS on_hold boolean DEFAULT false,
+  ADD COLUMN IF NOT EXISTS ss_order_id text,
+  ADD COLUMN IF NOT EXISTS ss_shipment_id text;</pre>
+
+    <div class="section-header" style="background:transparent;border:none;padding-left:0">1 — Install Supabase CLI & login</div>
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto">npm install -g supabase
 supabase login
 supabase link --project-ref piamamighqiielfztgic</pre>
-    <div class="section-header" style="background:transparent;border:none;padding-left:0">2 — Create the webhook function</div>
-    <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto">supabase functions new shopify-webhook</pre>
-    <div style="font-size:11px;color:var(--text3);margin:6px 0">Paste this into <span class="pn">supabase/functions/shopify-webhook/index.ts</span>:</div>
-    <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto;max-height:220px">import { createClient } from 'npm:@supabase/supabase-js@2'
+
+    <div class="section-header" style="background:transparent;border:none;padding-left:0">2 — Shopify order webhook (handles new orders, cancellations, refunds)</div>
+    <div style="font-size:11px;color:var(--text3);margin:4px 0 6px">Create <span class="pn">supabase/functions/shopify-orders/index.ts</span> and paste:</div>
+    <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto;max-height:280px">import { createClient } from 'npm:@supabase/supabase-js@2'
+const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
+
 Deno.serve(async (req) => {
+  if (req.method === 'GET') return new Response(JSON.stringify({pong:true}), {headers:{'Content-Type':'application/json'}})
+  const topic = req.headers.get('x-shopify-topic') || ''
   const order = await req.json()
-  const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
-  for (const li of order.line_items ?? []) {
-    await db.from('sales').insert({
-      order_number: order.name, pn: li.sku || li.title,
-      qty: li.quantity, source: 'Shopify', status: 'Open',
-      fulfillment_status: 'Open',
-      sale_date: (order.created_at ?? new Date().toISOString()).slice(0,10)
-    })
+
+  // Map Shopify financial/fulfillment status → ERP
+  const finStatus = (order.financial_status||'').toLowerCase()
+  const fs = order.cancel_reason ? 'Cancelled'
+    : finStatus === 'refunded' || finStatus === 'voided' ? 'Refunded'
+    : finStatus === 'partially_refunded' ? 'Refunded'
+    : 'Open'
+
+  if (topic === 'orders/create') {
+    for (const li of order.line_items ?? []) {
+      await db.from('sales').insert({
+        order_number: order.name, pn: li.sku || li.title,
+        qty: li.quantity, source: 'Shopify', fulfillment_status: 'Open',
+        financial_status: order.financial_status || 'pending',
+        sale_date: (order.created_at ?? new Date().toISOString()).slice(0,10)
+      }).onConflict('order_number,pn').merge({ qty: li.quantity })
+    }
+  } else if (topic === 'orders/cancelled') {
+    await db.from('sales')
+      .update({ fulfillment_status: 'Cancelled', cancelled_at: order.cancelled_at,
+                cancel_reason: order.cancel_reason, financial_status: order.financial_status })
+      .eq('order_number', order.name)
+  } else if (topic === 'orders/updated') {
+    if (finStatus === 'refunded' || finStatus === 'voided' || finStatus === 'partially_refunded') {
+      const refundAmt = order.refunds?.reduce((t,r) => t + parseFloat(r.transactions?.[0]?.amount||0), 0) || 0
+      await db.from('sales')
+        .update({ fulfillment_status: 'Refunded', financial_status: finStatus, refund_amount: refundAmt })
+        .eq('order_number', order.name)
+    }
   }
   return new Response('ok')
 })</pre>
-    <div class="section-header" style="background:transparent;border:none;padding-left:0">3 — Deploy it</div>
-    <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto">supabase functions deploy shopify-webhook --no-verify-jwt</pre>
-    <div class="section-header" style="background:transparent;border:none;padding-left:0">4 — Point Shopify at it</div>
-    <div style="font-size:11px;color:var(--text2);line-height:1.7">In Shopify Admin → <b>Settings → Notifications → Webhooks → Create webhook</b>:<br>
-    Event: <b>Order creation</b> · Format: <b>JSON</b> · URL:<br>
-    <span class="pn" style="color:var(--teal)">${edgeUrl}/shopify-webhook</span><br>
-    Save. Place a test order — it appears in your Sales page in seconds (realtime).</div>
+
+    <div class="section-header" style="background:transparent;border:none;padding-left:0">3 — ShipStation ship webhook (split shipments, tracking, on-hold)</div>
+    <div style="font-size:11px;color:var(--text3);margin:4px 0 6px">Replace <span class="pn">supabase/functions/shipstation-ship/index.ts</span> with:</div>
+    <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto;max-height:280px">import { createClient } from 'npm:@supabase/supabase-js@2'
+const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
+
+Deno.serve(async (req) => {
+  if (req.method === 'GET' || (await req.clone().json().catch(()=>({}))).ping)
+    return new Response(JSON.stringify({pong:true}), {headers:{'Content-Type':'application/json'}})
+
+  const body = await req.json()
+  const { resource_url, resource_type } = body
+
+  if (!resource_url) return new Response('no resource_url', {status:400})
+
+  // Fetch the actual shipment/order from ShipStation
+  const ssKey = Deno.env.get('SS_KEY')!, ssSec = Deno.env.get('SS_SECRET')!
+  const auth = btoa(ssKey + ':' + ssSec)
+  const ssRes = await fetch(resource_url, {headers:{Authorization:'Basic '+auth}})
+  if (!ssRes.ok) return new Response('SS fetch failed: '+ssRes.status, {status:502})
+  const data = await ssRes.json()
+
+  // --- SHIPPED ---
+  if (resource_type === 'SHIP_NOTIFY' || resource_type === 'ORDER_SHIPPED') {
+    const shipments = data.shipments ?? [data]
+    for (const ship of shipments) {
+      const orderNum = ship.orderNumber
+      const tracking = ship.trackingNumber
+      const carrier = ship.carrierCode?.toUpperCase() || ''
+      const shippedAt = new Date().toISOString()
+      // Which SKUs were in THIS shipment?
+      const shipItems = (ship.shipmentItems ?? []).map((i:any) => i.sku || i.name).filter(Boolean)
+
+      // Check if order has OTHER lines that are still open (= split shipment)
+      const { data: orderLines } = await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', orderNum)
+      const allPns = (orderLines ?? []).map((l:any) => l.pn)
+      const isSplit = shipItems.length > 0 && shipItems.length < allPns.length
+
+      if (shipItems.length > 0) {
+        // Update only the lines in this shipment
+        for (const sku of shipItems) {
+          await db.from('sales').update({
+            fulfillment_status: 'Shipped', tracking_number: tracking, carrier,
+            shipped_at: shippedAt, is_split_shipment: isSplit
+          }).eq('order_number', orderNum).eq('pn', sku)
+        }
+        // Mark remaining open lines as Partial (split shipped)
+        if (isSplit) {
+          await db.from('sales').update({ fulfillment_status: 'Partial', is_split_shipment: true })
+            .eq('order_number', orderNum).in('fulfillment_status', ['Open'])
+            .not('pn', 'in', '("' + shipItems.join('","') + '")')
+        }
+      } else {
+        // No item list — update whole order
+        await db.from('sales').update({
+          fulfillment_status: 'Shipped', tracking_number: tracking, carrier,
+          shipped_at: shippedAt
+        }).eq('order_number', orderNum).in('fulfillment_status', ['Open','Packed','Partial'])
+      }
+    }
+  }
+
+  // --- CANCELLED ---
+  if (resource_type === 'ORDER_CANCELLED') {
+    const orderNum = data.orderNumber
+    await db.from('sales').update({ fulfillment_status: 'Cancelled',
+      cancelled_at: new Date().toISOString() }).eq('order_number', orderNum)
+  }
+
+  // --- ON HOLD ---
+  if (resource_type === 'ORDER_ON_HOLD') {
+    await db.from('sales').update({ on_hold: true, fulfillment_status: 'On Hold' })
+      .eq('order_number', data.orderNumber)
+  }
+  if (resource_type === 'ORDER_HOLD_RELEASED') {
+    await db.from('sales').update({ on_hold: false, fulfillment_status: 'Open' })
+      .eq('order_number', data.orderNumber)
+  }
+
+  return new Response('ok')
+})</pre>
+
+    <div class="section-header" style="background:transparent;border:none;padding-left:0">4 — Set ShipStation env vars in Supabase</div>
+    <div style="font-size:11px;color:var(--text2);line-height:1.7;margin-bottom:8px">Dashboard → Edge Functions → <b>shipstation-ship</b> → Secrets → add:<br>
+    <code>SS_KEY</code> = your ShipStation API Key &nbsp;·&nbsp; <code>SS_SECRET</code> = your ShipStation API Secret</div>
+
+    <div class="section-header" style="background:transparent;border:none;padding-left:0">5 — Deploy both functions</div>
+    <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto">supabase functions deploy shopify-orders --no-verify-jwt
+supabase functions deploy shipstation-ship --no-verify-jwt</pre>
+
+    <div class="section-header" style="background:transparent;border:none;padding-left:0">6 — Register webhooks</div>
+    <div style="font-size:11px;color:var(--text2);line-height:1.9">
+      <b>Shopify</b> → Settings → Notifications → Webhooks → Create:<br>
+      &nbsp;· <b>orders/create</b> → <span class="pn" style="color:var(--teal)">${edgeUrl}/shopify-orders</span><br>
+      &nbsp;· <b>orders/cancelled</b> → same URL<br>
+      &nbsp;· <b>orders/updated</b> → same URL (catches refunds)<br><br>
+      <b>ShipStation</b> → Account Settings → Webhooks → Add Webhook:<br>
+      &nbsp;· Event: <b>SHIP_NOTIFY</b> (fires when label created = split-aware)<br>
+      &nbsp;· Event: <b>ORDER_CANCELLED</b><br>
+      &nbsp;· Event: <b>ORDER_ON_HOLD</b> and <b>ORDER_HOLD_RELEASED</b><br>
+      &nbsp;· URL for all: <span class="pn" style="color:var(--teal)">${edgeUrl}/shipstation-ship</span>
+    </div>
   </div>`:''}`;
 }
 
@@ -1891,7 +2098,7 @@ function parseShopifyCSV(text){
   }
 
   // Parse rows — each Shopify row is one line item, orders span multiple rows
-  const parsed=[]; // [{orderNum, pn, qty, status, date, fulfilledAt, cancelledAt, email}]
+  const parsed=[]; // [{orderNum, pn, qty, status, financial, date, fulfilledAt, cancelledAt, email, isSplit, on_hold}]
   for(let i=1;i<lines.length;i++){
     if(!lines[i].trim())continue;
     const r=parseRow(lines[i]);
@@ -1899,25 +2106,46 @@ function parseShopifyCSV(text){
     const orderNum=(r[C.name]||'').trim();
     if(!orderNum||!pn)continue;
     
-    // Map Shopify status to ERP status
-    const shopifyFs=(r[C.fulfilled]||r[C.itemStatus]||'').toLowerCase();
-    const financial=(r[C.financial]||'').toLowerCase();
+    // Map Shopify status to ERP status — use PER-LINE status, not order-level
+    const orderFs=(r[C.fulfilled]||'').toLowerCase();   // order-level: fulfilled/partial/null
+    const lineFs =(r[C.itemStatus]||'').toLowerCase();  // per-line: fulfilled/unfulfilled/partial
+    const financial=(r[C.financial]||'').toLowerCase(); // paid/refunded/partially_refunded/voided
     const cancelled=(r[C.cancelledAt]||'').trim();
+
     let erpStatus='Open';
     if(cancelled) erpStatus='Cancelled';
-    else if(financial==='refunded'||financial==='voided') erpStatus='Cancelled';
-    else if(shopifyFs==='fulfilled') erpStatus='Delivered';
-    else if(shopifyFs==='partial') erpStatus='Shipped';
+    else if(financial==='refunded'||financial==='voided') erpStatus='Refunded';
+    else if(financial==='partially_refunded') erpStatus='Refunded';
+    else if(lineFs==='fulfilled'||lineFs==='complete') {
+      // This specific line shipped — was the whole order fulfilled or just this line?
+      erpStatus = (orderFs==='fulfilled') ? 'Delivered' : 'Shipped';
+    } else if(lineFs==='unfulfilled'||lineFs===''||!lineFs) {
+      erpStatus = 'Open';
+    }
     
     parsed.push({
       orderNum, pn,
       qty:parseInt(r[C.itemQty]||'1')||1,
       status:erpStatus,
+      financial:financial||null,
       date:(r[C.created]||'').slice(0,10)||new Date().toISOString().slice(0,10),
-      fulfilledAt:(r[C.fulfilledAt]||'').slice(0,10)||null,
+      fulfilledAt:(r[C.fulfilledAt]||'').trim()||null,
+      cancelledAt:cancelled||null,
       email:(r[C.email]||'').trim(),
     });
   }
+
+  // Post-process: detect split shipments (same order has both Open and Shipped lines)
+  const orderStatuses={};
+  parsed.forEach(p=>{
+    if(!orderStatuses[p.orderNum])orderStatuses[p.orderNum]={hasOpen:false,hasShipped:false};
+    if(p.status==='Open')orderStatuses[p.orderNum].hasOpen=true;
+    if(p.status==='Shipped'||p.status==='Delivered')orderStatuses[p.orderNum].hasShipped=true;
+  });
+  parsed.forEach(p=>{
+    const ost=orderStatuses[p.orderNum];
+    p.isSplit=(ost.hasOpen&&ost.hasShipped)||false;
+  });
 
   if(!parsed.length){
     if(el)el.innerHTML='<div style="color:var(--red);font-size:12px">❌ No valid order lines found in CSV.</div>';
@@ -2020,28 +2248,56 @@ function setAllConflictDecisions(decision){
 
 async function executeShopifyImport(){
   if(!S._shopifyImport)return;
-  const{newLines,conflictOrders,decisions}=S._shopifyImport;
+  const{parsed,decisions}=S._shopifyImport;
   const el=document.getElementById('shopify-import-status');
+  if(el)el.innerHTML='<div style="color:var(--text3);font-size:12px;padding:10px">⏳ Checking database for existing orders…</div>';
+
+  // ── Step 1: Query ALL existing (order_number, pn) from DB — NOT limited to S.sales in memory ──
+  // S.sales is capped at 5000 rows; the DB query gets everything
+  let existing=new Set();
+  try{
+    const {data:existingRows,error}=await db.from('sales').select('order_number,pn').limit(500000);
+    if(!error&&existingRows) existing=new Set(existingRows.map(s=>(s.order_number||'')+'||'+(s.pn||'')));
+  }catch(e){
+    // Fallback to in-memory if DB query fails (partial dedup)
+    existing=new Set(S.sales.map(s=>(s.order_number||'')+'||'+(s.pn||'')));
+    toast('⚠ Could not query full DB for dedup — using in-memory (may miss older records)');
+  }
+
+  // ── Step 2: Recompute new vs conflict against full DB set ──
+  const newLines=parsed.filter(p=>!existing.has((p.orderNum||'')+'||'+(p.pn||'')));
+  const conflicts=parsed.filter(p=>existing.has((p.orderNum||'')+'||'+(p.pn||'')));
+  const conflictOrders={};
+  conflicts.forEach(c=>{
+    const erpLine=S.sales.find(s=>s.order_number===c.orderNum&&s.pn===c.pn);
+    (conflictOrders[c.orderNum]=conflictOrders[c.orderNum]||[]).push({csv:c,erp:erpLine});
+  });
+
   let imported=0,updated=0,skipped=0,errors=0;
 
-  // Insert new lines
+  // ── Step 3: Insert new lines in chunks ──
   const toInsert=newLines.map(l=>({
     order_number:l.orderNum, pn:l.pn, qty:l.qty,
-    fulfillment_status:l.status, source:'Shopify CSV',
+    fulfillment_status:l.status,
+    financial_status:l.financial||null,
+    cancelled_at:l.cancelledAt?new Date(l.cancelledAt).toISOString():null,
+    is_split_shipment:l.isSplit||false,
+    source:'Shopify CSV',
     sale_date:l.date,
     shipped_at:l.fulfilledAt?new Date(l.fulfilledAt).toISOString():null,
   }));
 
-  // Chunk inserts
-  for(let i=0;i<toInsert.length;i+=100){
-    const chunk=toInsert.slice(i,i+100);
+  const CHUNK=100;
+  for(let i=0;i<toInsert.length;i+=CHUNK){
+    const chunk=toInsert.slice(i,i+CHUNK);
     const{error}=await db.from('sales').insert(chunk);
-    if(error){errors++;}
+    if(error){errors++;console.error('Import chunk error:',error.message);}
     else imported+=chunk.length;
-    if(el)el.querySelector('button')&&(el.querySelector('button').textContent=`Importing… ${imported}/${toInsert.length}`);
+    const done=Math.min(i+CHUNK,toInsert.length);
+    if(el)el.innerHTML=`<div style="color:var(--text3);font-size:12px;padding:10px">⏳ Importing… ${done}/${toInsert.length} new lines (${errors} errors)</div>`;
   }
 
-  // Handle conflict decisions
+  // ── Step 4: Handle conflict decisions ──
   for(const[orderNum,decision] of Object.entries(decisions)){
     if(decision==='skip'){skipped++;continue;}
     if(decision==='keep'){continue;}
@@ -2051,6 +2307,9 @@ async function executeShopifyImport(){
         if(!erp){continue;}
         const{error}=await db.from('sales').update({
           fulfillment_status:csv.status,
+          financial_status:csv.financial||null,
+          cancelled_at:csv.cancelledAt?new Date(csv.cancelledAt).toISOString():erp.cancelled_at,
+          is_split_shipment:csv.isSplit||erp.is_split_shipment||false,
           qty:csv.qty,
           sale_date:csv.date,
           shipped_at:csv.fulfilledAt?new Date(csv.fulfilledAt).toISOString():erp.shipped_at,
@@ -2064,8 +2323,8 @@ async function executeShopifyImport(){
   S._shopifyImport=null;
   await refreshSales();
   render();
-  const msg=`✓ Shopify import done — ${imported} new, ${updated} updated, ${skipped} skipped${errors?', '+errors+' errors':''}`;
-  toast(msg);
+  const msg=`✓ Import done — ${imported} new, ${updated} updated, ${skipped} skipped${errors?', ⚠ '+errors+' errors (see console)':''}`;
+  toast(msg,3500);
   if(el)el.innerHTML=`<div style="color:var(--green);font-size:12px;padding:10px">${msg}</div>`;
 }
 
