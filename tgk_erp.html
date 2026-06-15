@@ -319,6 +319,20 @@ input:focus-visible,select:focus-visible,button:focus-visible{outline:2px solid 
 .wk-label{font-size:11px;font-weight:700}
 .toast{font-size:12.5px;border:1px solid var(--border2);box-shadow:0 6px 20px rgba(0,0,0,.1)}
 
+/* ═══ UTILITY CLASSES ═══ */
+.flex-row{display:flex;align-items:center;gap:8px}
+.flex-wrap{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.text-mono{font-family:var(--mono)}
+.text-sm{font-size:11px}
+.text-xs{font-size:10px}
+.text-muted{color:var(--text3)}
+.text-label{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--text3);font-weight:700}
+.ellipsis{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.w-full{width:100%}
+.sticky-top{position:sticky;top:0;z-index:5;background:var(--bg3)}
+.panel-body{padding:14px 16px}
+.gap-sm{gap:6px}
+.gap-lg{gap:16px}
 /* ═══ NUMERIC LEGIBILITY ═══ */
 .pn{font-weight:500;letter-spacing:.015em;font-size:12.5px}
 .money,.money-neutral,.money-cost,.money-vendor,.money-retail{font-size:12.5px;font-weight:500;letter-spacing:.01em}
@@ -1102,7 +1116,9 @@ function renderPurchases(){
     <div class="search-wrap"><span class="search-icon">⌕</span>
       <input placeholder="Vendor or part…" value="${sf.search||''}" oninput="setFilter('po','search',this.value)">
     </div>
-    ${['','On Order','In Transit','Received','Cancelled'].map(s=>`<button class="filter-chip ${sf.status===s&&s?'on-teal':''}" onclick="setFilter('po','status','${s}')">${s||'All'}</button>`).join('')}
+    ${['','On Order','In Transit','Ordered','Partial','Received','Cancelled'].map(s=>`<button class="filter-chip ${sf.status===s&&s?'on-teal':''}" onclick="setFilter('po','status','${s}')">${s||'All'}</button>`).join('')}
+    <button class="btn btn-sm" style="margin-left:auto" title="Remove duplicate POs (same vendor + date)" onclick="deduplicatePOs()">🧽 Dedupe POs</button>
+    <button class="btn btn-primary btn-sm" onclick="nav('pobuilder')">+ New PO</button>
   </div>
   <div class="tbl-wrap">
   <table><thead><tr><th>Date</th><th>Vendor</th><th>Part #</th><th>Description</th><th>Qty</th><th>Unit Cost</th><th>Extended</th><th>Status</th><th></th></tr></thead><tbody>
@@ -1208,6 +1224,17 @@ function renderSales(){
     </td>
   </tr>`;}).join('')}
   </tbody></table></div>`;
+}
+
+function saleMovements(pns){
+  const moves=S.corrections.filter(c=>pns.includes(c.pn)).slice(0,10);
+  if(!moves.length)return'<div class="section-empty">None</div>';
+  return moves.map(c=>`<div class="check-row">
+    <span class="text-xs text-mono text-muted" style="min-width:70px">${new Date(c.created_at).toLocaleDateString()}</span>
+    <span class="pn text-mono" style="min-width:110px">${c.pn}</span>
+    <span class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700;min-width:44px">${c.adjustment>0?'+':''}${c.adjustment}</span>
+    <span class="text-sm ellipsis" style="flex:1;color:var(--text2)">${c.reason||c.source}</span>
+  </div>`).join('');
 }
 
 function renderSaleDetail(s){
@@ -2000,7 +2027,7 @@ async function executeShopifyImport(){
   }
 
   S._shopifyImport=null;
-  await loadAll();
+  await refreshSales();
   render();
   const msg=`✓ Shopify import done — ${imported} new, ${updated} updated, ${skipped} skipped${errors?', '+errors+' errors':''}`;
   toast(msg);
@@ -2097,7 +2124,7 @@ async function ssManualSync(orderNum,tracking,carrier){
     }
   }
   if(!rows.length){toast('No lines updated — check order number');return;}
-  await loadAll();
+  await refreshSales();
   pushUndoMulti('Manual ship order '+orderNum,undoOps);
   toast('✓ Order '+orderNum+' marked Shipped · tracking: '+tracking);
   render();
@@ -3321,6 +3348,30 @@ async function createPOFromSuggestion(pn, vendor, qty, cost, desc) {
   await db.from('po_lines').insert({po_id:data.id,pn,description:desc,qty_ordered:qty,unit_cost:cost,qty_received:0,status:'Pending'});
   S.purchases=[data,...S.purchases];
   toast('PO created for '+pn);
+}
+
+async function deduplicatePOs(){
+  // Find POs with same vendor + order_date — keep lowest id, delete rest + their lines
+  const groups={};
+  S.purchases.forEach(p=>{
+    const k=(p.vendor||'')+'|'+(p.order_date||'');
+    (groups[k]=groups[k]||[]).push(p);
+  });
+  const dupes=Object.values(groups).filter(g=>g.length>1);
+  if(!dupes.length){toast('No duplicate POs found ✓');return;}
+  const count=dupes.reduce((t,g)=>t+g.length-1,0);
+  if(!confirm('Found '+count+' duplicate PO'+(count>1?'s':'')+' (same vendor + date). Delete them, keeping the oldest?'))return;
+  let deleted=0;
+  for(const group of dupes){
+    group.sort((a,b)=>a.id.localeCompare(b.id)); // keep first (oldest)
+    for(const po of group.slice(1)){
+      await db.from('po_lines').delete().eq('po_id',po.id);
+      await db.from('purchases').delete().eq('id',po.id);
+      S.purchases=S.purchases.filter(p=>p.id!==po.id);
+      deleted++;
+    }
+  }
+  toast(deleted+' duplicate PO'+(deleted>1?'s':'')+' removed');render();
 }
 
 async function createVendorPO(vendor){
