@@ -1293,13 +1293,19 @@ function renderSales(){
       if(!s.order_number){noNum.push(s);return;}
       (groups[s.order_number]=groups[s.order_number]||[]).push(s);
     });
-    const rank={'Shipped':5,'Delivered':4,'Packed':3,'On Hold':2,'Open':1,'Cancelled':0};
+    const rank={'Shipped':5,'Delivered':4,'Packed':3,'On Hold':2,'Partial':2,'Open':1,'Cancelled':0,'Refunded':0};
     return [
       ...Object.values(groups).map(lines=>{
         if(lines.length===1)return lines[0];
         const lead=lines.reduce((a,b)=>(rank[b.fulfillment_status||'Open']||0)>(rank[a.fulfillment_status||'Open']||0)?b:a,lines[0]);
         const totalQty=lines.reduce((t,s)=>t+(s.qty||1),0);
-        return{...lead,_grouped:true,_lineCount:lines.length,_allLines:lines,qty:totalQty,pn:'Multiple'};
+        // Partial shipment: some lines shipped/delivered, others still pending
+        const shippedLines=lines.filter(l=>l.fulfillment_status==='Shipped'||l.fulfillment_status==='Delivered');
+        const pendingLines=lines.filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
+        const isPartial=shippedLines.length>0&&pendingLines.length>0;
+        return{...lead,_grouped:true,_lineCount:lines.length,_allLines:lines,qty:totalQty,pn:'Multiple',
+          fulfillment_status:isPartial?'Partial':lead.fulfillment_status,
+          _isPartialShip:isPartial,_shippedCount:shippedLines.length,_pendingCount:pendingLines.length};
       }),
       ...noNum
     ].sort((a,b)=>new Date(b.sale_date||0)-new Date(a.sale_date||0));
@@ -1366,11 +1372,11 @@ function renderSales(){
     const multiTrack=s._grouped&&allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length>1;
     return `<tr class="rowlink" onclick="rowClick(event,function(){S.activeSale='${s.id}';pushHist();render()})">
     <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${s.sale_date?s.sale_date.slice(0,10):''}</td>
-    <td class="pn">${s.order_number||''}${s._grouped?` <span style="font-size:9px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 5px;border-radius:8px;font-family:var(--mono);font-weight:600">${s._lineCount} items</span>`:''}${split?` <span style="font-size:9px;background:var(--yellow-dim);color:var(--yellow);border:1px solid rgba(217,119,6,.25);border-radius:4px;padding:1px 5px;font-weight:700">🔀 Split</span>`:''}</td>
+    <td class="pn">${s.order_number||''}${s._grouped?` <span style="font-size:9px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 5px;border-radius:8px;font-family:var(--mono);font-weight:600">${s._lineCount} items</span>`:''}</td>
     <td class="pn" style="color:${s._grouped?'var(--text3)':'var(--teal)'}">${s._grouped?'Multiple SKUs':s.pn}</td>
     <td class="money-neutral" style="font-weight:700">${s._grouped?s.qty+' total':(s.qty||1)}</td>
     <td>${stock===null?'<span style="font-size:10px;color:var(--text3)">n/a</span>':`<span class="money" style="color:${canFill?'var(--green)':'var(--red)'};font-weight:700">${stock}</span>`}</td>
-    <td>${fsPill(fs)}${s.on_hold?` <span style="font-size:9px;color:var(--orange);font-weight:700">⏸ Hold</span>`:''}</td>
+    <td>${fsPill(s.fulfillment_status||'Open')}${s._isPartialShip?` <span style="font-size:9px;color:var(--yellow);font-weight:700">✂ ${s._shippedCount} of ${s._lineCount} shipped</span>`:''}${s.on_hold&&!s._isPartialShip?` <span style="font-size:9px;color:var(--orange);font-weight:700">⏸ Hold</span>`:''}</td>
     <td style="font-size:10px;font-family:var(--mono)">${multiTrack?`<span style="color:var(--yellow)" title="${allOrderLines.filter(x=>x.tracking_number).map(x=>(x.carrier?x.carrier+' ':'')+x.tracking_number).join('\n')}">🔀 ${allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length} shipments</span>`:repTracking?`<a href="${trackingUrl(repCarrier,repTracking)}" target="_blank" style="color:var(--teal);text-decoration:none" title="Track ${repCarrier} ${repTracking}">${repCarrier?repCarrier+' ':''}${repTracking} ↗</a>`:'<span style="color:var(--text3)">—</span>'}</td>
     <td style="display:flex;gap:4px">
       ${fs==='Open'?`<button class="btn btn-teal btn-sm" ${canFill?'':'disabled title="Insufficient stock"'} onclick="markPacked('${s.id}','${s.pn}',${s.qty||1})">Pack</button>`:''}
@@ -1409,11 +1415,16 @@ function renderSaleDetail(s){
     (rank[x.fulfillment_status||'Open']||0)>(rank[best]||0)?x.fulfillment_status:best,
     allLines[0].fulfillment_status||'Open');
 
-  // Split shipment: at least one line shipped AND at least one still open
+  // Split shipment: at least one line shipped AND at least one still open/pending
   const shippedLines=allLines.filter(x=>x.fulfillment_status==='Shipped'||x.fulfillment_status==='Delivered');
   const openLines=allLines.filter(x=>(x.fulfillment_status||'Open')==='Open');
+  const heldLines=allLines.filter(x=>x.fulfillment_status==='On Hold');
   const packedLines=allLines.filter(x=>x.fulfillment_status==='Packed');
-  const isSplit=shippedLines.length>0&&openLines.length>0;
+  const pendingLines=allLines.filter(x=>!['Shipped','Delivered','Cancelled','Refunded'].includes(x.fulfillment_status||'Open'));
+  const isSplit=shippedLines.length>0&&pendingLines.length>0;
+  const detailOrderFs=isSplit?'Partial':allLines.reduce((best,x)=>
+    (rank[x.fulfillment_status||'Open']||0)>(rank[best]||0)?x.fulfillment_status:best,
+    allLines[0].fulfillment_status||'Open');
 
   // Multiple distinct tracking numbers = split shipment
   const uniqueTrackings=[...new Set(allLines.filter(x=>x.tracking_number).map(x=>x.tracking_number))];
@@ -1442,19 +1453,19 @@ function renderSaleDetail(s){
     <div style="flex:1">
       <div style="font-size:15px;font-weight:700;color:var(--text)">
         Order ${s.order_number||'(no #)'}
-        ${fsPill(orderFs)}
+        ${fsPill(detailOrderFs)}
         ${isMulti?`<span style="font-size:10px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 7px;border-radius:8px;margin-left:6px;font-family:var(--mono)">${allLines.length} items</span>`:''}
-        ${isSplit?`<span style="font-size:10px;background:var(--yellow-dim);color:var(--yellow);border:1px solid rgba(217,119,6,.25);padding:1px 7px;border-radius:8px;margin-left:4px;font-weight:700">🔀 Split Shipment</span>`:''}
-        ${onHold?`<span style="font-size:10px;background:var(--orange-dim);color:var(--orange);border:1px solid rgba(234,88,12,.25);padding:1px 7px;border-radius:8px;margin-left:4px;font-weight:700">⏸ On Hold</span>`:''}
+        ${isSplit?`<span style="font-size:10px;background:var(--yellow-dim);color:var(--yellow);border:1px solid rgba(217,119,6,.25);padding:1px 7px;border-radius:8px;margin-left:4px;font-weight:700">✂ ${shippedLines.length} shipped · ${pendingLines.length} pending</span>`:''}
+        ${onHold&&!isSplit?`<span style="font-size:10px;background:var(--orange-dim);color:var(--orange);border:1px solid rgba(234,88,12,.25);padding:1px 7px;border-radius:8px;margin-left:4px;font-weight:700">⏸ On Hold</span>`:''}
       </div>
       <div style="font-size:11px;color:var(--text3)">${s.sale_date?s.sale_date.slice(0,10):''} · ${s.source||'—'}${financial?' · <span style="color:var(--text2)">'+financial+'</span>':''}</div>
     </div>
     ${openLines.length?`<button class="btn btn-teal" ${allCanPack?'':'disabled title="Insufficient stock on one or more items"'} onclick="packAllLines('${s.order_number||s.id}')">Pack All (${openLines.length})</button>`:''}
     ${packedLines.length?`<button class="btn btn-primary" onclick="openShipModal('${packedLines[0].id}','${packedLines[0].pn}',${packedLines[0].qty||1})">🚚 Ship</button>`:''}
     ${packedLines.length?`<button class="btn btn-sm" style="color:var(--orange)" onclick="unpackSaleOrder('${s.id}','${s.pn==='Multiple'?'':s.pn}',${s.qty||1})">↩ Unpack</button>`:''}
-    ${orderFs==='Shipped'?`<button class="btn btn-teal" onclick="markDelivered('${s.id}')">✓ Delivered</button>`:''}
-    ${orderFs==='Shipped'?`<button class="btn btn-sm" onclick="checkDelivery('${s.order_number||''}','${s.id}')">🔄 Check Delivery</button>`:''}
-    ${['Open','Packed','On Hold','Partial'].includes(orderFs)?`<button class="btn" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
+    ${detailOrderFs==='Shipped'?`<button class="btn btn-teal" onclick="markDelivered('${s.id}')">✓ Delivered</button>`:''}
+    ${detailOrderFs==='Shipped'?`<button class="btn btn-sm" onclick="checkDelivery('${s.order_number||''}','${s.id}')">🔄 Check Delivery</button>`:''}
+    ${['Open','Packed','On Hold','Partial'].includes(detailOrderFs)?`<button class="btn" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
   </div>
 
   ${(cancelledAt||financial==='refunded'||financial==='partially_refunded')?`
