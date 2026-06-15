@@ -496,6 +496,8 @@ const S = {
   activeSale:null,
   poCart:[], // [{pn,qty}]
   _shopifyImport:null,
+  countMode:'home', // home|spot|walk|sheet
+  walkItems:[], walkIdx:0,
   // Min/Max suggestions
   mmSuggest:null, mmLoading:false,
   // Edge function live status
@@ -4126,65 +4128,329 @@ async function loadCountLines(countId) {
 }
 
 function renderCycleCounts() {
+  // Active session → go straight to it
   if(S.activeCount){
     const count=S.cycleCounts.find(c=>c.id===S.activeCount);
     if(count) return renderCountDetail(count);
   }
-  const cats=[...new Set(S.parts.map(p=>p.category||'Uncategorized'))].sort();
+
+  const mode=S.countMode||'home';
+  if(mode==='spot') return renderSpotCount();
+  if(mode==='walk') return renderWalkCount();
+  if(mode==='sheet') return renderSheetModePicker();
+
+  // HOME screen
   const openCounts=S.cycleCounts.filter(c=>c.status==='Open');
   const doneCounts=S.cycleCounts.filter(c=>c.status==='Complete');
+  const cats=[...new Set(S.parts.filter(p=>!p.discontinued).map(p=>p.category||'Uncategorized').filter(Boolean))].sort();
+
   return `
-  <div class="grid-2">
-  <div>
-    <div class="panel">
-      <div class="panel-title"><span>Start New Count</span></div>
-      <div style="display:flex;flex-direction:column;gap:8px">
-        <button class="btn btn-primary" onclick="createCycleCount('everything')">Count EVERYTHING (${S.parts.filter(p=>!p.discontinued).length+S.assemblies.filter(a=>!a.discontinued).length} SKUs)</button>
-        <button class="btn btn-teal" onclick="createCycleCount('fg')">🏁 Finished Goods (${S.assemblies.filter(a=>!a.is_subassembly&&!a.discontinued).length})</button>
-        <button class="btn btn-teal" onclick="createCycleCount('sub')">🟠 Subassemblies (${S.assemblies.filter(a=>a.is_subassembly&&!a.discontinued).length})</button>
-        <button class="btn" onclick="createCycleCount('all')">Raw Parts Only (${S.parts.filter(p=>!p.discontinued).length})</button>
-        <div class="divider"></div>
-        <div style="font-size:11px;color:var(--text3);margin-bottom:4px">Count by Category:</div>
-        ${cats.map(c=>`<button class="btn btn-sm" onclick="createCycleCount('${c}')">${c} (${S.parts.filter(p=>(p.category||'Uncategorized')===c).length})</button>`).join('')}
-        <div class="divider"></div>
-        <div style="font-size:11px;font-weight:700;color:var(--text2);margin-bottom:6px">Count by Product + All Its BOM Components</div>
-        <div style="display:flex;gap:8px;align-items:center">
-          <div class="search-wrap" style="flex:1"><span class="search-icon">⌕</span><input id="bom-count-search" placeholder="Search finished good…" oninput="renderBOMCountSearch(this.value)" style="font-size:12px"></div>
-        </div>
-        <div id="bom-count-results" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
-      </div>
+  <!-- Three big mode cards -->
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:20px">
+    <div class="panel" style="padding:20px;cursor:pointer;border:2px solid var(--border);transition:border-color .15s;text-align:center" onclick="S.countMode='spot';render()" onmouseover="this.style.borderColor='var(--teal)'" onmouseout="this.style.borderColor='var(--border)'">
+      <div style="font-size:28px;margin-bottom:8px">⚡</div>
+      <div style="font-size:14px;font-weight:700;color:var(--text)">Spot Count</div>
+      <div style="font-size:11px;color:var(--text3);margin-top:4px">Count one item right now.<br>No setup needed.</div>
+    </div>
+    <div class="panel" style="padding:20px;cursor:pointer;border:2px solid var(--border);transition:border-color .15s;text-align:center" onclick="startWalkCount()" onmouseover="this.style.borderColor='var(--orange)'" onmouseout="this.style.borderColor='var(--border)'">
+      <div style="font-size:28px;margin-bottom:8px">🚶</div>
+      <div style="font-size:14px;font-weight:700;color:var(--text)">Walk Count</div>
+      <div style="font-size:11px;color:var(--text3);margin-top:4px">Go through items one by one.<br>Keyboard or scanner friendly.</div>
+    </div>
+    <div class="panel" style="padding:20px;cursor:pointer;border:2px solid var(--border);transition:border-color .15s;text-align:center" onclick="S.countMode='sheet';render()" onmouseover="this.style.borderColor='var(--blue)'" onmouseout="this.style.borderColor='var(--border)'">
+      <div style="font-size:28px;margin-bottom:8px">📋</div>
+      <div style="font-size:14px;font-weight:700;color:var(--text)">Sheet Count</div>
+      <div style="font-size:11px;color:var(--text3);margin-top:4px">Full planned count.<br>Print or work on screen.</div>
     </div>
   </div>
-  <div>
-    <div class="panel" style="padding:0">
-      <div class="section-header">Open Counts (${openCounts.length})</div>
-      ${openCounts.length===0?'<div class="section-empty">No open counts</div>':openCounts.map(c=>`
-      <div class="check-row">
-        <div style="flex:1">
-          <div style="font-size:12px;font-weight:500;color:var(--text)">${new Date(c.created_at).toLocaleDateString()} — ${({all:'Raw Parts',fg:'Finished Goods',sub:'Subassemblies',everything:'Everything'})[c.category_filter]||(c.category_filter?.startsWith('bom:')?'BOM: '+c.category_filter.slice(4):c.category_filter)}</div>
-        </div>
-        <span class="pill pill-orange">Open</span>
-        <button class="btn btn-teal btn-sm" style="margin-left:8px" onclick="openCount('${c.id}')">Continue →</button>
-        <button class="action-btn del" title="Delete this count" onclick="deleteCycleCount('${c.id}')">×</button>
-      </div>`).join('')}
-      <div class="section-header" style="margin-top:0;display:flex;justify-content:space-between;align-items:center">
-        <span>Completed (${doneCounts.length})</span>
-        ${doneCounts.length>3?`<button class="btn btn-sm" style="font-size:10px;margin-right:8px" onclick="deleteAllCompletedCounts()">🗑 Clear completed</button>`:''}
+
+  <!-- Open counts -->
+  ${openCounts.length?`
+  <div class="panel" style="padding:0;margin-bottom:14px">
+    <div class="section-header">In Progress (${openCounts.length})</div>
+    ${openCounts.map(c=>`
+    <div class="check-row rowlink" onclick="openCount('${c.id}')">
+      <div style="flex:1">
+        <div style="font-size:12px;font-weight:600;color:var(--text)">${({all:'Raw Parts',fg:'Finished Goods',sub:'Subassemblies',everything:'Everything'})[c.category_filter]||(c.category_filter?.startsWith('bom:')?'BOM: '+c.category_filter.slice(4):c.category_filter)}</div>
+        <div style="font-size:10px;color:var(--text3)">${new Date(c.created_at).toLocaleDateString()}</div>
       </div>
-      ${doneCounts.length===0?'<div class="section-empty">No completed counts</div>':doneCounts.map(c=>`
-      <div class="check-row">
-        <div style="flex:1">
-          <div style="font-size:12px;color:var(--text2)">${new Date(c.created_at).toLocaleDateString()} — ${({all:'Raw Parts',fg:'Finished Goods',sub:'Subassemblies',everything:'Everything'})[c.category_filter]||(c.category_filter?.startsWith('bom:')?'BOM: '+c.category_filter.slice(4):c.category_filter)}</div>
-          ${c.completed_at?`<div style="font-size:10px;color:var(--text3)">Completed ${new Date(c.completed_at).toLocaleDateString()}</div>`:''}
-        </div>
-        <span class="pill pill-teal">Done</span>
-        <button class="action-btn" style="margin-left:8px" onclick="openCount('${c.id}')">View</button>
-        <button class="action-btn del" title="Delete this count" onclick="deleteCycleCount('${c.id}')">×</button>
-      </div>`).join('')}
+      <button class="btn btn-teal btn-sm" onclick="event.stopPropagation();openCount('${c.id}')">Continue →</button>
+      <button class="action-btn del" onclick="event.stopPropagation();deleteCycleCount('${c.id}')">×</button>
+    </div>`).join('')}
+  </div>`:''}
+
+  <!-- Completed counts -->
+  ${doneCounts.length?`
+  <div class="panel" style="padding:0">
+    <div class="section-header" style="display:flex;justify-content:space-between;align-items:center">
+      <span>Completed (${doneCounts.length})</span>
+      ${doneCounts.length>3?`<button class="btn btn-sm" style="font-size:10px;margin-right:8px" onclick="deleteAllCompletedCounts()">🗑 Clear all</button>`:''}
     </div>
+    ${doneCounts.slice(0,8).map(c=>`
+    <div class="check-row rowlink" onclick="openCount('${c.id}')">
+      <div style="flex:1">
+        <div style="font-size:11px;color:var(--text2)">${({all:'Raw Parts',fg:'Finished Goods',sub:'Subassemblies',everything:'Everything'})[c.category_filter]||(c.category_filter?.startsWith('bom:')?'BOM: '+c.category_filter.slice(4):c.category_filter)}</div>
+        <div style="font-size:10px;color:var(--text3)">${new Date(c.created_at).toLocaleDateString()}${c.completed_at?' · completed '+new Date(c.completed_at).toLocaleDateString():''}</div>
+      </div>
+      <span class="pill pill-teal">Done</span>
+      <button class="action-btn" onclick="event.stopPropagation();openCount('${c.id}')">View</button>
+      <button class="action-btn del" onclick="event.stopPropagation();deleteCycleCount('${c.id}')">×</button>
+    </div>`).join('')}
+  </div>`:''}`;
+}
+
+// Sheet mode picker
+function renderSheetModePicker(){
+  const cats=[...new Set(S.parts.filter(p=>!p.discontinued).map(p=>p.category||'Uncategorized').filter(Boolean))].sort();
+  return `
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+    <button class="btn btn-sm" onclick="S.countMode='home';render()">← Back</button>
+    <div style="font-size:14px;font-weight:700">📋 Sheet Count — Choose Scope</div>
   </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:600px">
+    <button class="btn btn-primary" onclick="createCycleCount('everything')">Count Everything (${S.parts.filter(p=>!p.discontinued).length+S.assemblies.filter(a=>!a.discontinued).length} SKUs)</button>
+    <button class="btn btn-teal" onclick="createCycleCount('fg')">🏁 Finished Goods (${S.assemblies.filter(a=>!a.is_subassembly&&!a.discontinued).length})</button>
+    <button class="btn btn-teal" onclick="createCycleCount('sub')">🟠 Subassemblies (${S.assemblies.filter(a=>a.is_subassembly&&!a.discontinued).length})</button>
+    <button class="btn" onclick="createCycleCount('all')">Raw Parts Only (${S.parts.filter(p=>!p.discontinued).length})</button>
+    <button class="btn" style="border-color:var(--purple);color:var(--purple)" onclick="createCycleCount('hwp')">🟣 Hardware Packs (${S.assemblies.filter(a=>isHWPack(a.pn)&&!a.discontinued).length})</button>
+  </div>
+  <div class="divider"></div>
+  <div style="font-size:11px;font-weight:700;color:var(--text2);margin-bottom:8px">Count by Product + All Its BOM Components</div>
+  <div style="display:flex;gap:8px;align-items:center;max-width:400px">
+    <div class="search-wrap" style="flex:1"><span class="search-icon">⌕</span><input id="bom-count-search" placeholder="Search finished good…" oninput="renderBOMCountSearch(this.value)" style="font-size:12px"></div>
+  </div>
+  <div id="bom-count-results" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
+  <div class="divider"></div>
+  <div style="font-size:11px;font-weight:700;color:var(--text2);margin-bottom:8px">Count by Part Category</div>
+  <div style="display:flex;flex-wrap:wrap;gap:6px">
+    ${cats.map(c=>`<button class="btn btn-sm" onclick="createCycleCount('${c}')">${c} (${S.parts.filter(p=>(p.category||'Uncategorized')===c&&!p.discontinued).length})</button>`).join('')}
   </div>`;
 }
+
+// ── SPOT COUNT: type SKU + qty, instant save ──
+function renderSpotCount(){
+  return `
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
+    <button class="btn btn-sm" onclick="S.countMode='home';render()">← Back</button>
+    <div style="font-size:14px;font-weight:700">⚡ Spot Count</div>
+    <div style="font-size:11px;color:var(--text3)">Count any single item instantly — no session needed</div>
+  </div>
+  <div class="panel" style="max-width:480px;padding:20px">
+    <div class="form-group" style="margin-bottom:14px">
+      <label class="form-label">Part / SKU #</label>
+      <input id="spot-pn" class="form-input" placeholder="Type or scan part number…" oninput="spotCountLookup(this.value)" autocomplete="off" style="font-family:var(--mono);font-size:14px">
+      <div id="spot-pn-match" style="font-size:11px;color:var(--text3);margin-top:4px;min-height:16px"></div>
+    </div>
+    <div class="form-group" style="margin-bottom:14px">
+      <label class="form-label">System Qty (expected)</label>
+      <div id="spot-expected" class="form-input" style="background:var(--bg3);color:var(--text3);cursor:default">—</div>
+    </div>
+    <div class="form-group" style="margin-bottom:14px">
+      <label class="form-label">Counted Qty</label>
+      <input id="spot-qty" class="form-input" type="number" min="0" placeholder="Enter actual count" style="font-size:20px;font-family:var(--mono);font-weight:700" onkeydown="if(event.key==='Enter')applySpotCount()">
+    </div>
+    <div class="form-group" style="margin-bottom:16px">
+      <label class="form-label">Reason (optional)</label>
+      <input id="spot-reason" class="form-input" placeholder="Physical count, damaged, found stock…">
+      <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
+        ${['Physical count','Damaged','Found stock','Data fix'].map(r=>`<button type="button" class="filter-chip" onclick="document.getElementById('spot-reason').value='${r}'">${r}</button>`).join('')}
+      </div>
+    </div>
+    <button class="btn btn-primary w-full" style="padding:12px" onclick="applySpotCount()">✓ Apply Correction (Enter)</button>
+  </div>
+  <div id="spot-history" style="max-width:480px;margin-top:14px"></div>`;
+}
+
+function spotCountLookup(val){
+  const pn=val.trim();
+  const matchEl=document.getElementById('spot-pn-match');
+  const expEl=document.getElementById('spot-expected');
+  if(!pn){matchEl.textContent='';expEl.textContent='—';return;}
+  // Try parts first, then assemblies
+  const p=S.parts.find(x=>x.pn.toLowerCase()===pn.toLowerCase());
+  const a=S.assemblies.find(x=>x.pn.toLowerCase()===pn.toLowerCase());
+  if(p){matchEl.textContent='✓ '+p.description;matchEl.style.color='var(--teal)';expEl.textContent=p.total_unpckgd||0;}
+  else if(a){matchEl.textContent='✓ '+a.description+' (assembly)';matchEl.style.color='var(--teal)';expEl.textContent=a.total_on_hand||0;}
+  else{matchEl.textContent='Not found — will be skipped';matchEl.style.color='var(--text3)';expEl.textContent='—';}
+}
+
+async function applySpotCount(){
+  const pn=document.getElementById('spot-pn').value.trim();
+  const qtyInput=document.getElementById('spot-qty').value;
+  const reason=document.getElementById('spot-reason').value.trim()||'Spot Count';
+  if(!pn){toast('Enter a part number');document.getElementById('spot-pn').focus();return;}
+  if(qtyInput===''){toast('Enter the counted quantity');document.getElementById('spot-qty').focus();return;}
+  const newQty=parseFloat(qtyInput);
+  const p=S.parts.find(x=>x.pn.toLowerCase()===pn.toLowerCase());
+  const a=S.assemblies.find(x=>x.pn.toLowerCase()===pn.toLowerCase());
+  if(!p&&!a){toast('Part/SKU not found: '+pn);return;}
+  if(p){
+    const prev=p.total_unpckgd||0;
+    const adj=newQty-prev;
+    await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
+    S.parts=S.parts.map(x=>x.pn===p.pn?{...x,total_unpckgd:newQty}:x);
+    await db.from('inv_corrections').insert({pn:p.pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason,source:'spot_count'});
+    S.corrections=[{pn:p.pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason,source:'spot_count',created_at:new Date().toISOString()},...S.corrections];
+    const histEl=document.getElementById('spot-history');
+    if(histEl){histEl.innerHTML=`<div class="panel" style="padding:10px 14px;border-left:3px solid ${adj===0?'var(--teal)':adj>0?'var(--green)':'var(--red)'}"><div style="font-size:12px;font-weight:600">${p.pn} — ${adj===0?'No change':adj>0?'+'+adj+' added':adj+' removed'}</div><div style="font-size:11px;color:var(--text3)">${prev} → ${newQty} · ${reason}</div></div>`;}
+    toast(p.pn+': '+prev+' → '+newQty+(adj===0?' (no change)':(adj>0?' (+'+adj+')':' ('+adj+')')));
+  } else {
+    const prev=a.total_on_hand||0;
+    const adj=newQty-prev;
+    await db.from('assemblies').update({total_on_hand:newQty}).eq('id',a.id);
+    S.assemblies=S.assemblies.map(x=>x.pn===a.pn?{...x,total_on_hand:newQty}:x);
+    await db.from('inv_corrections').insert({pn:a.pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason:reason+' (assembly)',source:'spot_count'});
+    toast(a.pn+': '+prev+' → '+newQty);
+  }
+  // Clear for next item
+  document.getElementById('spot-pn').value='';
+  document.getElementById('spot-qty').value='';
+  document.getElementById('spot-pn-match').textContent='';
+  document.getElementById('spot-expected').textContent='—';
+  document.getElementById('spot-pn').focus();
+}
+
+// ── WALK COUNT: one item at a time, keyboard driven ──
+function startWalkCount(){
+  // Build list of all active items sorted by location/pn
+  const items=[
+    ...S.assemblies.filter(a=>!a.discontinued).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly',loc:a.location||''})),
+    ...S.parts.filter(p=>!p.discontinued).map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part',loc:p.location||''}))
+  ].sort((a,b)=>(a.loc||'zzz').localeCompare(b.loc||'zzz')||a.pn.localeCompare(b.pn));
+  S.walkItems=items.map(i=>({...i,counted:null,skip:false}));
+  S.walkIdx=0;
+  S.countMode='walk';
+  render();
+  setTimeout(()=>document.getElementById('walk-qty')?.focus(),100);
+}
+
+function renderWalkCount(){
+  const items=S.walkItems;
+  if(!items.length){S.countMode='home';render();return'';}
+  const idx=S.walkIdx;
+  const current=items[idx];
+  const countedItems=items.filter(i=>i.counted!==null);
+  const variances=countedItems.filter(i=>i.counted!==i.exp);
+  const pct=Math.round(idx/items.length*100);
+
+  return `
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap">
+    <button class="btn btn-sm" onclick="if(confirm('Exit walk count? Progress is saved in your browser.'))S.countMode='home';render()">✕ Exit</button>
+    <div style="flex:1">
+      <div style="font-size:13px;font-weight:700">🚶 Walk Count — ${idx} of ${items.length}</div>
+      <div style="height:6px;background:var(--bg4);border-radius:3px;margin-top:4px;overflow:hidden">
+        <div style="width:${pct}%;height:100%;background:var(--teal);border-radius:3px;transition:width .3s"></div>
+      </div>
+    </div>
+    <div style="text-align:right;font-size:11px;color:var(--text3)">${countedItems.length} counted · ${variances.length} variances</div>
+    ${countedItems.length?`<button class="btn btn-primary btn-sm" onclick="applyWalkCount()">✓ Apply ${variances.length} corrections</button>`:''}
+  </div>
+
+  <!-- Current item -->
+  <div class="panel" style="max-width:520px;padding:20px;border:2px solid var(--teal)">
+    <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.1em;margin-bottom:4px">${current?.type==='assembly'?'Assembly':'Part'} ${current?.loc?'· Bin: '+current.loc:''}</div>
+    <div style="font-size:20px;font-weight:800;font-family:var(--mono);color:var(--teal);margin-bottom:4px">${current?.pn||'Done'}</div>
+    <div style="font-size:13px;color:var(--text2);margin-bottom:16px">${current?.desc||''}</div>
+    <div style="display:flex;gap:12px;align-items:flex-end;margin-bottom:16px">
+      <div style="flex:1">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">System qty</div>
+        <div style="font-size:28px;font-weight:700;font-family:var(--mono);color:var(--text3)">${current?.exp??'—'}</div>
+      </div>
+      <div style="font-size:24px;color:var(--border2)">→</div>
+      <div style="flex:1">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">Counted qty</div>
+        <input id="walk-qty" class="form-input" type="number" min="0" placeholder="Count…"
+          value="${current?.counted??''}"
+          style="font-size:28px;font-family:var(--mono);font-weight:700;padding:8px;text-align:center;width:100%;color:var(--text)"
+          onkeydown="walkKeyHandler(event)">
+      </div>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-sm" onclick="walkNav(-1)" ${idx===0?'disabled':''}>← Prev</button>
+      <button class="btn btn-sm" onclick="walkSkip()" style="color:var(--text3)">Skip</button>
+      <button class="btn btn-primary" style="flex:1" onclick="walkNext()">Next → <span style="font-size:10px;opacity:.7">(Enter)</span></button>
+    </div>
+  </div>
+
+  <!-- Recent counts -->
+  ${countedItems.length?`
+  <div style="margin-top:14px;max-width:520px">
+    <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Recently counted</div>
+    ${[...countedItems].reverse().slice(0,4).map(i=>`
+    <div class="check-row" style="padding:6px 10px">
+      <span class="pn text-mono" style="min-width:120px">${i.pn}</span>
+      <span style="font-size:11px;color:var(--text3)">expected ${i.exp}</span>
+      <span style="flex:1"></span>
+      <span class="money" style="color:${i.counted===i.exp?'var(--teal)':i.counted>i.exp?'var(--green)':'var(--red)'};font-weight:700">${i.counted} ${i.counted!==i.exp?'('+(i.counted-i.exp>0?'+':'')+(i.counted-i.exp)+')':''}</span>
+    </div>`).join('')}
+  </div>`:''}`;
+}
+
+function walkKeyHandler(e){
+  if(e.key==='Enter'){e.preventDefault();walkNext();}
+  if(e.key==='ArrowRight'){e.preventDefault();walkNext();}
+  if(e.key==='ArrowLeft'){e.preventDefault();walkNav(-1);}
+  if(e.key==='Escape'){e.preventDefault();walkSkip();}
+}
+
+function walkNext(){
+  const qtyEl=document.getElementById('walk-qty');
+  const val=qtyEl?.value;
+  if(val!==''&&val!==null&&val!==undefined){
+    S.walkItems[S.walkIdx].counted=parseFloat(val);
+  }
+  if(S.walkIdx<S.walkItems.length-1){S.walkIdx++;render();}
+  else{
+    // End of list
+    const variances=S.walkItems.filter(i=>i.counted!==null&&i.counted!==i.exp).length;
+    if(confirm('End of list! Apply '+variances+' corrections now?')){applyWalkCount();}
+  }
+  setTimeout(()=>document.getElementById('walk-qty')?.focus(),50);
+}
+
+function walkNav(dir){
+  const qtyEl=document.getElementById('walk-qty');
+  if(qtyEl?.value!=='')S.walkItems[S.walkIdx].counted=parseFloat(qtyEl.value);
+  S.walkIdx=Math.max(0,Math.min(S.walkItems.length-1,S.walkIdx+dir));
+  render();
+  setTimeout(()=>document.getElementById('walk-qty')?.focus(),50);
+}
+
+function walkSkip(){
+  S.walkItems[S.walkIdx].skip=true;
+  S.walkItems[S.walkIdx].counted=null;
+  if(S.walkIdx<S.walkItems.length-1){S.walkIdx++;render();}
+  setTimeout(()=>document.getElementById('walk-qty')?.focus(),50);
+}
+
+async function applyWalkCount(){
+  const toApply=S.walkItems.filter(i=>i.counted!==null&&i.counted!==i.exp);
+  if(!toApply.length){toast('No variances to apply');return;}
+  let applied=0,errors=0;
+  for(const item of toApply){
+    if(item.type==='assembly'){
+      const a=S.assemblies.find(x=>x.pn===item.pn);
+      if(!a){errors++;continue;}
+      const{error}=await db.from('assemblies').update({total_on_hand:item.counted}).eq('id',a.id);
+      if(error){errors++;continue;}
+      S.assemblies=S.assemblies.map(x=>x.pn===item.pn?{...x,total_on_hand:item.counted}:x);
+      await db.from('inv_corrections').insert({pn:item.pn,previous_qty:item.exp,new_qty:item.counted,adjustment:item.counted-item.exp,reason:'Walk Count',source:'walk_count'});
+    } else {
+      const p=S.parts.find(x=>x.pn===item.pn);
+      if(!p){errors++;continue;}
+      const{error}=await db.from('parts').update({total_unpckgd:item.counted,updated_at:new Date().toISOString()}).eq('id',p.id);
+      if(error){errors++;continue;}
+      S.parts=S.parts.map(x=>x.pn===item.pn?{...x,total_unpckgd:item.counted}:x);
+      await db.from('inv_corrections').insert({pn:item.pn,previous_qty:item.exp,new_qty:item.counted,adjustment:item.counted-item.exp,reason:'Walk Count',source:'walk_count'});
+      applied++;
+    }
+    applied++;
+  }
+  S.walkItems=[]; S.walkIdx=0; S.countMode='home';
+  toast(applied+' corrections applied'+(errors?' ('+errors+' errors)':''));
+  render();
+}
+
 
 function printCycleCount(countId){
   const count=S.cycleCounts.find(c=>c.id===countId);
