@@ -1959,59 +1959,68 @@ supabase link --project-ref piamamighqiielfztgic</pre>
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto;max-height:280px">import { createClient } from 'npm:@supabase/supabase-js@2'
 const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
 
+function stripProtocol(s: string): string {
+  return s.replace('https://', '').replace('http://', '')
+}
+
 Deno.serve(async (req) => {
-  if (req.method === 'GET') return new Response(JSON.stringify({pong:true}), {headers:{'Content-Type':'application/json'}})
+  if (req.method === 'GET') {
+    return new Response(JSON.stringify({pong:true}), {headers:{'Content-Type':'application/json'}})
+  }
 
-  const body = await req.json().catch(() => ({}))
+  const body = await req.json().catch(() => ({})) as any
 
-  // ── SYNC ACTION: browser calls this to pull recent orders (bypasses Shopify CORS) ──
+  // Handle sync action - proxies Shopify API to avoid browser CORS restriction
   if (body.action === 'sync') {
-    const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace(/^https?:\/\//, '')
-    const key   = body.key  || Deno.env.get('SHOPIFY_KEY')   || ''
-    if (!store || !key) return new Response(JSON.stringify({error:'Missing Shopify credentials'}), {status:400, headers:{'Content-Type':'application/json'}})
-
+    const store = stripProtocol(body.store || Deno.env.get('SHOPIFY_STORE') || '')
+    const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
+    if (!store || !key) {
+      return new Response(JSON.stringify({error:'Missing credentials'}), {status:400, headers:{'Content-Type':'application/json'}})
+    }
     const since = body.since || new Date(Date.now() - 30*24*60*60*1000).toISOString()
-    const page  = body.page  || 1
-    const url   = 'https://' + store + '/admin/api/2024-01/orders.json?status=any&limit=250&updated_at_min=' + since + '&page=' + page
-
-    const ssRes = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
-    if (!ssRes.ok) return new Response(JSON.stringify({error:'Shopify '+ssRes.status}), {status:ssRes.status, headers:{'Content-Type':'application/json'}})
-    const data = await ssRes.json()
+    const page = body.page || 1
+    const url = 'https://' + store + '/admin/api/2024-01/orders.json?status=any&limit=250&updated_at_min=' + since + '&page=' + page
+    const shopRes = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
+    if (!shopRes.ok) {
+      return new Response(JSON.stringify({error:'Shopify error ' + shopRes.status}), {status:shopRes.status, headers:{'Content-Type':'application/json'}})
+    }
+    const data = await shopRes.json()
     return new Response(JSON.stringify(data), {headers:{'Content-Type':'application/json'}})
   }
 
-  // ── WEBHOOK: orders/create, orders/cancelled, orders/updated ──
+  // Handle Shopify webhooks
   const topic = req.headers.get('x-shopify-topic') || ''
   const order = body
-
-  const finStatus = (order.financial_status||'').toLowerCase()
+  const fin = (order.financial_status || '').toLowerCase()
   const fs = order.cancel_reason ? 'Cancelled'
-    : finStatus === 'refunded' || finStatus === 'voided' ? 'Refunded'
-    : finStatus === 'partially_refunded' ? 'Refunded'
+    : (fin === 'refunded' || fin === 'voided') ? 'Refunded'
+    : fin === 'partially_refunded' ? 'Refunded'
     : 'Open'
 
   if (topic === 'orders/create') {
-    for (const li of order.line_items ?? []) {
+    for (const li of order.line_items || []) {
       await db.from('sales').insert({
-        order_number: order.name, pn: li.sku || li.title,
-        qty: li.quantity, source: 'Shopify', fulfillment_status: 'Open',
+        order_number: order.name,
+        pn: li.sku || li.title,
+        qty: li.quantity,
+        source: 'Shopify',
+        fulfillment_status: 'Open',
         financial_status: order.financial_status || 'pending',
-        sale_date: (order.created_at ?? new Date().toISOString()).slice(0,10)
-      }).onConflict('order_number,pn').merge({ qty: li.quantity })
+        sale_date: (order.created_at || new Date().toISOString()).slice(0,10)
+      })
     }
   } else if (topic === 'orders/cancelled') {
     await db.from('sales')
-      .update({ fulfillment_status: 'Cancelled', cancelled_at: order.cancelled_at,
-                cancel_reason: order.cancel_reason, financial_status: order.financial_status })
+      .update({fulfillment_status: 'Cancelled', cancelled_at: order.cancelled_at})
       .eq('order_number', order.name)
   } else if (topic === 'orders/updated') {
-    if (finStatus === 'refunded' || finStatus === 'voided' || finStatus === 'partially_refunded') {
-      const refundAmt = order.refunds?.reduce((t,r) => t + parseFloat(r.transactions?.[0]?.amount||0), 0) || 0
+    if (fin === 'refunded' || fin === 'voided' || fin === 'partially_refunded') {
       await db.from('sales')
-        .update({ fulfillment_status: 'Refunded', financial_status: finStatus, refund_amount: refundAmt })
+        .update({fulfillment_status: 'Refunded', financial_status: fin})
         .eq('order_number', order.name)
     }
   }
+
   return new Response('ok')
 })</pre>
 
