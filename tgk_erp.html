@@ -585,6 +585,24 @@ function poPill(s){
   const m={'On Order':'pill-orange','In Transit':'pill-yellow','Received':'pill-teal','Cancelled':'pill-red'};
   return `<span class="pill ${m[s]||'pill-muted'}">${s}</span>`;
 }
+// Single source of truth for PO extended cost.
+// Legacy stub format: ONE po_line where unit_cost = total PO cost (not per-unit).
+// Detected by "X items" or "X-line PO" in EITHER po_line description OR header description.
+const _stubRe=/^\d+[\s-]+(items?|line[\s-]*PO)$/i;
+function poExtended(p){
+  const ls=S.poLines[p.id]||[];
+  const hd=(p.description||'').trim();
+  if(ls.length===1){
+    const d=(ls[0].description||'').trim();
+    if(_stubRe.test(d)||_stubRe.test(hd))return ls[0].unit_cost||0;
+    return(ls[0].qty_ordered||0)*(ls[0].unit_cost||0);
+  }
+  if(ls.length>1)return ls.reduce((t,l)=>t+(l.qty_ordered||0)*(l.unit_cost||0),0);
+  // No po_lines — fall back to header
+  if(p.pn==='Multiple'||(p.pn||'').includes(' more'))return p.unit_cost||0;
+  if(_stubRe.test(hd))return p.unit_cost||0;
+  return(p.unit_cost||0)*(p.qty||0);
+}
 // Global fulfillment-status pill map — used by renderSales & renderSaleDetail
 const FS_MAP={
   'Open':'pill-red',
@@ -639,7 +657,12 @@ async function loadAll(){
     ]);
     if(parts.error)throw parts.error;
     S.parts=parts.data||[];
-    S.assemblies=assemblies.data||[];
+    // Normalize is_subassembly based on PN pattern rule:
+    // Subassemblies = XX-XXXX numeric pattern (e.g. 01-0001). HW Packs and TGK-xxx are NEVER subassemblies.
+    S.assemblies=(assemblies.data||[]).map(a=>{
+      const shouldBeSub=/^\d{2}-\d{4}/.test(a.pn||'')&&!isHWPack(a.pn);
+      return{...a,is_subassembly:shouldBeSub,_classificationMismatch:a.is_subassembly!==shouldBeSub};
+    });
     S.sales=sales.data||[];
     S.purchases=purchases.data||[];
     S.dealers=dealers.data||[];
@@ -676,8 +699,9 @@ function setupRealtime(){
       updateBadge();if(['parts','inventory','dashboard'].includes(S.view))scheduleRender();
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'assemblies'},p=>{
-      if(p.eventType==='INSERT')S.assemblies=[...S.assemblies,p.new].sort((a,b)=>a.pn.localeCompare(b.pn));
-      else if(p.eventType==='UPDATE')S.assemblies=S.assemblies.map(x=>x.id===p.new.id?p.new:x);
+      const norm=a=>({...a,is_subassembly:/^\d{2}-\d{4}/.test(a.pn||'')&&!isHWPack(a.pn)});
+      if(p.eventType==='INSERT')S.assemblies=[...S.assemblies,norm(p.new)].sort((a,b)=>a.pn.localeCompare(b.pn));
+      else if(p.eventType==='UPDATE')S.assemblies=S.assemblies.map(x=>x.id===p.new.id?norm(p.new):x);
       else if(p.eventType==='DELETE')S.assemblies=S.assemblies.filter(x=>x.id!==p.old.id);
       if(['assemblies','dashboard'].includes(S.view))scheduleRender();
     })
@@ -812,13 +836,7 @@ function renderDashboard(){
   const openCounts=S.cycleCounts.filter(c=>c.status==='Open').length;
   const weekOrds=S.sales.filter(s=>s.sale_date>=daysAgo(7)).length;
   const openPOs=S.purchases.filter(p=>p.status!=='Received');
-  const openPOAmt=openPOs.reduce((s,p)=>{
-    const ls=S.poLines[p.id]||[];
-    if(ls.length)return s+ls.reduce((t,l)=>t+(l.qty_ordered||0)*(l.unit_cost||0),0);
-    // Legacy header-only: if pn='Multiple', unit_cost is the total extended, not per-unit
-    if(p.pn==='Multiple'||(p.pn||'').includes(' more'))return s+(p.unit_cost||0);
-    return s+(p.unit_cost||0)*(p.qty||0);
-  },0);
+  const openPOAmt=openPOs.reduce((s,p)=>s+poExtended(p),0);
   const feed=buildActivityFeed(12);
   return `
   <div class="kpi-grid kpi-grid-4">
@@ -883,7 +901,7 @@ function renderDashboard(){
       ${openPOs.slice(0,6).map(p=>`<tr style="cursor:pointer" onclick="openPODetail('${p.id}');nav('purchases')">
         <td class="main-col">${p.vendor}</td>
         <td class="pn">${p.pn}</td>
-        <td class="money-cost">${fc((p.unit_cost||0)*(p.qty||0))}</td>
+        <td class="money-cost">${fc(poExtended(p))}</td>
         <td>${poPill(p.status)}</td>
       </tr>`).join('')||'<tr><td colspan="4" class="section-empty">No open POs</td></tr>'}
       </tbody></table></div>
@@ -966,6 +984,7 @@ function renderAssemblies(){
     <button class="filter-chip ${sf.kind==='sub'?'on-teal':''}" onclick="setFilter('asm','kind',${sf.kind==='sub'?"''":"'sub'"})">Subassemblies (${S.assemblies.filter(a=>a.is_subassembly&&!a.discontinued).length})</button>
     <button class="filter-chip ${sf.showDisc?'on-teal':''}" onclick="setFilter('asm','showDisc',${sf.showDisc?'false':'true'})">🗄 Discontinued (${S.assemblies.filter(a=>a.discontinued).length})</button>
     <span class="filter-count">${list.length} assemblies</span>
+    ${S.assemblies.some(a=>a._classificationMismatch)?`<button class="btn btn-sm" style="color:var(--orange);border-color:var(--orange)" onclick="fixAssemblyClassification()" title="Some items have wrong subassembly flag in DB — click to fix">⚠ Fix Classification</button>`:''}
   </div>
   <div class="tbl-wrap">
   <table><thead><tr><th>SKU</th><th>Description</th><th>Category</th><th>MSRP</th><th>Tier 1</th><th>On Hand</th><th>Avg / Wk</th><th>Status</th><th></th></tr></thead><tbody>
@@ -1135,12 +1154,20 @@ function renderPurchases(){
       if(p.pn==='Multiple'||(p.pn||'').includes(' +')&&(p.pn||'').includes(' more')){
         return{pn:'Multiple',desc:p.description||'',qty:p.qty||0,unitCostHtml:'—',extended:p.unit_cost||0,tooltip:''};
       }
-      return{pn:p.pn,desc:p.description||'',qty:p.qty||0,unitCostHtml:fc(p.unit_cost||0,4),extended:(p.unit_cost||0)*(p.qty||0),tooltip:''};
+      return{pn:p.pn,desc:p.description||'',qty:p.qty||0,unitCostHtml:fc(p.unit_cost||0,4),extended:poExtended(p),tooltip:''};
     }
     const ext=lines.reduce((s,l)=>s+(l.qty_ordered||0)*(l.unit_cost||0),0);
     const totalQty=lines.reduce((s,l)=>s+(l.qty_ordered||0),0);
     if(lines.length===1){
-      return{pn:lines[0].pn,desc:lines[0].description||p.description||'',qty:totalQty,unitCostHtml:fc(lines[0].unit_cost||0,4),extended:ext,tooltip:''};
+      const desc0=(lines[0].description||'').trim();
+      const headerDesc=(p.description||'').trim();
+      // Stub line: "4 items", "18 items", "4-line PO" etc. in EITHER the line OR header description.
+      // These legacy POs store unit_cost = total PO cost (not per-unit). Don't multiply by qty.
+      const isStubLine=_stubRe.test(desc0)||_stubRe.test(headerDesc);
+      if(isStubLine){
+        return{pn:'Multiple',desc:desc0||headerDesc,qty:totalQty,unitCostHtml:'—',extended:lines[0].unit_cost||0,tooltip:''};
+      }
+      return{pn:lines[0].pn,desc:desc0||headerDesc||'',qty:totalQty,unitCostHtml:fc(lines[0].unit_cost||0,4),extended:(lines[0].qty_ordered||0)*(lines[0].unit_cost||0),tooltip:''};
     }
     const tip=lines.map(l=>`${l.pn} ×${l.qty_ordered} @ ${fc(l.unit_cost||0,4)}`).join('\n');
     return{pn:'Multiple',desc:lines.length+' items',qty:totalQty,unitCostHtml:'—',extended:ext,tooltip:tip};
@@ -1157,19 +1184,27 @@ function renderPurchases(){
   }
   if(sf.status)list=list.filter(p=>p.status===sf.status);
 
-  // On-Order KPI: sum from lines where available
-  const poExtended=p=>{
-    const ls=S.poLines[p.id]||[];
-    if(ls.length)return ls.reduce((t,l)=>t+(l.qty_ordered||0)*(l.unit_cost||0),0);
-    if(p.pn==='Multiple'||(p.pn||'').includes(' more'))return p.unit_cost||0;
-    return(p.unit_cost||0)*(p.qty||0);
-  };
-  const onOrderAmt=S.purchases.filter(p=>p.status==='On Order').reduce((s,p)=>s+poExtended(p),0);
+  // KPIs reflect the current filtered list
+  const filteredValue=list.reduce((s,p)=>s+poExtended(p),0);
+  const filteredVendors=new Set(list.map(p=>p.vendor)).size;
+  const filterLabel=sf.status||'All';
   return `
-  <div class="kpi-grid kpi-grid-3">
-    <div class="kpi"><div class="kpi-label">Total POs</div><div class="kpi-value">${S.purchases.length}</div></div>
-    <div class="kpi kpi-orange"><div class="kpi-label">On Order</div><div class="kpi-value" style="font-size:17px">${fc(onOrderAmt)}</div></div>
-    <div class="kpi kpi-yellow"><div class="kpi-label">In Transit</div><div class="kpi-value">${S.purchases.filter(p=>p.status==='In Transit').length}</div></div>
+  <div class="kpi-grid kpi-grid-3" style="margin-bottom:14px">
+    <div class="kpi" style="cursor:pointer" onclick="setFilter('po','status','')">
+      <div class="kpi-label">${filterLabel==='All'?'Total POs':filterLabel+' POs'}</div>
+      <div class="kpi-value">${list.length}</div>
+      <div class="kpi-sub">${S.purchases.length} total all time</div>
+    </div>
+    <div class="kpi kpi-orange">
+      <div class="kpi-label">${filterLabel==='All'?'Open Value':filterLabel+' Value'}</div>
+      <div class="kpi-value" style="font-size:17px">${fc(filteredValue)}</div>
+      <div class="kpi-sub">${list.length===S.purchases.length?'':'filtered from '+S.purchases.length+' total'}</div>
+    </div>
+    <div class="kpi kpi-teal">
+      <div class="kpi-label">Vendors</div>
+      <div class="kpi-value">${filteredVendors}</div>
+      <div class="kpi-sub">${filterLabel==='All'?'with open orders':'in this view'}</div>
+    </div>
   </div>
   <div class="filter-bar">
     <div class="search-wrap"><span class="search-icon">⌕</span>
@@ -1436,8 +1471,9 @@ function renderSaleDetail(s){
       <td style="white-space:nowrap;display:flex;gap:4px">
         ${lfs==='Open'?`<button class="btn btn-teal btn-sm" ${lcanFill?'':'disabled'} onclick="markPacked('${line.id}','${line.pn}',${line.qty||1})">Pack</button>`:''}
         ${lfs==='Packed'?`<button class="btn btn-primary btn-sm" onclick="openShipModal('${line.id}','${line.pn}',${line.qty||1})">Ship</button>`:''}
-        ${lfs==='Packed'?`<button class="action-btn" onclick="unpackSaleOrder('${line.id}','${line.pn}',${line.qty||1})">↩</button>`:''}
-        ${lfs==='Shipped'?`<button class="action-btn" onclick="markDelivered('${line.id}')">✓</button>`:''}
+        ${lfs==='Packed'?`<button class="action-btn" onclick="unpackSaleOrder('${line.id}','${line.pn}',${line.qty||1})">↩ Unpack</button>`:''}
+        ${lfs==='Shipped'?`<button class="action-btn" onclick="markDelivered('${line.id}')">✓ Delivered</button>`:''}
+        ${lfs==='Shipped'?`<button class="action-btn" style="color:var(--orange);border-color:rgba(234,88,12,.3)" title="Un-ship: restore inventory and revert this line to Open or On Hold" onclick="unshipLine('${line.id}','${line.pn}',${line.qty||1})">↩ Un-ship</button>`:''}
       </td>
     </tr>`;}).join('')}
   </tbody></table></div>
@@ -1503,8 +1539,56 @@ async function unpackSaleOrder(saleId, pn, qty){
   render();
 }
 
+// ── UN-SHIP: reverses a Shipped line — restores inventory, clears tracking, resets status ──
+async function unshipLine(saleId, pn, qty){
+  const line=S.sales.find(s=>s.id===saleId);
+  if(!line||line.fulfillment_status!=='Shipped'){toast('Line is not Shipped');return;}
+
+  const targetStatus=confirm(
+    `Un-ship ${pn} × ${qty} on order ${line.order_number||''}?\n\n`+
+    `• Restores ${qty} unit(s) to stock\n• Clears tracking from this line\n\n`+
+    `OK → set back to Open\nCancel → set back to On Hold`
+  )?'Open':'On Hold';
+
+  const asm=S.assemblies.find(a=>a.pn===pn);
+  const undoOps=[];
+
+  // Restore assembly inventory
+  if(asm){
+    const prev=asm.total_on_hand||0;
+    const newOh=prev+qty;
+    undoOps.push({action:'update',table:'assemblies',data:{...asm,total_on_hand:newOh},prev:{...asm}});
+    await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
+    S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
+    const{data:corr}=await db.from('inv_corrections').insert({
+      pn,previous_qty:prev,new_qty:newOh,adjustment:qty,
+      reason:`Un-ship — order ${line.order_number||saleId} reverted to ${targetStatus}`,
+      source:'unship'
+    }).select().single();
+    if(corr){S.corrections=[corr,...S.corrections];undoOps.push({action:'insert',table:'inv_corrections',data:corr});}
+  }
+
+  // Reset the sale line: clear tracking + revert status
+  undoOps.push({action:'update',table:'sales',
+    data:{id:saleId},
+    prev:{id:saleId,fulfillment_status:'Shipped',tracking_number:line.tracking_number,carrier:line.carrier,shipped_at:line.shipped_at}
+  });
+  const{error}=await db.from('sales').update({
+    fulfillment_status:targetStatus,
+    tracking_number:null,
+    carrier:null,
+    shipped_at:null
+  }).eq('id',saleId);
+  if(error){toast('Error reverting line: '+error.message);return;}
+
+  S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:targetStatus,tracking_number:null,carrier:null,shipped_at:null}:s);
+  pushUndoMulti(`Un-ship ${pn} on order ${line.order_number||''}`,undoOps);
+  await refreshSales();
+  render();
+  toast(`✓ ${pn} → ${targetStatus} · ${qty} unit${qty>1?'s':''} restored to stock`);
+}
+
 async function dedupeOrders(){
-  toast('Scanning all orders in database…');
 
   // Query the full DB — S.sales is capped at 5000 rows and would miss duplicates outside that window
   const {data:allRows,error}=await db.from('sales')
@@ -2864,6 +2948,21 @@ async function submitAsm(eid){
   if(data)S.assemblies=[...S.assemblies,data].sort((a,b)=>a.pn.localeCompare(b.pn));
   else S.assemblies=S.assemblies.map(a=>a.id===eid?{...a,...payload}:a);
   closeModal();toast('Assembly saved');render();
+}
+
+async function fixAssemblyClassification(){
+  // Write the correct is_subassembly value back to the DB for all misclassified records
+  const mismatched=S.assemblies.filter(a=>a._classificationMismatch);
+  if(!mismatched.length){toast('No mismatches to fix');return;}
+  if(!confirm(`Fix is_subassembly flag for ${mismatched.length} assemblies in the database?\n\nRule: only XX-XXXX numeric patterns (e.g. 01-0001) are subassemblies. All others become Finished Goods.`))return;
+  let fixed=0,failed=0;
+  for(const a of mismatched){
+    const{error}=await db.from('assemblies').update({is_subassembly:a.is_subassembly}).eq('id',a.id);
+    if(error){failed++;console.error(a.pn,error.message);}
+    else{fixed++;a._classificationMismatch=false;}
+  }
+  render();
+  toast(failed?`Fixed ${fixed}, failed ${failed} — check console`:`✓ Fixed ${fixed} assemblies — Subassemblies and Finished Goods now correctly classified`);
 }
 
 
