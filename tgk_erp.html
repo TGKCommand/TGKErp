@@ -2335,6 +2335,7 @@ async function executeShopifyImport(){
   });
 
   let imported=0,updated=0,skipped=0,errors=0;
+  const errorMsgs=[];
 
   // ── Step 3: Insert new lines in chunks ──
   const toInsert=newLines.map(l=>({
@@ -2352,10 +2353,15 @@ async function executeShopifyImport(){
   for(let i=0;i<toInsert.length;i+=CHUNK){
     const chunk=toInsert.slice(i,i+CHUNK);
     const{error}=await db.from('sales').insert(chunk);
-    if(error){errors++;console.error('Import chunk error:',error.message);}
+    if(error){
+      errors++;
+      const msg=`Chunk ${Math.floor(i/CHUNK)+1}: ${error.message}`;
+      errorMsgs.push(msg);
+      console.error('Import chunk error:',error.message);
+    }
     else imported+=chunk.length;
     const done=Math.min(i+CHUNK,toInsert.length);
-    if(el)el.innerHTML=`<div style="color:var(--text3);font-size:12px;padding:10px">⏳ Importing… ${done}/${toInsert.length} new lines (${errors} errors)</div>`;
+    if(el)el.innerHTML=`<div style="color:var(--text3);font-size:12px;padding:10px">⏳ Importing… ${done}/${toInsert.length} new lines${errors?' (⚠ '+errors+' errors)':''}</div>`;
   }
 
   // ── Step 4: Handle conflict decisions ──
@@ -2376,7 +2382,7 @@ async function executeShopifyImport(){
           shipped_at:csv.fulfilledAt?new Date(csv.fulfilledAt).toISOString():erp.shipped_at,
           // tracking_number and carrier are intentionally excluded — never overwrite with CSV data (CSV has no tracking)
         }).eq('id',erp.id);
-        if(error)errors++;
+        if(error){errors++;errorMsgs.push(`Update #${orderNum}: ${error.message}`);}
         else updated++;
       }
     }
@@ -2385,10 +2391,21 @@ async function executeShopifyImport(){
   S._shopifyImport=null;
   await refreshSales();
   render();
-  const msg=`✓ Import done — ${imported} new, ${updated} updated, ${skipped} skipped${errors?', ⚠ '+errors+' errors (see console)':''}`;
-  toast(msg,3500);
-  const dedupeTip=imported>0?'<div style="font-size:11px;color:var(--text3);margin-top:6px">If any orders have duplicate lines (from a previous import), click <b>🧽 Dedupe &amp; Recover Tracking</b> in the filter bar above to clean them up — tracking numbers are automatically rescued before duplicates are removed.</div>':'';
-  if(el)el.innerHTML=`<div style="color:var(--green);font-size:12px;padding:10px">${msg}</div>${dedupeTip}`;
+
+  const summaryLine=`✓ Import done — ${imported} new, ${updated} updated, ${skipped} skipped${errors?`, ⚠ ${errors} error${errors>1?'s':''}`:''}`; 
+  toast(summaryLine, errors?5000:3500);
+
+  let html=`<div style="color:${errors?'var(--yellow)':'var(--green)'};font-size:12px;padding:10px">${summaryLine}</div>`;
+  if(errorMsgs.length){
+    html+=`<div style="margin:6px 10px 0;padding:8px 12px;background:var(--red-dim);border:1px solid rgba(220,38,38,.2);border-radius:6px">
+      <div style="font-size:11px;font-weight:700;color:var(--red);margin-bottom:4px">⚠ Import Errors</div>
+      ${errorMsgs.slice(0,10).map(m=>`<div style="font-size:10px;font-family:var(--mono);color:var(--red);padding:2px 0">${escHtml(m)}</div>`).join('')}
+      ${errorMsgs.length>10?`<div style="font-size:10px;color:var(--text3)">${errorMsgs.length-10} more errors — check browser console (F12)</div>`:''}
+      <div style="font-size:10px;color:var(--text3);margin-top:4px">Common cause: missing DB columns — run the SQL migration in <b>Integrations → Setup Guide</b></div>
+    </div>`;
+  }
+  const dedupeTip=imported>0?`<div style="font-size:11px;color:var(--text3);margin-top:6px;padding:0 10px 8px">If any orders have duplicate lines, click <b>🧽 Dedupe &amp; Recover Tracking</b> on the Import Data page to clean them up.</div>`:'';
+  if(el)el.innerHTML=html+dedupeTip;
 }
 
 async function importOrdersFromShopify(){
@@ -4475,7 +4492,7 @@ async function createCycleCount(cat) {
   const liveParts=S.parts.filter(p=>!p.discontinued);
   const liveAsm=S.assemblies.filter(a=>!a.discontinued);
   if(cat==='all') items=liveParts.map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}));
-  else if(cat==='fg') items=liveAsm.filter(a=>!a.is_subassembly).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
+  else if(cat==='fg') items=liveAsm.filter(a=>!a.is_subassembly&&!isHWPack(a.pn)).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
   else if(cat==='sub') items=liveAsm.filter(a=>a.is_subassembly).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
   else if(cat==='hwp') items=liveAsm.filter(a=>isHWPack(a.pn)).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
   else if(cat==='everything') items=[
@@ -4500,12 +4517,50 @@ async function createCycleCount(cat) {
     const seen=new Set(); items=items.filter(i=>{if(seen.has(i.pn))return false;seen.add(i.pn);return true;});
   }
   else items=liveParts.filter(p=>(p.category||'Uncategorized')===cat).map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}));
+
   if(!items.length){toast('Nothing in that selection');return;}
+
   const {data,error}=await db.from('cycle_counts').insert({status:'Open',notes:'',category_filter:cat}).select().single();
-  if(error){toast('Error: '+error.message);return;}
-  const lines = items.map(i=>({count_id:data.id,pn:i.pn,description:i.desc,expected_qty:i.exp,item_type:i.type,notes:i.bomQty?'BOM qty/unit: '+i.bomQty:''}));
-  await db.from('cycle_count_lines').insert(lines);
+  if(error){toast('Error creating count: '+error.message);return;}
+
+  // Build lines payload — try with item_type first, fall back without if column missing
+  const makeLines=(withType)=>items.map(i=>{
+    const row={count_id:data.id,pn:i.pn,description:i.desc,expected_qty:i.exp,notes:i.bomQty?'BOM qty/unit: '+i.bomQty:''};
+    if(withType)row.item_type=i.type;
+    return row;
+  });
+
+  // Insert in chunks of 200 to avoid row limits
+  const CHUNK=200;
+  let insertError=null;
+  let lines=makeLines(true);
+  for(let i=0;i<lines.length;i+=CHUNK){
+    const chunk=lines.slice(i,i+CHUNK);
+    const{error:e}=await db.from('cycle_count_lines').insert(chunk);
+    if(e){insertError=e;break;}
+  }
+
+  // If item_type column doesn't exist yet, retry without it
+  if(insertError&&(insertError.message.includes('item_type')||insertError.code==='42703')){
+    await db.from('cycle_count_lines').delete().eq('count_id',data.id); // clean partial inserts
+    lines=makeLines(false);
+    insertError=null;
+    for(let i=0;i<lines.length;i+=CHUNK){
+      const chunk=lines.slice(i,i+CHUNK);
+      const{error:e}=await db.from('cycle_count_lines').insert(chunk);
+      if(e){insertError=e;break;}
+    }
+  }
+
+  if(insertError){
+    // Clean up the cycle_counts header row too
+    await db.from('cycle_counts').delete().eq('id',data.id);
+    toast('Error creating count lines: '+insertError.message+'\n\nYou may need to run the DB migration — see Integrations → Setup Guide');
+    return;
+  }
+
   S.cycleCounts=[data,...S.cycleCounts];
+  S.countMode='home';
   S.activeCount=data.id;
   S.countLines=lines.map((l,i)=>({...l,id:'temp-'+i,actual_qty:null}));
   await loadCountLines(data.id);
