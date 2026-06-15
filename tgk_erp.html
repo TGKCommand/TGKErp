@@ -754,6 +754,7 @@ function renderDashboard(){
         </div>
         <span style="font-size:9px;color:var(--text3);font-family:var(--mono);flex-shrink:0">${e.ts?new Date(e.ts).toLocaleDateString():''}</span>
       </div>`).join('')||'<div class="section-empty">No recent activity</div>'}
+  <div style="text-align:right;padding:4px 8px"><button class="btn btn-sm" style="font-size:10px;color:var(--text3)" onclick="clearActivityFeed()">🗑 Clear feed</button></div>
     </div>
     <div class="panel">
       <div class="panel-title"><span class="panel-title-left">Open Purchase Orders</span><button class="btn btn-sm" onclick="nav('purchases')">All POs →</button></div>
@@ -1206,7 +1207,7 @@ async function unpackSaleOrder(saleId, pn, qty){
     }
     // Reset sale line to Open
     undoOps.push({action:'update',table:'sales',data:{...line,fulfillment_status:'Open'},prev:{...line}});
-    const{error:sErr}=await db.from('sales').update({fulfillment_status:'Open',updated_at:new Date().toISOString()}).eq('id',line.id);
+    const{error:sErr}=await db.from('sales').update({fulfillment_status:'Open'}).eq('id',line.id);
     if(sErr){toast('Error resetting order: '+sErr.message);return;}
     S.sales=S.sales.map(s=>s.id===line.id?{...s,fulfillment_status:'Open'}:s);
   }
@@ -1626,7 +1627,7 @@ async function ssManualSync(orderNum,tracking,carrier){
   const undoOps=[];
   for(const sale of rows){
     undoOps.push({action:'update',table:'sales',data:{...sale,fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier},prev:{...sale}});
-    await db.from('sales').update({fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier||'',shipped_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq('id',sale.id);
+    await db.from('sales').update({fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier||'',shipped_at:new Date().toISOString()}).eq('id',sale.id);
     S.sales=S.sales.map(s=>s.id===sale.id?{...s,fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier||''}:s);
     const{data:asms}=await db.from('assemblies').select('*').eq('pn',sale.pn);
     if(asms?.[0]){
@@ -1636,6 +1637,8 @@ async function ssManualSync(orderNum,tracking,carrier){
       await db.from('inv_corrections').insert({pn:sale.pn,previous_qty:asms[0].total_on_hand||0,new_qty:newOh,adjustment:-(sale.qty||1),reason:'Manual ship — order '+orderNum+' tracking '+tracking,source:'shipment'});
     }
   }
+  if(!rows.length){toast('No lines updated — check order number');return;}
+  await loadAll();
   pushUndoMulti('Manual ship order '+orderNum,undoOps);
   toast('✓ Order '+orderNum+' marked Shipped · tracking: '+tracking);
   render();
@@ -2191,6 +2194,13 @@ function daysAgo(n){const d=new Date();d.setDate(d.getDate()-n);return d.toISOSt
 function fmtDT(ts){if(!ts)return'—';const d=new Date(ts);return d.toLocaleDateString()+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
 
 // ── Unified activity feed ──
+async function clearActivityFeed(){
+  if(!confirm('Clear the activity feed? This deletes all correction log entries (stock levels are NOT affected).'))return;
+  const{error}=await db.from('inv_corrections').delete().neq('id',0);
+  if(error){toast('Error: '+error.message);return;}
+  S.corrections=[];toast('Activity feed cleared');render();
+}
+
 function buildActivityFeed(limit){
   const events=[];
   S.corrections.slice(0,30).forEach(c=>events.push({ts:c.created_at,icon:c.source==='po_receipt'?'📦':c.source==='pack'?'🔧':c.source==='unpack'?'↩':c.source==='cycle_count'?'📋':c.source==='shipment'?'🚚':'✎',
@@ -3699,7 +3709,7 @@ function renderCorrections() {
     <span class="filter-count">${list.length} records</span>
   </div>
   <div class="tbl-wrap">
-  <table><thead><tr><th>Date</th><th>Part #</th><th>Previous</th><th>New Qty</th><th>Adjustment</th><th>Source</th><th>Reason</th></tr></thead><tbody>
+  <table><thead><tr><th>Date</th><th>Part #</th><th>Previous</th><th>New Qty</th><th>Adjustment</th><th>Source</th><th>Reason</th><th></th></tr></thead><tbody>
   ${list.map(c=>`<tr>
     <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${new Date(c.created_at).toLocaleString()}</td>
     <td class="pn" style="color:var(--text)">${c.pn}</td>
@@ -3708,8 +3718,18 @@ function renderCorrections() {
     <td class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700">${c.adjustment>0?'+':''}${c.adjustment}</td>
     <td><span class="pill pill-muted" style="font-size:9px">${c.source||'manual'}</span></td>
     <td style="font-size:11px;color:var(--text2)">${c.reason||''}</td>
+    <td><button class="action-btn del" title="Delete this entry" onclick="deleteCorrection('${c.id}')">×</button></td>
   </tr>`).join('')}
   </tbody></table></div>`;
+}
+
+async function deleteCorrection(id){
+  if(!id){toast('Cannot delete — no ID on this entry');return;}
+  if(!confirm('Delete this correction log entry? This only removes the log record, not any stock changes.'))return;
+  const{error}=await db.from('inv_corrections').delete().eq('id',id);
+  if(error){toast('Error: '+error.message);return;}
+  S.corrections=S.corrections.filter(c=>c.id!==id);
+  toast('Entry deleted');render();
 }
 
 async function submitManualCorrection(pn, newQty, reason) {
