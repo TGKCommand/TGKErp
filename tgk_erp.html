@@ -1157,23 +1157,45 @@ function renderSaleDetail(s){
 }
 
 async function unpackSaleOrder(saleId, pn, qty){
-  if(!confirm('Unpack '+qty+'× '+pn+'?\nThis returns the finished goods to stock and resets the order to Open.'))return;
   const sale=S.sales.find(s=>s.id===saleId);
-  const asm=S.assemblies.find(a=>a.pn===pn);
-  const undoOps=[];
-  if(asm){
-    const newOh=(asm.total_on_hand||0)+qty;
-    undoOps.push({action:'update',table:'assemblies',data:{...asm,total_on_hand:newOh},prev:{...asm}});
-    await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
-    S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
-    const{data:corrRow}=await db.from('inv_corrections').insert({pn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:qty,reason:'Order unpacked — '+(sale?.order_number||saleId),source:'unpack'}).select().single();
-    if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
+
+  // Resolve all lines to unpack: if grouped row (pn='Multiple'), get every line on this order
+  let linesToUnpack=[];
+  if(pn==='Multiple'||!pn){
+    const orderNum=sale?.order_number;
+    linesToUnpack=orderNum?S.sales.filter(s=>s.order_number===orderNum&&s.fulfillment_status==='Packed'):[sale].filter(Boolean);
+  } else {
+    linesToUnpack=[sale].filter(Boolean);
   }
-  if(sale)undoOps.push({action:'update',table:'sales',data:{...sale,fulfillment_status:'Open'},prev:{...sale}});
-  await db.from('sales').update({fulfillment_status:'Open',updated_at:new Date().toISOString()}).eq('id',saleId);
-  S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Open'}:s);
+  if(!linesToUnpack.length){toast('No packed lines found to unpack');return;}
+
+  const lineDesc=linesToUnpack.length>1?linesToUnpack.length+' lines':'1× '+pn;
+  if(!confirm('Unpack '+lineDesc+'?\nReturns finished goods to stock and resets order to Open.'))return;
+
+  const undoOps=[];
+
+  for(const line of linesToUnpack){
+    const linePn=line.pn; const lineQty=line.qty||1;
+    // Return assembly stock
+    const asm=S.assemblies.find(a=>a.pn===linePn);
+    if(asm){
+      const newOh=(asm.total_on_hand||0)+lineQty;
+      undoOps.push({action:'update',table:'assemblies',data:{...asm,total_on_hand:newOh},prev:{...asm}});
+      const{error:aErr}=await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
+      if(aErr){toast('Error updating stock for '+linePn+': '+aErr.message);return;}
+      S.assemblies=S.assemblies.map(a=>a.pn===linePn?{...a,total_on_hand:newOh}:a);
+      const{data:corrRow}=await db.from('inv_corrections').insert({pn:linePn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:lineQty,reason:'Order unpacked — '+(line.order_number||saleId),source:'unpack'}).select().single();
+      if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
+    }
+    // Reset sale line to Open
+    undoOps.push({action:'update',table:'sales',data:{...line,fulfillment_status:'Open'},prev:{...line}});
+    const{error:sErr}=await db.from('sales').update({fulfillment_status:'Open',updated_at:new Date().toISOString()}).eq('id',line.id);
+    if(sErr){toast('Error resetting order: '+sErr.message);return;}
+    S.sales=S.sales.map(s=>s.id===line.id?{...s,fulfillment_status:'Open'}:s);
+  }
+
   pushUndoMulti('Unpack order '+(sale?.order_number||''),undoOps);
-  toast('Unpacked — stock returned, order reset to Open');
+  toast('Unpacked '+lineDesc+' — stock returned, order Open');
   render();
 }
 
