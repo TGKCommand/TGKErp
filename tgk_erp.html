@@ -902,8 +902,13 @@ function renderDashboard(){
   const critical=S.assemblies.filter(a=>!a.discontinued&&liveStatus(a)==='critical').length;
   const needsReorder=S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||calcForecast(p.pn)>0)&&(p.total_unpckgd||0)<=calcReorderPoint(p)).length;
   const invVal=S.parts.reduce((s,p)=>s+Math.max(0,p.total_unpckgd||0)*(p.unit_cost||0),0);
+  // Separate Open (needs action) from On Hold (intentionally waiting)
   const openOrders=S.sales.filter(s=>!s.fulfillment_status||s.fulfillment_status==='Open');
+  const onHoldOrders=S.sales.filter(s=>s.fulfillment_status==='On Hold');
   const packedOrders=S.sales.filter(s=>s.fulfillment_status==='Packed');
+  // Stale open orders: Open but sale_date older than 60 days — likely historical/pre-system
+  const staleOpen=openOrders.filter(s=>s.sale_date&&s.sale_date<daysAgo(60));
+  const freshOpen=openOrders.filter(s=>!s.sale_date||s.sale_date>=daysAgo(60));
   const openWarranty=S.warrantyClaims.filter(w=>w.status==='Open').length;
   const openCounts=S.cycleCounts.filter(c=>c.status==='Open').length;
   const weekOrds=S.sales.filter(s=>s.sale_date>=daysAgo(7)).length;
@@ -912,11 +917,20 @@ function renderDashboard(){
   const feed=buildActivityFeed(12);
   return `
   <div class="kpi-grid kpi-grid-4">
-    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','Open');nav('sales')"><div class="kpi-label">Orders to Fulfill</div><div class="kpi-value">${openOrders.length}</div><div class="kpi-sub">${packedOrders.length} packed & ready to ship</div></div>
+    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','Open');nav('sales')">
+      <div class="kpi-label">Orders to Fulfill</div>
+      <div class="kpi-value">${freshOpen.length}</div>
+      <div class="kpi-sub">${packedOrders.length} packed · ${onHoldOrders.length} on hold</div>
+    </div>
     <div class="kpi kpi-orange" style="cursor:pointer" onclick="nav('planning')"><div class="kpi-label">Parts Need Reorder</div><div class="kpi-value">${needsReorder}</div><div class="kpi-sub">Below reorder point</div></div>
     <div class="kpi kpi-yellow" style="cursor:pointer" onclick="nav('assemblies')"><div class="kpi-label">Critical Assemblies</div><div class="kpi-value">${critical}</div></div>
     <div class="kpi kpi-teal"><div class="kpi-label">Parts Inventory Value</div><div class="kpi-value" style="font-size:17px">${fc(invVal)}</div><div class="kpi-sub">${weekOrds} orders this week</div></div>
   </div>
+  ${staleOpen.length>20?`<div class="panel" style="padding:10px 18px;display:flex;gap:12px;align-items:center;border-left:3px solid var(--red);flex-wrap:wrap">
+    <span style="font-size:12px;color:var(--red);font-weight:700">⚠ ${staleOpen.length} stale Open orders</span>
+    <span style="font-size:11px;color:var(--text2);flex:1">Orders older than 60 days still showing as Open — likely fulfilled before the ERP existed.</span>
+    <button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="closeHistoricalOrders()">🧹 Close old orders</button>
+  </div>`:''}
   ${openWarranty>0||openCounts>0?`<div class="panel" style="padding:10px 18px;display:flex;gap:18px;align-items:center;border-left:3px solid var(--yellow)">
     <span style="font-size:11px;color:var(--text2)">⚑ Pending tasks:</span>
     ${openWarranty>0?`<button class="filter-chip" onclick="nav('warranty')">${openWarranty} open warranty claim${openWarranty>1?'s':''}</button>`:''}
@@ -926,8 +940,8 @@ function renderDashboard(){
   <div>
     <div class="panel">
       <div class="panel-title"><span class="panel-title-left">🚚 Fulfillment Queue</span><button class="btn btn-sm" onclick="nav('sales')">All Orders →</button></div>
-      ${openOrders.length===0&&packedOrders.length===0?'<div class="section-empty">All orders fulfilled ✓</div>':
-      [...openOrders.slice(0,4),...packedOrders.slice(0,3)].map(s=>{
+      ${freshOpen.length===0&&packedOrders.length===0?'<div class="section-empty">All orders fulfilled ✓</div>':
+      [...freshOpen.slice(0,4),...packedOrders.slice(0,3)].map(s=>{
         const asm=S.assemblies.find(a=>a.pn===s.pn);
         const stock=asm?(asm.total_on_hand||0):null;
         const canFill=stock!==null&&stock>=(s.qty||1);
@@ -1345,6 +1359,9 @@ function renderSales(){
   if(q)list=list.filter(s=>s.pn.toLowerCase().includes(q)||(s.order_number||'').toLowerCase().includes(q)||(s.source||'').toLowerCase().includes(q));
   if(sf.fstatus)list=list.filter(s=>(s.fulfillment_status||'Open')===sf.fstatus);
   const open=S.sales.filter(s=>!s.fulfillment_status||s.fulfillment_status==='Open');
+  const onHold=S.sales.filter(s=>s.fulfillment_status==='On Hold');
+  const freshOpen=open.filter(s=>!s.sale_date||s.sale_date>=daysAgo(60));
+  const staleOpen=open.filter(s=>s.sale_date&&s.sale_date<daysAgo(60));
   const packed=S.sales.filter(s=>s.fulfillment_status==='Packed');
   const shipped7=S.sales.filter(s=>s.fulfillment_status==='Shipped'&&s.shipped_at&&s.shipped_at.slice(0,10)>=daysAgo(7));
   const rev7=S.sales.filter(s=>s.sale_date>=daysAgo(7)).reduce((t,s)=>{const a=S.assemblies.find(x=>x.pn===s.pn);return t+((a?.msrp||0)*(s.qty||1));},0);
@@ -1362,11 +1379,24 @@ function renderSales(){
 
   return `
   <div class="kpi-grid kpi-grid-4">
-    <div class="kpi kpi-red"><div class="kpi-label">Awaiting Fulfillment</div><div class="kpi-value">${open.length}</div><div class="kpi-sub">Open orders to pack</div></div>
-    <div class="kpi kpi-yellow"><div class="kpi-label">Packed — Ready to Ship</div><div class="kpi-value">${packed.length}</div></div>
+    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','Open')">
+      <div class="kpi-label">Awaiting Fulfillment</div>
+      <div class="kpi-value">${freshOpen.length}</div>
+      <div class="kpi-sub">${staleOpen.length>0?`<span style="color:var(--text3)">${staleOpen.length} stale (60+ days)</span>`:'Ready to pack'}</div>
+    </div>
+    <div class="kpi kpi-orange" style="cursor:pointer" onclick="setFilter('sales','fstatus','On Hold')">
+      <div class="kpi-label">On Hold</div>
+      <div class="kpi-value">${onHold.length}</div>
+      <div class="kpi-sub">${packed.length} packed ready to ship</div>
+    </div>
     <div class="kpi kpi-teal"><div class="kpi-label">Shipped — 7 Days</div><div class="kpi-value">${shipped7.length}</div><div class="kpi-sub">${S.sales.filter(s=>s.fulfillment_status==='Delivered'&&s.delivered_at&&s.delivered_at.slice(0,10)>=daysAgo(7)).length} delivered</div></div>
     <div class="kpi kpi-green"><div class="kpi-label">Est. Revenue — 7 Days</div><div class="kpi-value" style="font-size:17px">${fc(rev7)}</div></div>
   </div>
+  ${staleOpen.length>10?`<div class="panel" style="padding:10px 18px;display:flex;gap:12px;align-items:center;border-left:3px solid var(--orange);flex-wrap:wrap">
+    <span style="font-size:12px;font-weight:700;color:var(--orange)">⚠ ${staleOpen.length} orders open for 60+ days</span>
+    <span style="font-size:11px;color:var(--text2);flex:1">These were likely fulfilled before the ERP was set up. Mark them as Delivered to clean up the queue.</span>
+    <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="closeHistoricalOrders()">🧹 Close old orders</button>
+  </div>`:''}
   ${(S.fnStatus&&S.fnStatus.shopify===false)?`
   <div class="shopify-bar" style="border-color:var(--red);background:var(--red-dim)">
     <div class="shopify-icon" style="background:var(--red)">S</div>
@@ -2133,6 +2163,65 @@ Deno.serve(async (req) => {
     })
   }
 
+  // Bulk sync: fetch all shipments from ShipStation since a date and apply to ERP
+  if (body.action === 'bulk_sync') {
+    const bKey = Deno.env.get('SS_KEY') || ''
+    const bSec = Deno.env.get('SS_SECRET') || ''
+    if (!bKey || !bSec) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
+    const bAuth = btoa(bKey + ':' + bSec)
+    const since = body.since || new Date(Date.now() - 30*24*60*60*1000).toISOString().slice(0,10)
+    let page = 1, totalPages = 1, synced = 0, skipped = 0, notFound = 0
+
+    while (page <= totalPages) {
+      const url = 'https://ssapi.shipstation.com/shipments?shipDateStart=' + since
+        + '&pageSize=500&page=' + page + '&includeShipmentItems=true'
+      const bRes = await fetch(url, { headers: { Authorization: 'Basic ' + bAuth } })
+      if (!bRes.ok) return json({ error: 'ShipStation error ' + bRes.status }, 502)
+      const bData = await bRes.json()
+      totalPages = bData.pages || 1
+
+      for (const ship of (bData.shipments || [])) {
+        if (ship.voided) { skipped++; continue }
+        const rawNum = ship.orderNumber
+        const tracking = ship.trackingNumber
+        if (!tracking) { skipped++; continue }
+        const carrier = ship.carrierCode?.toUpperCase() || ''
+        const shippedAt = ship.shipDate ? new Date(ship.shipDate).toISOString() : new Date().toISOString()
+
+        // Resolve order number - try with and without # prefix
+        let lines: any[] = []
+        let resolvedNum = rawNum
+        const r1 = await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', rawNum)
+        if (r1.data?.length) {
+          lines = r1.data
+        } else {
+          const r2 = await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', '#' + rawNum)
+          if (r2.data?.length) { lines = r2.data; resolvedNum = '#' + rawNum }
+        }
+        if (!lines.length) { notFound++; continue }
+
+        const rawSkus = (ship.shipmentItems || []).flatMap((i: any) => [i.sku, i.name].filter(Boolean))
+        const norm = (s: string) => s.trim().toUpperCase()
+        const allPns = lines.map((l: any) => l.pn as string)
+        const matched = rawSkus.length > 0
+          ? allPns.filter(p => rawSkus.some((s: string) => { const e=norm(p),k=norm(s); return e===k||e.includes(k)||k.includes(e) }))
+          : allPns
+
+        for (const pn of matched) {
+          await db.from('sales').update({
+            fulfillment_status: 'Shipped', tracking_number: tracking,
+            carrier: carrier, shipped_at: shippedAt
+          }).eq('order_number', resolvedNum).eq('pn', pn)
+            .in('fulfillment_status', ['Open', 'Packed', 'Partial'])
+        }
+        synced++
+      }
+      page++
+    }
+    return json({ synced, skipped, notFound, pages: totalPages,
+      message: 'Synced ' + synced + ' shipments (' + skipped + ' skipped, ' + notFound + ' order not in ERP)' })
+  }
+
   const { resource_url, resource_type } = body
   console.log('[SS]', resource_type, resource_url)
 
@@ -2228,69 +2317,6 @@ Deno.serve(async (req) => {
     await db.from('sales')
       .update({ fulfillment_status: 'Open' })
       .eq('order_number', resolvedNum)
-  }
-
-  // Bulk sync: fetch all shipments from ShipStation since a date and apply to ERP
-  if (body.action === 'bulk_sync') {
-    const bKey = Deno.env.get('SS_KEY') || ''
-    const bSec = Deno.env.get('SS_SECRET') || ''
-    if (!bKey || !bSec) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
-    const bAuth = btoa(bKey + ':' + bSec)
-    const since = body.since || new Date(Date.now() - 30*24*60*60*1000).toISOString().slice(0,10)
-    let page = 1, totalPages = 1, synced = 0, skipped = 0, notFound = 0
-
-    while (page <= totalPages) {
-      const url = 'https://ssapi.shipstation.com/shipments?shipDateStart=' + since
-        + '&pageSize=500&page=' + page + '&includeShipmentItems=true'
-      const bRes = await fetch(url, { headers: { Authorization: 'Basic ' + bAuth } })
-      if (!bRes.ok) return json({ error: 'ShipStation error ' + bRes.status }, 502)
-      const bData = await bRes.json()
-      totalPages = bData.pages || 1
-
-      for (const ship of (bData.shipments || [])) {
-        if (ship.voided) { skipped++; continue }
-        const rawNum = ship.orderNumber
-        const tracking = ship.trackingNumber
-        if (!tracking) { skipped++; continue }
-        const carrier = ship.carrierCode?.toUpperCase() || ''
-        const shippedAt = ship.shipDate ? new Date(ship.shipDate).toISOString() : new Date().toISOString()
-
-        // Resolve order number - try with and without # prefix
-        let { data: lines } = await db.from('sales')
-          .select('id,pn,fulfillment_status').eq('order_number', rawNum)
-        let resolvedNum = rawNum
-        if (!lines?.length) {
-          const r2 = await db.from('sales')
-            .select('id,pn,fulfillment_status').eq('order_number', '#' + rawNum)
-          if (r2.data?.length) { lines = r2.data; resolvedNum = '#' + rawNum }
-        }
-        if (!lines?.length) { notFound++; continue }
-
-        // Match SKUs - fuzzy contains match same as webhook
-        const rawSkus = (ship.shipmentItems || []).flatMap((i: any) =>
-          [i.sku, i.name].filter(Boolean)
-        )
-        const norm = (s: string) => s.trim().toUpperCase()
-        const allPns = lines.map((l: any) => l.pn as string)
-        const matched = rawSkus.length > 0
-          ? allPns.filter(p => rawSkus.some((s: string) => { const e=norm(p),k=norm(s); return e===k||e.includes(k)||k.includes(e) }))
-          : allPns
-
-        for (const pn of matched) {
-          await db.from('sales').update({
-            fulfillment_status: 'Shipped',
-            tracking_number: tracking,
-            carrier: carrier,
-            shipped_at: shippedAt
-          }).eq('order_number', resolvedNum).eq('pn', pn)
-            .in('fulfillment_status', ['Open', 'Packed', 'Partial'])
-        }
-        synced++
-      }
-      page++
-    }
-    return json({ synced, skipped, notFound, pages: totalPages,
-      message: 'Synced ' + synced + ' shipments (' + skipped + ' skipped, ' + notFound + ' order not in ERP)' })
   }
 
   return ok('ok')
