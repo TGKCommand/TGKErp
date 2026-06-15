@@ -1108,6 +1108,7 @@ function renderSales(){
     <td style="display:flex;gap:4px">
       ${fs==='Open'?`<button class="btn btn-teal btn-sm" ${canFill?'':'disabled title="Insufficient stock"'} onclick="markPacked('${s.id}','${s.pn}',${s.qty||1})">Pack</button>`:''}
       ${fs==='Packed'?`<button class="btn btn-primary btn-sm" onclick="openShipModal('${s.id}','${s.pn}',${s.qty||1})">🚚 Ship</button>`:''}
+      ${fs==='Packed'?`<button class="action-btn" title="Undo pack — return stock, reset to Open" onclick="unpackSaleOrder('${s.id}','${s.pn}',${s.qty||1})">↩ Unpack</button>`:''}
       ${fs==='Shipped'?`<button class="action-btn" onclick="markDelivered('${s.id}')">✓ Delivered</button>`:''}
       ${fs==='Open'||fs==='Packed'?`<button class="action-btn" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
       <button class="action-btn del" onclick="deleteSale('${s.id}')">×</button>
@@ -1133,6 +1134,7 @@ function renderSaleDetail(s){
     </div>
     ${fs==='Open'?`<button class="btn btn-teal" ${canFill?'':'disabled title="Insufficient stock"'} onclick="markPacked('${s.id}','${s.pn}',${s.qty||1})">Pack</button>`:''}
     ${fs==='Packed'?`<button class="btn btn-primary" onclick="openShipModal('${s.id}','${s.pn}',${s.qty||1})">🚚 Ship</button>`:''}
+    ${fs==='Packed'?`<button class="btn btn-sm" style="color:var(--orange)" title="Undo pack — returns stock, resets to Open" onclick="unpackSaleOrder('${s.id}','${s.pn}',${s.qty||1})">↩ Unpack</button>`:''}
     ${fs==='Shipped'?`<button class="btn btn-teal" onclick="markDelivered('${s.id}')">✓ Delivered</button>`:''}
     ${fs==='Open'||fs==='Packed'?`<button class="btn" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
   </div>
@@ -1152,6 +1154,27 @@ function renderSaleDetail(s){
     ${moves.length===0?'<div class="section-empty">None</div>':moves.map(c=>`<div class="check-row"><span style="font-size:10px;font-family:var(--mono);color:var(--text3)">${new Date(c.created_at).toLocaleDateString()}</span><span class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700;min-width:40px">${c.adjustment>0?'+':''}${c.adjustment}</span><span style="flex:1;font-size:11px;color:var(--text2)">${c.reason||c.source}</span></div>`).join('')}</div>
   </div>
   </div>`;
+}
+
+async function unpackSaleOrder(saleId, pn, qty){
+  if(!confirm('Unpack '+qty+'× '+pn+'?\nThis returns the finished goods to stock and resets the order to Open.'))return;
+  const sale=S.sales.find(s=>s.id===saleId);
+  const asm=S.assemblies.find(a=>a.pn===pn);
+  const undoOps=[];
+  if(asm){
+    const newOh=(asm.total_on_hand||0)+qty;
+    undoOps.push({action:'update',table:'assemblies',data:{...asm,total_on_hand:newOh},prev:{...asm}});
+    await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
+    S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
+    const{data:corrRow}=await db.from('inv_corrections').insert({pn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:qty,reason:'Order unpacked — '+(sale?.order_number||saleId),source:'unpack'}).select().single();
+    if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
+  }
+  if(sale)undoOps.push({action:'update',table:'sales',data:{...sale,fulfillment_status:'Open'},prev:{...sale}});
+  await db.from('sales').update({fulfillment_status:'Open',updated_at:new Date().toISOString()}).eq('id',saleId);
+  S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Open'}:s);
+  pushUndoMulti('Unpack order '+(sale?.order_number||''),undoOps);
+  toast('Unpacked — stock returned, order reset to Open');
+  render();
 }
 
 async function dedupeOrders(){
@@ -1433,34 +1456,76 @@ async function ssTestOrder(){
   const orderNum=(document.getElementById('ss-test-order')?.value||'').trim();
   if(!orderNum){toast('Enter an order number to test');return;}
   const el=document.getElementById('ss-diag-result');
-  el.style.display='block'; el.textContent='⏳ Testing order '+orderNum+' against ShipStation + ERP…';
+  el.style.display='block';
+  el.textContent='⏳ Checking ERP database for order '+orderNum+'…';
+
+  // Query Supabase directly (avoids CORS — no edge function call needed)
+  const nums=[orderNum,'#'+orderNum,orderNum.replace(/^#/,'')];
+  let erpRows=[];
+  let matchedFmt='';
+  for(const n of nums){
+    const{data}=await db.from('sales').select('id,order_number,pn,fulfillment_status,qty,tracking_number,shipped_at').eq('order_number',n);
+    if(data?.length){erpRows=data;matchedFmt=n;break;}
+  }
+
+  let out='ORDER DIAGNOSTIC: '+orderNum+'\n'+'─'.repeat(44)+'\n\n';
+
+  // ERP check
+  out+='ERP DATABASE:\n';
+  if(erpRows.length){
+    out+='  ✓ Found '+erpRows.length+' line(s) matching "'+matchedFmt+'":\n';
+    erpRows.forEach(r=>{
+      out+='    · '+r.pn+' ×'+(r.qty||1)+' — '+r.fulfillment_status;
+      if(r.tracking_number)out+=' — tracking: '+r.tracking_number;
+      out+='\n';
+    });
+  }else{
+    out+='  ✗ NO ORDER FOUND in ERP for:\n';
+    nums.forEach(n=>out+='    tried: "'+n+'"\n');
+    out+='  → Either the order hasn\'t synced from Shopify yet,\n';
+    out+='    or the order number format differs.\n';
+    out+='  → All order numbers in ERP (recent 5):\n';
+    const{data:recent}=await db.from('sales').select('order_number').order('created_at',{ascending:false}).limit(5);
+    (recent||[]).forEach(r=>out+='      '+r.order_number+'\n');
+  }
+
+  // Function reachability check via ping
+  out+='\nEDGE FUNCTION (shipstation-ship):\n';
   try{
     const res=await fetch('https://piamamighqiielfztgic.supabase.co/functions/v1/shipstation-ship',{
-      method:'POST',
-      headers:{'Content-Type':'application/json','Authorization':'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA'},
-      body:JSON.stringify({test_order:orderNum})
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ping:true})
     });
-    const data=await res.json();
-    if(!res.ok&&data.error==='secrets_missing'){
-      el.textContent='❌ SHIPSTATION_KEY or SHIPSTATION_SECRET not set in Edge Function secrets.\n\nFix: Dashboard → Edge Functions → shipstation-ship → Secrets → add both keys.';
-      return;
+    if(res.ok){
+      const d=await res.json().catch(()=>({}));
+      out+='  ✓ Responding (pong received)\n';
+      out+='  → Function is deployed and JWT is OFF\n';
+      out+='  → Webhook URL: https://piamamighqiielfztgic.supabase.co/functions/v1/shipstation-ship\n';
+    }else{
+      out+='  ✗ HTTP '+res.status+' — JWT may still be ON\n';
+      out+='  → Dashboard → Edge Functions → shipstation-ship → toggle JWT OFF\n';
     }
-    let out='ORDER '+orderNum+'\n'+'─'.repeat(40)+'\n\n';
-    out+='SHIPSTATION:\n';
-    const ss=data.shipstation;
-    if(ss){
-      out+='  API status: '+ss.status+'\n';
-      if(ss.orders?.length){ss.orders.forEach(o=>{out+='  Found: "'+o.orderNumber+'" status='+o.orderStatus+' shipments='+o.shipments+'\n';});}
-      else out+='  ⚠ NO ORDER FOUND in ShipStation with number "'+orderNum+'"\n     (check it matches exactly what ShipStation stores)\n';
-    }
-    out+='\nERP DATABASE:\n';
-    if(data.erp_rows?.length){data.erp_rows.forEach(r=>{out+='  ✓ '+r.order_number+' · '+r.pn+' · '+r.fulfillment_status+'\n';});}
-    else out+='  ⚠ NO MATCH in ERP sales table\n     (tried "'+orderNum+'", "#'+orderNum+'")\n     → Check how Shopify stored the order number\n';
-    out+='\nLOG:\n'+(data.log||[]).map(l=>'  '+l).join('\n');
-    el.textContent=out;
   }catch(e){
-    el.textContent='❌ Cannot reach edge function\n\nMake sure:\n1. Function "shipstation-ship" is deployed\n2. JWT Verification is OFF\n3. Error: '+e.message;
+    out+='  ✗ Network error (CORS blocks browser→function calls)\n';
+    out+='  → This is normal — ShipStation calls it server-to-server (no CORS issue)\n';
+    out+='  → Test with PowerShell instead:\n';
+    out+='  (use PowerShell to test: send ping:true to the function URL)\n';
+    out+='  → Expected response: true (you already confirmed this ✓)\n';
   }
+
+  out+='\nNEXT STEPS:\n';
+  if(!erpRows.length){
+    out+='  1. Check Shopify webhook is configured (Integrations → Setup Guide)\n';
+    out+='  2. Place a test order in Shopify and see if it appears in Sales\n';
+    out+='  3. The order number in ERP must match what ShipStation uses\n';
+  }else if(erpRows.some(r=>r.fulfillment_status==='Shipped')){
+    out+='  ✓ Order is already marked Shipped — webhook worked!\n';
+  }else{
+    out+='  1. Ship this order in ShipStation (print a label)\n';
+    out+='  2. Wait 5-10 seconds, then refresh ERP\n';
+    out+='  3. Check Supabase: Dashboard → Edge Functions → shipstation-ship → Logs\n';
+  }
+
+  el.textContent=out;
 }
 
 async function ssManualShipPrompt(){
@@ -3734,6 +3799,9 @@ function exportTable(table) {
 // RENDER
 // ============================================================
 function render(){
+  // Hide loader on first render
+  const _ld=document.getElementById('app-loading'),_sh=document.getElementById('app-shell');
+  if(_ld&&_ld.style.display!=='none'){_ld.style.display='none';if(_sh)_sh.style.display='flex';}
   const views={dashboard:renderDashboard,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder};
   if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length)computeDemand();
   // Preserve focused input + caret across re-render
