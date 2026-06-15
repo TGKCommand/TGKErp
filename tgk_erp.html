@@ -385,7 +385,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
     <button class="nav-item" id="nav-corrections" onclick="nav('corrections')"><span class="nav-dot"></span>Corrections Log</button>
 
     <div class="sidebar-section">Sales</div>
-    <button class="nav-item" id="nav-sales" onclick="nav('sales')"><span class="nav-dot"></span>Sales Orders</button>
+    <button class="nav-item" id="nav-sales" onclick="nav('sales')"><span class="nav-dot"></span>Sales Orders<span class="nav-badge" id="sales-badge" style="display:none">0</span></button>
     <button class="nav-item" id="nav-dealers" onclick="nav('dealers')"><span class="nav-dot"></span>Dealers</button>
     <button class="nav-item" id="nav-warranty" onclick="nav('warranty')"><span class="nav-dot"></span>Warranty Claims</button>
 
@@ -773,8 +773,34 @@ function nav(v){
   S.view=v;
   document.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
   const el=$('nav-'+v);if(el)el.classList.add('active');
+  // Clear new-order badge when visiting Sales Orders
+  if(v==='sales'){
+    const b=$('sales-badge');
+    if(b){b.textContent='0';b.style.display='none';}
+    $('nav-sales')?.classList.remove('alert-nav');
+  }
   $('page-title').textContent=PAGE_TITLES[v]||v;
   pushHist();render();
+}
+
+// ── NEW ORDER ALERT: called by realtime listener on INSERT ──
+function showOrderAlert(orderNum, pn){
+  // Toast notification
+  toast(`🛒 New order #${orderNum} — ${pn}`, 6000);
+  // Badge on Sales nav (only if user isn't already on Sales)
+  if(S.view!=='sales'){
+    const b=$('sales-badge');
+    if(b){
+      const n=(parseInt(b.textContent)||0)+1;
+      b.textContent=n;
+      b.style.display='';
+      $('nav-sales')?.classList.add('alert-nav');
+    }
+  }
+  // Browser notification if permission granted
+  if(typeof Notification!=='undefined'&&Notification.permission==='granted'){
+    new Notification('TGK — New Order',{body:`#${orderNum} · ${pn}`,icon:'/favicon.ico'});
+  }
 }
 function onSearch(q){
   S.searchQ=q;
@@ -1303,6 +1329,7 @@ function renderSales(){
     ${fstats.map(s=>`<button class="filter-chip ${sf.fstatus===s?'on-teal':''}" onclick="setFilter('sales','fstatus','${s}')">${s}</button>`).join('')}
     <button class="btn btn-sm" style="margin-left:auto" title="Remove duplicate order lines (same order # + SKU). Tracking numbers on surviving rows are always preserved — tracking is rescued from duplicates before they are deleted." onclick="dedupeOrders()">🧽 Dedupe & Recover Tracking</button>
     <button class="btn btn-sm" title="Mark pre-system Open orders as Delivered" onclick="closeHistoricalOrders()">🧹 Close pre-system orders</button>
+    <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="syncOrdersNow()" title="Pull new orders from Shopify + check ShipStation for holds/splits">🔄 Sync Orders</button>
     <button class="btn btn-primary btn-sm" onclick='openModal("addSale",{})'>+ Manual Order</button>
     <span class="filter-count">${list.length} orders</span>
   </div>
@@ -1959,6 +1986,7 @@ Deno.serve(async (req) => {
 
   const body = await req.json()
   const { resource_url, resource_type } = body
+  console.log('[SS]', resource_type, resource_url)
 
   if (!resource_url) return new Response('no resource_url', {status:400})
 
@@ -1977,34 +2005,62 @@ Deno.serve(async (req) => {
       const tracking = ship.trackingNumber
       const carrier = ship.carrierCode?.toUpperCase() || ''
       const shippedAt = new Date().toISOString()
+
       // Which SKUs were in THIS shipment?
-      const shipItems = (ship.shipmentItems ?? []).map((i:any) => i.sku || i.name).filter(Boolean)
+      // ShipStation may send sku, name, or lineItemKey — try all.
+      const rawSkus = (ship.shipmentItems ?? []).flatMap((i:any) =>
+        [i.sku, i.name, i.lineItemKey].filter(Boolean)
+      )
+      console.log('[SS] order', orderNum, 'tracking', tracking, 'rawSkus', JSON.stringify(rawSkus))
 
-      // Check if order has OTHER lines that are still open (= split shipment)
-      const { data: orderLines } = await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', orderNum)
-      const allPns = (orderLines ?? []).map((l:any) => l.pn)
-      const isSplit = shipItems.length > 0 && shipItems.length < allPns.length
+      // Fetch all ERP lines for this order so we can do SKU matching
+      const { data: orderLines } = await db.from('sales')
+        .select('id,pn,fulfillment_status').eq('order_number', orderNum)
+      const erpLines = orderLines ?? []
+      const allErpPns = erpLines.map((l:any) => l.pn as string)
 
-      if (shipItems.length > 0) {
-        // Update only the lines in this shipment
-        for (const sku of shipItems) {
+      // Match ShipStation SKUs → ERP pns (case-insensitive, strip spaces)
+      // A ShipStation SKU matches an ERP pn if either contains the other (handles prefix diffs)
+      const norm = (s:string) => s.trim().toUpperCase()
+      const matchedPns = allErpPns.filter(erpPn =>
+        rawSkus.some(ssSku => {
+          const e = norm(erpPn), s = norm(ssSku)
+          return e === s || e.includes(s) || s.includes(e)
+        })
+      )
+      console.log('[SS] matchedPns', JSON.stringify(matchedPns), 'of', JSON.stringify(allErpPns))
+
+      const isSplit = matchedPns.length > 0 && matchedPns.length < allErpPns.length
+
+      if (matchedPns.length > 0) {
+        // Update ONLY the matched lines — do NOT touch the rest
+        for (const pn of matchedPns) {
           await db.from('sales').update({
             fulfillment_status: 'Shipped', tracking_number: tracking, carrier,
             shipped_at: shippedAt, is_split_shipment: isSplit
-          }).eq('order_number', orderNum).eq('pn', sku)
+          }).eq('order_number', orderNum).eq('pn', pn)
         }
-        // Mark remaining open lines as Partial (split shipped)
+        // Remaining open lines → Partial (they're on a split order)
         if (isSplit) {
-          await db.from('sales').update({ fulfillment_status: 'Partial', is_split_shipment: true })
-            .eq('order_number', orderNum).in('fulfillment_status', ['Open'])
-            .not('pn', 'in', '("' + shipItems.join('","') + '")')
+          const unshippedPns = allErpPns.filter(p => !matchedPns.includes(p))
+          for (const pn of unshippedPns) {
+            const line = erpLines.find((l:any) => l.pn === pn)
+            // Only update if still Open/Packed — don't overwrite On Hold or already Shipped
+            if (line && ['Open','Packed'].includes(line.fulfillment_status)) {
+              await db.from('sales').update({ fulfillment_status: 'Partial', is_split_shipment: true })
+                .eq('order_number', orderNum).eq('pn', pn)
+            }
+          }
         }
       } else {
-        // No item list — update whole order
+        // No SKU match at all — this is the dangerous fallback that caused the bug.
+        // Log a warning and update ALL open lines (but skip On Hold lines).
+        console.warn('[SS] WARNING: no SKU match for order', orderNum,
+          '— updating all Open/Packed lines. Fix SKUs in ShipStation to match ERP pns.')
         await db.from('sales').update({
-          fulfillment_status: 'Shipped', tracking_number: tracking, carrier,
-          shipped_at: shippedAt
+          fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt
         }).eq('order_number', orderNum).in('fulfillment_status', ['Open','Packed','Partial'])
+        // NOTE: lines in 'On Hold' status are intentionally NOT updated here
       }
     }
   }
@@ -2420,6 +2476,13 @@ async function executeShopifyImport(){
 
   let imported=0,updated=0,skipped=0,errors=0;
   const errorMsgs=[];
+  let _stripNewCols=false; // set true after first schema error so all subsequent chunks skip new cols
+
+  // Strip columns that might not exist in older DB schemas
+  const stripNewCols=row=>{
+    const{financial_status,cancelled_at,is_split_shipment,...base}=row;
+    return base;
+  };
 
   // ── Step 3: Insert new lines in chunks ──
   const toInsert=newLines.map(l=>({
@@ -2435,13 +2498,28 @@ async function executeShopifyImport(){
 
   const CHUNK=100;
   for(let i=0;i<toInsert.length;i+=CHUNK){
-    const chunk=toInsert.slice(i,i+CHUNK);
+    let chunk=toInsert.slice(i,i+CHUNK);
+    if(_stripNewCols)chunk=chunk.map(stripNewCols);
     const{error}=await db.from('sales').insert(chunk);
     if(error){
-      errors++;
-      const msg=`Chunk ${Math.floor(i/CHUNK)+1}: ${error.message}`;
-      errorMsgs.push(msg);
-      console.error('Import chunk error:',error.message);
+      // Schema error (missing column)? Strip new cols and retry this chunk once
+      const isSchemaErr=error.message.includes('column')||error.code==='42703'||error.message.includes('does not exist');
+      if(isSchemaErr&&!_stripNewCols){
+        _stripNewCols=true;
+        const{error:e2}=await db.from('sales').insert(chunk.map(stripNewCols));
+        if(e2){
+          errors++;
+          errorMsgs.push(`Chunk ${Math.floor(i/CHUNK)+1}: ${e2.message}`);
+          console.error('Import chunk error (retry):', e2.message);
+        } else {
+          imported+=chunk.length;
+          errorMsgs.push('⚠ DB missing new columns (financial_status, cancelled_at, is_split_shipment) — imported without them. Run the SQL migration when possible.');
+        }
+      } else {
+        errors++;
+        errorMsgs.push(`Chunk ${Math.floor(i/CHUNK)+1}: ${error.message}`);
+        console.error('Import chunk error:', error.message);
+      }
     }
     else imported+=chunk.length;
     const done=Math.min(i+CHUNK,toInsert.length);
@@ -2490,6 +2568,89 @@ async function executeShopifyImport(){
   }
   const dedupeTip=imported>0?`<div style="font-size:11px;color:var(--text3);margin-top:6px;padding:0 10px 8px">If any orders have duplicate lines, click <b>🧽 Dedupe &amp; Recover Tracking</b> on the Import Data page to clean them up.</div>`:'';
   if(el)el.innerHTML=html+dedupeTip;
+}
+
+async function syncOrdersNow(){
+  const store=(S.shopify?.store||'').trim();
+  const key=(S.shopify?.key||'').trim();
+  if(!store||!key){
+    toast('⚠ Shopify credentials not saved — go to Integrations to configure');
+    return;
+  }
+  toast('🔄 Syncing orders from Shopify…');
+  const cutoff=new Date(Date.now()-30*24*60*60*1000).toISOString(); // last 30 days
+  let newCount=0,updatedCount=0,page=1,keepGoing=true;
+
+  while(keepGoing){
+    try{
+      const url=`https://${store.replace(/^https?:\/\//,'')}/admin/api/2024-01/orders.json?status=any&limit=250&updated_at_min=${cutoff}&page=${page}`;
+      const res=await fetch(url,{headers:{'X-Shopify-Access-Token':key,'Content-Type':'application/json'}});
+      if(!res.ok){toast('Shopify error '+res.status+' — check credentials in Integrations');break;}
+      const{orders=[]}=await res.json();
+      if(!orders.length){keepGoing=false;break;}
+
+      for(const order of orders){
+        const orderNum=order.name;
+        for(const li of (order.line_items||[])){
+          const pn=li.sku||li.title;
+          if(!pn)continue;
+          const fs=order.financial_status==='refunded'?'Cancelled':
+            order.fulfillment_status==='fulfilled'?'Delivered':
+            order.fulfillment_status==='partial'?'Partial':'Open';
+          const existing=S.sales.find(s=>s.order_number===orderNum&&s.pn===pn);
+
+          if(!existing){
+            // New line — insert it
+            const{data}=await db.from('sales').insert({
+              order_number:orderNum,pn,qty:li.quantity||1,
+              fulfillment_status:fs,source:'Shopify Sync',
+              sale_date:(order.created_at||new Date().toISOString()).slice(0,10)
+            }).select().single();
+            if(data){S.sales=[data,...S.sales];newCount++;showOrderAlert(orderNum,pn);}
+          } else if(existing.fulfillment_status!==fs&&['Open','Partial'].includes(existing.fulfillment_status)){
+            // Status changed on Shopify side — update (but never overwrite Shipped/Delivered/Cancelled)
+            const{error}=await db.from('sales').update({fulfillment_status:fs}).eq('id',existing.id);
+            if(!error){S.sales=S.sales.map(s=>s.id===existing.id?{...s,fulfillment_status:fs}:s);updatedCount++;}
+          }
+        }
+      }
+
+      page++;
+      if(orders.length<250)keepGoing=false;
+    }catch(e){toast('Sync error: '+e.message);break;}
+  }
+
+  // Also check ShipStation for open orders that may have been held or split
+  const openOrders=[...new Set(S.sales.filter(s=>['Open','Partial'].includes(s.fulfillment_status||'Open')).map(s=>s.order_number).filter(Boolean))];
+  if(openOrders.length&&(S.shipstation?.key||S.settings?.shipstation?.key)){
+    toast('🔄 Checking ShipStation for holds and splits…');
+    const ssKey=S.shipstation?.key||S.settings?.shipstation?.key;
+    const ssSec=S.shipstation?.secret||S.settings?.shipstation?.secret;
+    if(ssKey&&ssSec){
+      try{
+        // Check a batch of open orders in ShipStation
+        const batch=openOrders.slice(0,50);
+        const ssRes=await fetch(`https://ssapi.shipstation.com/orders?orderStatus=on_hold&pageSize=100`,{
+          headers:{Authorization:'Basic '+btoa(ssKey+':'+ssSec)}
+        });
+        if(ssRes.ok){
+          const{orders:held=[]}=await ssRes.json();
+          for(const ho of held){
+            const num=ho.orderNumber;
+            const erpLines=S.sales.filter(s=>s.order_number===num&&s.fulfillment_status==='Open');
+            for(const line of erpLines){
+              await db.from('sales').update({fulfillment_status:'On Hold'}).eq('id',line.id);
+              S.sales=S.sales.map(s=>s.id===line.id?{...s,fulfillment_status:'On Hold'}:s);
+              updatedCount++;
+            }
+          }
+        }
+      }catch(e){console.warn('ShipStation hold check failed:',e.message);}
+    }
+  }
+
+  await refreshSales();render();
+  toast(`✓ Sync done — ${newCount} new order line${newCount!==1?'s':''}, ${updatedCount} updated`);
 }
 
 async function importOrdersFromShopify(){
