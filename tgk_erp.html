@@ -435,7 +435,6 @@ td[class*=money]{font-variant-numeric:tabular-nums}
   var PRIMARY='https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js';
   var FALLBACK='https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.min.js';
   loadScript(PRIMARY, null, function(){
-    console.warn('jsdelivr failed, trying unpkg…');
     loadScript(FALLBACK, null, function(){
       var el=document.getElementById('tgk-msg');
       if(el){el.textContent='Failed to load Supabase library. Check internet connection.';el.style.color='#dc2626';}
@@ -640,31 +639,27 @@ function setupRealtime(){
       if(p.eventType==='INSERT')S.parts=[...S.parts,p.new].sort((a,b)=>a.pn.localeCompare(b.pn));
       else if(p.eventType==='UPDATE')S.parts=S.parts.map(x=>x.id===p.new.id?p.new:x);
       else if(p.eventType==='DELETE')S.parts=S.parts.filter(x=>x.id!==p.old.id);
-      updateBadge();if(['parts','inventory','dashboard'].includes(S.view))render();
-      toast('Parts updated');
+      updateBadge();if(['parts','inventory','dashboard'].includes(S.view))scheduleRender();
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'assemblies'},p=>{
       if(p.eventType==='INSERT')S.assemblies=[...S.assemblies,p.new].sort((a,b)=>a.pn.localeCompare(b.pn));
       else if(p.eventType==='UPDATE')S.assemblies=S.assemblies.map(x=>x.id===p.new.id?p.new:x);
       else if(p.eventType==='DELETE')S.assemblies=S.assemblies.filter(x=>x.id!==p.old.id);
-      if(['assemblies','dashboard'].includes(S.view))render();
-      toast('Assemblies updated');
+      if(['assemblies','dashboard'].includes(S.view))scheduleRender();
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'sales'},p=>{
       if(p.eventType==='INSERT'){
-        // Only add if not already present (webhook dedup guard)
         if(!S.sales.find(s=>s.id===p.new.id)){
           S.sales=[p.new,...S.sales];
           showOrderAlert(p.new.order_number||'',p.new.pn||'');
         }
       }
-      // UPDATE handled below by the second subscription
-      if(['sales','dashboard'].includes(S.view))render();
+      if(['sales','dashboard'].includes(S.view))scheduleRender();
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'purchases'},p=>{
       if(p.eventType==='INSERT')S.purchases=[p.new,...S.purchases];
       else if(p.eventType==='UPDATE')S.purchases=S.purchases.map(x=>x.id===p.new.id?p.new:x);
-      if(['purchases','dashboard'].includes(S.view))render();
+      if(['purchases','dashboard'].includes(S.view))scheduleRender();
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'po_lines'},p=>{
       // Another user received a PO line — refresh the open PO detail if visible
@@ -675,13 +670,13 @@ function setupRealtime(){
           if(p.eventType==='INSERT')S.poLines[poId]=[...S.poLines[poId],p.new];
           else S.poLines[poId]=S.poLines[poId].map(l=>l.id===p.new.id?p.new:l);
         }
-        if(S.view==='purchases'&&S.activePO===poId)render();
+        if(S.view==='purchases'&&S.activePO===poId)scheduleRender();
       }
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'inv_corrections'},p=>{
       if(p.eventType==='INSERT'){
         S.corrections=[p.new,...S.corrections].slice(0,1000);
-        if(S.view==='corrections')render();
+        if(S.view==='corrections')scheduleRender();
         // Silent — don't toast for every correction (too noisy with multiple users)
       }
     })
@@ -695,7 +690,7 @@ function setupRealtime(){
     .on('postgres_changes',{event:'*',schema:'public',table:'cycle_count_lines'},p=>{
       if(p.eventType==='UPDATE'&&S.activeCount){
         S.countLines=S.countLines.map(l=>l.id===p.new.id?p.new:l);
-        if(S.view==='cyclecounts')render();
+        if(S.view==='cyclecounts')scheduleRender();
       }
     })
     .subscribe((status)=>{
@@ -1221,7 +1216,7 @@ function renderSaleDetail(s){
     ? S.sales.filter(x=>x.order_number===s.order_number).sort((a,b)=>a.pn.localeCompare(b.pn))
     : [s];
   const isMulti=allLines.length>1;
-  const fsMap={'Open':'pill-red','On Hold':'pill-purple','Packed':'pill-yellow','Shipped':'pill-teal','Delivered':'pill-green','Cancelled':'pill-muted'};
+  const fsMap=FS_MAP;
   const rank={'Delivered':5,'Shipped':4,'Packed':3,'On Hold':2,'Open':1,'Cancelled':0};
 
   // Order-level status = most progressed line
@@ -1979,7 +1974,7 @@ async function executeShopifyImport(){
   for(let i=0;i<toInsert.length;i+=100){
     const chunk=toInsert.slice(i,i+100);
     const{error}=await db.from('sales').insert(chunk);
-    if(error){errors++;console.warn('Insert error:',error);}
+    if(error){errors++;}
     else imported+=chunk.length;
     if(el)el.querySelector('button')&&(el.querySelector('button').textContent=`Importing… ${imported}/${toInsert.length}`);
   }
@@ -4565,6 +4560,12 @@ function exportTable(table) {
 // ============================================================
 // RENDER
 // ============================================================
+let _renderPending=false;
+function scheduleRender(){
+  if(_renderPending)return;
+  _renderPending=true;
+  requestAnimationFrame(()=>{_renderPending=false;render();});
+}
 function render(){
   // Hide loader on first render  if(_sh)_sh.style.display='flex';}
   const views={dashboard:renderDashboard,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder};
@@ -4584,6 +4585,23 @@ function render(){
     if(el){el.focus();try{el.setSelectionRange(selS,selE);}catch(e){}}
   }
   updateBadge();
+}
+
+// ── TARGETED TABLE REFRESH (avoids full loadAll on minor changes) ──
+async function refreshSales(){
+  const{data}=await db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000);
+  if(data)S.sales=data;
+  computeDemand();updateBadge();
+}
+async function refreshParts(){
+  const{data}=await db.from('parts').select('*').order('pn');
+  if(data)S.parts=data;
+  computeDemand();
+}
+async function refreshAssemblies(){
+  const{data}=await db.from('assemblies').select('*').order('pn');
+  if(data)S.assemblies=data;
+  computeDemand();
 }
 
 // ── INIT ─────────────────────────────────────────────────────
