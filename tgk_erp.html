@@ -2134,12 +2134,33 @@ const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
-
-function ok(body: string) {
-  return new Response(body, { headers: CORS })
-}
+function ok(body: string) { return new Response(body, { headers: CORS }) }
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { ...CORS, 'Content-Type': 'application/json' } })
+}
+
+// Normalize order number: strip leading # for map key comparison
+function stripHash(s: string): string { return s.replace(/^#/, '') }
+
+// Pre-fetch all open/packed/partial orders and build an in-memory lookup
+// Returns map of normalized orderNum -> [{id, pn, order_number, fulfillment_status}]
+async function buildOrderMap(): Promise<Record<string, any[]>> {
+  const { data } = await db.from('sales')
+    .select('id,order_number,pn,fulfillment_status')
+    .in('fulfillment_status', ['Open', 'Packed', 'Partial'])
+    .limit(100000)
+  const map: Record<string, any[]> = {}
+  for (const line of (data || [])) {
+    const key = stripHash(line.order_number || '')
+    if (!map[key]) map[key] = []
+    map[key].push(line)
+  }
+  return map
+}
+
+function ssAuth(): string {
+  const k = Deno.env.get('SS_KEY') || '', s = Deno.env.get('SS_SECRET') || ''
+  return btoa(k + ':' + s)
 }
 
 Deno.serve(async (req) => {
@@ -2149,82 +2170,158 @@ Deno.serve(async (req) => {
 
   if (req.method === 'GET' || body.ping) return new Response('pong', { headers: CORS })
 
-  // Secrets diagnostic - never exposes values, only confirms they're loaded
+  // Secrets check
   if (body.check_secrets) {
-    const k = Deno.env.get('SS_KEY') || ''
-    const s = Deno.env.get('SS_SECRET') || ''
-    return json({
-      ss_key_set: k.length > 0,
-      ss_key_length: k.length,
-      ss_key_preview: k.length > 4 ? k.slice(0,2)+'...'+k.slice(-2) : '(empty)',
-      ss_secret_set: s.length > 0,
-      ss_secret_length: s.length,
-      ss_secret_preview: s.length > 4 ? s.slice(0,2)+'...'+s.slice(-2) : '(empty)',
-    })
+    const k = Deno.env.get('SS_KEY') || '', s = Deno.env.get('SS_SECRET') || ''
+    return json({ ss_key_set: k.length > 0, ss_key_length: k.length, ss_key_preview: k.length > 4 ? k.slice(0,2)+'...'+k.slice(-2) : '(empty)', ss_secret_set: s.length > 0, ss_secret_length: s.length, ss_secret_preview: s.length > 4 ? s.slice(0,2)+'...'+s.slice(-2) : '(empty)' })
   }
 
-  // Bulk sync: fetch all shipments from ShipStation since a date and apply to ERP
+  // --- BULK SYNC: batch pre-fetch open orders then apply shipments in batch ---
   if (body.action === 'bulk_sync') {
-    const bKey = Deno.env.get('SS_KEY') || ''
-    const bSec = Deno.env.get('SS_SECRET') || ''
-    if (!bKey || !bSec) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
-    const bAuth = btoa(bKey + ':' + bSec)
+    const auth = ssAuth()
+    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
     const since = body.since || new Date(Date.now() - 30*24*60*60*1000).toISOString().slice(0,10)
+    const until = body.until || new Date().toISOString().slice(0,10)
+
+    // ONE query to get all open orders
+    const orderMap = await buildOrderMap()
+    const norm = (s: string) => s.trim().toUpperCase()
+
+    // Collect all updates grouped by tracking number so we can batch .in() calls
+    const updateGroups: Record<string, { ids: string[], tracking: string, carrier: string, shippedAt: string }> = {}
     let page = 1, totalPages = 1, synced = 0, skipped = 0, notFound = 0
 
     while (page <= totalPages) {
-      const url = 'https://ssapi.shipstation.com/shipments?shipDateStart=' + since
-        + '&pageSize=500&page=' + page + '&includeShipmentItems=true'
-      const bRes = await fetch(url, { headers: { Authorization: 'Basic ' + bAuth } })
-      if (!bRes.ok) return json({ error: 'ShipStation error ' + bRes.status }, 502)
-      const bData = await bRes.json()
-      totalPages = bData.pages || 1
+      const url = 'https://ssapi.shipstation.com/shipments?shipDateStart=' + since + '&shipDateEnd=' + until + '&pageSize=500&page=' + page + '&includeShipmentItems=true'
+      const res = await fetch(url, { headers: { Authorization: 'Basic ' + auth } })
+      if (!res.ok) return json({ error: 'ShipStation error ' + res.status }, 502)
+      const data = await res.json()
+      totalPages = data.pages || 1
 
-      for (const ship of (bData.shipments || [])) {
-        if (ship.voided) { skipped++; continue }
-        const rawNum = ship.orderNumber
-        const tracking = ship.trackingNumber
-        if (!tracking) { skipped++; continue }
-        const carrier = ship.carrierCode?.toUpperCase() || ''
-        const shippedAt = ship.shipDate ? new Date(ship.shipDate).toISOString() : new Date().toISOString()
-
-        // Resolve order number - try with and without # prefix
-        let lines: any[] = []
-        let resolvedNum = rawNum
-        const r1 = await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', rawNum)
-        if (r1.data?.length) {
-          lines = r1.data
-        } else {
-          const r2 = await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', '#' + rawNum)
-          if (r2.data?.length) { lines = r2.data; resolvedNum = '#' + rawNum }
-        }
+      for (const ship of (data.shipments || [])) {
+        if (ship.voided || !ship.trackingNumber) { skipped++; continue }
+        const rawNum = stripHash(ship.orderNumber || '')
+        const lines = orderMap[rawNum] || []
         if (!lines.length) { notFound++; continue }
 
         const rawSkus = (ship.shipmentItems || []).flatMap((i: any) => [i.sku, i.name].filter(Boolean))
-        const norm = (s: string) => s.trim().toUpperCase()
         const allPns = lines.map((l: any) => l.pn as string)
         const matched = rawSkus.length > 0
           ? allPns.filter(p => rawSkus.some((s: string) => { const e=norm(p),k=norm(s); return e===k||e.includes(k)||k.includes(e) }))
           : allPns
 
+        const tracking = ship.trackingNumber
+        const carrier = (ship.carrierCode || '').toUpperCase()
+        const shippedAt = ship.shipDate ? new Date(ship.shipDate).toISOString() : new Date().toISOString()
+        const gKey = tracking + '|' + carrier + '|' + shippedAt.slice(0,10)
+
+        if (!updateGroups[gKey]) updateGroups[gKey] = { ids: [], tracking, carrier, shippedAt }
         for (const pn of matched) {
-          await db.from('sales').update({
-            fulfillment_status: 'Shipped', tracking_number: tracking,
-            carrier: carrier, shipped_at: shippedAt
-          }).eq('order_number', resolvedNum).eq('pn', pn)
-            .in('fulfillment_status', ['Open', 'Packed', 'Partial'])
+          const line = lines.find((l: any) => l.pn === pn)
+          if (line) updateGroups[gKey].ids.push(line.id)
         }
         synced++
       }
       page++
     }
-    return json({ synced, skipped, notFound, pages: totalPages,
-      message: 'Synced ' + synced + ' shipments (' + skipped + ' skipped, ' + notFound + ' order not in ERP)' })
+
+    // Apply updates in batches - one .in() call per unique tracking number
+    let applied = 0
+    for (const g of Object.values(updateGroups)) {
+      const deduped = [...new Set(g.ids)]
+      for (let i = 0; i < deduped.length; i += 200) {
+        await db.from('sales').update({
+          fulfillment_status: 'Shipped', tracking_number: g.tracking,
+          carrier: g.carrier, shipped_at: g.shippedAt
+        }).in('id', deduped.slice(i, i+200))
+        applied += Math.min(200, deduped.length - i)
+      }
+    }
+    return json({ synced, skipped, notFound, applied, pages: totalPages, message: 'Synced ' + synced + ' shipments, applied ' + applied + ' line updates' })
+  }
+
+  // --- HOLD SYNC: fetch on-hold orders from ShipStation, update ERP ---
+  if (body.action === 'hold_sync') {
+    const auth = ssAuth()
+    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
+    const orderMap = await buildOrderMap()
+    let page = 1, totalPages = 1, markedHold = 0, markedOpen = 0
+
+    // Mark held orders
+    while (page <= totalPages) {
+      const res = await fetch('https://ssapi.shipstation.com/orders?orderStatus=on_hold&pageSize=500&page=' + page, { headers: { Authorization: 'Basic ' + auth } })
+      if (!res.ok) return json({ error: 'ShipStation error ' + res.status }, 502)
+      const data = await res.json()
+      totalPages = data.pages || 1
+      for (const order of (data.orders || [])) {
+        const lines = orderMap[stripHash(order.orderNumber || '')] || []
+        const ids = lines.filter((l: any) => ['Open','Packed'].includes(l.fulfillment_status)).map((l: any) => l.id as string)
+        if (ids.length) {
+          await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', ids)
+          markedHold += ids.length
+        }
+      }
+      page++
+    }
+
+    // Release holds: fetch awaiting_shipment orders and restore On Hold -> Open
+    const relRes = await fetch('https://ssapi.shipstation.com/orders?orderStatus=awaiting_shipment&pageSize=500', { headers: { Authorization: 'Basic ' + auth } })
+    if (relRes.ok) {
+      const relData = await relRes.json()
+      const { data: heldLines } = await db.from('sales').select('id,order_number').eq('fulfillment_status', 'On Hold').limit(5000)
+      for (const order of (relData.orders || [])) {
+        const rawNum = stripHash(order.orderNumber || '')
+        const toRelease = (heldLines || []).filter((l: any) => stripHash(l.order_number || '') === rawNum).map((l: any) => l.id as string)
+        if (toRelease.length) {
+          await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', toRelease)
+          markedOpen += toRelease.length
+        }
+      }
+    }
+    return json({ markedHold, markedOpen, message: markedHold + ' marked On Hold, ' + markedOpen + ' released to Open' })
+  }
+
+  // --- DELIVERY SYNC: check ShipStation for delivered shipments ---
+  if (body.action === 'delivery_sync') {
+    const auth = ssAuth()
+    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
+    const since = body.since || new Date(Date.now() - 45*24*60*60*1000).toISOString().slice(0,10)
+
+    // Get all Shipped ERP lines with tracking
+    const { data: shipped } = await db.from('sales')
+      .select('id,order_number,tracking_number')
+      .eq('fulfillment_status', 'Shipped')
+      .not('tracking_number', 'is', null)
+      .limit(2000)
+    if (!shipped?.length) return json({ delivered: 0, message: 'No shipped orders to check' })
+
+    // Build tracking -> id map
+    const trackMap: Record<string, string> = {}
+    for (const s of (shipped || [])) trackMap[(s.tracking_number || '').toUpperCase()] = s.id
+
+    // Fetch SS shipments and look for deliveryDate
+    const res = await fetch('https://ssapi.shipstation.com/shipments?shipDateStart=' + since + '&pageSize=500&includeShipmentItems=false', { headers: { Authorization: 'Basic ' + auth } })
+    if (!res.ok) return json({ error: 'ShipStation error ' + res.status }, 502)
+    const data = await res.json()
+
+    const toDeliver: string[] = []
+    for (const ship of (data.shipments || [])) {
+      if (!ship.deliveryDate && ship.shipmentStatus !== 'delivered') continue
+      const id = trackMap[(ship.trackingNumber || '').toUpperCase()]
+      if (id) toDeliver.push(id)
+    }
+
+    let delivered = 0
+    const now = new Date().toISOString()
+    for (let i = 0; i < toDeliver.length; i += 200) {
+      await db.from('sales').update({ fulfillment_status: 'Delivered', delivered_at: now }).in('id', toDeliver.slice(i, i+200))
+      delivered += Math.min(200, toDeliver.length - i)
+    }
+    return json({ delivered, checked: shipped?.length || 0, message: delivered + ' orders marked Delivered' })
   }
 
   const { resource_url, resource_type } = body
   console.log('[SS]', resource_type, resource_url)
-
   if (!resource_url) return new Response('no resource_url', { status: 400, headers: CORS })
 
   const ssKey = Deno.env.get('SS_KEY')!, ssSec = Deno.env.get('SS_SECRET')!
@@ -2241,86 +2338,58 @@ Deno.serve(async (req) => {
       const tracking = ship.trackingNumber
       const carrier = ship.carrierCode?.toUpperCase() || ''
       const shippedAt = new Date().toISOString()
-
-      const rawSkus = (ship.shipmentItems ?? []).flatMap((i: any) =>
-        [i.sku, i.name, i.lineItemKey].filter(Boolean)
-      )
+      const rawSkus = (ship.shipmentItems ?? []).flatMap((i: any) => [i.sku, i.name, i.lineItemKey].filter(Boolean))
       console.log('[SS] order', orderNum, 'tracking', tracking, 'rawSkus', JSON.stringify(rawSkus))
 
-      const { data: orderLines } = await db.from('sales')
-        .select('id,pn,fulfillment_status').eq('order_number', orderNum)
-      // ShipStation may omit the # prefix - try both formats
-      const erpLines = orderLines?.length ? orderLines
-        : (await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', '#' + orderNum)).data ?? []
+      const { data: orderLines } = await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', orderNum)
+      const erpLines = orderLines?.length ? orderLines : (await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', '#' + orderNum)).data ?? []
       const resolvedOrderNum = erpLines.length && !orderLines?.length ? '#' + orderNum : orderNum
       const allErpPns = erpLines.map((l: any) => l.pn as string)
-
       const norm = (s: string) => s.trim().toUpperCase()
-      const matchedPns = allErpPns.filter(erpPn =>
-        rawSkus.some((ssSku: string) => {
-          const e = norm(erpPn), s = norm(ssSku)
-          return e === s || e.includes(s) || s.includes(e)
-        })
-      )
+      const matchedPns = allErpPns.filter(erpPn => rawSkus.some((ssSku: string) => { const e=norm(erpPn),s=norm(ssSku); return e===s||e.includes(s)||s.includes(e) }))
       console.log('[SS] matchedPns', JSON.stringify(matchedPns), 'of', JSON.stringify(allErpPns))
-
       const isSplit = matchedPns.length > 0 && matchedPns.length < allErpPns.length
 
       if (matchedPns.length > 0) {
         for (const pn of matchedPns) {
-          await db.from('sales').update({
-            fulfillment_status: 'Shipped', tracking_number: tracking, carrier,
-            shipped_at: shippedAt, is_split_shipment: isSplit
-          }).eq('order_number', resolvedOrderNum).eq('pn', pn)
+          await db.from('sales').update({ fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt, is_split_shipment: isSplit }).eq('order_number', resolvedOrderNum).eq('pn', pn)
         }
         if (isSplit) {
           const unshippedPns = allErpPns.filter((p: string) => !matchedPns.includes(p))
           for (const pn of unshippedPns) {
             const line = erpLines.find((l: any) => l.pn === pn)
             if (line && ['Open', 'Packed'].includes(line.fulfillment_status)) {
-              await db.from('sales').update({ fulfillment_status: 'Partial', is_split_shipment: true })
-                .eq('order_number', resolvedOrderNum).eq('pn', pn)
+              await db.from('sales').update({ fulfillment_status: 'Partial', is_split_shipment: true }).eq('order_number', resolvedOrderNum).eq('pn', pn)
             }
           }
         }
       } else {
         console.warn('[SS] WARNING: no SKU match for order', resolvedOrderNum, '- updating all Open/Packed lines')
-        await db.from('sales').update({
-          fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt
-        }).eq('order_number', resolvedOrderNum).in('fulfillment_status', ['Open', 'Packed', 'Partial'])
+        await db.from('sales').update({ fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt }).eq('order_number', resolvedOrderNum).in('fulfillment_status', ['Open', 'Packed', 'Partial'])
       }
     }
   }
 
   if (resource_type === 'ORDER_CANCELLED') {
     const rawNum = data.orderNumber
-    const { data: existing } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
-    const resolvedNum = existing?.length ? rawNum : '#' + rawNum
-    await db.from('sales')
-      .update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() })
-      .eq('order_number', resolvedNum)
+    const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
+    const rn = ex?.length ? rawNum : '#' + rawNum
+    await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('order_number', rn)
   }
-
   if (resource_type === 'ORDER_ON_HOLD') {
     const rawNum = data.orderNumber
-    const { data: existing } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
-    const resolvedNum = existing?.length ? rawNum : '#' + rawNum
-    await db.from('sales')
-      .update({ fulfillment_status: 'On Hold' })
-      .eq('order_number', resolvedNum)
+    const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
+    await db.from('sales').update({ fulfillment_status: 'On Hold' }).eq('order_number', ex?.length ? rawNum : '#' + rawNum)
   }
-
   if (resource_type === 'ORDER_HOLD_RELEASED') {
     const rawNum = data.orderNumber
-    const { data: existing } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
-    const resolvedNum = existing?.length ? rawNum : '#' + rawNum
-    await db.from('sales')
-      .update({ fulfillment_status: 'Open' })
-      .eq('order_number', resolvedNum)
+    const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
+    await db.from('sales').update({ fulfillment_status: 'Open' }).eq('order_number', ex?.length ? rawNum : '#' + rawNum)
   }
 
   return ok('ok')
-})</pre>
+})
+</pre>
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">4 — Set ShipStation env vars in Supabase</div>
     <div style="font-size:11px;color:var(--text2);line-height:1.7;margin-bottom:8px">Dashboard → Edge Functions → <b>shipstation-ship</b> → Secrets → add:<br>
@@ -2473,37 +2542,51 @@ async function ssReplayWebhook(){
 async function checkDelivery(orderNum, saleId){
   toast('Checking ShipStation for delivery…');
   try{
-    const res=await fetch('https://piamamighqiielfztgic.supabase.co/functions/v1/shipstation-delivery-sync',{
-      method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA'},
-      body:JSON.stringify({sync:true})
+    const res=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'delivery_sync'})
     });
     const data=await res.json().catch(()=>({}));
-    if(data.ok){
-      await loadAll();render();
+    if(res.ok){
+      await refreshSales();render();
       const sale=S.sales.find(s=>s.id===saleId);
       if(sale?.fulfillment_status==='Delivered')toast('✓ Marked Delivered!');
-      else toast('Synced — '+data.delivered+' delivered, '+data.updated+' updated. Order may still be in transit.');
-    }else toast('Sync error: '+(data.error||'unknown'));
+      else toast('Sync done — '+data.delivered+' delivered. Order may still be in transit.');
+    }else toast('Sync error: '+(data.error||res.status));
   }catch(e){
-    // CORS fallback — mark manually
-    const doManual=confirm('Cannot reach sync function from browser (CORS).\n\nHas this package been delivered? Click OK to mark it Delivered now.');
+    const doManual=confirm('Cannot reach sync function.\n\nHas this package been delivered? Click OK to mark it Delivered now.');
     if(doManual){await markDelivered(saleId);}
   }
 }
 
-async function runDeliverySync(){
-  toast('Running delivery sync…');
+async function runHoldSync(){
+  toast('Checking ShipStation for held/released orders…');
   try{
-    const res=await fetch('https://piamamighqiielfztgic.supabase.co/functions/v1/shipstation-delivery-sync',{
-      method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA'},
-      body:JSON.stringify({sync:true})
+    const res=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'hold_sync'})
     });
     const data=await res.json().catch(()=>({}));
-    if(data.ok){
-      await loadAll();render();
-      toast('Delivery sync done — '+data.delivered+' delivered, '+data.updated+' tracking updates');
-    }else toast('Error: '+(data.error||'unknown'));
-  }catch(e){toast('CORS blocks browser call — sync runs automatically every hour via cron');}
+    if(res.ok){
+      await refreshSales();render();
+      toast('Hold sync done — '+data.markedHold+' on hold, '+data.markedOpen+' released',4000);
+    }else toast('Hold sync error: '+(data.error||res.status));
+  }catch(e){toast('Hold sync error: '+e.message);}
+}
+
+async function runDeliverySync(){
+  toast('Checking ShipStation for delivered packages…');
+  try{
+    const res=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'delivery_sync'})
+    });
+    const data=await res.json().catch(()=>({}));
+    if(res.ok){
+      await refreshSales();render();
+      toast('Delivery sync done — '+data.delivered+' marked Delivered',4000);
+    }else toast('Delivery sync error: '+(data.error||res.status));
+  }catch(e){toast('Delivery sync error: '+e.message);}
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -3059,46 +3142,78 @@ async function ssBulkSync(){
   const el=document.getElementById('ss-diag-result');
   el.style.display='block';
 
-  // Ask for date range
+  // Show inline date range form instead of two sequential prompts
+  const today=new Date().toISOString().slice(0,10);
   const defaultSince=new Date(Date.now()-30*24*60*60*1000).toISOString().slice(0,10);
-  const since=prompt('Pull all ShipStation shipments from this date onwards:\n(Format: YYYY-MM-DD)',defaultSince);
-  if(!since)return;
-  if(!/^\d{4}-\d{2}-\d{2}$/.test(since.trim())){toast('Use YYYY-MM-DD format');return;}
+  el.innerHTML=`
+    <div style="font-size:11px;font-weight:700;color:var(--text2);margin-bottom:10px">📦 Bulk Sync Shipments from ShipStation</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+      <label style="font-size:11px;color:var(--text3)">From</label>
+      <input id="bsync-from" type="date" value="${defaultSince}" style="font-size:11px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg2);color:var(--text)">
+      <label style="font-size:11px;color:var(--text3)">To</label>
+      <input id="bsync-to" type="date" value="${today}" style="font-size:11px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg2);color:var(--text)">
+      <button class="btn btn-primary btn-sm" onclick="ssBulkSyncRun()">▶ Run Sync</button>
+      <button class="btn btn-sm" onclick="document.getElementById('ss-diag-result').style.display='none'">Cancel</button>
+    </div>
+    <div style="font-size:10px;color:var(--text3)">Tip: if sync times out, reduce the date range to 30-day chunks</div>`;
+}
 
-  el.textContent='Fetching shipments from ShipStation since '+since+'...\nThis may take a moment for large date ranges.';
+async function ssBulkSyncRun(){
+  const el=document.getElementById('ss-diag-result');
+  const since=(document.getElementById('bsync-from')?.value||'').trim();
+  const until=(document.getElementById('bsync-to')?.value||'').trim();
+  if(!since||!until){toast('Enter both dates');return;}
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(since)||!/^\d{4}-\d{2}-\d{2}$/.test(until)){toast('Use YYYY-MM-DD format');return;}
+  if(since>until){toast('Start date must be before end date');return;}
+
+  el.innerHTML=`<div style="color:var(--text3);font-size:11px">⏳ Fetching shipments ${since} → ${until}…<br>This may take 30-60 seconds for large ranges.</div>`;
   const edgeUrl=SUPA_URL+'/functions/v1/shipstation-ship';
+
+  // 90s client-side timeout — edge function limit is 60s, this gives a clean error message
+  const controller=new AbortController();
+  const tOut=setTimeout(()=>controller.abort(),90000);
 
   try{
     const res=await fetch(edgeUrl,{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action:'bulk_sync',since:since.trim()})
+      body:JSON.stringify({action:'bulk_sync',since:since.trim(),until:until.trim()}),
+      signal:controller.signal
     });
+    clearTimeout(tOut);
     const data=await res.json().catch(()=>({}));
 
     if(!res.ok){
-      el.textContent='Error '+res.status+':\n'+(data.error||JSON.stringify(data))+'\n\nMake sure:\n· Edge function is deployed with the latest code\n· SS_KEY and SS_SECRET secrets are set';
+      if(res.status===504||res.status===524){
+        el.innerHTML='<div style="color:var(--yellow)">⏱ Sync timed out (edge function 60s limit).<br><br>Try a shorter date range — split into 30-day chunks and run each separately.</div>';
+        return;
+      }
+      el.innerHTML='<div style="color:var(--red)">Error '+res.status+':<br>'+(data.error||JSON.stringify(data))+'<br><br>Make sure the edge function is deployed with latest code and SS_KEY/SS_SECRET are set.</div>';
       return;
     }
 
-    let out='BULK SYNC COMPLETE\n'+'─'.repeat(44)+'\n\n';
-    out+='Shipments synced:  '+data.synced+'\n';
-    out+='Skipped (voided/no tracking): '+data.skipped+'\n';
-    out+='Order not in ERP:  '+data.notFound+'\n';
-    out+='Pages fetched:     '+(data.pages||1)+'\n\n';
-    out+=data.message+'\n';
+    let out='<div style="color:var(--green);font-size:11px;font-weight:700;margin-bottom:8px">✓ Bulk Sync Complete — '+since+' to '+until+'</div>';
+    out+='<div style="font-size:11px;font-family:var(--mono);color:var(--text2)">';
+    out+='Shipments synced:  '+data.synced+'<br>';
+    out+='Skipped (voided/no tracking): '+data.skipped+'<br>';
+    out+='Order not in ERP:  '+data.notFound+'<br>';
+    out+='Pages fetched:     '+(data.pages||1)+'<br>';
+    out+='</div>';
     if(data.notFound>0){
-      out+='\nNote: "Order not in ERP" means ShipStation has shipments for orders\n';
-      out+='that don\'t exist in the ERP yet. Run "Sync Orders" (Sales page) first\n';
-      out+='to import those orders from Shopify, then run Bulk Sync again.\n';
+      out+='<div style="font-size:10px;color:var(--text3);margin-top:6px">Orders not in ERP: run 🔄 Sync Orders first, then bulk sync again.</div>';
     }
-    el.textContent=out;
+    el.innerHTML=out;
 
     await refreshSales();
     render();
     toast('✓ Bulk sync done — '+data.synced+' shipments applied');
   }catch(e){
-    el.textContent='Network error: '+e.message+'\n\nRedeploy the edge function and try again.';
+    clearTimeout(tOut);
+    if(e.name==='AbortError'){
+      el.innerHTML='<div style="color:var(--yellow)">⏱ Sync timed out after 90 seconds.<br><br>Try a shorter date range — 30-day chunks work well for catching up.</div>';
+    }else{
+      el.innerHTML='<div style="color:var(--red)">Network error: '+escHtml(e.message)+'<br><br>Redeploy the edge function and try again.</div>';
+    }
   }
 }
 
