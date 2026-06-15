@@ -563,13 +563,13 @@ async function loadAll(){
     const [parts,assemblies,sales,purchases,dealers,settings,bomItems,warrantyClaims,corrections,cycleCounts]=await Promise.all([
       db.from('parts').select('*').order('pn'),
       db.from('assemblies').select('*').order('pn'),
-      db.from('sales').select('*').order('sale_date',{ascending:false}).limit(200),
+      db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000),
       db.from('purchases').select('*').order('order_date',{ascending:false}),
       db.from('dealers').select('*').order('name'),
       db.from('settings').select('*'),
       db.from('bom_items').select('*').order('parent_pn').order('sort_order'),
       db.from('warranty_claims').select('*').order('created_at',{ascending:false}).limit(100),
-      db.from('inv_corrections').select('*').order('created_at',{ascending:false}).limit(200),
+      db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
       db.from('cycle_counts').select('*').order('created_at',{ascending:false}).limit(50),
     ]);
     if(parts.error)throw parts.error;
@@ -597,8 +597,10 @@ async function loadAll(){
   }
 }
 
+let _rtChannel=null, _rtStatus='connecting';
 function setupRealtime(){
-  db.channel('erp-live')
+  if(_rtChannel){try{_rtChannel.unsubscribe();}catch(e){}}
+  _rtChannel=db.channel('erp-live')
     .on('postgres_changes',{event:'*',schema:'public',table:'parts'},p=>{
       if(p.eventType==='INSERT')S.parts=[...S.parts,p.new].sort((a,b)=>a.pn.localeCompare(b.pn));
       else if(p.eventType==='UPDATE')S.parts=S.parts.map(x=>x.id===p.new.id?p.new:x);
@@ -623,7 +625,16 @@ function setupRealtime(){
       else if(p.eventType==='UPDATE')S.purchases=S.purchases.map(x=>x.id===p.new.id?p.new:x);
       if(['purchases','dashboard'].includes(S.view))render();
     })
-    .subscribe();
+    .subscribe((status)=>{
+      _rtStatus=status;
+      const dot=document.getElementById('sync-dot');
+      const lbl=document.getElementById('sync-label');
+      if(dot){dot.className='sync-dot'+(status==='SUBSCRIBED'?' ok':status==='CHANNEL_ERROR'?' err':' busy');}
+      if(lbl){lbl.textContent=status==='SUBSCRIBED'?'Live — Real-time':status==='CHANNEL_ERROR'?'Disconnected':'Connecting…';}
+      if(status==='CHANNEL_ERROR'){
+        setTimeout(()=>{toast('Reconnecting to live sync…');setupRealtime();},5000);
+      }
+    });
 }
 
 // ============================================================
@@ -1131,47 +1142,104 @@ function renderSales(){
 }
 
 function renderSaleDetail(s){
-  const fs=s.fulfillment_status||'Open';
-  const asm=S.assemblies.find(a=>a.pn===s.pn);
-  const stock=asm?(asm.total_on_hand||0):null;
-  const canFill=stock!==null&&stock>=(s.qty||1);
-  const siblings=S.sales.filter(x=>x.order_number===s.order_number&&x.id!==s.id&&s.order_number);
-  const fsMap={'Open':'pill-red','Packed':'pill-yellow','Shipped':'pill-teal','Delivered':'pill-green','Cancelled':'pill-muted'};
-  const moves=S.corrections.filter(c=>c.pn===s.pn).slice(0,5);
+  // ALL lines on this order (including the lead line s)
+  const allLines=s.order_number
+    ? S.sales.filter(x=>x.order_number===s.order_number).sort((a,b)=>a.pn.localeCompare(b.pn))
+    : [s];
+  const isMulti=allLines.length>1;
+  const fsMap={'Open':'pill-red','On Hold':'pill-purple','Packed':'pill-yellow','Shipped':'pill-teal','Delivered':'pill-green','Cancelled':'pill-muted'};
+  const rank={'Delivered':5,'Shipped':4,'Packed':3,'On Hold':2,'Open':1,'Cancelled':0};
+
+  // Order-level status = most progressed line
+  const orderFs=allLines.reduce((best,x)=>
+    (rank[x.fulfillment_status||'Open']||0)>(rank[best]||0)?x.fulfillment_status:best,
+    allLines[0].fulfillment_status||'Open');
+
+  // Order-level: can we pack ALL open lines?
+  const allCanPack=allLines.every(x=>{
+    if((x.fulfillment_status||'Open')!=='Open')return true; // already done
+    const a=S.assemblies.find(a=>a.pn===x.pn);
+    return a&&(a.total_on_hand||0)>=(x.qty||1);
+  });
+  const openLines=allLines.filter(x=>(x.fulfillment_status||'Open')==='Open');
+  const packedLines=allLines.filter(x=>x.fulfillment_status==='Packed');
+
+  // Tracking from any shipped line
+  const shipLine=allLines.find(x=>x.tracking_number)||s;
+  const moves=S.corrections.filter(c=>allLines.some(l=>l.pn===c.pn)).slice(0,8);
+
   return `
-  <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
     <button class="btn btn-sm" onclick="S.activeSale=null;render()">← Sales</button>
     <div style="flex:1">
-      <div style="font-size:15px;font-weight:700;color:var(--text)">Order ${s.order_number||'(no #)'} <span class="pill ${fsMap[fs]||'pill-muted'}" style="vertical-align:middle;margin-left:6px">${fs}</span></div>
+      <div style="font-size:15px;font-weight:700;color:var(--text)">
+        Order ${s.order_number||'(no #)'}
+        <span class="pill ${fsMap[orderFs]||'pill-muted'}" style="vertical-align:middle;margin-left:6px">${orderFs}</span>
+        ${isMulti?`<span style="font-size:10px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 7px;border-radius:8px;margin-left:6px;font-family:var(--mono)">${allLines.length} items</span>`:''}
+      </div>
       <div style="font-size:11px;color:var(--text3)">${s.sale_date?s.sale_date.slice(0,10):''} · ${s.source||'—'}</div>
     </div>
-    ${fs==='Open'?`<button class="btn btn-teal" ${canFill?'':'disabled title="Insufficient stock"'} onclick="markPacked('${s.id}','${s.pn}',${s.qty||1})">Pack</button>`:''}
-    ${fs==='Packed'?`<button class="btn btn-primary" onclick="openShipModal('${s.id}','${s.pn}',${s.qty||1})">🚚 Ship</button>`:''}
-    ${fs==='Packed'?`<button class="btn btn-sm" style="color:var(--orange)" title="Undo pack — returns stock, resets to Open" onclick="unpackSaleOrder('${s.id}','${s.pn}',${s.qty||1})">↩ Unpack</button>`:''}
-    ${fs==='Shipped'?`<button class="btn btn-teal" onclick="markDelivered('${s.id}')">✓ Delivered</button>`:''}
-    ${fs==='Shipped'?`<button class="btn btn-sm" title="Check ShipStation for delivery update" onclick="checkDelivery('${s.order_number||''}','${s.id}')">🔄 Check Delivery</button>`:''}
-    ${fs==='Open'||fs==='Packed'?`<button class="btn" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
+    ${openLines.length?`<button class="btn btn-teal" ${allCanPack?'':'disabled title="Insufficient stock on one or more items"'} onclick="packAllLines('${s.order_number||s.id}')">Pack All (${openLines.length})</button>`:''}
+    ${packedLines.length?`<button class="btn btn-primary" onclick="openShipModal('${packedLines[0].id}','${packedLines[0].pn}',${packedLines[0].qty||1})">🚚 Ship</button>`:''}
+    ${packedLines.length?`<button class="btn btn-sm" style="color:var(--orange)" onclick="unpackSaleOrder('${s.id}','${s.pn==='Multiple'?'':s.pn}',${s.qty||1})">↩ Unpack</button>`:''}
+    ${orderFs==='Shipped'?`<button class="btn btn-teal" onclick="markDelivered('${s.id}')">✓ Delivered</button>`:''}
+    ${orderFs==='Shipped'?`<button class="btn btn-sm" onclick="checkDelivery('${s.order_number||''}','${s.id}')">🔄 Check Delivery</button>`:''}
+    ${['Open','Packed','On Hold'].includes(orderFs)?`<button class="btn" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
   </div>
-  <div class="kpi-grid kpi-grid-4">
-    <div class="kpi kpi-teal" style="cursor:pointer" onclick="lookupGo('assembly','${s.pn}')"><div class="kpi-label">SKU (click for dossier)</div><div class="kpi-value" style="font-size:14px;font-family:var(--mono)">${s.pn}</div></div>
-    <div class="kpi"><div class="kpi-label">Quantity</div><div class="kpi-value">${s.qty||1}</div></div>
-    <div class="kpi ${canFill?'kpi-green':'kpi-red'}"><div class="kpi-label">Stock Available</div><div class="kpi-value">${stock??'—'}</div></div>
-    <div class="kpi ${s.tracking_number?'kpi-teal':''}" style="${s.tracking_number?'cursor:pointer':''}" ${s.tracking_number?`onclick="window.open(trackingUrl('${s.carrier||''}','${s.tracking_number}'),'_blank')"`:''}>
-      <div class="kpi-label">Tracking ${s.tracking_number?'↗':''}</div>
-      <div class="kpi-value" style="font-size:11px;font-family:var(--mono)">${s.tracking_number?s.tracking_number:'—'}</div>
-      <div class="kpi-sub">${s.carrier||''}${s.shipped_at?' · shipped '+new Date(s.shipped_at).toLocaleDateString():''}${s.delivered_at?' · ✓ delivered '+new Date(s.delivered_at).toLocaleDateString():''}</div>
+
+  ${shipLine.tracking_number?`
+  <div class="panel" style="padding:10px 16px;margin-bottom:10px;display:flex;align-items:center;gap:12px;cursor:pointer" onclick="window.open(trackingUrl('${shipLine.carrier||''}','${shipLine.tracking_number}'),'_blank')">
+    <div style="font-size:18px">📦</div>
+    <div style="flex:1">
+      <div style="font-size:12px;font-weight:700;color:var(--teal)">${shipLine.carrier||''} ${shipLine.tracking_number} ↗</div>
+      <div style="font-size:11px;color:var(--text3)">${shipLine.shipped_at?'Shipped '+new Date(shipLine.shipped_at).toLocaleDateString():''}${shipLine.delivered_at?' · ✓ Delivered '+new Date(shipLine.delivered_at).toLocaleDateString():''}</div>
     </div>
-  </div>
-  <div class="grid-2">
-  <div>
-    ${siblings.length?`<div class="panel" style="padding:0"><div class="section-header">Other items on this order (${siblings.length})</div>
-    ${siblings.map(x=>`<div class="check-row rowlink" onclick="openSaleDetail('${x.id}')"><span class="pn" style="color:var(--teal)">${x.pn}</span><span class="money-neutral">×${x.qty||1}</span><span style="flex:1"></span><span class="pill ${fsMap[x.fulfillment_status||'Open']||'pill-muted'}" style="font-size:9px">${x.fulfillment_status||'Open'}</span></div>`).join('')}</div>`:''}
-  </div>
-  <div>
-    <div class="panel" style="padding:0"><div class="section-header">Recent stock movements — ${s.pn}</div>
-    ${moves.length===0?'<div class="section-empty">None</div>':moves.map(c=>`<div class="check-row"><span style="font-size:10px;font-family:var(--mono);color:var(--text3)">${new Date(c.created_at).toLocaleDateString()}</span><span class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700;min-width:40px">${c.adjustment>0?'+':''}${c.adjustment}</span><span style="flex:1;font-size:11px;color:var(--text2)">${c.reason||c.source}</span></div>`).join('')}</div>
-  </div>
-  </div>`;
+  </div>`:'' }
+
+  <div class="tbl-wrap" style="margin-bottom:14px">
+  <table><thead class="sticky-header"><tr>
+    <th>SKU</th><th>Description</th><th>Ordered</th>
+    <th>In Stock</th><th>Status</th><th>Actions</th>
+  </tr></thead><tbody>
+  ${allLines.map(line=>{
+    const la=S.assemblies.find(a=>a.pn===line.pn);
+    const lstock=la?(la.total_on_hand||0):null;
+    const lfs=line.fulfillment_status||'Open';
+    const lcanFill=lstock!==null&&lstock>=(line.qty||1);
+    return `<tr>
+      <td class="pn rowlink" style="color:var(--teal)" onclick="lookupGo('assembly','${line.pn}')">${line.pn} ↗</td>
+      <td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${la?.description||''}</td>
+      <td class="money-neutral" style="font-weight:700">${line.qty||1}</td>
+      <td class="money" style="color:${lstock===null?'var(--text3)':lcanFill?'var(--green)':'var(--red)'};font-weight:700">
+        ${lstock===null?'n/a':lstock}
+        ${lstock!==null&&!lcanFill?`<span style="font-size:9px;color:var(--red)"> (need ${(line.qty||1)-lstock} more)</span>`:''}
+      </td>
+      <td><span class="pill ${fsMap[lfs]||'pill-muted'}">${lfs}</span></td>
+      <td style="white-space:nowrap;display:flex;gap:4px">
+        ${lfs==='Open'?`<button class="btn btn-teal btn-sm" ${lcanFill?'':'disabled'} onclick="markPacked('${line.id}','${line.pn}',${line.qty||1})">Pack</button>`:''}
+        ${lfs==='Packed'?`<button class="btn btn-primary btn-sm" onclick="openShipModal('${line.id}','${line.pn}',${line.qty||1})">Ship</button>`:''}
+        ${lfs==='Packed'?`<button class="action-btn" onclick="unpackSaleOrder('${line.id}','${line.pn}',${line.qty||1})">↩</button>`:''}
+        ${lfs==='Shipped'?`<button class="action-btn" onclick="markDelivered('${line.id}')">✓</button>`:''}
+      </td>
+    </tr>`;}).join('')}
+  </tbody></table></div>
+
+  <div class="panel" style="padding:0"><div class="section-header">Stock movements — this order</div>
+  ${moves.length===0?'<div class="section-empty">None</div>':moves.map(c=>`<div class="check-row">
+    <span style="font-size:10px;font-family:var(--mono);color:var(--text3);min-width:70px">${new Date(c.created_at).toLocaleDateString()}</span>
+    <span class="pn" style="min-width:110px;color:var(--text)">${c.pn}</span>
+    <span class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700;min-width:44px">${c.adjustment>0?'+':''}${c.adjustment}</span>
+    <span style="flex:1;font-size:11px;color:var(--text2)">${c.reason||c.source}</span>
+  </div>`).join('')}</div>`;
+}
+
+// Pack all open lines on an order at once
+async function packAllLines(orderNumOrId){
+  const lines=S.sales.filter(s=>s.order_number===orderNumOrId||(s.id===orderNumOrId)).filter(s=>(s.fulfillment_status||'Open')==='Open');
+  if(!lines.length){toast('No open lines to pack');return;}
+  for(const line of lines){
+    await markPacked(line.id,line.pn,line.qty||1);
+  }
 }
 
 async function unpackSaleOrder(saleId, pn, qty){
@@ -1259,10 +1327,22 @@ async function closeHistoricalOrders(){
 // ── Fulfillment actions ──
 async function markPacked(saleId,pn,qty){
   const asm=S.assemblies.find(a=>a.pn===pn);
-  if(asm&&(asm.total_on_hand||0)<qty){toast('Insufficient assembly stock — pack more first');return;}
-  await db.from('sales').update({fulfillment_status:'Packed'}).eq('id',saleId);
+  if(!asm){toast('Assembly '+pn+' not found');return;}
+  if((asm.total_on_hand||0)<qty){toast('Insufficient stock — have '+(asm.total_on_hand||0)+', need '+qty);return;}
+  const sale=S.sales.find(s=>s.id===saleId);
+  const newOh=(asm.total_on_hand||0)-qty;
+  const{error:ae}=await db.from('assemblies').update({total_on_hand:newOh}).eq('id',asm.id);
+  if(ae){toast('Stock update failed: '+ae.message);return;}
+  S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
+  await db.from('inv_corrections').insert({pn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Packed — order '+(sale?.order_number||saleId),source:'pack'});
+  const{error:se}=await db.from('sales').update({fulfillment_status:'Packed'}).eq('id',saleId);
+  if(se){toast('Sale update failed: '+se.message);return;}
   S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Packed'}:s);
-  toast('Order marked Packed — ready to ship');render();
+  pushUndoMulti('Pack order '+(sale?.order_number||''),[
+    {action:'update',table:'assemblies',data:{...asm,total_on_hand:newOh},prev:{...asm}},
+    {action:'update',table:'sales',data:{id:saleId,fulfillment_status:'Packed'},prev:{id:saleId,fulfillment_status:sale?.fulfillment_status||'Open'}}
+  ]);
+  toast('Packed '+qty+'× '+pn);render();
 }
 
 function openShipModal(saleId,pn,qty){openModal('shipOrder',{saleId,pn,qty});}
@@ -1294,15 +1374,22 @@ async function submitShipment(saleId,pn,qty){
 }
 
 async function markDelivered(saleId){
-  await db.from('sales').update({fulfillment_status:'Delivered'}).eq('id',saleId);
-  S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Delivered'}:s);
-  toast('Order delivered ✓');render();
+  const sale=S.sales.find(s=>s.id===saleId);
+  const now=new Date().toISOString();
+  const{error}=await db.from('sales').update({fulfillment_status:'Delivered',delivered_at:now}).eq('id',saleId);
+  if(error){toast('Error: '+error.message);return;}
+  S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Delivered',delivered_at:now}:s);
+  if(sale)pushUndoMulti('Delivered '+(sale.order_number||''),[{action:'update',table:'sales',data:{...sale,fulfillment_status:'Delivered'},prev:{...sale}}]);
+  toast('Order marked Delivered ✓');render();
 }
 
 async function cancelOrder(saleId){
   if(!confirm('Cancel this order?'))return;
-  await db.from('sales').update({fulfillment_status:'Cancelled'}).eq('id',saleId);
+  const sale=S.sales.find(s=>s.id===saleId);
+  const{error}=await db.from('sales').update({fulfillment_status:'Cancelled'}).eq('id',saleId);
+  if(error){toast('Error: '+error.message);return;}
   S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Cancelled'}:s);
+  if(sale)pushUndoMulti('Cancel order '+(sale.order_number||''),[{action:'update',table:'sales',data:{...sale,fulfillment_status:'Cancelled'},prev:{...sale}}]);
   toast('Order cancelled');render();
 }
 
@@ -3654,6 +3741,7 @@ async function updateCountLineNote(lineId, note) {
 }
 
 async function applyCountCorrections(countId) {
+  let _corrErrors=0;
   const variances=S.countLines.filter(l=>l.actual_qty!=null&&l.actual_qty!==(l.expected_qty||0));
   if(!variances.length){
     await db.from('cycle_counts').update({status:'Complete',completed_at:new Date().toISOString()}).eq('id',countId);
@@ -3675,9 +3763,10 @@ async function applyCountCorrections(countId) {
       S.corrections=[{pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count',source:'cycle_count',created_at:new Date().toISOString()},...S.corrections];
     } else {
       const part=S.parts.find(p=>p.pn===line.pn);
-      if(!part) continue;
+      if(!part){_corrErrors++;continue;}
       const prev=part.total_unpckgd||0;
-      await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
+      const{error:_pe}=await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
+      if(_pe){_corrErrors++;continue;}
       S.parts=S.parts.map(p=>p.pn===line.pn?{...p,total_unpckgd:newQty}:p);
       await db.from('inv_corrections').insert({pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count '+(line.notes?'— '+line.notes:''),source:'cycle_count',reference_id:countId});
       S.corrections=[{pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count',source:'cycle_count',created_at:new Date().toISOString()},...S.corrections];
