@@ -640,43 +640,61 @@ function updateBadge(){
 // ============================================================
 // DATA LOADING
 // ============================================================
+// Paginate a Supabase table past the server-side max_rows (default 1000)
+async function fetchAll(query){
+  const PAGE=1000;
+  let rows=[],from=0;
+  while(true){
+    const{data,error}=await query(from,from+PAGE-1);
+    if(error)throw error;
+    if(!data?.length)break;
+    rows=[...rows,...data];
+    if(data.length<PAGE)break;
+    from+=PAGE;
+  }
+  return rows;
+}
+
 async function loadAll(){
   try{
-    const [parts,assemblies,sales,purchases,dealers,settings,bomItems,warrantyClaims,corrections,cycleCounts,poLinesAll]=await Promise.all([
-      db.from('parts').select('*').order('pn'),
-      db.from('assemblies').select('*').order('pn'),
-      db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000),
-      db.from('purchases').select('*').order('order_date',{ascending:false}),
-      db.from('dealers').select('*').order('name'),
+    // Small/bounded tables — single query is fine
+    const[assemblies,dealers,settings,warrantyClaims,corrections,cycleCounts]=await Promise.all([
+      db.from('assemblies').select('*').order('pn').limit(5000),
+      db.from('dealers').select('*').order('name').limit(500),
       db.from('settings').select('*'),
-      db.from('bom_items').select('*').order('parent_pn').order('sort_order'),
       db.from('warranty_claims').select('*').order('created_at',{ascending:false}).limit(100),
       db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
       db.from('cycle_counts').select('*').order('created_at',{ascending:false}).limit(50),
-      db.from('po_lines').select('*').order('po_id'),
     ]);
-    if(parts.error)throw parts.error;
-    S.parts=parts.data||[];
-    // Normalize is_subassembly based on PN pattern rule:
-    // Subassemblies = XX-XXXX numeric pattern (e.g. 01-0001). HW Packs and TGK-xxx are NEVER subassemblies.
+    if(assemblies.error)throw assemblies.error;
+
+    // Large tables — paginate past the server 1000-row cap
+    const[parts,bomItems,sales,purchases,poLinesAll]=await Promise.all([
+      fetchAll((f,t)=>db.from('parts').select('*').order('pn').range(f,t)),
+      fetchAll((f,t)=>db.from('bom_items').select('*').order('parent_pn').order('sort_order').range(f,t)),
+      fetchAll((f,t)=>db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000).range(f,t)),
+      fetchAll((f,t)=>db.from('purchases').select('*').order('order_date',{ascending:false}).range(f,t)),
+      fetchAll((f,t)=>db.from('po_lines').select('*').order('po_id').range(f,t)),
+    ]);
+
+    S.parts=parts;
     S.assemblies=(assemblies.data||[]).map(a=>{
       const shouldBeSub=/^\d{2}-\d{4}/.test(a.pn||'')&&!isHWPack(a.pn);
       return{...a,is_subassembly:shouldBeSub,_classificationMismatch:a.is_subassembly!==shouldBeSub};
     });
-    S.sales=sales.data||[];
-    S.purchases=purchases.data||[];
+    S.sales=sales;
+    S.purchases=purchases;
     S.dealers=dealers.data||[];
     (settings.data||[]).forEach(s=>S.settings[s.key]=s.value);
     if(S.settings.shopify)Object.assign(S.shopify,S.settings.shopify);
     if(S.settings.shipstation)Object.assign(S.shipstation,S.settings.shipstation);
     S.boms={};
-    (bomItems.data||[]).forEach(i=>{if(!S.boms[i.parent_pn])S.boms[i.parent_pn]=[];S.boms[i.parent_pn].push(i);});
+    bomItems.forEach(i=>{if(!S.boms[i.parent_pn])S.boms[i.parent_pn]=[];S.boms[i.parent_pn].push(i);});
     S.warrantyClaims=warrantyClaims.data||[];
     S.corrections=corrections.data||[];
     S.cycleCounts=cycleCounts.data||[];
-    // Index all PO lines by po_id (bulk-loaded so list view can compute real costs)
     S.poLines={};
-    (poLinesAll.data||[]).forEach(l=>{if(!S.poLines[l.po_id])S.poLines[l.po_id]=[];S.poLines[l.po_id].push(l);});
+    poLinesAll.forEach(l=>{if(!S.poLines[l.po_id])S.poLines[l.po_id]=[];S.poLines[l.po_id].push(l);});
     if(!S.selBOM&&Object.keys(S.boms).length)S.selBOM=Object.keys(S.boms)[0];
     setSyncState('ok');
     updateBadge();
@@ -684,7 +702,7 @@ async function loadAll(){
   }catch(e){
     setSyncState('err');
     console.error('loadAll error:',e);
-    throw e; // rethrow so the caller (startTGK) can auto-retry
+    throw e;
   }
 }
 
@@ -2793,16 +2811,25 @@ async function syncOrdersNow(){
       });
       if(!resp.ok){
         const txt=await resp.text().catch(()=>'');
-        // Edge function not yet updated? Fall back with a clear message
-        if(resp.status===400&&txt.includes('Missing action')||resp.status===404){
+        if(resp.status===401){
+          toast('⚠ Shopify rejected the API key — go to Integrations → Shopify, re-enter your Admin API token (starts with shpat_) and save',7000);
+          return;
+        }
+        if((resp.status===400&&txt.includes('Missing action'))||resp.status===404){
           toast('⚠ Edge function needs updating — copy the new shopify-orders code from Integrations → Setup Guide and redeploy',6000);
           return;
         }
-        toast('Sync error '+resp.status+': '+txt);
+        toast('Sync error '+resp.status+': '+txt.slice(0,200));
         break;
       }
-      const json=await resp.json();
-      if(json.error){toast('Shopify error: '+json.error);break;}
+      const json=await resp.json().catch(()=>({}));
+      if(json.error){
+        if(json.error.includes('401')||json.error.includes('Unauthorized')){
+          toast('⚠ Shopify rejected the API key — check your Admin API token in Integrations → Shopify',7000);
+          return;
+        }
+        toast('Shopify error: '+json.error);break;
+      }
       orders=json.orders||[];
     }catch(e){toast('Network error calling edge function: '+e.message);break;}
 
