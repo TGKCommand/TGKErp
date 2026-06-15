@@ -1616,76 +1616,97 @@ async function unshipLine(saleId, pn, qty){
 }
 
 async function dedupeOrders(){
+  const el=document.getElementById('shopify-import-status');
+  function prog(t){toast(t,2000);console.log('[dedupe]',t);}
 
-  // Query the full DB — S.sales is capped at 5000 rows and would miss duplicates outside that window
-  const {data:allRows,error}=await db.from('sales')
-    .select('id,order_number,pn,fulfillment_status,tracking_number,carrier,shipped_at,sale_date,created_at')
-    .not('order_number','is',null)
-    .order('order_number').order('pn');
-  if(error){toast('Error scanning orders: '+error.message);return;}
+  // ── Step 1: Paginate through ALL sales rows (avoids Supabase 1000-row default cap) ──
+  prog('🔍 Scanning full database for duplicates…');
+  let allRows=[], from=0, batchSize=1000, keepFetching=true;
+  while(keepFetching){
+    const{data,error}=await db.from('sales')
+      .select('id,order_number,pn,fulfillment_status,tracking_number,carrier,shipped_at,sale_date,qty,source,created_at')
+      .not('order_number','is',null)
+      .order('created_at',{ascending:true})
+      .range(from,from+batchSize-1);
+    if(error){toast('Error scanning: '+error.message);return;}
+    if(!data||data.length===0)break;
+    allRows=[...allRows,...data];
+    if(data.length<batchSize)keepFetching=false;
+    else from+=batchSize;
+    if(allRows.length%5000===0)prog(`Scanned ${allRows.length} rows…`);
+  }
+  prog(`Scanned ${allRows.length} total rows`);
 
-  const rank={'Delivered':5,'Shipped':4,'Packed':3,'On Hold':2,'Open':1,'Refunded':0,'Cancelled':0};
+  // ── Step 2: Group by order_number+pn, find duplicates ──
+  const rank={'Delivered':6,'Shipped':5,'Packed':4,'Partial':3,'On Hold':2,'Open':1,'Refunded':0,'Cancelled':0};
   const groups={};
-  (allRows||[]).forEach(s=>{
+  allRows.forEach(s=>{
     const k=(s.order_number||'')+'||'+(s.pn||'');
     (groups[k]=groups[k]||[]).push(s);
   });
-
   const dupes=Object.values(groups).filter(g=>g.length>1);
-  if(!dupes.length){toast('No duplicate order lines found ✓');return;}
+
+  if(!dupes.length){toast('✓ No duplicates found — all order lines are unique');return;}
 
   const totalExtra=dupes.reduce((t,g)=>t+g.length-1,0);
   const trackingGroups=dupes.filter(g=>g.some(r=>r.tracking_number)).length;
-  const noTrackingWinner=dupes.filter(g=>{
-    // Would the naïve winner (highest status) lack tracking while a loser has it?
-    const sorted=[...g].sort((a,b)=>(rank[b.fulfillment_status||'Open']||0)-(rank[a.fulfillment_status||'Open']||0));
-    return !sorted[0].tracking_number&&sorted.slice(1).some(l=>l.tracking_number);
-  }).length;
 
-  const msg=`Found ${totalExtra} duplicate line${totalExtra>1?'s':''} across ${dupes.length} order+SKU combos.\n\n`+
-    (trackingGroups>0?`📦 ${trackingGroups} groups have tracking info — tracking will be rescued to the surviving row before duplicates are deleted.\n`+
-    (noTrackingWinner>0?`⚡ ${noTrackingWinner} groups: the highest-status row lacks tracking; tracking will be copied from a duplicate before it's deleted.\n`:'')+'\n':'')+
-    'Proceed? This cannot be undone (but can be undone with the Undo button).';
-  if(!confirm(msg))return;
+  if(!confirm(
+    `Found ${totalExtra} duplicate line${totalExtra>1?'s':''} across ${dupes.length} order+SKU combinations.\n\n`+
+    (trackingGroups?`📦 Tracking numbers will be rescued to the surviving row.\n\n`:'')+
+    `The row with the highest fulfillment status (or tracking number) is kept.\nAll others are deleted.\n\n`+
+    `Proceed? This will delete ${totalExtra} rows.`
+  ))return;
 
-  let deleted=0,rescued=0;
-  const undoOps=[];
+  // ── Step 3: Determine winners, rescue tracking, collect IDs to delete ──
+  const idsToDelete=[];
+  const trackingPatches=[]; // [{id, tracking_number, carrier, shipped_at}]
 
   for(const g of dupes){
-    // Sort: rows with tracking always win over rows without; then by status rank
+    // Sort: rows with tracking first, then by status rank, then keep oldest (created_at asc)
     g.sort((a,b)=>{
       const ta=a.tracking_number?1:0, tb=b.tracking_number?1:0;
-      if(tb!==ta) return tb-ta;                                                    // tracking > no-tracking
-      return (rank[b.fulfillment_status||'Open']||0)-(rank[a.fulfillment_status||'Open']||0); // higher status
+      if(tb!==ta)return tb-ta;
+      const ra=rank[a.fulfillment_status||'Open']||0, rb=rank[b.fulfillment_status||'Open']||0;
+      if(rb!==ra)return rb-ra;
+      return new Date(a.created_at)-new Date(b.created_at); // oldest wins (original record)
     });
-
     const winner=g[0];
     const losers=g.slice(1);
 
-    // If winner has no tracking but a loser does, rescue it first
+    // Rescue tracking from a loser if winner has none
     if(!winner.tracking_number){
       const donor=losers.find(l=>l.tracking_number);
-      if(donor){
-        const patch={tracking_number:donor.tracking_number,carrier:donor.carrier||null,shipped_at:donor.shipped_at||winner.shipped_at};
-        undoOps.push({action:'update',table:'sales',data:{id:winner.id},prev:{id:winner.id,tracking_number:null,carrier:null,shipped_at:winner.shipped_at}});
-        await db.from('sales').update(patch).eq('id',winner.id);
-        Object.assign(winner,patch);
-        rescued++;
-      }
+      if(donor)trackingPatches.push({id:winner.id,tracking_number:donor.tracking_number,carrier:donor.carrier||null,shipped_at:donor.shipped_at||winner.shipped_at,fulfillment_status:donor.fulfillment_status||winner.fulfillment_status});
     }
-
-    // Delete all losers
-    for(const loser of losers){
-      undoOps.push({action:'delete',table:'sales',data:loser}); // undo a deletion = re-insert
-      await db.from('sales').delete().eq('id',loser.id);
-      deleted++;
-    }
+    losers.forEach(l=>idsToDelete.push(l.id));
   }
 
-  pushUndoMulti('Dedupe '+deleted+' order lines',undoOps);
+  // ── Step 4: Apply tracking patches ──
+  let rescued=0;
+  for(const patch of trackingPatches){
+    const{id,...fields}=patch;
+    await db.from('sales').update(fields).eq('id',id);
+    rescued++;
+  }
+  if(rescued)prog(`Rescued tracking on ${rescued} rows`);
+
+  // ── Step 5: Batch delete in chunks of 200 ──
+  prog(`Deleting ${idsToDelete.length} duplicate rows…`);
+  const CHUNK=200;
+  let deleted=0;
+  for(let i=0;i<idsToDelete.length;i+=CHUNK){
+    const batch=idsToDelete.slice(i,i+CHUNK);
+    const{error}=await db.from('sales').delete().in('id',batch);
+    if(error){toast('Delete error: '+error.message);break;}
+    deleted+=batch.length;
+    if(idsToDelete.length>500)prog(`Deleted ${deleted} of ${idsToDelete.length}…`);
+  }
+
+  // ── Step 6: Reload and re-render ──
   await refreshSales();
   render();
-  toast(`✓ Removed ${deleted} duplicate${deleted>1?'s':''}${rescued>0?' · tracking rescued on '+rescued+' order'+(rescued>1?'s':''):''}`);
+  toast(`✓ Cleaned up ${deleted} duplicate${deleted!==1?'s':''}${rescued?' · rescued tracking on '+rescued+' orders':''}`);
 }
 
 async function closeHistoricalOrders(){
@@ -2577,8 +2598,22 @@ async function syncOrdersNow(){
     toast('⚠ Shopify credentials not saved — go to Integrations to configure');
     return;
   }
-  toast('🔄 Syncing orders from Shopify…');
-  const cutoff=new Date(Date.now()-30*24*60*60*1000).toISOString(); // last 30 days
+
+  // ── Step 1: Query FULL DB for existing (order_number, pn) keys ──
+  // S.sales is capped at 5000 rows — using it directly causes duplicates for older orders
+  toast('🔄 Checking existing orders in database…');
+  let existingKeys=new Set();
+  try{
+    const{data:existingRows,error}=await db.from('sales').select('order_number,pn').limit(500000);
+    if(!error&&existingRows)existingKeys=new Set(existingRows.map(s=>(s.order_number||'')+'||'+(s.pn||'')));
+    else existingKeys=new Set(S.sales.map(s=>(s.order_number||'')+'||'+(s.pn||'')));
+  }catch(e){
+    existingKeys=new Set(S.sales.map(s=>(s.order_number||'')+'||'+(s.pn||'')));
+  }
+
+  // ── Step 2: Fetch recent Shopify orders ──
+  toast('🔄 Syncing from Shopify…');
+  const cutoff=new Date(Date.now()-30*24*60*60*1000).toISOString();
   let newCount=0,updatedCount=0,page=1,keepGoing=true;
 
   while(keepGoing){
@@ -2594,63 +2629,65 @@ async function syncOrdersNow(){
         for(const li of (order.line_items||[])){
           const pn=li.sku||li.title;
           if(!pn)continue;
+          const key2=(orderNum||'')+'||'+(pn||'');
           const fs=order.financial_status==='refunded'?'Cancelled':
             order.fulfillment_status==='fulfilled'?'Delivered':
             order.fulfillment_status==='partial'?'Partial':'Open';
-          const existing=S.sales.find(s=>s.order_number===orderNum&&s.pn===pn);
 
-          if(!existing){
-            // New line — insert it
+          if(!existingKeys.has(key2)){
+            // Genuinely new — insert and add to set immediately to prevent within-run dupes
             const{data}=await db.from('sales').insert({
               order_number:orderNum,pn,qty:li.quantity||1,
               fulfillment_status:fs,source:'Shopify Sync',
               sale_date:(order.created_at||new Date().toISOString()).slice(0,10)
             }).select().single();
-            if(data){S.sales=[data,...S.sales];newCount++;showOrderAlert(orderNum,pn);}
-          } else if(existing.fulfillment_status!==fs&&['Open','Partial'].includes(existing.fulfillment_status)){
-            // Status changed on Shopify side — update (but never overwrite Shipped/Delivered/Cancelled)
-            const{error}=await db.from('sales').update({fulfillment_status:fs}).eq('id',existing.id);
-            if(!error){S.sales=S.sales.map(s=>s.id===existing.id?{...s,fulfillment_status:fs}:s);updatedCount++;}
+            if(data){
+              existingKeys.add(key2); // prevent re-insertion if Shopify returns this order again
+              S.sales=[data,...S.sales];
+              newCount++;
+              if(S.view!=='sales')showOrderAlert(orderNum,pn);
+            }
+          } else {
+            // Exists — update status only if it changed on Shopify and ERP still shows Open/Partial
+            const mem=S.sales.find(s=>s.order_number===orderNum&&s.pn===pn);
+            if(mem&&mem.fulfillment_status!==fs&&['Open','Partial'].includes(mem.fulfillment_status)){
+              await db.from('sales').update({fulfillment_status:fs}).eq('id',mem.id);
+              S.sales=S.sales.map(s=>s.id===mem.id?{...s,fulfillment_status:fs}:s);
+              updatedCount++;
+            }
           }
         }
       }
-
       page++;
       if(orders.length<250)keepGoing=false;
     }catch(e){toast('Sync error: '+e.message);break;}
   }
 
-  // Also check ShipStation for open orders that may have been held or split
-  const openOrders=[...new Set(S.sales.filter(s=>['Open','Partial'].includes(s.fulfillment_status||'Open')).map(s=>s.order_number).filter(Boolean))];
-  if(openOrders.length&&(S.shipstation?.key||S.settings?.shipstation?.key)){
-    toast('🔄 Checking ShipStation for holds and splits…');
-    const ssKey=S.shipstation?.key||S.settings?.shipstation?.key;
-    const ssSec=S.shipstation?.secret||S.settings?.shipstation?.secret;
-    if(ssKey&&ssSec){
-      try{
-        // Check a batch of open orders in ShipStation
-        const batch=openOrders.slice(0,50);
-        const ssRes=await fetch(`https://ssapi.shipstation.com/orders?orderStatus=on_hold&pageSize=100`,{
-          headers:{Authorization:'Basic '+btoa(ssKey+':'+ssSec)}
-        });
-        if(ssRes.ok){
-          const{orders:held=[]}=await ssRes.json();
-          for(const ho of held){
-            const num=ho.orderNumber;
-            const erpLines=S.sales.filter(s=>s.order_number===num&&s.fulfillment_status==='Open');
-            for(const line of erpLines){
-              await db.from('sales').update({fulfillment_status:'On Hold'}).eq('id',line.id);
-              S.sales=S.sales.map(s=>s.id===line.id?{...s,fulfillment_status:'On Hold'}:s);
-              updatedCount++;
-            }
+  // ── Step 3: Check ShipStation for held orders ──
+  const ssKey=(S.shipstation?.key||S.settings?.shipstation?.key||'').trim();
+  const ssSec=(S.shipstation?.secret||S.settings?.shipstation?.secret||'').trim();
+  if(ssKey&&ssSec){
+    try{
+      const ssRes=await fetch('https://ssapi.shipstation.com/orders?orderStatus=on_hold&pageSize=100',{
+        headers:{Authorization:'Basic '+btoa(ssKey+':'+ssSec)}
+      });
+      if(ssRes.ok){
+        const{orders:held=[]}=await ssRes.json();
+        for(const ho of held){
+          const num=ho.orderNumber;
+          const erpLines=S.sales.filter(s=>s.order_number===num&&s.fulfillment_status==='Open');
+          for(const line of erpLines){
+            await db.from('sales').update({fulfillment_status:'On Hold'}).eq('id',line.id);
+            S.sales=S.sales.map(s=>s.id===line.id?{...s,fulfillment_status:'On Hold'}:s);
+            updatedCount++;
           }
         }
-      }catch(e){console.warn('ShipStation hold check failed:',e.message);}
-    }
+      }
+    }catch(e){console.warn('ShipStation hold check skipped:',e.message);}
   }
 
   await refreshSales();render();
-  toast(`✓ Sync done — ${newCount} new order line${newCount!==1?'s':''}, ${updatedCount} updated`);
+  toast(`✓ Sync done — ${newCount} new, ${updatedCount} updated`);
 }
 
 async function importOrdersFromShopify(){
