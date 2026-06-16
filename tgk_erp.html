@@ -662,8 +662,13 @@ async function fetchAll(query){
 
 function normalizeAssemblies(rows){
   return(rows||[]).map(a=>{
-    const shouldBeSub=/^\d{2}-\d{4}/.test(a.pn||'')&&!isHWPack(a.pn);
-    return{...a,is_subassembly:shouldBeSub,_classificationMismatch:a.is_subassembly!==shouldBeSub};
+    // Pattern-based rule: XX-XXXX format (e.g. 01-0001) = subassembly, unless it's a HW pack
+    const patternSaysSub=/^\d{2}-\d{4}/.test(a.pn||'')&&!isHWPack(a.pn);
+    // Trust the DB value as the authority — if the DB has is_subassembly explicitly set, use it.
+    // Flag a mismatch so the user can review/fix if needed.
+    const dbVal=a.is_subassembly;
+    const effectiveSub=(dbVal===true||dbVal===false)?dbVal:patternSaysSub;
+    return{...a,is_subassembly:effectiveSub,_classificationMismatch:patternSaysSub!==effectiveSub};
   });
 }
 
@@ -723,7 +728,7 @@ function setupRealtime(){
       updateBadge();if(['parts','inventory','dashboard'].includes(S.view))scheduleRender();
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'assemblies'},p=>{
-      const norm=a=>({...a,is_subassembly:/^\d{2}-\d{4}/.test(a.pn||'')&&!isHWPack(a.pn)});
+      const norm=a=>{const p=/^\d{2}-\d{4}/.test(a.pn||'')&&!isHWPack(a.pn);const d=a.is_subassembly;return{...a,is_subassembly:(d===true||d===false)?d:p};};
       if(p.eventType==='INSERT')S.assemblies=[...S.assemblies,norm(p.new)].sort((a,b)=>a.pn.localeCompare(b.pn));
       else if(p.eventType==='UPDATE')S.assemblies=S.assemblies.map(x=>x.id===p.new.id?norm(p.new):x);
       else if(p.eventType==='DELETE')S.assemblies=S.assemblies.filter(x=>x.id!==p.old.id);
@@ -1296,7 +1301,7 @@ function renderInventory(){
   if(q)list=list.filter(p=>p.pn.toLowerCase().includes(q)||((p.description||'').toLowerCase().includes(q)));
   if(sf.reorder)list=list.filter(p=>avgWk(p)>0&&wks(p)!==null&&wks(p)<(p.lead_time_weeks+2));
   const groupBy=sf.group||'';
-  const reorderCnt=S.parts.filter(p=>avgWk(p)>0&&wks(p)!==null&&wks(p)<(p.lead_time_weeks+2)).length;
+  const reorderCnt=S.parts.filter(p=>!p.discontinued&&avgWk(p)>0&&wks(p)!==null&&wks(p)<(p.lead_time_weeks+2)).length;
 
   function partRow(p){
     const w=wks(p);const col=wkColor(w);const pct=wkPct(w);
@@ -1330,8 +1335,8 @@ function renderInventory(){
       const gNeed=gList.filter(p=>avgWk(p)>0&&wks(p)!==null&&wks(p)<(p.lead_time_weeks+2)).length;
       bodyHtml+=`<tr style="background:var(--bg3)"><td colspan="8" style="padding:6px 10px;font-size:11px;font-weight:700;color:var(--text2);border-top:2px solid var(--border)">
         <span style="color:var(--orange)">${v}</span>
-        <span style="font-weight:400;color:var(--text3);margin-left:10px">${gList.length} SKUs · ${fc(gVal)} value${gNeed?' · ':''}</span>
-        ${gNeed?`<span style="color:var(--yellow)">${gNeed} need reorder</span>`:''}
+        <span style="font-weight:400;color:var(--text3);margin-left:10px">${gList.length} SKUs · ${fc(gVal)} value</span>
+        ${gNeed?` · <span style="color:var(--yellow)">${gNeed} need reorder</span>`:''}
       </td></tr>`;
       gList.forEach(p=>{bodyHtml+=partRow(p);});
     });
@@ -1339,10 +1344,7 @@ function renderInventory(){
     const groups={};
     list.forEach(p=>{const c=p.category||'Uncategorized';(groups[c]=groups[c]||[]).push(p);});
     Object.keys(groups).sort().forEach(c=>{
-      bodyHtml+=`<tr style="background:var(--bg3)"><td colspan="8" style="padding:6px 10px;font-size:11px;font-weight:700;color:var(--text2);border-top:2px solid var(--border)">
-        <span style="color:var(--teal)">${c}</span>
-        <span style="font-weight:400;color:var(--text3);margin-left:10px">${groups[c].length} SKUs</span>
-      </td></tr>`;
+      bodyHtml+=`<tr style="background:var(--bg3)"><td colspan="8" style="padding:6px 10px;font-size:11px;font-weight:700;color:var(--teal);border-top:2px solid var(--border)">${c} <span style="font-weight:400;color:var(--text3);margin-left:8px">${groups[c].length} SKUs</span></td></tr>`;
       groups[c].forEach(p=>{bodyHtml+=partRow(p);});
     });
   }else{
@@ -1372,7 +1374,7 @@ function renderInventory(){
   <div class="tbl-wrap">
   <table><thead class="sticky-header"><tr>
     <th>Part #</th><th>Description</th><th>Vendor</th><th>Bin</th>
-    <th title="Click − or + for quick ±1 adjust; click the number to set exact qty">On Hand <span style="font-size:9px;color:var(--text3)">±</span></th>
+    <th title="Click − or + for quick ±1; click number for exact qty">On Hand <span style="font-size:9px;color:var(--text3)">±</span></th>
     <th>Stock Health</th><th>Lead</th><th>Action</th>
   </tr></thead><tbody>
   ${bodyHtml}
@@ -4224,11 +4226,11 @@ function bulkDiscontinue(table){
   const overflow=items.length>8?' <span style="color:var(--text3)">and '+(items.length-8)+' more…</span>':'';
   const existing=document.getElementById('bulk-disc-modal');if(existing)existing.remove();
   const modal=document.createElement('div');modal.id='bulk-disc-modal';
-  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9999;display:flex;align-items:center;justify-content:center';
-  modal.innerHTML=`<div style="background:var(--bg0);border:1px solid var(--border);border-radius:10px;padding:22px 24px;max-width:440px;width:92%">
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML=`<div style="background:var(--bg2);border:1px solid var(--border2);border-radius:10px;padding:22px 24px;max-width:440px;width:92%;box-shadow:0 16px 48px rgba(0,0,0,.18)">
     <div style="font-size:15px;font-weight:700;color:var(--text);margin-bottom:6px">🗄 Discontinue ${items.length} ${items.length===1?noun:nounPlural}?</div>
     <div style="font-size:12px;color:var(--text3);margin-bottom:14px">They will be hidden from Inventory, Planning &amp; Production. Restore via the Discontinued filter.</div>
-    <div style="font-size:11px;background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:10px;max-height:160px;overflow-y:auto;line-height:1.8">
+    <div style="font-size:11px;background:var(--bg4);border:1px solid var(--border);border-radius:6px;padding:10px;max-height:160px;overflow-y:auto;line-height:1.8">
       ${preview.map(pn=>'<span style="color:var(--text2)">'+pn+'</span>').join(' · ')}${overflow}
     </div>
     <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:18px">
@@ -5318,8 +5320,8 @@ function renderPlanning() {
       <td><input class="inline-edit" style="width:55px" type="number" value="${p.min_qty||0}" onchange="savePlanField('${p.id}','min_qty',+this.value,'${p.pn}')"></td>
       <td><input class="inline-edit" style="width:55px" type="number" value="${p.max_qty||0}" onchange="savePlanField('${p.id}','max_qty',+this.value,'${p.pn}')"></td>
       <td><input class="inline-edit" style="width:55px" type="number" value="${p.safety_stock||0}" onchange="savePlanField('${p.id}','safety_stock',+this.value,'${p.pn}')"></td>
-      <td><input class="inline-edit" style="width:55px" type="number" value="${moq}" title="Minimum order qty" onchange="savePlanField('${p.id}','moq',+this.value,'${p.pn}')"></td>
-      <td class="money-neutral" title="12-wk avg · 4-wk: ${avgWk4(p).toFixed(2)}/wk">${wkd.toFixed(2)}/wk</td>
+      <td><input class="inline-edit" style="width:55px" type="number" value="${moq}" title="Minimum order qty — won't flag unless suggested ≥ MOQ" onchange="savePlanField('${p.id}','moq',+this.value,'${p.pn}')"></td>
+      <td class="money-neutral" title="12-wk avg · 4-wk: ${avgWk4(p).toFixed(2)}/wk — auto from sales">${wkd.toFixed(2)}/wk</td>
       <td class="money-cost" style="font-weight:700" title="Reorder point: ${rp} · Order ${orderQty} @ ${fc(costForQty(p,orderQty),4)}/ea">${sq}${moq>sq?'<span style="color:var(--text3);font-size:9px"> →'+moq+'</span>':''}</td>
       <td><span class="pill ${statusCls}" title="Reorder point: ${rp}">${status}</span></td>
       <td style="display:flex;gap:4px">${oh<=rp&&orderQty>0&&!(moq>0&&sq<moq)?`<button class="btn btn-primary btn-sm" onclick='createPOFromSuggestion("${p.pn}","${p.vendor||''}",${orderQty},${costForQty(p,orderQty)},"${p.description||''}")'>Order ${orderQty}</button>`:''}<button class="action-btn" title="AI suggest min/max" onclick="aiSuggestMinMax('${p.pn}')">✨</button></td>
@@ -5337,11 +5339,9 @@ async function savePlanField(id, field, value, pn) {
   if(prev) pushUndo('update','parts',{...prev,[field]:value},prev,'Edit '+field+' for '+pn);
 }
 
-async function quickAdjustStock(partId, pn, delta){
-  const part=S.parts.find(p=>p.id===partId);
-  if(!part)return;
-  const prev=part.total_unpckgd||0;
-  const newQty=prev+delta;
+async function quickAdjustStock(partId,pn,delta){
+  const part=S.parts.find(p=>p.id===partId);if(!part)return;
+  const prev=part.total_unpckgd||0;const newQty=prev+delta;
   const{error}=await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',partId);
   if(error){toast('Error: '+error.message);return;}
   await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newQty,adjustment:delta,reason:'Quick adjust (±1)',source:'quick_adjust'});
@@ -5409,19 +5409,16 @@ async function createVendorPO(vendor){
   openPODetail(po.id);nav('purchases');
 }
 
-async function createSuggestedPOs() {
-  const needsReorder = S.parts.filter(p=>{
+async function createSuggestedPOs(){
+  const needsReorder=S.parts.filter(p=>{
     if(p.discontinued)return false;
-    const rp=calcReorderPoint(p);
-    return (p.total_unpckgd||0)<=rp && calcSuggestedQty(p)>0;
+    return (p.total_unpckgd||0)<=calcReorderPoint(p)&&calcSuggestedQty(p)>0;
   });
   if(!needsReorder.length){toast('Nothing needs reordering');return;}
-
-  // Group by vendor
   const groups={};
   needsReorder.forEach(p=>{
     const sq=calcSuggestedQty(p);const moq=p.moq||0;
-    if(moq>0&&sq<moq)return; // skip MOQ-gated items
+    if(moq>0&&sq<moq)return;
     const oq=Math.max(sq,moq);if(oq<=0)return;
     const v=p.vendor||'No Vendor';
     if(!groups[v])groups[v]=[];
@@ -5429,26 +5426,20 @@ async function createSuggestedPOs() {
   });
   const vendorList=Object.keys(groups).sort();
   if(!vendorList.length){toast('Nothing meets ordering criteria');return;}
-
   const existing=document.getElementById('create-po-review');if(existing)existing.remove();
   const modal=document.createElement('div');modal.id='create-po-review';
-  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9999;display:flex;align-items:center;justify-content:center';
-
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
   const grandTotal=vendorList.reduce((s,v)=>s+groups[v].reduce((t,x)=>t+x.total,0),0);
-  const totalPOs=vendorList.length;
-
   const vendorSections=vendorList.map(v=>{
-    const items=groups[v];
-    const vTotal=items.reduce((s,x)=>s+x.total,0);
-    const rows=items.map(x=>`
-      <tr>
-        <td style="padding:4px 6px"><input type="checkbox" id="cpr-${x.p.id}" checked></td>
-        <td style="padding:4px 6px;font-family:var(--mono);font-size:11px;color:var(--teal)">${x.p.pn}</td>
-        <td style="padding:4px 6px;font-size:11px;color:var(--text2);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${x.p.description||''}</td>
-        <td style="padding:4px 6px;text-align:right;font-family:var(--mono);font-size:11px">${x.oq}</td>
-        <td style="padding:4px 6px;text-align:right;font-size:11px;color:var(--text3)">${fc(x.cost,4)}</td>
-        <td style="padding:4px 6px;text-align:right;font-size:11px;font-weight:600">${fc(x.total)}</td>
-      </tr>`).join('');
+    const items=groups[v];const vTotal=items.reduce((s,x)=>s+x.total,0);
+    const rows=items.map(x=>`<tr>
+      <td style="padding:4px 6px"><input type="checkbox" id="cpr-${x.p.id}" checked></td>
+      <td style="padding:4px 6px;font-family:var(--mono);font-size:11px;color:var(--teal)">${x.p.pn}</td>
+      <td style="padding:4px 6px;font-size:11px;color:var(--text2);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${x.p.description||''}</td>
+      <td style="padding:4px 6px;text-align:right;font-family:var(--mono);font-size:11px">${x.oq}</td>
+      <td style="padding:4px 6px;text-align:right;font-size:11px;color:var(--text3)">${fc(x.cost,4)}</td>
+      <td style="padding:4px 6px;text-align:right;font-size:11px;font-weight:600">${fc(x.total)}</td>
+    </tr>`).join('');
     return `<div style="margin-bottom:14px">
       <div style="font-size:11px;font-weight:700;color:var(--orange);padding:6px 8px;background:var(--bg3);border-radius:6px 6px 0 0;border:1px solid var(--border);border-bottom:none;display:flex;align-items:center;gap:8px">
         <span style="flex:1">${v}</span>
@@ -5458,34 +5449,30 @@ async function createSuggestedPOs() {
       <div style="border:1px solid var(--border);border-radius:0 0 6px 6px;overflow:hidden">
         <table style="width:100%;border-collapse:collapse">
           <thead><tr style="font-size:10px;color:var(--text3);background:var(--bg4)">
-            <th style="padding:3px 6px;text-align:left;width:24px"></th>
-            <th style="padding:3px 6px;text-align:left">Part #</th>
-            <th style="padding:3px 6px;text-align:left">Description</th>
-            <th style="padding:3px 6px;text-align:right">Qty</th>
-            <th style="padding:3px 6px;text-align:right">Unit</th>
-            <th style="padding:3px 6px;text-align:right">Total</th>
+            <th style="padding:3px 6px;width:24px"></th><th style="padding:3px 6px;text-align:left">Part #</th>
+            <th style="padding:3px 6px;text-align:left">Description</th><th style="padding:3px 6px;text-align:right">Qty</th>
+            <th style="padding:3px 6px;text-align:right">Unit</th><th style="padding:3px 6px;text-align:right">Total</th>
           </tr></thead><tbody>${rows}</tbody>
         </table>
       </div>
     </div>`;
   }).join('');
-
   modal.innerHTML=`
-    <div style="background:var(--bg0);border:1px solid var(--border);border-radius:10px;width:min(680px,96vw);max-height:88vh;display:flex;flex-direction:column">
-      <div style="padding:18px 20px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">
+    <div style="background:var(--bg2);border:1px solid var(--border2);border-radius:10px;width:min(680px,96vw);max-height:88vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.18)">
+      <div style="padding:16px 20px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">
         <div style="flex:1">
-          <div style="font-size:15px;font-weight:700;color:var(--text)">Create Suggested POs</div>
-          <div style="font-size:11px;color:var(--text3)">${totalPOs} PO${totalPOs!==1?'s':''} across ${vendorList.length} vendor${vendorList.length!==1?'s':''} · ${fc(grandTotal)} total</div>
+          <div style="font-size:15px;font-weight:700;color:var(--text)">Review &amp; Create Suggested POs</div>
+          <div style="font-size:11px;color:var(--text3)">${vendorList.length} PO${vendorList.length!==1?'s':''} across ${vendorList.length} vendor${vendorList.length!==1?'s':''} · ${fc(grandTotal)} total</div>
         </div>
-        <button onclick="document.getElementById('create-po-review').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer">✕</button>
+        <button onclick="document.getElementById('create-po-review').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">✕</button>
       </div>
-      <div style="padding:16px 20px;overflow-y:auto;flex:1">
-        <div style="font-size:11px;color:var(--text3);margin-bottom:12px">One PO will be created per vendor. Uncheck any items to exclude them.</div>
+      <div style="padding:14px 20px;overflow-y:auto;flex:1">
+        <div style="font-size:11px;color:var(--text3);margin-bottom:12px">One PO per vendor. Uncheck items to exclude.</div>
         ${vendorSections}
       </div>
-      <div style="padding:14px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:10px">
+      <div style="padding:12px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:10px">
         <button class="btn btn-sm" onclick="document.getElementById('create-po-review').remove()">Cancel</button>
-        <button class="btn btn-primary" onclick="confirmCreateSuggestedPOs()">✓ Create ${totalPOs} PO${totalPOs!==1?'s':''}</button>
+        <button class="btn btn-primary" onclick="confirmCreateSuggestedPOs()">✓ Create ${vendorList.length} PO${vendorList.length!==1?'s':''}</button>
       </div>
     </div>`;
   document.body.appendChild(modal);
@@ -5493,31 +5480,24 @@ async function createSuggestedPOs() {
 
 async function confirmCreateSuggestedPOs(){
   document.getElementById('create-po-review')?.remove();
-  const needsReorder=S.parts.filter(p=>{
-    if(p.discontinued)return false;
-    const rp=calcReorderPoint(p);
-    return (p.total_unpckgd||0)<=rp&&calcSuggestedQty(p)>0;
-  });
+  const needsReorder=S.parts.filter(p=>{if(p.discontinued)return false;return (p.total_unpckgd||0)<=calcReorderPoint(p)&&calcSuggestedQty(p)>0;});
   const groups={};
   needsReorder.forEach(p=>{
     const sq=calcSuggestedQty(p);const moq=p.moq||0;
     if(moq>0&&sq<moq)return;
     const oq=Math.max(sq,moq);if(oq<=0)return;
     const chk=document.getElementById('cpr-'+p.id);
-    if(chk&&!chk.checked)return; // user unchecked
+    if(chk&&!chk.checked)return;
     const v=p.vendor||'No Vendor';
     if(!groups[v])groups[v]=[];
     groups[v].push({p,oq,cost:costForQty(p,oq)});
   });
   let created=0;
-  for(const [vendor,items] of Object.entries(groups)){
+  for(const[vendor,items]of Object.entries(groups)){
     if(!items.length)continue;
-    if(items.length===1){
-      await createPOFromSuggestion(items[0].p.pn,vendor,items[0].oq,items[0].cost,items[0].p.description||'');
-    }else{
-      // Multi-line PO for this vendor
-      const total=items.reduce((t,x)=>t+x.oq*x.cost,0);
-      const {data:po,error}=await db.from('purchases').insert({
+    if(items.length===1){await createPOFromSuggestion(items[0].p.pn,vendor,items[0].oq,items[0].cost,items[0].p.description||'');}
+    else{
+      const{data:po,error}=await db.from('purchases').insert({
         vendor,pn:items[0].p.pn+(items.length>1?' +'+(items.length-1)+' more':''),
         description:items.length+'-line PO',qty:items.reduce((t,x)=>t+x.oq,0),
         unit_cost:0,status:'Draft',order_date:new Date().toISOString().slice(0,10),updated_at:new Date().toISOString()
@@ -5580,29 +5560,27 @@ async function deletePOTracking(tid,poId){
   render();
 }
 
-// ── QUICK RECEIVE MODAL ──────────────────────────────────────
 async function quickReceive(poId){
   const po=S.purchases.find(p=>p.id===poId);
   if(!po){toast('PO not found');return;}
   if(!S.poLines[poId]||S.poLines[poId].length===0) await loadPOLines(poId);
-  const lines=(S.poLines[poId]||[]);
+  const lines=S.poLines[poId]||[];
   const pending=lines.filter(l=>(l.qty_received||0)<(l.qty_ordered||0));
   if(!pending.length){toast('All lines already received ✓');return;}
-
   const existing=document.getElementById('quick-recv-modal');if(existing)existing.remove();
   const modal=document.createElement('div');modal.id='quick-recv-modal';
-  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9999;display:flex;align-items:center;justify-content:center';
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
   modal.innerHTML=`
-    <div style="background:var(--bg0);border:1px solid var(--border);border-radius:10px;width:min(600px,95vw);max-height:85vh;display:flex;flex-direction:column">
-      <div style="padding:18px 20px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">
+    <div style="background:var(--bg2);border:1px solid var(--border2);border-radius:10px;width:min(600px,95vw);max-height:85vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.18)">
+      <div style="padding:16px 20px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">
         <div style="flex:1">
           <div style="font-size:14px;font-weight:700;color:var(--text)">📦 Receive — ${po.vendor}</div>
           <div style="font-size:11px;color:var(--text3)">${po.order_date||''} · ${pending.length} line${pending.length!==1?'s':''} pending</div>
         </div>
-        <button onclick="document.getElementById('quick-recv-modal').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer">✕</button>
+        <button onclick="document.getElementById('quick-recv-modal').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">✕</button>
       </div>
       <div style="overflow-y:auto;padding:14px 20px;flex:1">
-        <div style="font-size:11px;color:var(--text3);margin-bottom:10px">✓ = receive this line. Edit qty if different from expected. Leave unchecked to skip.</div>
+        <div style="font-size:11px;color:var(--text3);margin-bottom:10px">✓ = receive this line. Edit qty if different from expected. Uncheck to skip.</div>
         <table style="width:100%;border-collapse:collapse">
           <thead><tr style="font-size:10px;color:var(--text3);border-bottom:1px solid var(--border)">
             <th style="padding:4px 6px;text-align:left">✓</th>
@@ -5611,24 +5589,21 @@ async function quickReceive(poId){
             <th style="padding:4px 6px;text-align:right">Expected</th>
             <th style="padding:4px 6px;text-align:right">Receive Qty</th>
           </tr></thead><tbody>
-          ${pending.map(l=>{
-            const remaining=(l.qty_ordered||0)-(l.qty_received||0);
-            return `<tr style="border-bottom:1px solid var(--border)">
-              <td style="padding:8px 6px"><input type="checkbox" id="qr-chk-${l.id}" checked></td>
-              <td style="padding:8px 6px;font-family:var(--mono);font-size:11px;color:var(--teal)">${l.pn}</td>
-              <td style="padding:8px 6px;font-size:11px;color:var(--text2);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${l.description||''}</td>
-              <td style="padding:8px 6px;text-align:right;font-size:11px;color:var(--text3)">${remaining}</td>
-              <td style="padding:8px 6px;text-align:right"><input id="qr-qty-${l.id}" type="number" min="0" value="${remaining}" style="width:70px;text-align:right;background:var(--bg4);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:4px 6px;font-size:12px;font-family:var(--mono)"></td>
-            </tr>`;
-          }).join('')}
+          ${pending.map(l=>{const rem=(l.qty_ordered||0)-(l.qty_received||0);return `<tr style="border-bottom:1px solid var(--border)">
+            <td style="padding:8px 6px"><input type="checkbox" id="qr-chk-${l.id}" checked></td>
+            <td style="padding:8px 6px;font-family:var(--mono);font-size:11px;color:var(--teal)">${l.pn}</td>
+            <td style="padding:8px 6px;font-size:11px;color:var(--text2);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${l.description||''}</td>
+            <td style="padding:8px 6px;text-align:right;font-size:11px;color:var(--text3)">${rem}</td>
+            <td style="padding:8px 6px;text-align:right"><input id="qr-qty-${l.id}" type="number" min="0" value="${rem}" style="width:70px;text-align:right;background:var(--bg4);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:4px 6px;font-size:12px;font-family:var(--mono)"></td>
+          </tr>`;}).join('')}
           </tbody>
         </table>
       </div>
-      <div style="padding:14px 20px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px">
+      <div style="padding:12px 20px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px">
         <div style="flex:1">
           <label style="font-size:11px;color:var(--text3);display:flex;align-items:center;gap:6px">
             <input type="checkbox" id="qr-mark-transit" ${(S.poTracking[poId]||[]).length===0&&po.status==='Ordered'?'checked':''}>
-            Mark as "In Transit" after receiving
+            Mark as "In Transit" if not fully received
           </label>
         </div>
         <button class="btn btn-sm" onclick="document.getElementById('quick-recv-modal').remove()">Cancel</button>
@@ -5645,42 +5620,35 @@ async function submitQuickReceive(poId){
   for(const line of lines){
     const chk=document.getElementById('qr-chk-'+line.id);
     if(!chk||!chk.checked){skipped++;continue;}
-    const qtyInp=document.getElementById('qr-qty-'+line.id);
-    const qty=parseFloat(qtyInp?.value)||0;
+    const qty=parseFloat(document.getElementById('qr-qty-'+line.id)?.value)||0;
     if(qty<=0){skipped++;continue;}
     await checkInLineQuick(line.id,poId,line.pn,line.qty_ordered,line.qty_received||0,qty);
     received++;
   }
-  // Reload lines, update PO status
   await loadPOLines(poId);
   const updated=S.poLines[poId]||[];
   const allDone=updated.length>0&&updated.every(l=>(l.qty_received||0)>=(l.qty_ordered||0));
   const po=S.purchases.find(p=>p.id===poId);
   let newStatus=po?.status;
-  if(allDone){
-    newStatus='Received';
-  }else if(markTransit&&po?.status==='Ordered'){
-    newStatus='In Transit';
-  }
+  if(allDone) newStatus='Received';
+  else if(markTransit&&(po?.status==='Ordered'||po?.status==='Draft')) newStatus='In Transit';
   if(newStatus&&newStatus!==po?.status){
     await db.from('purchases').update({status:newStatus,updated_at:new Date().toISOString()}).eq('id',poId);
     S.purchases=S.purchases.map(p=>p.id===poId?{...p,status:newStatus}:p);
   }
   document.getElementById('quick-recv-modal')?.remove();
   render();
-  const parts=received===1?'line':'lines';
-  toast(`✓ Received ${received} ${parts}${skipped?' ('+skipped+' skipped)':''}${allDone?' — PO complete!':''}`);
+  toast(`✓ Received ${received} line${received!==1?'s':''}${skipped?' ('+skipped+' skipped)':''}${allDone?' — PO complete!':''}`);
 }
 
-// ── QUICK ADD TRACKING ───────────────────────────────────────
-function quickAddTracking(poId, vendorName){
+function quickAddTracking(poId,vendorName){
   const existing=document.getElementById('quick-track-modal');if(existing)existing.remove();
   const modal=document.createElement('div');modal.id='quick-track-modal';
   modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
   const existing2=S.poTracking[poId]||[];
   const existingHtml=existing2.length?'<div style="margin-bottom:12px">'+existing2.map(t=>`<div style="display:flex;align-items:center;gap:8px;font-size:11px;margin-bottom:4px"><span class="pill pill-muted" style="min-width:44px;justify-content:center">${t.carrier}</span><span style="font-family:var(--mono);color:var(--teal);user-select:all">${t.tracking_number}</span><button onclick="deletePOTrackingQ('${t.id}','${poId}')" style="background:transparent;border:none;color:var(--text3);cursor:pointer;font-size:14px;line-height:1">×</button></div>`).join('')+'</div>':'';
   modal.innerHTML=`
-    <div style="background:var(--bg0);border:1px solid var(--border);border-radius:10px;padding:20px 22px;max-width:420px;width:92%">
+    <div style="background:var(--bg2);border:1px solid var(--border2);border-radius:10px;padding:20px 22px;max-width:420px;width:92%;box-shadow:0 16px 48px rgba(0,0,0,.18)">
       <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:4px">🔗 Add Tracking — ${vendorName}</div>
       <div style="font-size:11px;color:var(--text3);margin-bottom:14px">Adding tracking automatically advances status to "In Transit"</div>
       ${existingHtml}
@@ -5707,7 +5675,6 @@ async function submitQuickTracking(poId){
   if(error){toast('Error: '+error.message+(error.message.includes('po_tracking')?' — run po_tracking SQL first':''));return;}
   if(!S.poTracking[poId])S.poTracking[poId]=[];
   S.poTracking[poId].push(data);
-  // Auto-advance status to In Transit
   const po=S.purchases.find(p=>p.id===poId);
   if(po&&(po.status==='Ordered'||po.status==='Draft'||po.status==='On Order')){
     await db.from('purchases').update({status:'In Transit',updated_at:new Date().toISOString()}).eq('id',poId);
@@ -5720,7 +5687,6 @@ async function submitQuickTracking(poId){
 async function deletePOTrackingQ(tid,poId){
   await db.from('po_tracking').delete().eq('id',tid);
   if(S.poTracking[poId])S.poTracking[poId]=S.poTracking[poId].filter(t=>t.id!==tid);
-  // Re-render just the modal content
   const existing=document.getElementById('quick-track-modal');
   if(existing){const po=S.purchases.find(p=>p.id===poId);existing.remove();quickAddTracking(poId,po?.vendor||'');}
   else render();
@@ -5768,7 +5734,7 @@ function renderPODetail(po) {
   ${lines.length===0?`<div class="panel"><div class="section-empty">No line items. Click "Add Line" to add parts to this PO.</div></div>`:''}
   ${lines.map(line=>{
     const remaining=Math.max(0,(line.qty_ordered||0)-(line.qty_received||0));
-    const done=line.qty_received>=(line.qty_ordered||0);
+    const done=(line.qty_received||0)>=(line.qty_ordered||0);
     const pct=line.qty_ordered>0?Math.min(100,Math.round(((line.qty_received||0)/line.qty_ordered)*100)):0;
     return `<div class="check-row" style="background:${done?'rgba(13,148,136,.04)':'var(--bg2)'};border:1px solid var(--border);border-radius:8px;margin-bottom:8px;flex-wrap:wrap;gap:10px">
       <div style="display:flex;flex-direction:column;min-width:120px">
@@ -6350,7 +6316,7 @@ function renderBuildPlanner(asm){
     <div class="panel" style="padding:0">
       <div class="section-header">Component Requirements — for ${want} unit${want>1?'s':''}</div>
       ${b.checks.length===0?'<div class="section-empty">No BOM — nothing will be deducted</div>':''}
-      <table><thead><tr><th>Part #</th><th>Description</th><th>Bin</th><th>Per Unit</th><th>Need</th><th>Have</th><th>Short</th><th>OK?</th></tr></thead><tbody>
+      <table><thead><tr><th>Part #</th><th>Description</th><th>Bin</th><th>Per Unit</th><th>Need</th><th>Have</th><th>Short</th><th>OK?</th><th></th></tr></thead><tbody>
       ${b.checks.map(c=>{
         const totNeed=c.need*want;
         const short=Math.max(0,totNeed-c.avail);
@@ -6364,6 +6330,8 @@ function renderBuildPlanner(asm){
           <td class="money" style="color:${c.avail>=totNeed?'var(--green)':'var(--red)'};font-weight:700">${c.avail}</td>
           <td class="money" style="color:${short>0?'var(--red)':'var(--text3)'};font-weight:700">${short||'—'}</td>
           <td>${c.avail>=totNeed?'<span class="ok-dot" style="background:var(--green);display:inline-block"></span>':'<span class="ok-dot" style="background:var(--red);display:inline-block"></span>'}</td>
+          <td>${c.isSub?`<button class="btn btn-sm" style="font-size:10px;color:var(--orange);border-color:rgba(234,88,12,.35);padding:3px 8px;white-space:nowrap" onclick="event.stopPropagation();openBuild('${c.pn}')" title="Open build planner for ${c.pn}">🔧 Build Sub</button>`:''}
+          </td>
         </tr>`;}).join('')}
       </tbody></table>
     </div>
@@ -6426,12 +6394,13 @@ async function unpackPlanned(pn,asmId,qty){
 }
 
 async function packPlanned(pn,asmId,qty){
-  // direct pack of computed qty (bypasses input lookup)
+  // Set activeBuild=null BEFORE packUnits so its render() shows the production list
+  S.activeBuild=null;
+  S.buildQty=null;
   const fakeInput=document.createElement('input');fakeInput.id='pack-qty-'+asmId;fakeInput.value=qty;
   document.body.appendChild(fakeInput);
   await packUnits(pn,asmId,false);
   fakeInput.remove();
-  S.buildQty=null;
 }
 
 async function orderShortages(pn,want){
