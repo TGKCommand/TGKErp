@@ -1293,14 +1293,24 @@ function renderBOMs(){
   const margin=msrp?((msrp-totalCost-(asm.shipping_cost||10)-msrp*0.03)/msrp*100):null;
   const partMap={};S.parts.forEach(p=>partMap[p.pn]=p);
   const typeColor={part:'var(--teal)',subassembly:'var(--orange)',packaging:'#a855f7'};
+  const selDisplay=sel?(sel+(asm?.description?' — '+asm.description:'')):'';
+  // All assemblies (not just those with BOMs) available for parent selector
+  const allAsmPNs=S.assemblies.map(a=>a.pn).sort();
   return `
   <div class="grid-2-lg">
   <div>
     <div class="panel">
       <div class="panel-title"><span>Select Assembly</span></div>
-      <select class="form-input" onchange="S.selBOM=this.value;render()">
-        ${keys.map(k=>`<option value="${k}" ${k===sel?'selected':''}>${k} — ${S.assemblies.find(a=>a.pn===k)?.description||''}</option>`).join('')}
-      </select>
+      <div id="bom-sel-wrap" style="position:relative">
+        <input id="bom-sel-input" class="form-input" value="${escHtml(selDisplay)}"
+          placeholder="Search assemblies…" autocomplete="off"
+          oninput="bomSrchFilter(this.value)"
+          onfocus="bomSrchOpen(this)"
+          onkeydown="bomSrchKey(event)"
+          style="padding-right:28px">
+        <span style="position:absolute;right:8px;top:50%;transform:translateY(-50%);color:var(--text3);pointer-events:none;font-size:12px">▾</span>
+        <div id="bom-sel-dd" style="display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;background:var(--bg2);border:1px solid var(--border2);border-radius:8px;max-height:280px;overflow-y:auto;z-index:300;box-shadow:0 8px 24px rgba(0,0,0,.25)"></div>
+      </div>
     </div>
     ${sel?`<div class="panel" style="padding:0">
       <div style="padding:14px 18px;border-bottom:1px solid var(--border)">
@@ -1351,13 +1361,21 @@ function renderBOMs(){
       <div class="form-row">
         <div class="form-group">
           <label class="form-label">Assembly (Parent)</label>
-          <select id="bom-parent" class="form-input">
-            ${S.assemblies.map(a=>`<option value="${a.pn}" ${a.pn===sel?'selected':''}>${a.pn}</option>`).join('')}
-          </select>
+          <div id="bom-par-wrap" style="position:relative">
+            <input id="bom-parent-input" class="form-input" value="${escHtml(sel)}"
+              placeholder="Search assemblies…" autocomplete="off"
+              oninput="bomParFilter(this.value)"
+              onfocus="bomParOpen(this)"
+              onkeydown="bomParKey(event)"
+              style="padding-right:28px">
+            <span style="position:absolute;right:8px;top:50%;transform:translateY(-50%);color:var(--text3);pointer-events:none;font-size:12px">▾</span>
+            <div id="bom-par-dd" style="display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;background:var(--bg2);border:1px solid var(--border2);border-radius:8px;max-height:220px;overflow-y:auto;z-index:300;box-shadow:0 8px 24px rgba(0,0,0,.25)"></div>
+          </div>
+          <input type="hidden" id="bom-parent" value="${escHtml(sel)}">
         </div>
       </div>
       <div class="form-row cols-2">
-        <div class="form-group"><label class="form-label">Child Part #</label><input id="bom-child" class="form-input" placeholder="PN"></div>
+        <div class="form-group"><label class="form-label">Child Part #</label><input id="bom-child" class="form-input" placeholder="PN" list="bom-child-list"><datalist id="bom-child-list">${[...S.parts.map(p=>p.pn),...S.assemblies.map(a=>a.pn)].sort().map(pn=>`<option value="${pn}">`).join('')}</datalist></div>
         <div class="form-group"><label class="form-label">Qty</label><input id="bom-qty" class="form-input" type="number" min="0.001" step="0.001" value="1"></div>
       </div>
       <div class="form-row cols-2">
@@ -1371,10 +1389,86 @@ function renderBOMs(){
   </div></div>`;
 }
 
-// ============================================================
-// INVENTORY
-// ============================================================
-function renderInventory(){
+// ── BOM SEARCHABLE COMBOBOX ──────────────────────────────────────────────────
+// Shared dropdown builder for both the "Select Assembly" and "Parent" pickers
+function _bomDdBuild(dd, q, currentVal, onSelect) {
+  const keys=Object.keys(S.boms).sort();
+  // For parent picker we want ALL assemblies, not just those with BOMs
+  const all=S.assemblies.map(a=>a.pn).sort();
+  const pool=(dd.id==='bom-par-dd')?all:keys;
+  const lq=(q||'').toLowerCase().trim();
+  const filtered=lq?pool.filter(function(k){
+    const a=S.assemblies.find(function(x){return x.pn===k;});
+    return k.toLowerCase().includes(lq)||(a?.description||'').toLowerCase().includes(lq);
+  }):pool;
+  if(!filtered.length){dd.innerHTML='<div style="padding:12px 14px;font-size:12px;color:var(--text3)">No assemblies found</div>';return;}
+  dd.innerHTML=filtered.map(function(k,i){
+    const a=S.assemblies.find(function(x){return x.pn===k;});
+    const isSel=k===currentVal;
+    return '<div class="_bom-opt" data-val="'+k+'" data-idx="'+i+'"'
+      +' onclick="'+onSelect+'(\''+k+'\')"'
+      +' style="padding:8px 12px;cursor:pointer;background:'+(isSel?'var(--bg4)':'transparent')+';border-bottom:1px solid var(--border)"'
+      +' onmouseenter="this.style.background=\'var(--bg3)\'" onmouseleave="this.style.background=\''+(isSel?'var(--bg4)':'transparent')+'\'">'
+      +'<div style="font-family:var(--mono);font-size:12px;color:var(--teal)">'+k+'</div>'
+      +(a?.description?'<div style="font-size:10px;color:var(--text3);margin-top:1px">'+escHtml(a.description)+'</div>':'')
+    +'</div>';
+  }).join('');
+}
+function _bomDdKey(e, ddId, inputId, onSelect){
+  const dd=document.getElementById(ddId);
+  if(!dd||dd.style.display==='none')return;
+  const opts=Array.from(dd.querySelectorAll('._bom-opt'));
+  if(!opts.length)return;
+  const cur=dd.querySelector('._bom-opt[data-active]');
+  let idx=cur?parseInt(cur.dataset.idx):-1;
+  if(e.key==='ArrowDown'){e.preventDefault();if(cur)cur.removeAttribute('data-active');idx=Math.min(idx+1,opts.length-1);opts[idx].setAttribute('data-active','1');opts[idx].scrollIntoView({block:'nearest'});}
+  else if(e.key==='ArrowUp'){e.preventDefault();if(cur)cur.removeAttribute('data-active');idx=Math.max(idx-1,0);opts[idx].setAttribute('data-active','1');opts[idx].scrollIntoView({block:'nearest'});}
+  else if(e.key==='Enter'){e.preventDefault();const act=dd.querySelector('._bom-opt[data-active]')||opts[0];if(act)window[onSelect](act.dataset.val);}
+  else if(e.key==='Escape'){dd.style.display='none';const inp=document.getElementById(inputId);if(inp){const sel=S.selBOM||'';const a=S.assemblies.find(function(x){return x.pn===sel;});inp.value=ddId==='bom-sel-dd'?(sel?(sel+(a?.description?' — '+a.description:'')):''):(sel||'');}}
+}
+function _bomDdOpen(input, ddId, onSelect){
+  const dd=document.getElementById(ddId);if(!dd)return;
+  const cur=ddId==='bom-sel-dd'?S.selBOM||'':($('bom-parent')||{}).value||S.selBOM||'';
+  _bomDdBuild(dd,input.value,cur,onSelect);
+  dd.style.display='block';
+  input.select();
+  // Close on outside click
+  setTimeout(function(){
+    function outside(e){
+      const wrap=document.getElementById(ddId==='bom-sel-dd'?'bom-sel-wrap':'bom-par-wrap');
+      if(!wrap||!wrap.contains(e.target)){
+        dd.style.display='none';
+        document.removeEventListener('click',outside);
+        // Restore display value
+        const inp=document.getElementById(ddId==='bom-sel-dd'?'bom-sel-input':'bom-parent-input');
+        if(inp){const sel=S.selBOM||'';const a=S.assemblies.find(function(x){return x.pn===sel;});inp.value=ddId==='bom-sel-dd'?(sel?(sel+(a?.description?' — '+a.description:'')):''):(sel||'');}
+      }
+    }
+    document.addEventListener('click',outside);
+  },0);
+}
+
+// Main selector (left panel)
+function bomSrchOpen(inp){_bomDdOpen(inp,'bom-sel-dd','bomSrchPick');}
+function bomSrchFilter(q){var dd=document.getElementById('bom-sel-dd');if(dd)_bomDdBuild(dd,q,S.selBOM||'','bomSrchPick');}
+function bomSrchKey(e){_bomDdKey(e,'bom-sel-dd','bom-sel-input','bomSrchPick');}
+function bomSrchPick(pn){
+  S.selBOM=pn;
+  var dd=document.getElementById('bom-sel-dd');if(dd)dd.style.display='none';
+  var $bp=document.getElementById('bom-parent');if($bp)$bp.value=pn;
+  var bpi=document.getElementById('bom-parent-input');if(bpi)bpi.value=pn;
+  render();
+}
+
+// Parent picker (right panel "Add BOM Item")
+function bomParOpen(inp){_bomDdOpen(inp,'bom-par-dd','bomParPick');}
+function bomParFilter(q){var dd=document.getElementById('bom-par-dd');if(dd)_bomDdBuild(dd,q,$('bom-parent')?.value||'','bomParPick');}
+function bomParKey(e){_bomDdKey(e,'bom-par-dd','bom-parent-input','bomParPick');}
+function bomParPick(pn){
+  var dd=document.getElementById('bom-par-dd');if(dd)dd.style.display='none';
+  var inp=document.getElementById('bom-parent-input');if(inp)inp.value=pn;
+  var hidden=document.getElementById('bom-parent');if(hidden)hidden.value=pn;
+}
   let list=S.parts.filter(p=>!p.discontinued);
   const sf=S.filters.inv||{};
   const q=(sf.search||S.searchQ||'').toLowerCase();
