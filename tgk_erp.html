@@ -3040,8 +3040,12 @@ Deno.serve(async (req) => {
   if (body.action === 'create_order') {
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
     const auth = ssAuth()
-    const { orderNumber, customerName, customerEmail, pn, description, qty, shipTo, internalNotes } = body
+    const { orderNumber, customerName, customerEmail, pn, description, qty, shipTo, internalNotes, ssItems } = body
     if (!orderNumber || !pn || !shipTo?.street1) return json({ error: 'orderNumber, pn and shipTo.street1 required' }, 400)
+    // Use ssItems array if provided (multi-item warranty), otherwise fall back to single item
+    const items = (Array.isArray(ssItems) && ssItems.length)
+      ? ssItems.map((it: any, i: number) => ({ lineItemKey: String(i + 1), sku: it.sku || it.pn || pn, name: it.name || it.description || it.sku || pn, quantity: it.quantity || it.qty || 1, unitPrice: 0 }))
+      : [{ lineItemKey: '1', sku: pn, name: description || pn, quantity: qty || 1, unitPrice: 0 }]
     const ssPayload = {
       orderNumber,
       orderDate: new Date().toISOString(),
@@ -3050,7 +3054,7 @@ Deno.serve(async (req) => {
       customerEmail: customerEmail || undefined,
       billTo: { name: shipTo.name || customerName || 'Customer', street1: shipTo.street1, city: shipTo.city, state: shipTo.state, postalCode: shipTo.postal_code, country: shipTo.country || 'US' },
       shipTo: { name: shipTo.name || customerName || 'Customer', street1: shipTo.street1, street2: shipTo.street2 || undefined, city: shipTo.city, state: shipTo.state, postalCode: shipTo.postal_code, country: shipTo.country || 'US' },
-      items: [{ lineItemKey: '1', sku: pn, name: description || pn, quantity: qty || 1, unitPrice: 0 }],
+      items,
       internalNotes: internalNotes || ('Warranty replacement order from TGK ERP — ' + orderNumber),
       advancedOptions: { source: 'TGK ERP Warranty' }
     }
@@ -3059,8 +3063,11 @@ Deno.serve(async (req) => {
       headers: { 'Content-Type': 'application/json', Authorization: 'Basic ' + auth },
       body: JSON.stringify(ssPayload)
     })
-    const ssData = await ssRes.json()
-    if (!ssRes.ok) return json({ error: 'ShipStation error: ' + (ssData.ExceptionMessage || ssData.message || ssRes.status) }, 502)
+    // Read as text first — ShipStation sometimes returns non-JSON errors which would crash .json()
+    const ssRaw = await ssRes.text()
+    let ssData: any = {}
+    try { ssData = JSON.parse(ssRaw) } catch (_) { /* ShipStation returned non-JSON */ }
+    if (!ssRes.ok) return json({ error: 'ShipStation ' + ssRes.status + ': ' + (ssData.ExceptionMessage || ssData.message || ssRaw.slice(0, 300)) }, 502)
     return json({ orderId: ssData.orderId, orderNumber: ssData.orderNumber, status: ssData.orderStatus })
   }
 
@@ -7992,8 +7999,17 @@ async function confirmShipWarranty(claimId, pn){
     let json;
     try{json=JSON.parse(rawText);}
     catch(e){
-      const preview=rawText.slice(0,300).replace(/</g,'&lt;');
-      if(statusEl){statusEl.style.display='block';statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.innerHTML='<b>✗ Edge function returned non-JSON (HTTP '+resp.status+')</b><br><br>This usually means the <code>create_order</code> action hasn\'t been deployed to the <b>shipstation-ship</b> edge function yet.<br><br>Copy the updated function code from <b>Integrations → Setup Guide</b> and redeploy, then try again.<br><br><details><summary style="cursor:pointer;font-size:10px;opacity:.7">Raw response</summary><pre style="font-size:9px;margin-top:4px;white-space:pre-wrap">'+preview+'</pre></details>';}
+      const preview=rawText?rawText.slice(0,400).replace(/</g,'&lt;'):'(empty response body)';
+      const hint=resp.status===400
+        ?'HTTP 400 with no JSON usually means the edge function crashed before it could respond — often because ShipStation returned a non-JSON error that wasn\'t caught. Redeploy the updated <b>shipstation-ship</b> function from the Setup Guide (the create_order block now handles this).'
+        :'This usually means the <b>create_order</b> action hasn\'t been deployed yet. Copy the updated code from <b>Integrations → Setup Guide</b> and redeploy.';
+      if(statusEl){
+        statusEl.style.display='block';
+        statusEl.style.background='rgba(220,38,38,.1)';
+        statusEl.style.color='var(--red)';
+        statusEl.innerHTML='<b>✗ Edge function returned non-JSON (HTTP '+resp.status+')</b><br><br>'+hint
+          +(preview?'<br><br><div style="font-size:10px;color:var(--text3);margin-top:4px">Raw response from server:</div><pre style="font-size:9px;margin-top:4px;white-space:pre-wrap;background:var(--bg2);padding:6px;border-radius:4px;border:1px solid var(--border)">'+preview+'</pre>':'');
+      }
       if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
       return;
     }
