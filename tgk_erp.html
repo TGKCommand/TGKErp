@@ -389,6 +389,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
     <button class="nav-item" id="nav-inventory" onclick="nav('inventory')"><span class="nav-dot"></span>Inventory<span class="nav-badge" id="low-badge" style="display:none">0</span></button>
     <button class="nav-item" id="nav-packqueue" onclick="nav('packqueue')"><span class="nav-dot"></span>Production</button>
     <button class="nav-item" id="nav-purchases" onclick="nav('purchases')"><span class="nav-dot"></span>Purchase Orders</button>
+    <button class="nav-item" id="nav-vendors" onclick="nav('vendors')"><span class="nav-dot"></span>Vendors</button>
     <button class="nav-item" id="nav-pobuilder" onclick="nav('pobuilder')"><span class="nav-dot"></span>PO Builder</button>
     <button class="nav-item" id="nav-cyclecounts" onclick="nav('cyclecounts')"><span class="nav-dot"></span>Cycle Counts</button>
     <button class="nav-item" id="nav-corrections" onclick="nav('corrections')"><span class="nav-dot"></span>Corrections Log</button>
@@ -527,6 +528,7 @@ const S = {
   // Custom standalone categories/vendors (persisted in settings table)
   customCats:{parts:[],assemblies:[]},
   customVendors:[],
+  vendors:[],
 };
 
 // ============================================================
@@ -704,12 +706,13 @@ function normalizeAssemblies(rows){
 
 async function loadAll(){
   try{
-    const[parts,assemblies,sales,purchases,dealers,settings,bomItems,warrantyClaims,shipmentErrors,corrections,cycleCounts,poLinesAll,poTrackingAll]=await Promise.all([
+    const[parts,assemblies,sales,purchases,dealers,vendors,settings,bomItems,warrantyClaims,shipmentErrors,corrections,cycleCounts,poLinesAll,poTrackingAll]=await Promise.all([
       db.from('parts').select('*').order('pn'),
       db.from('assemblies').select('*').order('pn'),
       db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000),
       db.from('purchases').select('*').order('order_date',{ascending:false}),
       db.from('dealers').select('*').order('name'),
+      db.from('vendors').select('*').order('name'),
       db.from('settings').select('*'),
       fetchAll((f,t)=>db.from('bom_items').select('*').order('parent_pn').order('sort_order').range(f,t)),
       db.from('warranty_claims').select('*').order('created_at',{ascending:false}).limit(100),
@@ -725,6 +728,7 @@ async function loadAll(){
     S.sales=sales.data||[];
     S.purchases=purchases.data||[];
     S.dealers=dealers.data||[];
+    S.vendors=vendors.data||[];
     (settings.data||[]).forEach(s=>S.settings[s.key]=s.value);
     if(S.settings.shopify)Object.assign(S.shopify,S.settings.shopify);
     if(S.settings.shipstation)Object.assign(S.shipstation,S.settings.shipstation);
@@ -860,7 +864,7 @@ function setupRealtime(){
 // ============================================================
 // NAV
 // ============================================================
-const PAGE_TITLES={dashboard:'Dashboard',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',planning:'Inventory Planning',purchases:'Purchase Orders',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Corrections Log',warranty:'Customer Resolution',import:'Import Data',pobuilder:'PO Builder'};
+const PAGE_TITLES={dashboard:'Dashboard',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',planning:'Inventory Planning',purchases:'Purchase Orders',vendors:'Vendors',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Corrections Log',warranty:'Customer Resolution',import:'Import Data',pobuilder:'PO Builder'};
 
 function nav(v){
   if(v!==S.view){S.activePO=null;S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.parentBuild=null;S.parentBuildQty=null;S.activeCount=null;if(v!=='packqueue')S.workOrderMode=false;S.searchQ='';}
@@ -963,12 +967,26 @@ function trackingUrl(carrier, tracking){
   if(!tracking)return'';
   const c=(carrier||'').toUpperCase();
   if(c.includes('UPS'))return'https://www.ups.com/track?tracknum='+tracking;
-  if(c.includes('USPS'))return'https://tools.usps.com/go/TrackConfirmAction?qtc_tLabels1='+tracking;
+  if(c.includes('USPS')||c.includes('STAMPS')||c.includes('ENDICIA'))return'https://tools.usps.com/go/TrackConfirmAction?qtc_tLabels1='+tracking;
   if(c.includes('FEDEX')||c.includes('FED'))return'https://www.fedex.com/fedextrack/?trknbr='+tracking;
   if(c.includes('DHL'))return'https://www.dhl.com/us-en/home/tracking.html?tracking-id='+tracking;
   if(c.includes('ONTRAC'))return'https://www.ontrac.com/tracking/?number='+tracking;
   if(c.includes('LSO'))return'https://www.lso.com/go/track?tracking_id='+tracking;
   return'https://www.google.com/search?q='+encodeURIComponent(tracking+' '+carrier+' tracking');
+}
+function carrierLabel(code){
+  if(!code)return'';
+  const c=code.toUpperCase();
+  if(c.includes('UPS'))return'UPS';
+  if(c.includes('USPS')||c.includes('STAMPS')||c.includes('ENDICIA'))return'USPS';
+  if(c.includes('FEDEX')||c.includes('FED_EX'))return'FedEx';
+  if(c.includes('DHL'))return'DHL';
+  if(c.includes('ONTRAC'))return'OnTrac';
+  if(c.includes('LSO'))return'LSO';
+  if(c.includes('AMAZON'))return'Amazon';
+  if(c.includes('ASENDIA'))return'Asendia';
+  if(c.includes('FIRSTMILE')||c.includes('FIRST_MILE'))return'FirstMile';
+  return code; // fall back to raw code if unknown
 }
 
 function escHtml(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
@@ -2515,6 +2533,120 @@ async function cancelOrder(saleId){
 // ============================================================
 // DEALERS
 // ============================================================
+// ============================================================
+// VENDORS
+// ============================================================
+function renderVendors(){
+  const sf=S.filters.vendors||{};
+  const q=(sf.search||'').toLowerCase();
+  let list=(S.vendors||[]);
+  if(q)list=list.filter(v=>(v.name||'').toLowerCase().includes(q)||(v.city||'').toLowerCase().includes(q)||(v.contact_name||'').toLowerCase().includes(q)||(v.email||'').toLowerCase().includes(q));
+  // Count POs per vendor name
+  const poCounts={};
+  (S.purchases||[]).forEach(p=>{if(p.vendor)poCounts[p.vendor]=(poCounts[p.vendor]||0)+1;});
+  return `
+  <div class="filter-bar">
+    <div class="search-wrap"><span class="search-icon">⌕</span><input placeholder="Name, city, contact…" value="${sf.search||''}" oninput="setFilter('vendors','search',this.value)"></div>
+    <button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="openVendorModal(null)">+ Add Vendor</button>
+    <span class="filter-count">${list.length} vendor${list.length!==1?'s':''}</span>
+  </div>
+  ${list.length===0?`<div class="section-empty" style="margin-top:40px">${q?'No vendors match that search':'No vendors yet — click + Add Vendor to get started'}</div>`:`
+  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;padding:4px 0">
+  ${list.map(v=>{
+    const pos=poCounts[v.name]||0;
+    const loc=[v.city,v.state].filter(Boolean).join(', ');
+    return `<div class="panel" style="padding:0;cursor:pointer;transition:box-shadow .15s" onclick="openVendorModal('${v.id}')" onmouseenter="this.style.boxShadow='0 0 0 2px var(--teal)'" onmouseleave="this.style.boxShadow=''">
+      <div style="padding:14px 16px 10px">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px">
+          <div style="font-size:14px;font-weight:700;color:var(--text)">${escHtml(v.name)}</div>
+          ${pos?`<span class="pill pill-teal" style="font-size:9px;white-space:nowrap">${pos} PO${pos!==1?'s':''}</span>`:''}
+        </div>
+        ${v.website?`<a href="${escHtml(v.website.startsWith('http')?v.website:'https://'+v.website)}" target="_blank" onclick="event.stopPropagation()" style="font-size:11px;color:var(--teal);text-decoration:none">${escHtml(v.website)}</a>`:''}
+      </div>
+      <div style="border-top:1px solid var(--border);padding:10px 16px;display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;font-size:11px">
+        ${v.contact_name?`<div><span style="color:var(--text3)">Contact</span><br><b>${escHtml(v.contact_name)}</b>${v.contact_title?`<span style="color:var(--text3)"> · ${escHtml(v.contact_title)}</span>`:''}</div>`:''}
+        ${v.contact_email||v.email?`<div><span style="color:var(--text3)">Email</span><br><a href="mailto:${escHtml(v.contact_email||v.email)}" onclick="event.stopPropagation()" style="color:var(--teal);text-decoration:none">${escHtml(v.contact_email||v.email)}</a></div>`:''}
+        ${v.contact_phone||v.phone?`<div><span style="color:var(--text3)">Phone</span><br><a href="tel:${escHtml(v.contact_phone||v.phone)}" onclick="event.stopPropagation()" style="color:var(--text2);text-decoration:none">${escHtml(v.contact_phone||v.phone)}</a></div>`:''}
+        ${loc?`<div><span style="color:var(--text3)">Location</span><br>${escHtml(loc)}</div>`:''}
+      </div>
+      ${v.notes?`<div style="border-top:1px solid var(--border);padding:8px 16px;font-size:11px;color:var(--text3);font-style:italic">${escHtml(v.notes.slice(0,120))}${v.notes.length>120?'…':''}</div>`:''}
+    </div>`;
+  }).join('')}
+  </div>`}`;
+}
+
+function openVendorModal(id){
+  const v=id?(S.vendors||[]).find(x=>x.id===id):null;
+  const title=v?'Edit Vendor':'Add Vendor';
+  const fi=(fid,label,val,extra='')=>`<div class="form-group"><label class="form-label">${label}</label><input id="${fid}" class="form-input" value="${escHtml(val||'')}" ${extra}></div>`;
+  const overlay=document.createElement('div');
+  overlay.id='vendor-overlay';
+  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto';
+  overlay.innerHTML=`<div class="modal" style="width:620px;max-width:96vw">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+      <div style="font-size:15px;font-weight:700;color:var(--text)">${v?'✎ Edit':'+ Add'} Vendor</div>
+      <button onclick="document.getElementById('vendor-overlay').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">×</button>
+    </div>
+    <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Company</div>
+    <div class="form-row cols-2">${fi('v-name','Vendor Name',v?.name,'placeholder="Company name"')} ${fi('v-website','Website',v?.website,'placeholder="www.example.com"')}</div>
+    <div class="form-row cols-2">${fi('v-email','General Email',v?.email,'type="email" placeholder="info@company.com"')} ${fi('v-phone','Main Phone',v?.phone,'placeholder="(555) 123-4567"')}</div>
+    <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin:12px 0 8px">Address</div>
+    <div class="form-row">${fi('v-street1','Street',v?.street1,'placeholder="123 Main St"')}</div>
+    <div class="form-row">${fi('v-street2','Suite / Unit',v?.street2,'placeholder="Suite 100"')}</div>
+    <div class="form-row cols-2">${fi('v-city','City',v?.city,'')} ${fi('v-state','State',v?.state,'placeholder="CA"')}</div>
+    <div class="form-row cols-2">${fi('v-zip','ZIP',v?.postal_code,'')} ${fi('v-country','Country',v?.country||'US','')}</div>
+    <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin:12px 0 8px">Primary Contact</div>
+    <div class="form-row cols-2">${fi('v-cname','Contact Name',v?.contact_name,'placeholder="Jane Smith"')} ${fi('v-ctitle','Title',v?.contact_title,'placeholder="Sales Rep"')}</div>
+    <div class="form-row cols-2">${fi('v-cemail','Contact Email',v?.contact_email,'type="email" placeholder="jane@company.com"')} ${fi('v-cphone','Contact Phone',v?.contact_phone,'placeholder="(555) 123-4567"')}</div>
+    <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin:12px 0 8px">Notes</div>
+    <div class="form-row"><div class="form-group"><label class="form-label">Notes</label><textarea id="v-notes" class="form-input" rows="3" placeholder="Payment terms, lead times, account numbers…">${escHtml(v?.notes||'')}</textarea></div></div>
+    <div class="modal-footer" style="justify-content:space-between">
+      <div>${v?`<button class="btn" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="deleteVendor('${v.id}')">Delete</button>`:''}</div>
+      <div style="display:flex;gap:8px">
+        <button class="btn" onclick="document.getElementById('vendor-overlay').remove()">Cancel</button>
+        <button class="btn btn-primary" onclick="submitVendor('${v?.id||''}')">Save Vendor</button>
+      </div>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  setTimeout(()=>document.getElementById('v-name')?.focus(),50);
+}
+
+async function submitVendor(editId){
+  const g=id=>document.getElementById(id)?.value?.trim()||null;
+  const name=g('v-name');
+  if(!name){toast('Vendor name is required');return;}
+  const payload={
+    name,website:g('v-website'),email:g('v-email'),phone:g('v-phone'),
+    street1:g('v-street1'),street2:g('v-street2'),city:g('v-city'),state:g('v-state'),
+    postal_code:g('v-zip'),country:g('v-country')||'US',
+    contact_name:g('v-cname'),contact_title:g('v-ctitle'),
+    contact_email:g('v-cemail'),contact_phone:g('v-cphone'),
+    notes:g('v-notes'),updated_at:new Date().toISOString()
+  };
+  if(editId){
+    const{error}=await db.from('vendors').update(payload).eq('id',editId);
+    if(error){toast('Error: '+error.message);return;}
+    S.vendors=(S.vendors||[]).map(v=>v.id===editId?{...v,...payload}:v);
+    document.getElementById('vendor-overlay')?.remove();
+    toast('Vendor updated');render();
+  } else {
+    const{data,error}=await db.from('vendors').insert(payload).select().single();
+    if(error){toast('Error: '+error.message);return;}
+    S.vendors=[...(S.vendors||[]),data].sort((a,b)=>(a.name||'').localeCompare(b.name||''));
+    document.getElementById('vendor-overlay')?.remove();
+    toast('Vendor added');render();
+  }
+}
+
+async function deleteVendor(id){
+  if(!confirm('Delete this vendor?'))return;
+  await db.from('vendors').delete().eq('id',id);
+  S.vendors=(S.vendors||[]).filter(v=>v.id!==id);
+  document.getElementById('vendor-overlay')?.remove();
+  toast('Vendor deleted');render();
+}
+
 function renderDealers(){
   let list=S.dealers;
   const q=(S.searchQ||'').toLowerCase();
@@ -2708,7 +2840,30 @@ CREATE TABLE IF NOT EXISTS shipment_errors (
   shipped_at timestamptz,
   created_at timestamptz DEFAULT now()
 );
-ALTER TABLE shipment_errors DISABLE ROW LEVEL SECURITY;</pre>
+ALTER TABLE shipment_errors DISABLE ROW LEVEL SECURITY;
+
+-- Vendor directory
+CREATE TABLE IF NOT EXISTS vendors (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name text NOT NULL,
+  website text,
+  phone text,
+  email text,
+  street1 text,
+  street2 text,
+  city text,
+  state text,
+  postal_code text,
+  country text DEFAULT 'US',
+  contact_name text,
+  contact_title text,
+  contact_email text,
+  contact_phone text,
+  notes text,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+ALTER TABLE vendors DISABLE ROW LEVEL SECURITY;</pre>
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">1 — Install Supabase CLI & login</div>
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto">npm install -g supabase
@@ -8289,8 +8444,8 @@ function renderWarranty() {
     const isReplacement=w.resolution_type==='replacement';
     const canShip=isReplacement&&w.status==='Approved'&&!w.ss_order_id;
     const shipped=w.ss_order_id||w.status==='Shipped';
-    const wtyTrackUrl=w.tracking_number?('https://www.google.com/search?q='+encodeURIComponent((w.carrier||'')+' '+w.tracking_number+' tracking')):'';
-    return `<tr>
+    const wtyTrackUrl=w.tracking_number?trackingUrl(w.carrier||'',w.tracking_number):'';
+    const wtyCarrier=carrierLabel(w.carrier||'');    return `<tr>
       <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${new Date(w.created_at).toLocaleDateString()}</td>
       <td class="pn" style="color:var(--teal)">${w.pn}</td>
       <td style="font-size:11px">${escHtml(w.customer_name||'—')}</td>
@@ -8300,7 +8455,7 @@ function renderWarranty() {
         ${resLabel[w.resolution_type||'no_action']||''}
         ${shipped&&w.ss_order_id?`<div style="font-size:9px;color:var(--teal);font-family:var(--mono);margin-top:2px">SS#${w.ss_order_id}</div>`:''}
       </td>
-      <td style="font-size:10px">${w.tracking_number?`<a href="${wtyTrackUrl}" target="_blank" style="color:var(--teal);text-decoration:none">${w.carrier?w.carrier+' ':''}<b>${w.tracking_number}</b> ↗</a>`:`<span style="color:var(--text3)">${w.ss_order_id?'Pending…':'—'}</span>`}</td>
+      <td style="font-size:10px">${w.tracking_number?`<a href="${wtyTrackUrl}" target="_blank" style="color:var(--teal);text-decoration:none">${wtyCarrier?wtyCarrier+' ':''}<b>${w.tracking_number}</b> ↗</a>`:`<span style="color:var(--text3)">${w.ss_order_id?'Pending…':'—'}</span>`}</td>
       <td><span class="pill ${statusMap[w.status]||'pill-muted'}">${w.status}</span></td>
       <td style="display:flex;gap:4px;flex-wrap:wrap">
         ${canShip?`<button class="btn btn-teal btn-sm" onclick="shipWarrantyReplacement('${w.id}')">🚚 Ship</button>`:''}
@@ -8349,8 +8504,8 @@ function renderShipmentErrors(){
     const wrongItem=e.error_type!=='missing_item'&&e.actual_pn&&e.actual_pn!==e.expected_pn;
     const wrongQty=e.error_type!=='missing_item'&&e.actual_qty!==e.expected_qty;
     const canShip=['reship_correct','send_additional'].includes(e.resolution)&&!e.ss_order_id&&e.status!=='Resolved';
-    const seTrackUrl=e.tracking_number?('https://www.google.com/search?q='+encodeURIComponent((e.carrier||'')+' '+e.tracking_number+' tracking')):'';
-    return `<tr>
+    const seTrackUrl=e.tracking_number?trackingUrl(e.carrier||'',e.tracking_number):'';
+    const seCarrier=carrierLabel(e.carrier||'');    return `<tr>
       <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${new Date(e.created_at).toLocaleDateString()}</td>
       <td class="pn">${escHtml(e.order_number||'—')}</td>
       <td style="font-size:11px">${escHtml(e.customer_name||'—')}</td>
@@ -8358,7 +8513,7 @@ function renderShipmentErrors(){
       <td style="font-size:11px;color:var(--teal)">${escHtml(e.expected_pn||'—')} ×${e.expected_qty||1}</td>
       <td style="font-size:11px;color:${wrongItem||wrongQty?'var(--orange)':'var(--text2)'}">${e.error_type==='missing_item'?'<span style="color:var(--red);font-style:italic">Not shipped</span>':`${escHtml(e.actual_pn||e.expected_pn||'—')} ×${e.actual_qty??e.expected_qty??1}`}</td>
       <td style="font-size:11px">${resLabel[e.resolution]||e.resolution||'—'}${e.ss_order_id?`<div style="font-size:9px;color:var(--teal);font-family:var(--mono)">SS#${e.ss_order_id}</div>`:''}</td>
-      <td style="font-size:10px">${e.tracking_number?`<a href="${seTrackUrl}" target="_blank" style="color:var(--teal);text-decoration:none">${e.carrier?e.carrier+' ':''}<b>${e.tracking_number}</b> ↗</a>`:`<span style="color:var(--text3)">${e.ss_order_id?'Pending…':'—'}</span>`}</td>
+      <td style="font-size:10px">${e.tracking_number?`<a href="${seTrackUrl}" target="_blank" style="color:var(--teal);text-decoration:none">${seCarrier?seCarrier+' ':''}<b>${e.tracking_number}</b> ↗</a>`:`<span style="color:var(--text3)">${e.ss_order_id?'Pending…':'—'}</span>`}</td>
       <td><span class="pill ${e.status==='Open'?'pill-red':e.status==='Reshipping'?'pill-yellow':'pill-green'}">${e.status}</span></td>
       <td style="display:flex;gap:4px;flex-wrap:wrap">
         ${canShip?`<button class="btn btn-teal btn-sm" onclick="shipShipmentError('${e.id}')">🚚 Ship</button>`:''}
@@ -9137,7 +9292,7 @@ function scheduleRender(){
 }
 function render(){
   // Hide loader on first render  if(_sh)_sh.style.display='flex';}
-  const views={dashboard:renderDashboard,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder};
+  const views={dashboard:renderDashboard,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder};
   if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length)computeDemand();
   // Preserve focused input + caret across re-render
   const active=document.activeElement;
