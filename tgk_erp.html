@@ -1096,7 +1096,7 @@ function renderParts(){
   </div>
   <div class="tbl-wrap">
   <table><thead><tr>
-    <th style="width:32px"><input type="checkbox" title="Select all" onchange="toggleAllParts(this,${escHtml(JSON.stringify(list.map(p=>p.id)))})"></th>
+    <th style="width:32px"><input type="checkbox" title="Select all" ${list.length>0&&list.every(p=>S.selectedParts.has(p.id))?'checked':''} onchange="toggleAllParts(this,${escHtml(JSON.stringify(list.map(p=>p.id)))})"></th>
     <th>Part #</th><th>Description</th><th>Vendor</th><th>Unit Cost</th><th>On Hand</th><th>Avg / Wk</th><th>Wks Stock</th><th>Lead</th><th></th>
   </tr></thead><tbody>
   ${list.map(p=>{
@@ -1165,7 +1165,7 @@ function renderAssemblies(){
   </div>
   <div class="tbl-wrap">
   <table><thead><tr>
-    <th style="width:32px"><input type="checkbox" title="Select all" onchange="toggleAllAsms(this,${escHtml(JSON.stringify(list.map(a=>a.id)))})"></th>
+    <th style="width:32px"><input type="checkbox" title="Select all" ${list.length>0&&list.every(a=>S.selectedAsms.has(a.id))?'checked':''} onchange="toggleAllAsms(this,${escHtml(JSON.stringify(list.map(a=>a.id)))})"></th>
     <th style="width:40px"></th><th>SKU</th><th>Description</th><th>Category</th><th>MSRP</th><th>Tier 1</th><th>On Hand</th><th>Avg / Wk</th><th>Status</th><th></th>
   </tr></thead><tbody>
   ${list.map(a=>{
@@ -2325,6 +2325,7 @@ Deno.serve(async (req) => {
     if (!store || !key) return new Response(JSON.stringify({error:'Missing Shopify credentials'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
 
     const skuMap: any = {}
+    const skusNoImg: string[] = []   // SKUs found in Shopify but product has no image
     let page_info = ''
     let fetched = 0
 
@@ -2356,6 +2357,9 @@ Deno.serve(async (req) => {
             skuMap[sku] = img                    // exact case
             skuMap[sku.toUpperCase()] = img       // uppercase for case-insensitive match
             skuMap[sku.toLowerCase()] = img       // lowercase
+          } else {
+            // SKU exists in Shopify but the product has no image uploaded
+            skusNoImg.push(sku)
           }
         }
       }
@@ -2366,7 +2370,7 @@ Deno.serve(async (req) => {
       page_info = next[1]
     }
 
-    return new Response(JSON.stringify({skuMap, count: Object.keys(skuMap).length, fetched}), {headers:{...CORS,'Content-Type':'application/json'}})
+    return new Response(JSON.stringify({skuMap, skusNoImg, count: Object.keys(skuMap).length, fetched}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
 
   // Shopify webhook handling
@@ -2750,12 +2754,23 @@ async function syncShopifyImages(){
     const res=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'sync_images',store:S.shopify.store,key:S.shopify.key})});
     const data=await res.json().catch(()=>({}));
     if(!res.ok){toast('Error: '+(data.error||res.status));return;}
-    const{skuMap={}}=data;
+    const{skuMap={},skusNoImg=[]}=data;
     const norm=function(s){return s.toUpperCase().replace(/[\s_]+/g,'-').replace(/[^A-Z0-9-]/g,'');};
     const normMap={};
-    Object.keys(skuMap).forEach(function(sku){var k=norm(sku);if(!normMap[k])normMap[k]={img:skuMap[sku],sku:sku};});
+    // Build normMap only from unique normalized keys (skip the lowercase/uppercase duplicates edge fn adds)
+    const seenNorm=new Set();
+    Object.keys(skuMap).forEach(function(sku){
+      var k=norm(sku);
+      if(!seenNorm.has(k)){seenNorm.add(k);normMap[k]={img:skuMap[sku],sku:sku};}
+    });
+    // Also build a Set of normalized SKUs that Shopify has but have no image (from skusNoImg array)
+    const noImgNorm=new Set((skusNoImg||[]).map(function(s){return norm(s);}));
+
     var updated=0,alreadyCurrent=0,colMissing=false;
-    var unmatchedPns=[];
+    var unmatchedPns=[];      // not found in Shopify at all (or no image)
+    var noImgPns=[];          // found in Shopify but product has no image
+    var updateErrors=[];
+
     for(var i=0;i<S.assemblies.length;i++){
       var asm=S.assemblies[i];
       var img=skuMap[asm.pn]||skuMap[asm.pn.toUpperCase()]||skuMap[asm.pn.toLowerCase()]||(normMap[norm(asm.pn)]&&normMap[norm(asm.pn)].img)||null;
@@ -2763,27 +2778,83 @@ async function syncShopifyImages(){
         if(img===asm.image_url){alreadyCurrent++;}
         else{
           var r=await db.from('assemblies').update({image_url:img}).eq('id',asm.id);
-          if(r.error){if(r.error.message.includes('image_url')||r.error.code==='42703'){colMissing=true;break;}}
+          if(r.error){
+            if(r.error.message.includes('image_url')||r.error.code==='42703'){colMissing=true;break;}
+            else{updateErrors.push(asm.pn+': '+r.error.message);}
+          }
           else{S.assemblies=S.assemblies.map(function(a){return a.id===asm.id?Object.assign({},a,{image_url:img}):a;});updated++;}
         }
-      }else{unmatchedPns.push(asm.pn);}
+      }else{
+        // Distinguish: is this SKU present in Shopify but just missing an image?
+        var asmNorm=norm(asm.pn);
+        if(noImgNorm.has(asmNorm)){
+          noImgPns.push(asm.pn);
+        }else{
+          // Try partial-match: is any Shopify SKU a substring of this PN or vice versa?
+          var hint='';
+          var allShopifyNorm=Array.from(seenNorm);
+          var close=allShopifyNorm.filter(function(k){return k.includes(asmNorm)||asmNorm.includes(k);});
+          if(close.length){hint=' (close: '+close.slice(0,2).map(function(k){return normMap[k]?normMap[k].sku:k;}).join(', ')+')';}
+          unmatchedPns.push(asm.pn+(hint||''));
+        }
+      }
     }
     if(colMissing){toast('Column missing - run: ALTER TABLE assemblies ADD COLUMN IF NOT EXISTS image_url text; in Supabase SQL Editor',8000);return;}
     render();
-    var totalSkus=Object.keys(skuMap).length;
-    var sampleSkus=Object.keys(skuMap).filter(function(k){return k.match(/^TGK/i);}).slice(0,5).join(', ')||Object.keys(skuMap).slice(0,5).join(', ');
-    if(updated>0){
-      toast('Saved '+updated+' images. '+unmatchedPns.length+' assemblies have no Shopify match.',6000);
-    }else if(alreadyCurrent>0){
-      toast('All images already current ('+alreadyCurrent+' matched). '+unmatchedPns.length+' have no Shopify match.',5000);
-    }else{
-      toast('No matches. '+totalSkus+' Shopify SKUs scanned. Examples: '+sampleSkus+'. Check Shopify variant SKUs match your assembly part numbers.',8000);
-    }
-    if(unmatchedPns.length>0){
-      console.log('Unmatched assemblies (no Shopify image):',unmatchedPns);
-      console.log('Shopify SKUs found:',Object.keys(skuMap).slice(0,30));
-    }
+    // Show rich results panel
+    showImageSyncResults({
+      totalShopifySkus:Object.keys(skuMap).length/3|0, // div3 because edge fn stores exact+upper+lower
+      fetched:data.fetched||0,
+      updated,alreadyCurrent,
+      noImgPns,unmatchedPns,updateErrors
+    });
   }catch(e){toast('Image sync error: '+e.message);}
+}
+
+function showImageSyncResults(r){
+  const existing=document.getElementById('img-sync-modal');
+  if(existing)existing.remove();
+  const ok=r.updated>0||r.alreadyCurrent>0;
+  const rows=[
+    '<tr><td style="color:var(--text3)">Shopify products scanned</td><td style="font-weight:700">'+r.fetched+'</td></tr>',
+    '<tr><td style="color:var(--text3)">Unique SKUs with images</td><td style="font-weight:700">'+r.totalShopifySkus+'</td></tr>',
+    r.updated?'<tr><td style="color:var(--teal)">✓ Images saved to ERP</td><td style="font-weight:700;color:var(--teal)">'+r.updated+'</td></tr>':'',
+    r.alreadyCurrent?'<tr><td style="color:var(--text3)">Already up to date</td><td>'+r.alreadyCurrent+'</td></tr>':'',
+  ].filter(Boolean).join('');
+
+  var noImgHtml='',unmatchedHtml='',errHtml='';
+  if(r.noImgPns.length){
+    noImgHtml='<div style="margin-top:12px"><div style="font-size:11px;font-weight:700;color:var(--yellow);margin-bottom:4px">⚠ '+r.noImgPns.length+' assemblies found in Shopify but product has no image uploaded:</div>'
+      +'<div style="font-size:11px;color:var(--text2);background:var(--bg1);border-radius:4px;padding:8px;max-height:120px;overflow-y:auto">'+r.noImgPns.join('<br>')+'</div>'
+      +'<div style="font-size:10px;color:var(--text3);margin-top:4px">→ Upload a product image in Shopify for these, then re-sync.</div></div>';
+  }
+  if(r.unmatchedPns.length){
+    unmatchedHtml='<div style="margin-top:12px"><div style="font-size:11px;font-weight:700;color:var(--red);margin-bottom:4px">✗ '+r.unmatchedPns.length+' assemblies not found in Shopify SKUs:</div>'
+      +'<div style="font-size:11px;color:var(--text2);background:var(--bg1);border-radius:4px;padding:8px;max-height:180px;overflow-y:auto">'+r.unmatchedPns.map(function(p){
+        var hint=p.match(/\(close:.*\)$/);
+        var pn=hint?p.replace(/\s*\(close:.*\)$/,''):p;
+        return '<span style="color:var(--text)">'+pn+'</span>'+(hint?'<span style="color:var(--yellow);font-size:10px"> '+hint[0]+'</span>':'');
+      }).join('<br>')+'</div>'
+      +'<div style="font-size:10px;color:var(--text3);margin-top:4px">→ Ensure the Shopify variant SKU exactly matches the ERP Part #. "Close" matches shown above where found.</div></div>';
+  }
+  if(r.updateErrors.length){
+    errHtml='<div style="margin-top:10px;font-size:11px;color:var(--red)">DB errors: '+r.updateErrors.join('; ')+'</div>';
+  }
+
+  const modal=document.createElement('div');
+  modal.id='img-sync-modal';
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9999;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML=`<div style="background:var(--bg0);border:1px solid var(--border);border-radius:10px;padding:20px 24px;max-width:520px;width:92%;max-height:80vh;overflow-y:auto;position:relative">
+    <button onclick="document.getElementById('img-sync-modal').remove()" style="position:absolute;top:14px;right:16px;background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">✕</button>
+    <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:14px">🖼 Image Sync Results</div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px">${rows}</table>
+    ${noImgHtml}${unmatchedHtml}${errHtml}
+    ${(!r.noImgPns.length&&!r.unmatchedPns.length&&!r.updateErrors.length)?'<div style="margin-top:12px;font-size:12px;color:var(--teal)">✓ All assemblies with Shopify images are up to date.</div>':''}
+    <div style="margin-top:16px;display:flex;justify-content:flex-end">
+      <button class="btn btn-sm" onclick="document.getElementById('img-sync-modal').remove()">Close</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
 }
 function openImageLightbox(src,alt){
   const existing=document.getElementById('img-lightbox');
