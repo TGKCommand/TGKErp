@@ -8457,11 +8457,30 @@ async function confirmShipShipmentError(errorId){
       return;
     }
     const ssOrderId=String(json.orderId||json.orderNumber||'created');
+    // Deduct inventory for the reshipped item
+    const isAsm=!!S.assemblies.find(function(a){return a.pn===pn;});
+    if(isAsm){
+      const a=S.assemblies.find(function(a){return a.pn===pn;});
+      if(a){
+        const newOh=Math.max(0,(a.total_on_hand||0)-qty);
+        await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',a.id);
+        S.assemblies=S.assemblies.map(function(x){return x.pn===pn?{...x,total_on_hand:newOh}:x;});
+        await db.from('inv_corrections').insert({pn,previous_qty:a.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Shipment error reship (SS#'+ssOrderId+') — original order '+e.order_number,source:'shipment_error'});
+      }
+    } else {
+      const p=S.parts.find(function(x){return x.pn===pn;});
+      if(p){
+        const newQty=Math.max(0,(p.total_unpckgd||0)-qty);
+        await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
+        S.parts=S.parts.map(function(x){return x.pn===pn?{...x,total_unpckgd:newQty}:x;});
+        await db.from('inv_corrections').insert({pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:-qty,reason:'Shipment error reship (SS#'+ssOrderId+') — original order '+e.order_number,source:'shipment_error'});
+      }
+    }
     // Save SS order ID and advance to Reshipping
     const{error:dbErr}=await db.from('shipment_errors').update({ss_order_id:ssOrderId,status:'Reshipping',updated_at:new Date().toISOString()}).eq('id',errorId);
     if(!dbErr){S.shipmentErrors=S.shipmentErrors.map(x=>x.id===errorId?{...x,ss_order_id:ssOrderId,status:'Reshipping'}:x);}
     document.getElementById('se-ship-overlay')?.remove();
-    toast('✓ ShipStation order created — SS#'+ssOrderId+'. Use 📡 to pull tracking once shipped.');
+    toast('✓ ShipStation order created — SS#'+ssOrderId+'. Inventory deducted: '+pn+' ×'+qty+'. Use 📡 to pull tracking once shipped.');
     render();
   }catch(err){
     if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='✗ '+err.message;}
