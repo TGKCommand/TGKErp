@@ -1623,6 +1623,7 @@ function renderSaleDetail(s){
     ${packedLines.length?`<button class="btn btn-sm" style="color:var(--orange)" onclick="unpackSaleOrder('${s.id}','${s.pn==='Multiple'?'':s.pn}',${s.qty||1})">↩ Unpack</button>`:''}
     ${detailOrderFs==='Shipped'?`<button class="btn btn-teal" onclick="markDelivered('${s.id}')">✓ Delivered</button>`:''}
     ${detailOrderFs==='Shipped'?`<button class="btn btn-sm" onclick="checkDelivery('${s.order_number||''}','${s.id}')">🔄 Check Delivery</button>`:''}
+    <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="fetchOrderTracking('${s.order_number||s.id}')" title="Ask ShipStation for this order's shipment status and tracking">📡 Get Tracking</button>
     ${['Open','Packed','On Hold','Partial'].includes(detailOrderFs)?`<button class="btn" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
   </div>
 
@@ -2851,6 +2852,39 @@ async function ssTestOrder(){
 
 // Manually replay the ShipStation SHIP_NOTIFY webhook for an order
 // Constructs the resource_url the same way ShipStation would and calls the edge function
+// Check ShipStation for a specific order's shipment/tracking status
+async function fetchOrderTracking(orderNum){
+  const clean=orderNum.replace(/^#/,'');
+  toast('Checking ShipStation for order '+orderNum+'…');
+  const edgeUrl=SUPA_URL+'/functions/v1/shipstation-ship';
+  const resourceUrl='https://ssapi.shipstation.com/shipments?orderNumber='+encodeURIComponent(clean)+'&pageSize=10&sortBy=ShipDate&sortDir=DESC';
+  try{
+    const res=await fetch(edgeUrl,{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({resource_type:'SHIP_NOTIFY',resource_url:resourceUrl})
+    });
+    if(res.ok){
+      await refreshSales();
+      render();
+      const lines=S.sales.filter(s=>s.order_number===orderNum||s.order_number===clean||s.order_number==='#'+clean);
+      const shipped=lines.filter(l=>l.fulfillment_status==='Shipped'&&l.tracking_number);
+      if(shipped.length){
+        toast('✓ Tracking found — '+shipped.map(l=>(l.carrier?l.carrier+' ':'')+l.tracking_number).join(', '),5000);
+      }else{
+        const txt=await res.text().catch(()=>'');
+        // Try the non-hash version too
+        if(!clean.startsWith(orderNum)){
+          await fetch(edgeUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resource_type:'SHIP_NOTIFY',resource_url:'https://ssapi.shipstation.com/shipments?orderNumber='+encodeURIComponent('#'+clean)+'&pageSize=10&sortBy=ShipDate&sortDir=DESC'})});
+          await refreshSales();render();
+        }
+        toast('No shipment found in ShipStation yet for order '+orderNum+'. If it shipped, make sure "On Items Shipped" webhook is active.',6000);
+      }
+    }else{
+      toast('ShipStation check failed ('+res.status+') — check edge function is deployed and SS_KEY/SS_SECRET are set');
+    }
+  }catch(e){toast('Error: '+e.message);}
+}
+
 async function ssReplayWebhook(){
   const rawNum=(document.getElementById('ss-test-order')?.value||'').trim();
   if(!rawNum){toast('Enter an order number first');return;}
