@@ -787,6 +787,13 @@ function setupRealtime(){
         if(S.view==='cyclecounts')scheduleRender();
       }
     })
+    .on('postgres_changes',{event:'UPDATE',schema:'public',table:'warranty_claims'},p=>{
+      S.warrantyClaims=S.warrantyClaims.map(w=>w.id===p.new.id?p.new:w);
+      if(S.view==='warranty')scheduleRender();
+      if(p.new.tracking_number&&p.new.status==='Shipped'&&!S.warrantyClaims.find(w=>w.id===p.new.id&&w.tracking_number)){
+        toast('🚚 Warranty shipped! '+(p.new.carrier?p.new.carrier+' ':'')+p.new.tracking_number,6000);
+      }
+    })
     .subscribe((status)=>{
       _rtStatus=status;
       const dot=document.getElementById('sync-dot');
@@ -2646,7 +2653,9 @@ ALTER TABLE warranty_claims
   ADD COLUMN IF NOT EXISTS resolution_type text DEFAULT 'no_action',
   ADD COLUMN IF NOT EXISTS shipping_details jsonb,
   ADD COLUMN IF NOT EXISTS ss_order_id text,
-  ADD COLUMN IF NOT EXISTS resolved_at timestamptz;
+  ADD COLUMN IF NOT EXISTS resolved_at timestamptz,
+  ADD COLUMN IF NOT EXISTS tracking_number text,
+  ADD COLUMN IF NOT EXISTS carrier text;
 
 -- Shipment errors (wrong item / wrong qty shipped)
 CREATE TABLE IF NOT EXISTS shipment_errors (
@@ -3074,6 +3083,19 @@ Deno.serve(async (req) => {
       const shippedAt = new Date().toISOString()
       const rawSkus = (ship.shipmentItems ?? []).flatMap((i: any) => [i.sku, i.name, i.lineItemKey].filter(Boolean))
       console.log('[SS] order', orderNum, 'tracking', tracking, 'rawSkus', JSON.stringify(rawSkus))
+
+      // WARRANTY orders: update warranty_claims table directly, skip sales lookup
+      if (orderNum && orderNum.startsWith('WARRANTY-')) {
+        const claimId = orderNum.replace('WARRANTY-', '')
+        console.log('[SS] warranty claim', claimId, 'shipped, tracking', tracking)
+        await db.from('warranty_claims').update({
+          tracking_number: tracking || null,
+          carrier: carrier || null,
+          status: 'Shipped',
+          resolved_at: shippedAt
+        }).eq('id', claimId)
+        continue
+      }
 
       const { data: orderLines } = await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', orderNum)
       const erpLines = orderLines?.length ? orderLines : (await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', '#' + orderNum)).data ?? []
@@ -4596,6 +4618,7 @@ function openModal(type,data){
       <span class="pn" style="color:var(--teal);font-size:13px">${escHtml(w.pn)}</span>
       <span style="font-size:10px;color:var(--text3)">logged ${new Date(w.created_at).toLocaleDateString()}</span>
       ${w.ss_order_id?`<span style="font-size:10px;color:var(--teal);font-family:var(--mono);margin-left:auto">SS#${escHtml(w.ss_order_id)}</span>`:''}
+      ${w.tracking_number?`<a href="${trackingUrl(w.carrier||'',w.tracking_number)}" target="_blank" style="font-size:10px;color:var(--teal);font-family:var(--mono);text-decoration:none">${w.carrier?w.carrier+' ':''}${escHtml(w.tracking_number)} ↗</a>`:''}
     </div>
     <div class="form-row cols-2">${fi('wty-e-order','Order #',w.order_number||'')} ${fi('wty-e-name','Customer Name',w.customer_name||'')}</div>
     <div class="form-row">${fi('wty-e-email','Customer Email',w.customer_email||'','type="email"')}</div>
@@ -8101,6 +8124,7 @@ function renderWarranty() {
       <td style="font-size:11px">
         ${resLabel[w.resolution_type||'no_action']||''}
         ${shipped&&w.ss_order_id?`<div style="font-size:9px;color:var(--teal);font-family:var(--mono);margin-top:2px" title="ShipStation Order ID">SS#${w.ss_order_id}</div>`:''}
+        ${w.tracking_number?`<div style="font-size:9px;margin-top:2px"><a href="${trackingUrl(w.carrier||'',w.tracking_number)}" target="_blank" style="color:var(--teal);text-decoration:none;font-family:var(--mono)" title="Track ${w.carrier||''} ${w.tracking_number}">${w.carrier?w.carrier+' ':''}${w.tracking_number} ↗</a></div>`:''}
       </td>
       <td><span class="pill ${statusMap[w.status]||'pill-muted'}">${w.status}</span></td>
       <td style="display:flex;gap:4px;flex-wrap:wrap">
