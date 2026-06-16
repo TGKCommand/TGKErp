@@ -824,9 +824,15 @@ function setupRealtime(){
       }
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'shipment_errors'},p=>{
-      if(p.eventType==='INSERT')S.shipmentErrors=[p.new,...S.shipmentErrors];
-      else if(p.eventType==='UPDATE')S.shipmentErrors=S.shipmentErrors.map(e=>e.id===p.new.id?p.new:e);
-      else if(p.eventType==='DELETE')S.shipmentErrors=S.shipmentErrors.filter(e=>e.id!==p.old.id);
+      if(p.eventType==='INSERT')S.shipmentErrors=[p.new,...(S.shipmentErrors||[])];
+      else if(p.eventType==='UPDATE'){
+        const prev=(S.shipmentErrors||[]).find(e=>e.id===p.new.id);
+        S.shipmentErrors=(S.shipmentErrors||[]).map(e=>e.id===p.new.id?p.new:e);
+        if(!prev?.tracking_number&&p.new.tracking_number){
+          toast(`📦 Correction shipped — #${p.new.order_number||p.new.id}: ${p.new.carrier||''} ${p.new.tracking_number}`,6000);
+        }
+      }
+      else if(p.eventType==='DELETE')S.shipmentErrors=(S.shipmentErrors||[]).filter(e=>e.id!==p.old.id);
       updateBadge();
       if(S.view==='warranty')scheduleRender();
     })
@@ -2685,6 +2691,9 @@ CREATE TABLE IF NOT EXISTS shipment_errors (
   status text DEFAULT 'Open',
   ss_order_id text,
   resolved_at timestamptz,
+  tracking_number text,
+  carrier text,
+  shipped_at timestamptz,
   created_at timestamptz DEFAULT now()
 );
 ALTER TABLE shipment_errors DISABLE ROW LEVEL SECURITY;</pre>
@@ -3060,6 +3069,14 @@ Deno.serve(async (req) => {
       const shippedAt = new Date().toISOString()
       const rawSkus = (ship.shipmentItems ?? []).flatMap((i: any) => [i.sku, i.name, i.lineItemKey].filter(Boolean))
       console.log('[SS] order', orderNum, 'tracking', tracking, 'rawSkus', JSON.stringify(rawSkus))
+
+      // --- SHERROR: shipment error correction order ---
+      if (orderNum?.startsWith('SHERROR-')) {
+        const errorId = orderNum.replace('SHERROR-', '')
+        await db.from('shipment_errors').update({ tracking_number: tracking, carrier, shipped_at: shippedAt }).eq('id', errorId)
+        console.log('[SS] SHERROR tracking saved for', errorId, tracking)
+        continue
+      }
 
       const { data: orderLines } = await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', orderNum)
       const erpLines = orderLines?.length ? orderLines : (await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', '#' + orderNum)).data ?? []
@@ -8259,6 +8276,7 @@ function renderShipmentErrors(){
   const etypeColor={wrong_item:'var(--orange)',wrong_qty:'var(--yellow)',missing_item:'var(--red)',extra_item:'var(--blue)',damaged:'var(--purple)'};
   const resLabel={none:'Pending',reship_correct:'🚚 Reship',send_additional:'➕ Send More',customer_keeps:'✓ Keep',return_required:'↩ Return'};
   const nextStatus={Open:'Reshipping',Reshipping:'Resolved'};
+  const canShipRes=['reship_correct','send_additional'];
   return `
   <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr)">
     <div class="kpi kpi-red"><div class="kpi-label">Open</div><div class="kpi-value">${counts.Open}</div></div>
@@ -8276,10 +8294,12 @@ function renderShipmentErrors(){
     <button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="openModal('addShipmentError',{})">+ Log Error</button>
   </div>
   <div class="tbl-wrap">
-  <table><thead><tr><th>Date</th><th>Order #</th><th>Customer</th><th>Error Type</th><th>Expected</th><th>Shipped</th><th>Resolution</th><th>Status</th><th>Action</th></tr></thead><tbody>
-  ${list.length===0?'<tr><td colspan="9" class="section-empty">No shipment errors logged</td></tr>':list.map(e=>{
+  <table><thead><tr><th>Date</th><th>Order #</th><th>Customer</th><th>Error Type</th><th>Expected</th><th>Shipped</th><th>Resolution</th><th>Tracking</th><th>Status</th><th>Action</th></tr></thead><tbody>
+  ${list.length===0?'<tr><td colspan="10" class="section-empty">No shipment errors logged</td></tr>':list.map(e=>{
     const wrongItem=e.error_type!=='missing_item'&&e.actual_pn&&e.actual_pn!==e.expected_pn;
     const wrongQty=e.error_type!=='missing_item'&&e.actual_qty!==e.expected_qty;
+    const canShip=canShipRes.includes(e.resolution)&&!e.ss_order_id&&e.status!=='Resolved';
+    const trackingUrl_=e.carrier&&e.tracking_number?`https://www.google.com/search?q=${encodeURIComponent((e.carrier||'')+' '+e.tracking_number+' tracking')}`:'';
     return `<tr>
       <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${new Date(e.created_at).toLocaleDateString()}</td>
       <td class="pn">${escHtml(e.order_number||'—')}</td>
@@ -8288,9 +8308,11 @@ function renderShipmentErrors(){
       <td style="font-size:11px;color:var(--teal)">${escHtml(e.expected_pn||'—')} ×${e.expected_qty||1}</td>
       <td style="font-size:11px;color:${wrongItem||wrongQty?'var(--orange)':'var(--text2)'}">${e.error_type==='missing_item'?'<span style="color:var(--red);font-style:italic">Not shipped</span>':`${escHtml(e.actual_pn||e.expected_pn||'—')} ×${e.actual_qty??e.expected_qty??1}`}</td>
       <td style="font-size:11px">${resLabel[e.resolution]||e.resolution||'—'}${e.ss_order_id?`<div style="font-size:9px;color:var(--teal);font-family:var(--mono)">SS#${e.ss_order_id}</div>`:''}</td>
+      <td style="font-size:10px">${e.tracking_number?`<a href="${trackingUrl_}" target="_blank" style="color:var(--teal);text-decoration:none">${e.carrier?e.carrier+' ':''}<b>${e.tracking_number}</b> ↗</a>`:`<span style="color:var(--text3)">—</span>`}</td>
       <td><span class="pill ${e.status==='Open'?'pill-red':e.status==='Reshipping'?'pill-yellow':'pill-green'}">${e.status}</span></td>
       <td style="display:flex;gap:4px;flex-wrap:wrap">
-        ${nextStatus[e.status]?`<button class="action-btn" onclick="advanceShipmentError('${e.id}','${nextStatus[e.status]}')">→ ${nextStatus[e.status]}</button>`:''}
+        ${canShip?`<button class="btn btn-teal btn-sm" onclick="shipShipmentError('${e.id}')">🚚 Ship</button>`:''}
+        ${!canShip&&nextStatus[e.status]?`<button class="action-btn" onclick="advanceShipmentError('${e.id}','${nextStatus[e.status]}')">→ ${nextStatus[e.status]}</button>`:''}
         <button class="action-btn" onclick="openModal('addShipmentError',{id:'${e.id}'})">✎</button>
         <button class="action-btn del" onclick="deleteShipmentError('${e.id}')">×</button>
       </td>
@@ -8458,6 +8480,107 @@ async function deleteShipmentError(id){
   await db.from('shipment_errors').delete().eq('id',id);
   S.shipmentErrors=(S.shipmentErrors||[]).filter(e=>e.id!==id);
   toast('Deleted');updateBadge();render();
+}
+
+// ── Ship Correction via ShipStation ──
+function shipShipmentError(id){
+  const e=(S.shipmentErrors||[]).find(x=>x.id===id);
+  if(!e){toast('Record not found');return;}
+  // Try to pre-fill address from the original sale
+  const originalSale=e.order_number?S.sales.find(s=>s.order_number===e.order_number):null;
+  const overlay=document.createElement('div');
+  overlay.id='se-ship-overlay';
+  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto';
+  overlay.innerHTML=`<div class="modal" style="width:520px;max-width:96vw">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+      <div>
+        <div style="font-size:15px;font-weight:700;color:var(--text)">🚚 Ship Correction</div>
+        <div style="font-size:11px;color:var(--text3);margin-top:2px">
+          ${escHtml(e.order_number||'')} · ${escHtml(e.expected_pn||'')} ×${e.expected_qty||1}
+          ${e.error_type?` · <span style="color:var(--orange)">${e.error_type.replace(/_/g,' ')}</span>`:''}
+        </div>
+      </div>
+      <button onclick="document.getElementById('se-ship-overlay').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">×</button>
+    </div>
+    <div style="padding:10px 12px;background:var(--teal-dim);border-radius:6px;border:1px solid rgba(13,148,136,.2);font-size:11px;color:var(--text2);margin-bottom:14px">
+      <b>Correction item:</b> ${escHtml(e.expected_pn||'')} ×${e.expected_qty||1}
+      &nbsp;·&nbsp; <b>Customer:</b> ${escHtml(e.customer_name||'—')}
+      ${e.resolution==='send_additional'?'<br><span style="color:var(--orange)">⚠ Sending <b>additional</b> quantity on top of what was already shipped</span>':''}
+    </div>
+    <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Ship-to Address</div>
+    <div class="form-row"><div class="form-group"><label class="form-label">Name</label><input id="se-ship-name" class="form-input" value="${escHtml(e.customer_name||'')}"></div></div>
+    <div class="form-row"><div class="form-group"><label class="form-label">Address Line 1</label><input id="se-ship-addr1" class="form-input" placeholder="123 Main St"></div></div>
+    <div class="form-row"><div class="form-group"><label class="form-label">Address Line 2 (optional)</label><input id="se-ship-addr2" class="form-input" placeholder="Apt, Suite…"></div></div>
+    <div class="form-row cols-2">
+      <div class="form-group"><label class="form-label">City</label><input id="se-ship-city" class="form-input" placeholder="City"></div>
+      <div class="form-group"><label class="form-label">State</label><input id="se-ship-state" class="form-input" placeholder="CA"></div>
+    </div>
+    <div class="form-row cols-2">
+      <div class="form-group"><label class="form-label">ZIP</label><input id="se-ship-zip" class="form-input" placeholder="90210"></div>
+      <div class="form-group"><label class="form-label">Country</label><input id="se-ship-country" class="form-input" value="US"></div>
+    </div>
+    <div id="se-ship-status" style="display:none;padding:10px;border-radius:6px;font-size:11px;margin-top:8px"></div>
+    <div class="modal-footer">
+      <button class="btn" onclick="document.getElementById('se-ship-overlay').remove()">Cancel</button>
+      <button id="se-ship-submit" class="btn btn-teal" onclick="confirmShipShipmentError('${id}')">🚚 Create ShipStation Order</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+}
+
+async function confirmShipShipmentError(id){
+  const e=(S.shipmentErrors||[]).find(x=>x.id===id);
+  if(!e){toast('Record not found');return;}
+  const name=(document.getElementById('se-ship-name')?.value||'').trim();
+  const addr1=(document.getElementById('se-ship-addr1')?.value||'').trim();
+  const city=(document.getElementById('se-ship-city')?.value||'').trim();
+  const zip=(document.getElementById('se-ship-zip')?.value||'').trim();
+  if(!addr1||!city||!zip){toast('Address, city and ZIP required');return;}
+  const shipTo={name,street1:addr1,street2:(document.getElementById('se-ship-addr2')?.value||'').trim(),city,state:(document.getElementById('se-ship-state')?.value||'').trim(),postal_code:zip,country:(document.getElementById('se-ship-country')?.value||'US').trim()};
+  const statusEl=document.getElementById('se-ship-status');
+  const submitBtn=document.getElementById('se-ship-submit');
+  if(statusEl){statusEl.style.display='block';statusEl.style.background='var(--bg3)';statusEl.style.color='var(--text2)';statusEl.textContent='⏳ Creating order in ShipStation…';}
+  if(submitBtn){submitBtn.disabled=true;submitBtn.textContent='Creating…';}
+  try{
+    const resp=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        action:'create_order',
+        orderNumber:'SHERROR-'+id,
+        customerName:e.customer_name||name,
+        customerEmail:e.customer_email||'',
+        pn:e.expected_pn,
+        description:e.expected_pn,
+        qty:e.expected_qty||1,
+        shipTo,
+        internalNotes:`Shipment error correction — Original order ${e.order_number||'N/A'} · Error: ${(e.error_type||'').replace(/_/g,' ')} · ${e.notes||''}`.trim(),
+        advancedOptions:{source:'TGK ERP Shipment Error'}
+      })
+    });
+    const rawText=await resp.text();
+    let json;
+    try{json=JSON.parse(rawText);}catch(_){
+      if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.innerHTML=`<b>✗ Edge function returned non-JSON (HTTP ${resp.status})</b><br>Redeploy the updated <b>shipstation-ship</b> function from Setup Guide.`;}
+      if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
+      return;
+    }
+    if(!resp.ok||json.error){
+      if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='✗ '+(json.error||'Edge function error (HTTP '+resp.status+')');}
+      if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
+      return;
+    }
+    const ssOrderId=json.orderId||json.orderNumber||'(created)';
+    // Save SS order ID + advance to Reshipping
+    const{error:dbErr}=await db.from('shipment_errors').update({ss_order_id:String(ssOrderId),status:'Reshipping'}).eq('id',id);
+    if(!dbErr)S.shipmentErrors=(S.shipmentErrors||[]).map(x=>x.id===id?{...x,ss_order_id:String(ssOrderId),status:'Reshipping'}:x);
+    document.getElementById('se-ship-overlay')?.remove();
+    toast(`✓ ShipStation correction order created — SS#${ssOrderId}. Tracking will appear automatically when shipped.`,6000);
+    updateBadge();render();
+  }catch(err){
+    if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='✗ Network error: '+err.message;}
+    if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
+  }
 }
 
 function shipWarrantyReplacement(id){
