@@ -614,6 +614,7 @@ const FS_MAP={
   'Delivered':'pill-green',
   'Refunded':'pill-purple',
   'Returned':'pill-red',
+  'Pre-order':'pill-purple',
   'Cancelled':'pill-muted',
 };
 function fsPill(fs){
@@ -989,6 +990,7 @@ function renderParts(){
       ${cats.map(c=>`<option value="${c}" ${sf.cat===c?'selected':''}>${c}</option>`).join('')}
     </select>
     <button class="filter-chip ${sf.showDisc?'on-teal':''}" onclick="setFilter('parts','showDisc',${sf.showDisc?'false':'true'})">🗄 Discontinued (${S.parts.filter(p=>p.discontinued).length})</button>
+    <button class="btn btn-sm" style="margin-left:auto" onclick="openModal('manageCategories',{table:'parts'})">⚙ Categories</button>
     <span class="filter-count">${list.length} parts</span>
   </div>
   <div class="tbl-wrap">
@@ -1042,6 +1044,7 @@ function renderAssemblies(){
     <button class="filter-chip ${sf.kind==='fg'?'on-teal':''}" onclick="setFilter('asm','kind',${sf.kind==='fg'?"''":"'fg'"})">Finished Goods (${S.assemblies.filter(a=>!a.is_subassembly&&!a.discontinued).length})</button>
     <button class="filter-chip ${sf.kind==='sub'?'on-teal':''}" onclick="setFilter('asm','kind',${sf.kind==='sub'?"''":"'sub'"})">Subassemblies (${S.assemblies.filter(a=>a.is_subassembly&&!a.discontinued).length})</button>
     <button class="filter-chip ${sf.showDisc?'on-teal':''}" onclick="setFilter('asm','showDisc',${sf.showDisc?'false':'true'})">🗄 Discontinued (${S.assemblies.filter(a=>a.discontinued).length})</button>
+    <button class="btn btn-sm" style="margin-left:auto" onclick="openModal('manageCategories',{table:'assemblies'})">⚙ Categories</button>
     <span class="filter-count">${list.length} assemblies</span>
     ${S.assemblies.some(a=>a._classificationMismatch)?`<button class="btn btn-sm" style="color:var(--orange);border-color:var(--orange)" onclick="fixAssemblyClassification()" title="Some items have wrong subassembly flag in DB — click to fix">⚠ Fix Classification</button>`:''}
   </div>
@@ -1339,7 +1342,7 @@ function renderSales(){
   const packed=S.sales.filter(s=>s.fulfillment_status==='Packed');
   const shipped7=S.sales.filter(s=>s.fulfillment_status==='Shipped'&&s.shipped_at&&s.shipped_at.slice(0,10)>=daysAgo(7));
   const rev7=S.sales.filter(s=>s.sale_date>=daysAgo(7)).reduce((t,s)=>{const a=S.assemblies.find(x=>x.pn===s.pn);return t+((a?.msrp||0)*(s.qty||1));},0);
-  const fstats=['Open','On Hold','Packed','Partial','Shipped','Delivered','Refunded','Cancelled'];
+  const fstats=['Open','Pre-order','On Hold','Packed','Partial','Shipped','Delivered','Returned','Refunded','Cancelled'];
 
   // Detect split-shipped orders: any grouped order that has lines in different shipment states
   function isSplitOrder(orderNum){
@@ -1562,7 +1565,10 @@ function renderSaleDetail(s){
         ${lfs==='Packed'?`<button class="action-btn" onclick="unpackSaleOrder('${line.id}','${line.pn}',${line.qty||1})">↩ Unpack</button>`:''}
         ${lfs==='Shipped'?`<button class="action-btn" onclick="markDelivered('${line.id}')">✓ Delivered</button>`:''}
         ${lfs==='Shipped'?`<button class="action-btn" style="color:var(--orange);border-color:rgba(234,88,12,.3)" title="Un-ship: restore inventory and revert this line to Open or On Hold" onclick="unshipLine('${line.id}','${line.pn}',${line.qty||1})">↩ Un-ship</button>`:''}
-        ${(lfs==='Shipped'||lfs==='Delivered')?`<button class="action-btn" style="color:var(--red);border-color:rgba(220,38,38,.3)" title="Process a return for this item" onclick="openReturnModal('${line.id}','${line.pn}',${line.qty||1},'${line.order_number||s.order_number||''}')">↩ Return</button>`:''}
+        ${(lfs==='Shipped'||lfs==='Delivered')?`<button class="action-btn" style="color:var(--red);border-color:rgba(220,38,38,.3)" title="Process a return for this item" onclick="openReturnModal('${line.id}','${line.pn}',${line.qty||1},'${escHtml(line.order_number||s.order_number||'')}')">↩ Return</button>`:''}
+        ${lfs==='Open'?`<button class="action-btn" style="color:var(--purple);border-color:rgba(124,58,237,.3)" title="Mark as Pre-order — item not yet available" onclick="markPreorder('${line.id}')">Pre-order</button>`:''}
+        ${lfs==='Pre-order'?`<button class="action-btn" style="color:var(--green)" title="Mark as Open — item now available" onclick="markOpenFromPreorder('${line.id}')">→ Open</button>`:''}
+
       </td>
     </tr>`;}).join('')}
   </tbody></table></div>
@@ -1628,7 +1634,19 @@ async function unpackSaleOrder(saleId, pn, qty){
   render();
 }
 
-// ── UN-SHIP: reverses a Shipped line — restores inventory, clears tracking, resets status ──
+// ── PRE-ORDER ──────────────────────────────────────────────────────────────
+async function markPreorder(saleId){
+  await db.from('sales').update({fulfillment_status:'Pre-order'}).eq('id',saleId);
+  S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Pre-order'}:s);
+  toast('Marked as Pre-order');render();
+}
+async function markOpenFromPreorder(saleId){
+  await db.from('sales').update({fulfillment_status:'Open'}).eq('id',saleId);
+  S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Open'}:s);
+  toast('Moved to Open — ready to fulfill');render();
+}
+
+// ── RETURNS ────────────────────────────────────────────────────────────────
 function openReturnModal(saleId, pn, qty, orderNum){
   const reasons=['Wrong item shipped','Customer changed mind','Defective / not working','Damaged in shipping','Duplicate order','Other'];
   openModal('custom', {
@@ -1721,6 +1739,7 @@ async function processReturn(saleId, pn, qty, orderNum){
 
 // ── UN-SHIP: reverses a Shipped line — restores inventory, clears tracking, resets status ──
 async function unshipLine(saleId, pn, qty){
+  const line=S.sales.find(s=>s.id===saleId);
   if(!line||line.fulfillment_status!=='Shipped'){toast('Line is not Shipped');return;}
 
   const targetStatus=confirm(
@@ -3637,6 +3656,39 @@ function openModal(type,data){
     <div class="form-row"><div class="form-group"><label class="form-label">Issue Description</label><textarea class="form-input" id="wty-issue" rows="3" placeholder="Describe the issue…"></textarea></div></div>
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitWarranty()">Log Claim</button></div>`;
   }
+  else if(type==='custom'){
+    title=data.title||'';
+    body=(data.html||'');
+    if(data.onConfirm){
+      body+=`<div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="${data.onConfirm}">Confirm</button></div>`;
+    }
+  }
+  else if(type==='manageCategories'){
+    const table=data.table||'parts';
+    const items=table==='parts'?S.parts:S.assemblies;
+    const cats=[...new Set(items.map(x=>x.category||'').filter(Boolean))].sort();
+    title='Manage Categories — '+(table==='parts'?'Parts':'Assemblies');
+    body=`<div style="margin-bottom:12px">
+      <div style="font-size:11px;color:var(--text3);margin-bottom:8px">Current categories (${cats.length})</div>
+      <div style="display:flex;flex-direction:column;gap:6px;max-height:280px;overflow-y:auto">
+        ${cats.map(c=>{
+          const count=items.filter(x=>x.category===c).length;
+          return `<div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--bg1);border-radius:6px;border:1px solid var(--border)">
+            <span style="flex:1;font-size:12px;font-weight:600">${escHtml(c)}</span>
+            <span style="font-size:10px;color:var(--text3)">${count} items</span>
+            <button class="action-btn" onclick="renameCategory('${table}','${escHtml(c)}')">Rename</button>
+            <button class="action-btn" style="color:var(--orange)" onclick="mergeCategoryPrompt('${table}','${escHtml(c)}')">Merge into…</button>
+            <button class="action-btn" style="color:var(--red)" onclick="deleteCategory('${table}','${escHtml(c)}')">Delete</button>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;padding-top:12px;border-top:1px solid var(--border)">
+      <input id="new-cat-name" class="form-input" placeholder="New category name…" style="flex:1">
+      <button class="btn btn-primary btn-sm" onclick="addCategory('${table}')">+ Add</button>
+    </div>
+    <div class="modal-footer"><button class="btn" onclick="closeModal()">Done</button></div>`;
+  }
   else return;
 
   box.innerHTML=`<div class="modal-title">${title}<button class="modal-close" onclick="closeModal()">✕</button></div>${body}`;
@@ -3710,6 +3762,62 @@ async function deletePart(pn, id){
   if(error){toast('Error: '+error.message);return;}
   S.parts=S.parts.filter(p=>p.id!==id);
   toast('Part '+pn+' deleted');render();
+}
+
+// ── CATEGORY MANAGEMENT ─────────────────────────────────────────────────────
+async function addCategory(table){
+  const name=document.getElementById('new-cat-name')?.value.trim();
+  if(!name){toast('Enter a category name');return;}
+  toast('Category "'+name+'" added — assign parts to it via Edit');
+  document.getElementById('new-cat-name').value='';
+  closeModal();
+}
+
+async function renameCategory(table,oldName){
+  const newName=prompt('Rename category "'+oldName+'" to:',oldName);
+  if(!newName||newName===oldName)return;
+  const items=(table==='parts'?S.parts:S.assemblies).filter(x=>x.category===oldName);
+  if(!items.length){toast('No items in that category');return;}
+  const dbTable=table==='parts'?'parts':'assemblies';
+  const{error}=await db.from(dbTable).update({category:newName}).eq('category',oldName);
+  if(error){toast('Error: '+error.message);return;}
+  if(table==='parts')S.parts=S.parts.map(p=>p.category===oldName?{...p,category:newName}:p);
+  else S.assemblies=S.assemblies.map(a=>a.category===oldName?{...a,category:newName}:a);
+  closeModal();toast('Renamed "'+oldName+'" → "'+newName+'" ('+items.length+' items updated)');render();
+}
+
+async function mergeCategoryPrompt(table,fromName){
+  const items=(table==='parts'?S.parts:S.assemblies);
+  const cats=[...new Set(items.map(x=>x.category||'').filter(c=>c&&c!==fromName))].sort();
+  const into=prompt('Merge "'+fromName+'" into which category?\n\nExisting: '+cats.join(', '),'');
+  if(!into)return;
+  await mergeCategory(table,fromName,into.trim());
+}
+
+async function mergeCategory(table,fromName,intoName){
+  const count=(table==='parts'?S.parts:S.assemblies).filter(x=>x.category===fromName).length;
+  const dbTable=table==='parts'?'parts':'assemblies';
+  const{error}=await db.from(dbTable).update({category:intoName}).eq('category',fromName);
+  if(error){toast('Error: '+error.message);return;}
+  if(table==='parts')S.parts=S.parts.map(p=>p.category===fromName?{...p,category:intoName}:p);
+  else S.assemblies=S.assemblies.map(a=>a.category===fromName?{...a,category:intoName}:a);
+  closeModal();toast('Merged "'+fromName+'" into "'+intoName+'" ('+count+' items)');render();
+}
+
+async function deleteCategory(table,name){
+  const count=(table==='parts'?S.parts:S.assemblies).filter(x=>x.category===name).length;
+  if(count>0){
+    const action=prompt(count+' items are in "'+name+'". Move them to (leave blank to clear category):','');
+    if(action===null)return;
+    const into=action.trim();
+    const dbTable=table==='parts'?'parts':'assemblies';
+    const{error}=await db.from(dbTable).update({category:into||null}).eq('category',name);
+    if(error){toast('Error: '+error.message);return;}
+    if(table==='parts')S.parts=S.parts.map(p=>p.category===name?{...p,category:into||null}:p);
+    else S.assemblies=S.assemblies.map(a=>a.category===name?{...a,category:into||null}:a);
+    toast('Category "'+name+'" deleted — '+count+' items '+(into?'moved to "'+into+'"':'uncategorised'));
+  }else toast('Category "'+name+'" removed (was empty)');
+  closeModal();render();
 }
 
 async function deleteAsm(pn, id){
@@ -4505,10 +4613,15 @@ function isHWPack(pn){ return /^TGK-P\d/i.test(pn||''); }
 
 function bomBucket(childPn,itemType){
   const pnU=(childPn||'').toUpperCase();
-  // Hardware Packs: TGK-P + digits (TGK-P01 … TGK-P100). TGK-PCV etc. are NOT packs.
   if(isHWPack(childPn))return{label:'HARDWARE PACK',cls:'bomtag-hwp'};
-  // Subassemblies: typed as assembly OR numeric XX-XXXX part numbers (01-0001, 05-0002…)
-  if(itemType==='assembly'||/^\d{2}-\d{4}/.test(pnU))return{label:'SUBASSEMBLY',cls:'bomtag-sub'};
+  // Subassemblies: numeric XX-XXXX pattern only (01-0001, 05-0002)
+  if(/^\d{2}-\d{4}/.test(pnU))return{label:'SUBASSEMBLY',cls:'bomtag-sub'};
+  // Non-subassembly assembly component = finished good
+  if(itemType==='assembly'){
+    const a=S.assemblies.find(x=>x.pn===childPn);
+    if(a&&a.is_subassembly)return{label:'SUBASSEMBLY',cls:'bomtag-sub'};
+    return{label:'FINISHED GOOD',cls:'bomtag-comp'};
+  }
   const p=S.parts.find(x=>x.pn===childPn);
   const cat=p?.category||'';
   const txt=((p?.description||'')+' '+childPn).toLowerCase();
@@ -6174,13 +6287,25 @@ function renderCorrections() {
   let list=S.corrections;
   const q=(sf.search||'').toLowerCase();
   if(q) list=list.filter(c=>c.pn.toLowerCase().includes(q)||(c.reason||'').toLowerCase().includes(q));
-  if(sf.source) list=list.filter(c=>c.source===sf.source);
-  const sources=[...new Set(S.corrections.map(c=>c.source||'manual'))];
+  if(sf.source) list=list.filter(c=>(c.source||'manual')===sf.source);
+  // Fixed source chips with friendly labels — always shown regardless of data
+  const fixedSources=[
+    {key:'manual',label:'Manual'},
+    {key:'cycle_count',label:'Cycle Count'},
+    {key:'pack',label:'Pack / Build'},
+    {key:'unship',label:'Un-ship'},
+    {key:'return',label:'Return'},
+    {key:'shopify',label:'Shopify'},
+  ];
+  // Also pick up any sources in the data not covered by fixedSources
+  const dataSources=[...new Set(S.corrections.map(c=>c.source||'manual'))];
+  const extraSources=dataSources.filter(s=>!fixedSources.find(f=>f.key===s));
   return `
   <div class="filter-bar">
     <div class="search-wrap"><span class="search-icon">⌕</span><input placeholder="Part # or reason…" value="${sf.search||''}" oninput="setFilter('corrections','search',this.value)"></div>
-    <button class="filter-chip ${!sf.source?'on-teal':''}" onclick="setFilter('corrections','source','')">All</button>
-    ${sources.map(s=>`<button class="filter-chip ${sf.source===s?'on-teal':''}" onclick="setFilter('corrections','source','${s}')">${s}</button>`).join('')}
+    <button class="filter-chip ${!sf.source?'on-teal':''}" onclick="setFilter('corrections','source','')">All (${S.corrections.length})</button>
+    ${fixedSources.map(s=>{const n=S.corrections.filter(c=>(c.source||'manual')===s.key).length;return`<button class="filter-chip ${sf.source===s.key?'on-teal':''}" onclick="setFilter('corrections','source','${sf.source===s.key?'':s.key}')">${s.label}${n?` (${n})`:''}</button>`;}).join('')}
+    ${extraSources.map(s=>`<button class="filter-chip ${sf.source===s?'on-teal':''}" onclick="setFilter('corrections','source','${sf.source===s?'':s}')">${s}</button>`).join('')}
     <button class="btn btn-sm" style="margin-left:auto" onclick="openModal('manualCorrection',{})">+ Manual Adjustment</button>
     <span class="filter-count">${list.length} records</span>
   </div>
