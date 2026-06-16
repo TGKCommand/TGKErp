@@ -2566,7 +2566,14 @@ function renderIntegrations(){
   ADD COLUMN IF NOT EXISTS is_split_shipment boolean DEFAULT false,
   ADD COLUMN IF NOT EXISTS on_hold boolean DEFAULT false,
   ADD COLUMN IF NOT EXISTS ss_order_id text,
-  ADD COLUMN IF NOT EXISTS ss_shipment_id text;</pre>
+  ADD COLUMN IF NOT EXISTS ss_shipment_id text;
+
+-- Warranty claim columns for replacement shipping
+ALTER TABLE warranty_claims
+  ADD COLUMN IF NOT EXISTS resolution_type text DEFAULT 'no_action',
+  ADD COLUMN IF NOT EXISTS shipping_details jsonb,
+  ADD COLUMN IF NOT EXISTS ss_order_id text,
+  ADD COLUMN IF NOT EXISTS resolved_at timestamptz;</pre>
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">1 — Install Supabase CLI & login</div>
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto">npm install -g supabase
@@ -3013,6 +3020,34 @@ Deno.serve(async (req) => {
     const rawNum = data.orderNumber
     const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
     await db.from('sales').update({ fulfillment_status: 'Open' }).eq('order_number', ex?.length ? rawNum : '#' + rawNum)
+  }
+
+  // --- CREATE ORDER: fire a new order into ShipStation (used by warranty replacements) ---
+  if (body.action === 'create_order') {
+    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
+    const auth = ssAuth()
+    const { orderNumber, customerName, customerEmail, pn, description, qty, shipTo, internalNotes } = body
+    if (!orderNumber || !pn || !shipTo?.street1) return json({ error: 'orderNumber, pn and shipTo.street1 required' }, 400)
+    const ssPayload = {
+      orderNumber,
+      orderDate: new Date().toISOString(),
+      orderStatus: 'awaiting_shipment',
+      customerUsername: customerEmail || undefined,
+      customerEmail: customerEmail || undefined,
+      billTo: { name: shipTo.name || customerName || 'Customer', street1: shipTo.street1, city: shipTo.city, state: shipTo.state, postalCode: shipTo.postal_code, country: shipTo.country || 'US' },
+      shipTo: { name: shipTo.name || customerName || 'Customer', street1: shipTo.street1, street2: shipTo.street2 || undefined, city: shipTo.city, state: shipTo.state, postalCode: shipTo.postal_code, country: shipTo.country || 'US' },
+      items: [{ lineItemKey: '1', sku: pn, name: description || pn, quantity: qty || 1, unitPrice: 0 }],
+      internalNotes: internalNotes || ('Warranty replacement order from TGK ERP — ' + orderNumber),
+      advancedOptions: { source: 'TGK ERP Warranty' }
+    }
+    const ssRes = await fetch('https://ssapi.shipstation.com/orders/createorder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Basic ' + auth },
+      body: JSON.stringify(ssPayload)
+    })
+    const ssData = await ssRes.json()
+    if (!ssRes.ok) return json({ error: 'ShipStation error: ' + (ssData.ExceptionMessage || ssData.message || ssRes.status) }, 502)
+    return json({ orderId: ssData.orderId, orderNumber: ssData.orderNumber, status: ssData.orderStatus })
   }
 
   return ok('ok')
@@ -4378,6 +4413,22 @@ function openModal(type,data){
     ${fi('wty-order','Order #','')}</div>
     <div class="form-row cols-2">${fi('wty-name','Customer Name','')} ${fi('wty-email','Customer Email','','type="email"')}</div>
     <div class="form-row"><div class="form-group"><label class="form-label">Issue Description</label><textarea class="form-input" id="wty-issue" rows="3" placeholder="Describe the issue…"></textarea></div></div>
+    <div class="form-row"><div class="form-group"><label class="form-label">Resolution Type</label>
+      <select id="wty-resolution" class="form-input" onchange="document.getElementById('wty-ship-section').style.display=this.value==='replacement'?'block':'none'">
+        <option value="no_action">No Action</option>
+        <option value="replacement">Replacement (ship product to customer)</option>
+        <option value="repair">Repair</option>
+        <option value="refund">Refund</option>
+      </select>
+    </div></div>
+    <div id="wty-ship-section" style="display:none;margin-top:2px;padding:12px;background:var(--bg3);border-radius:8px;border:1px solid var(--border)">
+      <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">🚚 Replacement Shipping Address</div>
+      <div class="form-row">${fi('wty-ship-name','Ship-to Name','','placeholder="Customer full name"')}</div>
+      <div class="form-row">${fi('wty-ship-addr1','Address Line 1','','placeholder="123 Main St"')}</div>
+      <div class="form-row">${fi('wty-ship-addr2','Address Line 2 (optional)','','placeholder="Apt, Suite…"')}</div>
+      <div class="form-row cols-2">${fi('wty-ship-city','City','')} ${fi('wty-ship-state','State / Province','')}</div>
+      <div class="form-row cols-2">${fi('wty-ship-zip','ZIP / Postal Code','')} ${fi('wty-ship-country','Country','US')}</div>
+    </div>
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitWarranty()">Log Claim</button></div>`;
   }
   else if(type==='custom'){
@@ -4745,7 +4796,22 @@ async function submitWarranty(){
   const pn=document.getElementById('wty-pn').value;
   const issue=document.getElementById('wty-issue').value.trim();
   if(!pn||!issue){toast('SKU and issue required');return;}
-  const payload={pn,order_number:document.getElementById('wty-order').value.trim(),customer_name:document.getElementById('wty-name').value.trim(),customer_email:document.getElementById('wty-email').value.trim(),issue,status:'Open'};
+  const resolution=document.getElementById('wty-resolution')?.value||'no_action';
+  let shipping_details=null;
+  if(resolution==='replacement'){
+    const addr1=(document.getElementById('wty-ship-addr1')?.value||'').trim();
+    const city=(document.getElementById('wty-ship-city')?.value||'').trim();
+    const zip=(document.getElementById('wty-ship-zip')?.value||'').trim();
+    if(!addr1||!city||!zip){toast('Street address, city and ZIP required for replacement');return;}
+    shipping_details={
+      name:(document.getElementById('wty-ship-name')?.value||'').trim(),
+      street1:addr1,
+      street2:(document.getElementById('wty-ship-addr2')?.value||'').trim(),
+      city,state:(document.getElementById('wty-ship-state')?.value||'').trim(),
+      postal_code:zip,country:(document.getElementById('wty-ship-country')?.value||'US').trim()
+    };
+  }
+  const payload={pn,order_number:document.getElementById('wty-order').value.trim(),customer_name:document.getElementById('wty-name').value.trim(),customer_email:document.getElementById('wty-email').value.trim(),issue,resolution_type:resolution,shipping_details,status:'Open'};
   const{data,error}=await db.from('warranty_claims').insert(payload).select().single();
   if(error){toast('Error: '+error.message);return;}
   S.warrantyClaims=[data,...S.warrantyClaims];
@@ -7589,11 +7655,12 @@ function renderWarranty() {
   const q=(sf.search||'').toLowerCase();
   if(q) list=list.filter(w=>w.pn.toLowerCase().includes(q)||(w.customer_name||'').toLowerCase().includes(q)||(w.order_number||'').toLowerCase().includes(q));
   if(sf.status) list=list.filter(w=>w.status===sf.status);
-  const statuses=['Open','In Review','Approved','Denied','Resolved'];
+  const statuses=['Open','In Review','Approved','Shipped','Denied','Resolved'];
   const counts={};statuses.forEach(s=>{counts[s]=S.warrantyClaims.filter(w=>w.status===s).length;});
+  const resLabel={'no_action':'','replacement':'🔄 Replace','repair':'🔧 Repair','refund':'💰 Refund'};
   return `
-  <div class="kpi-grid kpi-grid-5" style="--kpi-grid-5:repeat(5,1fr)">
-    ${statuses.map(s=>`<div class="kpi ${s==='Open'?'kpi-red':s==='Resolved'?'kpi-green':''}"><div class="kpi-label">${s}</div><div class="kpi-value">${counts[s]||0}</div></div>`).join('')}
+  <div class="kpi-grid" style="grid-template-columns:repeat(6,1fr)">
+    ${statuses.map(s=>`<div class="kpi ${s==='Open'?'kpi-red':s==='Shipped'?'kpi-teal':s==='Resolved'?'kpi-green':''}"><div class="kpi-label">${s}</div><div class="kpi-value">${counts[s]||0}</div></div>`).join('')}
   </div>
   <div class="filter-bar">
     <div class="search-wrap"><span class="search-icon">⌕</span><input placeholder="SKU, customer, order #…" value="${sf.search||''}" oninput="setFilter('warranty','search',this.value)"></div>
@@ -7602,19 +7669,27 @@ function renderWarranty() {
     <button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="openModal('addWarranty',{})">+ Log Claim</button>
   </div>
   <div class="tbl-wrap">
-  <table><thead><tr><th>Date</th><th>SKU</th><th>Customer</th><th>Order #</th><th>Issue</th><th>Status</th><th>Action</th></tr></thead><tbody>
-  ${list.length===0?'<tr><td colspan="7" class="section-empty">No warranty claims</td></tr>':list.map(w=>{
-    const statusMap={'Open':'pill-red','In Review':'pill-yellow','Approved':'pill-teal','Denied':'pill-muted','Resolved':'pill-green'};
+  <table><thead><tr><th>Date</th><th>SKU</th><th>Customer</th><th>Order #</th><th>Issue</th><th>Resolution</th><th>Status</th><th>Action</th></tr></thead><tbody>
+  ${list.length===0?'<tr><td colspan="8" class="section-empty">No warranty claims</td></tr>':list.map(w=>{
+    const statusMap={'Open':'pill-red','In Review':'pill-yellow','Approved':'pill-teal','Shipped':'pill-teal','Denied':'pill-muted','Resolved':'pill-green'};
     const nextStatus={'Open':'In Review','In Review':'Approved','Approved':'Resolved','Denied':'Resolved'};
+    const isReplacement=w.resolution_type==='replacement';
+    const canShip=isReplacement&&w.status==='Approved'&&!w.ss_order_id;
+    const shipped=w.ss_order_id||w.status==='Shipped';
     return `<tr>
       <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${new Date(w.created_at).toLocaleDateString()}</td>
       <td class="pn" style="color:var(--teal)">${w.pn}</td>
-      <td style="font-size:11px">${w.customer_name||'—'}</td>
+      <td style="font-size:11px">${escHtml(w.customer_name||'—')}</td>
       <td class="pn">${w.order_number||'—'}</td>
-      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${w.issue}</td>
+      <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px" title="${escHtml(w.issue)}">${escHtml(w.issue)}</td>
+      <td style="font-size:11px">
+        ${resLabel[w.resolution_type||'no_action']||''}
+        ${shipped&&w.ss_order_id?`<div style="font-size:9px;color:var(--teal);font-family:var(--mono);margin-top:2px" title="ShipStation Order ID">SS#${w.ss_order_id}</div>`:''}
+      </td>
       <td><span class="pill ${statusMap[w.status]||'pill-muted'}">${w.status}</span></td>
-      <td style="display:flex;gap:4px">
-        ${nextStatus[w.status]?`<button class="action-btn" onclick="advanceWarranty('${w.id}','${nextStatus[w.status]}')">→ ${nextStatus[w.status]}</button>`:''}
+      <td style="display:flex;gap:4px;flex-wrap:wrap">
+        ${canShip?`<button class="btn btn-teal btn-sm" onclick="shipWarrantyReplacement('${w.id}')">🚚 Ship</button>`:''}
+        ${!canShip&&nextStatus[w.status]?`<button class="action-btn" onclick="advanceWarranty('${w.id}','${nextStatus[w.status]}')">→ ${nextStatus[w.status]}</button>`:''}
         <button class="action-btn del" onclick="deleteWarranty('${w.id}')">×</button>
       </td>
     </tr>`;
@@ -7623,7 +7698,7 @@ function renderWarranty() {
 }
 
 async function advanceWarranty(id, newStatus) {
-  const {error}=await db.from('warranty_claims').update({status:newStatus,resolved_at:['Resolved','Denied'].includes(newStatus)?new Date().toISOString():null}).eq('id',id);
+  const {error}=await db.from('warranty_claims').update({status:newStatus,resolved_at:['Resolved','Denied','Shipped'].includes(newStatus)?new Date().toISOString():null}).eq('id',id);
   if(error){toast('Error');return;}
   S.warrantyClaims=S.warrantyClaims.map(w=>w.id===id?{...w,status:newStatus}:w);
   toast('Status → '+newStatus);render();
@@ -7634,6 +7709,99 @@ async function deleteWarranty(id) {
   await db.from('warranty_claims').delete().eq('id',id);
   S.warrantyClaims=S.warrantyClaims.filter(w=>w.id!==id);
   toast('Claim deleted');render();
+}
+
+function shipWarrantyReplacement(id){
+  const w=S.warrantyClaims.find(x=>x.id===id);
+  if(!w){toast('Claim not found');return;}
+  const sd=w.shipping_details||{};
+  const asm=S.assemblies.find(a=>a.pn===w.pn);
+  const overlay=document.createElement('div');
+  overlay.id='wty-ship-overlay';
+  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:center;justify-content:center;padding:20px';
+  overlay.innerHTML='<div class="modal" style="width:540px;max-width:95vw">'
+    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">'
+      +'<div><div style="font-size:15px;font-weight:700;color:var(--text)">🚚 Ship Warranty Replacement</div>'
+      +'<div style="font-size:11px;color:var(--text3);margin-top:2px">'+escHtml(w.pn)+(asm?' — '+escHtml(asm.description):'')+'</div></div>'
+      +'<button onclick="document.getElementById(\'wty-ship-overlay\').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">×</button>'
+    +'</div>'
+    +'<div style="padding:10px 12px;background:var(--bg3);border-radius:6px;border:1px solid var(--border);font-size:11px;color:var(--text2);margin-bottom:14px">'
+      +'<strong>Claim:</strong> '+escHtml(w.issue)+'<br>'
+      +'<strong>Customer:</strong> '+escHtml(w.customer_name||'—')+(w.customer_email?' &lt;'+escHtml(w.customer_email)+'&gt;':'')
+    +'</div>'
+    +'<div class="form-group" style="margin-bottom:10px"><label class="form-label">Ship-to Name</label>'
+      +'<input id="ws-name" class="form-input" value="'+escHtml(sd.name||w.customer_name||'')+'" placeholder="Full name"></div>'
+    +'<div class="form-group" style="margin-bottom:10px"><label class="form-label">Address Line 1</label>'
+      +'<input id="ws-addr1" class="form-input" value="'+escHtml(sd.street1||'')+'"></div>'
+    +'<div class="form-group" style="margin-bottom:10px"><label class="form-label">Address Line 2</label>'
+      +'<input id="ws-addr2" class="form-input" value="'+escHtml(sd.street2||'')+'" placeholder="Apt, suite… (optional)"></div>'
+    +'<div style="display:flex;gap:10px;margin-bottom:10px">'
+      +'<div class="form-group" style="flex:2"><label class="form-label">City</label><input id="ws-city" class="form-input" value="'+escHtml(sd.city||'')+'"></div>'
+      +'<div class="form-group" style="flex:1"><label class="form-label">State</label><input id="ws-state" class="form-input" value="'+escHtml(sd.state||'')+'"></div>'
+      +'<div class="form-group" style="flex:1"><label class="form-label">ZIP</label><input id="ws-zip" class="form-input" value="'+escHtml(sd.postal_code||'')+'"></div>'
+    +'</div>'
+    +'<div style="display:flex;gap:10px;margin-bottom:14px">'
+      +'<div class="form-group" style="flex:1"><label class="form-label">Country</label><input id="ws-country" class="form-input" value="'+escHtml(sd.country||'US')+'"></div>'
+      +'<div class="form-group" style="flex:1"><label class="form-label">Qty</label><input id="ws-qty" type="number" min="1" value="1" class="form-input"></div>'
+    +'</div>'
+    +'<div id="wty-ship-status" style="display:none;padding:10px;border-radius:6px;margin-bottom:10px;font-size:12px"></div>'
+    +'<div style="display:flex;gap:8px;justify-content:flex-end;padding-top:12px;border-top:1px solid var(--border)">'
+      +'<button class="btn" onclick="document.getElementById(\'wty-ship-overlay\').remove()">Cancel</button>'
+      +'<button id="ws-submit" class="btn btn-teal" onclick="confirmShipWarranty(\''+id+'\',\''+escHtml(w.pn)+'\')">🚚 Create ShipStation Order</button>'
+    +'</div>'
+  +'</div>';
+  document.body.appendChild(overlay);
+  setTimeout(function(){document.getElementById('ws-name')?.focus();},50);
+}
+
+async function confirmShipWarranty(claimId, pn){
+  const name=(document.getElementById('ws-name')?.value||'').trim();
+  const addr1=(document.getElementById('ws-addr1')?.value||'').trim();
+  const city=(document.getElementById('ws-city')?.value||'').trim();
+  const zip=(document.getElementById('ws-zip')?.value||'').trim();
+  if(!addr1||!city||!zip){toast('Address, city and ZIP are required');return;}
+  const shipTo={name,street1:addr1,street2:(document.getElementById('ws-addr2')?.value||'').trim(),city,state:(document.getElementById('ws-state')?.value||'').trim(),postal_code:zip,country:(document.getElementById('ws-country')?.value||'US').trim()};
+  const qty=parseInt(document.getElementById('ws-qty')?.value)||1;
+  const asm=S.assemblies.find(a=>a.pn===pn);
+  const claim=S.warrantyClaims.find(w=>w.id===claimId);
+
+  // Update status UI
+  const statusEl=document.getElementById('wty-ship-status');
+  const submitBtn=document.getElementById('ws-submit');
+  if(statusEl){statusEl.style.display='block';statusEl.style.background='var(--bg3)';statusEl.style.color='var(--text2)';statusEl.textContent='⏳ Creating order in ShipStation…';}
+  if(submitBtn){submitBtn.disabled=true;submitBtn.textContent='Creating…';}
+
+  try{
+    const resp=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        action:'create_order',
+        orderNumber:'WARRANTY-'+claimId,
+        customerName:claim?.customer_name||name,
+        customerEmail:claim?.customer_email||'',
+        pn,description:asm?.description||pn,qty,
+        shipTo,
+        internalNotes:'Warranty replacement — Claim #'+claimId+'. Issue: '+(claim?.issue||'')
+      })
+    });
+    const json=await resp.json();
+    if(!resp.ok||json.error){
+      if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='✗ '+( json.error||'Edge function error (HTTP '+resp.status+')');}
+      if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
+      return;
+    }
+    // Success — save SS order info to the claim
+    const ssOrderId=json.orderId||json.orderNumber||'(created)';
+    const{error:dbErr}=await db.from('warranty_claims').update({ss_order_id:String(ssOrderId),status:'Shipped',resolved_at:new Date().toISOString(),shipping_details:shipTo}).eq('id',claimId);
+    if(!dbErr){S.warrantyClaims=S.warrantyClaims.map(w=>w.id===claimId?{...w,ss_order_id:String(ssOrderId),status:'Shipped',shipping_details:shipTo}:w);}
+    document.getElementById('wty-ship-overlay')?.remove();
+    toast('✓ ShipStation order created — SS Order #'+ssOrderId,5000);
+    render();
+  }catch(err){
+    if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='✗ Network error: '+err.message;}
+    if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
+  }
 }
 
 // ============================================================
