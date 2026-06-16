@@ -159,7 +159,7 @@ select.form-input{cursor:pointer}
 /* ── MODAL ── */
 .overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:100;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
 .overlay.hidden{display:none}
-.modal{background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-lg);width:560px;max-width:95vw;max-height:90vh;overflow-y:auto;padding:24px}
+.modal{background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-lg);width:660px;max-width:96vw;max-height:90vh;overflow-y:auto;padding:24px}
 .modal-title{font-size:14px;font-weight:700;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between}
 .modal-close{background:none;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1;padding:2px}
 .modal-close:hover{color:var(--text)}
@@ -486,6 +486,7 @@ const S = {
   activePO:null, poLines:{}, poTracking:{},
   selectedParts:new Set(), selectedAsms:new Set(), bulkEditMode:null,
   workOrderMode:false, workOrderBuilds:{},
+  pendingBOMLines:[],
   // Cycle counts
   cycleCounts:[], activeCount:null, countLines:[],
   // Corrections
@@ -882,40 +883,118 @@ function getVendors(){return[...new Set(S.parts.map(function(p){return p.vendor|
 function handleSelNew(el){if(el.value==='__new'){el.value='';showNewCat(el.id);}}
 function handleVendorSelNew(el){if(el.value==='__new'){el.value='';showNewVendor(el.id);}}
 
-function buildCatSelect(id,table,selected){
+function buildCatCascade(id,table,selected){
   var cats=getCats(table);
-  var tops=cats.filter(function(c){return c.indexOf('/')<0;});
-  var subs={};
-  cats.filter(function(c){return c.indexOf('/')>=0;}).forEach(function(c){
-    var parent=c.slice(0,c.indexOf('/'));
-    if(!subs[parent])subs[parent]=[];
-    subs[parent].push(c);
+  var tops=[...new Set(cats.map(function(c){return c.split('/')[0];}))].sort();
+  var subMap={};
+  cats.filter(function(c){return c.includes('/');}).forEach(function(c){
+    var slash=c.indexOf('/');var top=c.slice(0,slash);var sub=c.slice(slash+1);
+    if(!subMap[top])subMap[top]=[];subMap[top].push(sub);
   });
-  var addedSubs=new Set();
-  var opts='<option value="">No category</option>';
-  tops.forEach(function(cat){
-    opts+='<option value="'+escHtml(cat)+'"'+(selected===cat?' selected':'')+'>'+escHtml(cat)+'</option>';
-    (subs[cat]||[]).forEach(function(sub){
-      var label=sub.slice(sub.indexOf('/')+1);
-      opts+='<option value="'+escHtml(sub)+'"'+(selected===sub?' selected':'')+'>  ↳ '+escHtml(label)+'</option>';
-      addedSubs.add(sub);
-    });
+  var selParts=(selected||'').split('/');
+  var selTop=selParts[0]||'';var selSub=selParts.slice(1).join('/')||'';
+  var subs=selTop?(subMap[selTop]||[]):[];
+
+  var topOpts='<option value="">No category</option>';
+  tops.forEach(function(t){topOpts+='<option value="'+escHtml(t)+'"'+(t===selTop?' selected':'')+'>'+escHtml(t)+'</option>';});
+  topOpts+='<option value="__new_top">+ New category…</option>';
+
+  var subOpts='<option value="">— Top level only —</option>';
+  subs.forEach(function(s){subOpts+='<option value="'+escHtml(s)+'"'+(s===selSub?' selected':'')+'>'+escHtml(s)+'</option>';});
+  subOpts+='<option value="__new_sub">+ New sub-category…</option>';
+
+  return '<div style="display:flex;flex-direction:column;gap:6px">'
+    +'<select id="'+id+'-l1" class="form-input" onchange="catL1(\''+id+'\',\''+table+'\')">'+topOpts+'</select>'
+    +'<div id="'+id+'-l2-wrap" style="display:'+(selTop?'flex':'none')+';flex-direction:column;gap:6px">'
+      +'<select id="'+id+'-l2" class="form-input" onchange="catL2(\''+id+'\')">'+subOpts+'</select>'
+    +'</div>'
+    +'<div id="'+id+'-ntop" style="display:none;background:var(--bg3);border-radius:6px;padding:10px;border:1px solid var(--border)">'
+      +'<div style="font-size:10px;color:var(--teal);font-weight:700;margin-bottom:6px">New Top-Level Category</div>'
+      +'<div style="display:flex;gap:6px">'
+        +'<input id="'+id+'-ntop-nm" class="form-input" placeholder="Category name…" style="flex:1">'
+        +'<button type="button" class="btn btn-primary btn-sm" onclick="catAddTop(\''+id+'\',\''+table+'\')">Add</button>'
+        +'<button type="button" class="btn btn-sm" onclick="document.getElementById(\''+id+'-ntop\').style.display=\'none\'">Cancel</button>'
+      +'</div>'
+    +'</div>'
+    +'<div id="'+id+'-nsub" style="display:none;background:var(--bg3);border-radius:6px;padding:10px;border:1px solid var(--border)">'
+      +'<div style="font-size:10px;color:var(--teal);font-weight:700;margin-bottom:6px">New Sub-Category under <span id="'+id+'-nsub-par" style="color:var(--orange)"></span></div>'
+      +'<div style="display:flex;gap:6px">'
+        +'<input id="'+id+'-nsub-nm" class="form-input" placeholder="Sub-category name…" style="flex:1">'
+        +'<button type="button" class="btn btn-primary btn-sm" onclick="catAddSub(\''+id+'\')">Add</button>'
+        +'<button type="button" class="btn btn-sm" onclick="document.getElementById(\''+id+'-nsub\').style.display=\'none\'">Cancel</button>'
+      +'</div>'
+    +'</div>'
+    +'<input type="hidden" id="'+id+'" value="'+escHtml(selected||'')+'">'
+  +'</div>';
+}
+// Keep old name as alias for any other callers
+function buildCatSelect(id,table,selected){return buildCatCascade(id,table,selected);}
+
+function catL1(id,table){
+  var l1=document.getElementById(id+'-l1');
+  var l2Wrap=document.getElementById(id+'-l2-wrap');
+  var l2=document.getElementById(id+'-l2');
+  var hidden=document.getElementById(id);
+  var val=l1.value;
+  if(val==='__new_top'){
+    l1.value='';
+    document.getElementById(id+'-ntop').style.display='block';
+    setTimeout(function(){var el=document.getElementById(id+'-ntop-nm');if(el)el.focus();},50);
+    hidden.value='';return;
+  }
+  var cats=getCats(table);
+  var subMap={};
+  cats.filter(function(c){return c.includes('/');}).forEach(function(c){
+    var slash=c.indexOf('/');var top=c.slice(0,slash);var sub=c.slice(slash+1);
+    if(!subMap[top])subMap[top]=[];subMap[top].push(sub);
   });
-  cats.filter(function(c){return c.indexOf('/')>=0&&!addedSubs.has(c);}).forEach(function(c){
-    opts+='<option value="'+escHtml(c)+'"'+(selected===c?' selected':'')+'>'+escHtml(c)+'</option>';
-  });
-  opts+='<option value="__new">+ New category...</option>';
-  var topOpts=tops.map(function(t){return'<option value="'+escHtml(t)+'">'+escHtml(t)+'</option>';}).join('');
-  var out='<select id="'+id+'" class="form-input" onchange="handleSelNew(this)">'+opts+'</select>';
-  out+='<div id="'+id+'-new" style="display:none;margin-top:8px;padding:10px;background:var(--bg2);border-radius:6px;border:1px solid var(--border)">';
-  out+='<div style="font-size:10px;color:var(--teal);font-weight:700;margin-bottom:8px">New Category</div>';
-  out+='<div style="display:flex;gap:6px;margin-bottom:6px">';
-  out+='<select id="'+id+'-par" class="form-input" style="flex:1"><option value="">Top level</option>'+topOpts+'</select>';
-  out+='<input id="'+id+'-nm" class="form-input" placeholder="Name..." style="flex:1"></div>';
-  out+='<div style="display:flex;gap:6px">';
-  out+='<button type="button" class="btn btn-primary btn-sm" onclick="applyNewCat(&quot;'+id+'&quot;)">Add</button>';
-  out+='<button type="button" class="btn btn-sm" onclick="cancelNewCat(&quot;'+id+'&quot;)">Cancel</button></div></div>';
-  return out;
+  var subs=val?(subMap[val]||[]):[];
+  var subOpts='<option value="">— Top level only —</option>';
+  subs.forEach(function(s){subOpts+='<option value="'+escHtml(s)+'">'+escHtml(s)+'</option>';});
+  subOpts+='<option value="__new_sub">+ New sub-category…</option>';
+  l2.innerHTML=subOpts;
+  l2Wrap.style.display=val?'flex':'none';
+  hidden.value=val;
+}
+function catL2(id){
+  var l1=document.getElementById(id+'-l1');
+  var l2=document.getElementById(id+'-l2');
+  var hidden=document.getElementById(id);
+  var top=l1.value;var sub=l2.value;
+  if(sub==='__new_sub'){
+    l2.value='';
+    var parSpan=document.getElementById(id+'-nsub-par');if(parSpan)parSpan.textContent=top;
+    document.getElementById(id+'-nsub').style.display='block';
+    setTimeout(function(){var el=document.getElementById(id+'-nsub-nm');if(el)el.focus();},50);
+    return;
+  }
+  hidden.value=sub?top+'/'+sub:top;
+}
+function catAddTop(id,table){
+  var nm=(document.getElementById(id+'-ntop-nm')?.value||'').trim();
+  if(!nm){toast('Enter a name');return;}
+  var l1=document.getElementById(id+'-l1');var hidden=document.getElementById(id);
+  var lastOpt=l1.options[l1.options.length-1];
+  l1.insertBefore(new Option(nm,nm,true,true),lastOpt);l1.value=nm;
+  var l2=document.getElementById(id+'-l2');var l2Wrap=document.getElementById(id+'-l2-wrap');
+  l2.innerHTML='<option value="">— Top level only —</option><option value="__new_sub">+ New sub-category…</option>';
+  l2Wrap.style.display='flex';
+  hidden.value=nm;
+  document.getElementById(id+'-ntop').style.display='none';
+  document.getElementById(id+'-ntop-nm').value='';
+  toast('"'+nm+'" added — saves with the record');
+}
+function catAddSub(id){
+  var nm=(document.getElementById(id+'-nsub-nm')?.value||'').trim();
+  if(!nm){toast('Enter a sub-category name');return;}
+  var l1=document.getElementById(id+'-l1');var l2=document.getElementById(id+'-l2');var hidden=document.getElementById(id);
+  var top=l1.value;if(!top){toast('Select a top-level category first');return;}
+  var lastOpt=l2.options[l2.options.length-1];
+  l2.insertBefore(new Option(nm,nm,true,true),lastOpt);l2.value=nm;
+  hidden.value=top+'/'+nm;
+  document.getElementById(id+'-nsub').style.display='none';
+  document.getElementById(id+'-nsub-nm').value='';
+  toast('"'+top+'/'+nm+'" added — saves with the record');
 }
 
 function buildVendorSelect(id,selected){
@@ -4011,7 +4090,7 @@ function openModal(type,data){
     <div class="form-group"><label class="form-label">Vendor</label>${buildVendorSelect('m-vendor',data.vendor||'')}</div></div>
     <div class="form-row">${fi('m-desc','Description',data.description||'')}</div>
     <div class="form-row cols-2">
-    <div class="form-group"><label class="form-label">Category</label>${buildCatSelect('m-cat','parts',data.category||'')}</div>
+    <div class="form-group"><label class="form-label">Category</label>${buildCatCascade('m-cat','parts',data.category||'')}</div>
     ${fi('m-cost','Unit Cost',data.unit_cost||0,'type="number" step="0.0001"')}</div>
     <div class="form-row cols-2">${fi('m-lead','Lead Time (wks)',data.lead_time_weeks||1,'type="number" min="1"')} ${fi('m-avg','Avg Sales / Wk',data.avg_sales_wk||0,'type="number" step="0.01"')}</div>
     <div class="form-row cols-2">${fi('m-unpckgd','On Hand (Unpacked)',data.total_unpckgd||0,'type="number"')} ${fi('m-min','Min Qty',data.min_qty||0,'type="number" step="0.1"')}</div>
@@ -4021,13 +4100,41 @@ function openModal(type,data){
   }
   else if(type==='addAsm'||type==='editAsm'){
     title=type==='addAsm'?'Add Assembly':'Edit Assembly';
+    S.pendingBOMLines=[];
+    const existingBOM=data.pn?(S.boms[data.pn]||[]):[];
+    const existingRows=existingBOM.map(function(b){
+      return '<div id="m-bom-ex-'+b.id+'" style="display:flex;align-items:center;gap:8px;padding:5px 8px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;margin-bottom:4px">'
+        +'<span style="font-family:var(--mono);font-size:11px;color:var(--teal);min-width:80px">'+escHtml(b.child_pn)+'</span>'
+        +'<span style="font-size:10px;color:var(--text3);flex:1">'+(S.parts.find(function(p){return p.pn===b.child_pn;})||S.assemblies.find(function(a){return a.pn===b.child_pn;})||{}).description+'</span>'
+        +'<span style="font-size:11px;color:var(--text2)">×'+b.qty+'</span>'
+        +'<span style="font-size:10px;background:var(--bg4);border-radius:4px;padding:1px 6px;color:var(--text3)">'+b.item_type+'</span>'
+        +'<button type="button" onclick="modalDeleteBOM(\''+b.id+'\',\''+escHtml(b.child_pn)+'\',\''+escHtml(data.pn||'')+'\''+')" style="background:transparent;border:none;color:var(--text3);cursor:pointer;font-size:16px;line-height:1;padding:2px">×</button>'
+      +'</div>';
+    }).join('');
+    const allPNs=[...S.parts.map(function(p){return p.pn;}),...S.assemblies.map(function(a){return a.pn;})].sort();
     body=`<div class="form-row cols-2">${fi('m-pn','SKU',data.pn||'',data.id?'readonly':'')}
-    <div class="form-group"><label class="form-label">Category</label>${buildCatSelect('m-cat','assemblies',data.category||'')}</div></div>
+    <div class="form-group"><label class="form-label">Category</label>${buildCatCascade('m-cat','assemblies',data.category||'')}</div></div>
     <div class="form-row">${fi('m-desc','Description',data.description||'')}</div>
     <div class="form-row cols-2">${fi('m-msrp','MSRP',data.msrp||0,'type="number" step="0.01"')} ${fi('m-ship','Shipping Cost',data.shipping_cost||10,'type="number" step="0.01"')}</div>
     <div class="form-row cols-2">${fi('m-oh','On Hand',data.total_on_hand||0,'type="number"')} ${fs('m-status','Status',[['ok','In Stock'],['low','Low'],['critical','Critical']],data.status||'ok')}</div>
     <div class="form-row cols-2">${fi('m-avg','Avg Sales / Wk',data.avg_sales_wk||0,'type="number" step="0.01"')} ${fi('m-drawing','Drawing URL',data.drawing_url||'','placeholder="https://…"')}</div>
     <div class="form-row"><label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text2);cursor:pointer"><input type="checkbox" id="m-disc" ${data.discontinued?'checked':''}> 🗄 Discontinued — hide from Production &amp; queues</label></div>
+    <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px">
+      <div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Bill of Materials <span style="font-weight:400;text-transform:none;color:var(--text3);font-size:10px">(optional — add components this assembly consumes)</span></div>
+      <div id="m-bom-existing">${existingRows}</div>
+      <div id="m-bom-pending"></div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px;padding:8px 10px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)">
+        <input id="m-bom-pn" class="form-input" placeholder="Part # or SKU" style="flex:2;min-width:90px" list="m-bom-pn-list" autocomplete="off">
+        <datalist id="m-bom-pn-list">${allPNs.map(function(pn){return'<option value="'+escHtml(pn)+'">';}).join('')}</datalist>
+        <input id="m-bom-qty" type="number" min="0.001" step="0.001" value="1" class="form-input" style="width:65px">
+        <select id="m-bom-type" class="form-input" style="width:110px">
+          <option value="part">Part</option>
+          <option value="subassembly">Subassembly</option>
+          <option value="packaging">Packaging</option>
+        </select>
+        <button type="button" class="btn btn-teal btn-sm" onclick="modalAddBOMRow()">+ Add Line</button>
+      </div>
+    </div>
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitAsm('${data.id||''}')">Save Assembly</button></div>`;
   }
   else if(type==='shipOrder'){
@@ -4449,6 +4556,41 @@ async function submitWarranty(){
   S.warrantyClaims=[data,...S.warrantyClaims];
   closeModal();toast('Warranty claim logged');render();
 }
+function modalAddBOMRow(){
+  var pn=(document.getElementById('m-bom-pn')?.value||'').trim();
+  var qty=parseFloat(document.getElementById('m-bom-qty')?.value)||1;
+  var type=document.getElementById('m-bom-type')?.value||'part';
+  if(!pn){toast('Enter a Part # or SKU');return;}
+  var item=S.parts.find(function(p){return p.pn===pn;})||S.assemblies.find(function(a){return a.pn===pn;});
+  var desc=item?item.description||'':'(not yet in catalog)';
+  var idx=S.pendingBOMLines.length;
+  S.pendingBOMLines.push({pn:pn,qty:qty,type:type,idx:idx});
+  var container=document.getElementById('m-bom-pending');if(!container)return;
+  var row=document.createElement('div');
+  row.id='m-bom-prow-'+idx;
+  row.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 8px;background:var(--bg2);border:1px solid var(--teal);border-radius:6px;margin-bottom:4px';
+  row.innerHTML='<span style="font-family:var(--mono);font-size:11px;color:var(--teal);min-width:80px">'+escHtml(pn)+'</span>'
+    +'<span style="font-size:10px;color:var(--text3);flex:1">'+escHtml(desc)+'</span>'
+    +'<span style="font-size:11px;color:var(--text2)">×'+qty+'</span>'
+    +'<span style="font-size:10px;background:var(--teal-dim);color:var(--teal);border-radius:4px;padding:1px 6px">'+type+'</span>'
+    +'<button type="button" onclick="modalRemoveBOMRow('+idx+')" style="background:transparent;border:none;color:var(--text3);cursor:pointer;font-size:16px;line-height:1;padding:2px" title="Remove">×</button>';
+  container.appendChild(row);
+  document.getElementById('m-bom-pn').value='';
+  document.getElementById('m-bom-qty').value='1';
+  document.getElementById('m-bom-pn').focus();
+}
+function modalRemoveBOMRow(idx){
+  S.pendingBOMLines=S.pendingBOMLines.filter(function(l){return l.idx!==idx;});
+  var el=document.getElementById('m-bom-prow-'+idx);if(el)el.remove();
+}
+async function modalDeleteBOM(bomId,childPn,parentPn){
+  var{error}=await db.from('bom_items').delete().eq('id',bomId);
+  if(error){toast('Error: '+error.message);return;}
+  if(S.boms[parentPn])S.boms[parentPn]=S.boms[parentPn].filter(function(b){return b.id!==bomId;});
+  var el=document.getElementById('m-bom-ex-'+bomId);if(el)el.remove();
+  toast('BOM line removed');
+}
+
 async function submitAsm(eid){
   const pn=$('m-pn').value.trim();if(!pn){toast('SKU required');return;}
   const payload={pn,description:$('m-desc').value.trim(),category:$('m-cat').value.trim(),msrp:parseFloat($('m-msrp').value)||0,shipping_cost:parseFloat($('m-ship').value)||10,total_on_hand:parseInt($('m-oh').value)||0,status:$('m-status').value,avg_sales_wk:parseFloat($('m-avg').value)||0,drawing_url:$('m-drawing').value.trim(),discontinued:$('m-disc').checked,updated_at:new Date().toISOString()};
@@ -4458,7 +4600,27 @@ async function submitAsm(eid){
   if(error){toast('Error: '+error.message);return;}
   if(data)S.assemblies=[...S.assemblies,data].sort((a,b)=>a.pn.localeCompare(b.pn));
   else S.assemblies=S.assemblies.map(a=>a.id===eid?{...a,...payload}:a);
-  closeModal();toast('Assembly saved');render();
+
+  // Save any pending BOM lines
+  const pending=(S.pendingBOMLines||[]).filter(Boolean);
+  if(pending.length>0){
+    const finalPn=data?data.pn:pn;
+    const existing=S.boms[finalPn]||[];
+    const bomInserts=pending.map(function(item,i){
+      return{parent_pn:finalPn,child_pn:item.pn,qty:item.qty,item_type:item.type,unit_cost:0,sort_order:existing.length+i+1};
+    });
+    const{data:bomData,error:bomErr}=await db.from('bom_items').insert(bomInserts).select();
+    if(bomErr){toast('Assembly saved but BOM error: '+bomErr.message);}
+    else{
+      if(!S.boms[finalPn])S.boms[finalPn]=[];
+      S.boms[finalPn]=[...S.boms[finalPn],...(bomData||[])];
+      if(!S.selBOM)S.selBOM=finalPn;
+    }
+    S.pendingBOMLines=[];
+  }
+  closeModal();
+  toast(pending.length>0?'Assembly saved with '+pending.length+' BOM line'+(pending.length!==1?'s':''):'Assembly saved');
+  render();
 }
 
 async function fixAssemblyClassification(){
