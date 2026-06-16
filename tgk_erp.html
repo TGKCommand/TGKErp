@@ -2741,52 +2741,46 @@ async function testShopify(){
 
 async function syncShopifyImages(){
   if(!S.shopify.key){toast('Save Shopify credentials first');return;}
-  toast('Fetching product images from Shopify…');
+  toast('Fetching product images from Shopify...');
   try{
-    const res=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action:'sync_images',store:S.shopify.store,key:S.shopify.key})
-    });
+    const res=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'sync_images',store:S.shopify.store,key:S.shopify.key})});
     const data=await res.json().catch(()=>({}));
     if(!res.ok){toast('Error: '+(data.error||res.status));return;}
     const{skuMap={}}=data;
-    let matched=0,updated=0,colMissing=false;
-
-    for(const asm of S.assemblies){
-      // Try exact match, then uppercase, then lowercase
-      const img=skuMap[asm.pn]||skuMap[asm.pn.toUpperCase()]||skuMap[asm.pn.toLowerCase()]||skuMap[(asm.pn||'').replace(/-/g,'')]||null;
-      if(img&&img!==asm.image_url){
-        const{error}=await db.from('assemblies').update({image_url:img}).eq('id',asm.id);
-        if(error){
-          if(error.message.includes('image_url')||error.code==='42703'){colMissing=true;break;}
-        }else{
-          S.assemblies=S.assemblies.map(a=>a.id===asm.id?{...a,image_url:img}:a);
-          updated++;
+    const norm=function(s){return s.toUpperCase().replace(/[\s_]+/g,'-').replace(/[^A-Z0-9-]/g,'');};
+    const normMap={};
+    Object.keys(skuMap).forEach(function(sku){var k=norm(sku);if(!normMap[k])normMap[k]={img:skuMap[sku],sku:sku};});
+    var updated=0,alreadyCurrent=0,colMissing=false;
+    var unmatchedPns=[];
+    for(var i=0;i<S.assemblies.length;i++){
+      var asm=S.assemblies[i];
+      var img=skuMap[asm.pn]||skuMap[asm.pn.toUpperCase()]||skuMap[asm.pn.toLowerCase()]||(normMap[norm(asm.pn)]&&normMap[norm(asm.pn)].img)||null;
+      if(img){
+        if(img===asm.image_url){alreadyCurrent++;}
+        else{
+          var r=await db.from('assemblies').update({image_url:img}).eq('id',asm.id);
+          if(r.error){if(r.error.message.includes('image_url')||r.error.code==='42703'){colMissing=true;break;}}
+          else{S.assemblies=S.assemblies.map(function(a){return a.id===asm.id?Object.assign({},a,{image_url:img}):a;});updated++;}
         }
-        matched++;
-      }
+      }else{unmatchedPns.push(asm.pn);}
     }
-
-    if(colMissing){
-      toast('⚠ Column missing — run this SQL in Supabase SQL Editor, then sync again:',6000);
-      setTimeout(()=>alert('Run in Supabase → SQL Editor:\n\nALTER TABLE assemblies ADD COLUMN IF NOT EXISTS image_url text;\n\nThen click 🖼 Sync Images again.'),500);
-      return;
-    }
-
+    if(colMissing){toast('Column missing - run: ALTER TABLE assemblies ADD COLUMN IF NOT EXISTS image_url text; in Supabase SQL Editor',8000);return;}
     render();
-    const noMatch=S.assemblies.filter(a=>!a.image_url&&!skuMap[a.pn]&&!skuMap[a.pn.toUpperCase()]&&!skuMap[a.pn.toLowerCase()]);
+    var totalSkus=Object.keys(skuMap).length;
+    var sampleSkus=Object.keys(skuMap).filter(function(k){return k.match(/^TGK/i);}).slice(0,5).join(', ')||Object.keys(skuMap).slice(0,5).join(', ');
     if(updated>0){
-      toast('🖼 '+updated+' images saved ('+data.fetched+' Shopify products scanned)',5000);
-    }else if(matched>0){
-      toast('🖼 Already up to date — '+matched+' images current',4000);
+      toast('Saved '+updated+' images. '+unmatchedPns.length+' assemblies have no Shopify match.',6000);
+    }else if(alreadyCurrent>0){
+      toast('All images already current ('+alreadyCurrent+' matched). '+unmatchedPns.length+' have no Shopify match.',5000);
     }else{
-      const shopifySkus=Object.keys(skuMap).filter(k=>k===k.toUpperCase()).slice(0,5);
-      toast('🖼 No matches — '+data.fetched+' products fetched. Sample Shopify SKUs: '+shopifySkus.join(', ')+'. Check your assembly part numbers match Shopify variant SKUs.',8000);
+      toast('No matches. '+totalSkus+' Shopify SKUs scanned. Examples: '+sampleSkus+'. Check Shopify variant SKUs match your assembly part numbers.',8000);
     }
-    if(noMatch.length>0)console.log('Assemblies with no Shopify image match:',noMatch.map(a=>a.pn));
+    if(unmatchedPns.length>0){
+      console.log('Unmatched assemblies (no Shopify image):',unmatchedPns);
+      console.log('Shopify SKUs found:',Object.keys(skuMap).slice(0,30));
+    }
   }catch(e){toast('Image sync error: '+e.message);}
 }
-
 function openImageLightbox(src,alt){
   const existing=document.getElementById('img-lightbox');
   if(existing)existing.remove();
@@ -2874,9 +2868,12 @@ async function ssTestOrder(){
 // Check ShipStation for a specific order's shipment/tracking status
 async function fetchOrderTracking(orderNum){
   const clean=orderNum.replace(/^#/,'');
-  toast('Checking ShipStation for order '+orderNum+'…');
+  toast('Checking ShipStation for order '+orderNum+'...');
   const edgeUrl=SUPA_URL+'/functions/v1/shipstation-ship';
-  const resourceUrl='https://ssapi.shipstation.com/shipments?orderNumber='+encodeURIComponent(clean)+'&pageSize=10&sortBy=ShipDate&sortDir=DESC';
+
+  // includeShipmentItems=true is critical — lets edge fn match per-SKU for split orders
+  const resourceUrl='https://ssapi.shipstation.com/shipments?orderNumber='+encodeURIComponent(clean)+'&pageSize=10&sortBy=ShipDate&sortDir=DESC&includeShipmentItems=true';
+
   try{
     const res=await fetch(edgeUrl,{
       method:'POST',headers:{'Content-Type':'application/json'},
@@ -2885,21 +2882,28 @@ async function fetchOrderTracking(orderNum){
     if(res.ok){
       await refreshSales();
       render();
+      // Show per-line result
       const lines=S.sales.filter(s=>s.order_number===orderNum||s.order_number===clean||s.order_number==='#'+clean);
       const shipped=lines.filter(l=>l.fulfillment_status==='Shipped'&&l.tracking_number);
+      const open=lines.filter(l=>['Open','Packed','Partial','On Hold'].includes(l.fulfillment_status||'Open'));
       if(shipped.length){
-        toast('✓ Tracking found — '+shipped.map(l=>(l.carrier?l.carrier+' ':'')+l.tracking_number).join(', '),5000);
-      }else{
-        const txt=await res.text().catch(()=>'');
-        // Try the non-hash version too
-        if(!clean.startsWith(orderNum)){
-          await fetch(edgeUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resource_type:'SHIP_NOTIFY',resource_url:'https://ssapi.shipstation.com/shipments?orderNumber='+encodeURIComponent('#'+clean)+'&pageSize=10&sortBy=ShipDate&sortDir=DESC'})});
-          await refreshSales();render();
+        const trackingSummary=shipped.map(l=>(l.pn||'')+(l.tracking_number?' — '+(l.carrier?l.carrier+' ':'')+l.tracking_number:'')).join(' | ');
+        if(open.length){
+          toast('Partial: '+shipped.length+' item'+(shipped.length!==1?'s':'')+' shipped, '+open.length+' still open. '+trackingSummary,6000);
+        }else{
+          toast('All items shipped! '+trackingSummary,5000);
         }
-        toast('No shipment found in ShipStation yet for order '+orderNum+'. If it shipped, make sure "On Items Shipped" webhook is active.',6000);
+      }else{
+        // Also try with # prefix
+        const altUrl='https://ssapi.shipstation.com/shipments?orderNumber='+encodeURIComponent('#'+clean)+'&pageSize=10&sortBy=ShipDate&sortDir=DESC&includeShipmentItems=true';
+        await fetch(edgeUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resource_type:'SHIP_NOTIFY',resource_url:altUrl})});
+        await refreshSales();render();
+        const shipped2=S.sales.filter(s=>(s.order_number===orderNum||s.order_number===clean||s.order_number==='#'+clean)&&s.fulfillment_status==='Shipped'&&s.tracking_number);
+        if(shipped2.length){toast('Tracking found! '+shipped2.map(l=>(l.carrier?l.carrier+' ':'')+l.tracking_number).join(', '),5000);}
+        else{toast('No shipment found for order '+orderNum+' in ShipStation. If it shipped recently, try Bulk Sync Shipments.',5000);}
       }
     }else{
-      toast('ShipStation check failed ('+res.status+') — check edge function is deployed and SS_KEY/SS_SECRET are set');
+      toast('ShipStation check failed — check edge function is deployed and SS_KEY/SS_SECRET are set');
     }
   }catch(e){toast('Error: '+e.message);}
 }
