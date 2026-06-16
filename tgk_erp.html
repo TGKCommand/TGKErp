@@ -496,6 +496,7 @@ const S = {
   warrantyClaims:[],
   // Production
   activeBuild:null, buildQty:null, buildCoverage:4,
+  parentBuild:null, parentBuildQty:null,
   // Lookup
   lookupQ:'', lookupSel:null,
   activeSale:null,
@@ -800,7 +801,7 @@ function setupRealtime(){
 const PAGE_TITLES={dashboard:'Dashboard',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',planning:'Inventory Planning',purchases:'Purchase Orders',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Corrections Log',warranty:'Warranty Claims',import:'Import Data',pobuilder:'PO Builder'};
 
 function nav(v){
-  if(v!==S.view){S.activePO=null;S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.activeCount=null;if(v!=='packqueue')S.workOrderMode=false;S.searchQ='';}
+  if(v!==S.view){S.activePO=null;S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.parentBuild=null;S.parentBuildQty=null;S.activeCount=null;if(v!=='packqueue')S.workOrderMode=false;S.searchQ='';}
   S.view=v;
   document.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
   const el=$('nav-'+v);if(el)el.classList.add('active');
@@ -861,6 +862,16 @@ window.addEventListener('popstate',function(e){
 });
 function openSaleDetail(id){S.activeSale=id;pushHist();render();}
 function openBuild(pn){S.activeBuild=pn;S.buildQty=null;if(S.view!=='packqueue')nav('packqueue');else{pushHist();render();}}
+
+// Open a sub-assembly build from within a parent build planner
+// Saves the parent so we can return to it after packing the sub
+function openSubBuild(subPn, parentPn, parentQty){
+  S.parentBuild=parentPn;
+  S.parentBuildQty=parentQty||null;
+  S.activeBuild=subPn;
+  S.buildQty=null;
+  pushHist();render();
+}
 function lookupGo(type,pn){S.lookupSel={type,pn};S.lookupQ=pn;if(S.view!=='lookup')nav('lookup');else{pushHist();render();}}
 
 function trackingUrl(carrier, tracking){
@@ -6730,10 +6741,12 @@ function renderBuildPlanner(asm){
   const feasible=b.maxBuild===Infinity?want:Math.min(want,b.maxBuild);
   return `
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
-    <button class="btn btn-sm" onclick="S.activeBuild=null;S.buildQty=null;render()">← Production</button>
+    ${S.parentBuild
+      ? `<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.35)" onclick="S.activeBuild=S.parentBuild;S.buildQty=S.parentBuildQty;S.parentBuild=null;S.parentBuildQty=null;render()">← Back to ${S.parentBuild}</button>`
+      : `<button class="btn btn-sm" onclick="S.activeBuild=null;S.buildQty=null;render()">← Production</button>`}
     ${asm.image_url?`<img src="${escHtml(asm.image_url)}" style="width:52px;height:52px;object-fit:cover;border-radius:6px;border:1px solid var(--border);cursor:zoom-in;transition:transform .15s" onmouseenter="this.style.transform='scale(1.1)'" onmouseleave="this.style.transform='scale(1)'" onclick="openImageLightbox('${escHtml(asm.image_url)}','${escHtml(asm.pn)}')" onerror="this.style.display='none'">`:''}
     <div style="flex:1">
-      <div style="font-size:14px;font-weight:700;color:var(--text)">${asm.pn} — Build Planner</div>
+      <div style="font-size:14px;font-weight:700;color:var(--text)">${asm.pn} — Build Planner${S.parentBuild?` <span style="font-size:11px;font-weight:400;color:var(--orange)">(sub-assembly for ${S.parentBuild})</span>`:''}</div>
       <div style="font-size:11px;color:var(--text3)">${asm.description||''}</div>
     </div>
     <span class="pill ${(asm.total_on_hand||0)>0?'pill-teal':'pill-red'}">On hand: ${asm.total_on_hand||0}</span>
@@ -6792,7 +6805,7 @@ function renderBuildPlanner(asm){
           <td class="money" style="color:${c.avail>=totNeed?'var(--green)':'var(--red)'};font-weight:700">${c.avail}</td>
           <td class="money" style="color:${short>0?'var(--red)':'var(--text3)'};font-weight:700">${short||'—'}</td>
           <td>${c.avail>=totNeed?'<span class="ok-dot" style="background:var(--green);display:inline-block"></span>':'<span class="ok-dot" style="background:var(--red);display:inline-block"></span>'}</td>
-          <td>${c.isSub?`<button class="btn btn-sm" style="font-size:10px;color:var(--orange);border-color:rgba(234,88,12,.35);padding:3px 8px;white-space:nowrap" onclick="event.stopPropagation();openBuild('${c.pn}')" title="Open build planner for ${c.pn}">🔧 Build Sub</button>`:''}
+          <td>${c.isSub?`<button class="btn btn-sm" style="font-size:10px;color:var(--orange);border-color:rgba(234,88,12,.35);padding:3px 8px;white-space:nowrap" onclick="event.stopPropagation();openSubBuild('${c.pn}','${asm.pn}',${want})" title="Build ${c.pn} then return here">🔧 Build Sub</button>`:''}
           </td>
         </tr>`;}).join('')}
       </tbody></table>
@@ -6856,9 +6869,14 @@ async function unpackPlanned(pn,asmId,qty){
 }
 
 async function packPlanned(pn,asmId,qty){
-  // Set activeBuild=null BEFORE packUnits so its render() shows the production list
-  S.activeBuild=null;
-  S.buildQty=null;
+  // If we came from a parent build, restore it after packing — otherwise go to production list
+  const returnToPn=S.parentBuild;
+  const returnQty=S.parentBuildQty;
+  S.parentBuild=null;
+  S.parentBuildQty=null;
+  // Set activeBuild to the parent (or null) so packUnits' render() lands in the right place
+  S.activeBuild=returnToPn||null;
+  S.buildQty=returnToPn?returnQty:null;
   const fakeInput=document.createElement('input');fakeInput.id='pack-qty-'+asmId;fakeInput.value=qty;
   document.body.appendChild(fakeInput);
   await packUnits(pn,asmId,false);
