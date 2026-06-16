@@ -3528,17 +3528,46 @@ Deno.serve(async (req) => {
     }
   }
 
-  if (resource_type === 'ORDER_CANCELLED') {
+if (resource_type === 'ORDER_CANCELLED') {
     const rawNum = data.orderNumber
     const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
     const rn = ex?.length ? rawNum : '#' + rawNum
     await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('order_number', rn)
   }
+
+  // ORDER_NOTIFY fires when an order is modified in ShipStation (status change, hold, etc.)
+  // ShipStation does NOT have ORDER_ON_HOLD or ORDER_HOLD_RELEASED webhook triggers —
+  // hold status is synced via the hold_sync action (called by Sync Orders button).
+  // We handle ORDER_NOTIFY defensively in case SS fires it for status changes.
+  if (resource_type === 'ORDER_NOTIFY') {
+    const order = data
+    const rawNum = order.orderNumber || ''
+    if (rawNum) {
+      const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
+      const rn = ex?.length ? rawNum : '#' + rawNum
+      const ss = (order.orderStatus || '').toLowerCase()
+      if (ss === 'on_hold') {
+        await db.from('sales').update({ fulfillment_status: 'On Hold' })
+          .eq('order_number', rn)
+          .in('fulfillment_status', ['Open', 'Packed', 'Partial'])
+        console.log('[SS] ORDER_NOTIFY on_hold', rn)
+      } else if (ss === 'awaiting_shipment') {
+        await db.from('sales').update({ fulfillment_status: 'Open' })
+          .eq('order_number', rn)
+          .eq('fulfillment_status', 'On Hold')
+        console.log('[SS] ORDER_NOTIFY awaiting_shipment (released hold)', rn)
+      } else if (ss === 'cancelled') {
+        await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('order_number', rn)
+        console.log('[SS] ORDER_NOTIFY cancelled', rn)
+      }
+    }
+  }
+
+  // Keep legacy handlers in case a future SS plan exposes these events
   if (resource_type === 'ORDER_ON_HOLD') {
     const rawNum = data.orderNumber
     const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
     const resolvedHold = ex?.length ? rawNum : '#' + rawNum
-    // Only hold lines still awaiting shipment — never overwrite already-Shipped/Delivered lines
     await db.from('sales').update({ fulfillment_status: 'On Hold' })
       .eq('order_number', resolvedHold)
       .in('fulfillment_status', ['Open', 'Packed', 'Partial'])
@@ -3548,7 +3577,6 @@ Deno.serve(async (req) => {
     const rawNum = data.orderNumber
     const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
     const resolvedRel = ex?.length ? rawNum : '#' + rawNum
-    // Only release lines that are actually On Hold — never touch Shipped/Delivered lines
     await db.from('sales').update({ fulfillment_status: 'Open' })
       .eq('order_number', resolvedRel)
       .eq('fulfillment_status', 'On Hold')
@@ -3573,13 +3601,12 @@ supabase functions deploy shipstation-ship --no-verify-jwt</pre>
       &nbsp;· <b>orders/create</b> → <span class="pn" style="color:var(--teal)">${edgeUrl}/shopify-orders</span><br>
       &nbsp;· <b>orders/cancelled</b> → same URL<br>
       &nbsp;· <b>orders/updated</b> → same URL (catches refunds)<br><br>
-      <b>ShipStation</b> → Account Settings → Webhooks → Add Webhook — create one webhook per event, all pointing to the same URL:<br>
+      <b>ShipStation</b> → Account Settings → Webhooks → Add Webhook — create one webhook per event:<br>
       &nbsp;· Event: <b>SHIP_NOTIFY</b> (items shipped / partial shipment) → <span class="pn" style="color:var(--teal)">${edgeUrl}/shipstation-ship</span><br>
-      &nbsp;· Event: <b>ORDER_ON_HOLD</b> → same URL <span style="color:var(--yellow);font-weight:600">⚠ required for hold to update ERP</span><br>
-      &nbsp;· Event: <b>ORDER_HOLD_RELEASED</b> → same URL<br>
+      &nbsp;· Event: <b>ORDER_NOTIFY</b> → same URL (catches hold/release status changes)<br>
       &nbsp;· Event: <b>NEW_ORDER</b> → same URL (manually-created SS orders)<br>
       &nbsp;· Event: <b>ORDER_CANCELLED</b> → same URL<br>
-      <span style="color:var(--text3);font-size:10px">Each event needs its own webhook entry in ShipStation — they cannot be combined into one.</span>
+      <span style="color:var(--text3);font-size:10px">ShipStation does not have dedicated hold/release webhook events — hold status is synced automatically when you click 🔄 Sync Orders, or via the Hold Sync button in Integrations.</span>
     </div>
   </div>`:''}`;
 }
