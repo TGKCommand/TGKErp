@@ -4418,21 +4418,52 @@ function openModal(type,data){
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitManualCorrection(document.getElementById('mc-pn').value,+document.getElementById('mc-new').value,document.getElementById('mc-reason').value)">Apply Correction</button></div>`;
   }
   else if(type==='addWarranty'){
-    const pns=S.assemblies.map(a=>a.pn).sort();
     title='Log Warranty Claim';
-    body=`<div class="form-row cols-2"><div class="form-group"><label class="form-label">SKU</label><select id="wty-pn" class="form-input"><option value="">Select…</option>${pns.map(p=>`<option value="${p}">${p}</option>`).join('')}</select></div>
-    ${fi('wty-order','Order #','')}</div>
-    <div class="form-row cols-2">${fi('wty-name','Customer Name','')} ${fi('wty-email','Customer Email','','type="email"')}</div>
-    <div class="form-row"><div class="form-group"><label class="form-label">Issue Description</label><textarea class="form-input" id="wty-issue" rows="3" placeholder="Describe the issue…"></textarea></div></div>
+    S.wtyItems=[];
+    const allPNs=[...S.parts.map(p=>p.pn),...S.assemblies.map(a=>a.pn)].sort();
+    body=`<div class="form-row cols-2">${fi('wty-order','Order #','')} ${fi('wty-name','Customer Name','')}</div>
+    <div class="form-row">${fi('wty-email','Customer Email','','type="email"')}</div>
+    <div class="form-row"><div class="form-group"><label class="form-label">Issue Description</label><textarea class="form-input" id="wty-issue" rows="2" placeholder="Describe the issue…"></textarea></div></div>
     <div class="form-row"><div class="form-group"><label class="form-label">Resolution Type</label>
-      <select id="wty-resolution" class="form-input" onchange="document.getElementById('wty-ship-section').style.display=this.value==='replacement'?'block':'none'">
+      <select id="wty-resolution" class="form-input" onchange="wtyShowItemsIfReplacement()">
         <option value="no_action">No Action</option>
         <option value="replacement">Replacement (ship product to customer)</option>
         <option value="repair">Repair</option>
         <option value="refund">Refund</option>
       </select>
     </div></div>
-    <div id="wty-ship-section" style="display:none;margin-top:2px;padding:12px;background:var(--bg3);border-radius:8px;border:1px solid var(--border)">
+
+    <div id="wty-items-wrap" style="display:none;margin-top:4px;border-top:1px solid var(--border);padding-top:14px">
+      <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Replacement Items</div>
+
+      <!-- Assembly reference picker for quick BOM access -->
+      <div style="padding:10px 12px;background:var(--bg3);border-radius:8px;border:1px solid var(--border);margin-bottom:10px">
+        <label class="form-label" style="margin-bottom:6px">Reference Assembly (load components to pick from)</label>
+        <div id="wty-asmsel-wrap" style="position:relative">
+          <input id="wty-asm-input" class="form-input" placeholder="Search assemblies…" autocomplete="off"
+            oninput="wtyAsmFilter(this.value)" onfocus="wtyAsmOpen(this)" onkeydown="wtyAsmKey(event)"
+            style="padding-right:28px">
+          <span style="position:absolute;right:8px;top:50%;transform:translateY(-50%);color:var(--text3);pointer-events:none;font-size:12px">▾</span>
+          <div id="wty-asm-dd" style="display:none;position:absolute;top:calc(100%+4px);left:0;right:0;background:var(--bg2);border:1px solid var(--border2);border-radius:8px;max-height:200px;overflow-y:auto;z-index:300;box-shadow:0 8px 24px rgba(0,0,0,.25)"></div>
+          <input type="hidden" id="wty-asm-val">
+        </div>
+        <div id="wty-bom-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
+      </div>
+
+      <!-- Items list -->
+      <div id="wty-item-rows" style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px"></div>
+
+      <!-- Manual add row -->
+      <div style="display:flex;gap:6px;align-items:center;padding:8px 10px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)">
+        <input id="wty-add-pn" class="form-input" placeholder="Part # or SKU" style="flex:2;min-width:80px"
+          list="wty-all-pns" autocomplete="off">
+        <datalist id="wty-all-pns">${allPNs.map(p=>`<option value="${escHtml(p)}">`).join('')}</datalist>
+        <input id="wty-add-qty" type="number" min="1" value="1" class="form-input" style="width:60px">
+        <button type="button" class="btn btn-teal btn-sm" onclick="wtyAddItem()">+ Add Line</button>
+      </div>
+    </div>
+
+    <div id="wty-ship-section" style="display:none;margin-top:10px;padding:12px;background:var(--bg3);border-radius:8px;border:1px solid var(--border)">
       <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">🚚 Replacement Shipping Address</div>
       <div class="form-row">${fi('wty-ship-name','Ship-to Name','','placeholder="Customer full name"')}</div>
       <div class="form-row">${fi('wty-ship-addr1','Address Line 1','','placeholder="123 Main St"')}</div>
@@ -4804,10 +4835,11 @@ async function submitManualSale(){
   closeModal();toast('Order '+orderNum+' created');render();
 }
 async function submitWarranty(){
-  const pn=document.getElementById('wty-pn').value;
-  const issue=document.getElementById('wty-issue').value.trim();
-  if(!pn||!issue){toast('SKU and issue required');return;}
+  const issue=(document.getElementById('wty-issue')?.value||'').trim();
+  if(!issue){toast('Issue description required');return;}
   const resolution=document.getElementById('wty-resolution')?.value||'no_action';
+  const items=S.wtyItems||[];
+  if(resolution==='replacement'&&items.length===0){toast('Add at least one replacement item');return;}
   let shipping_details=null;
   if(resolution==='replacement'){
     const addr1=(document.getElementById('wty-ship-addr1')?.value||'').trim();
@@ -4822,11 +4854,145 @@ async function submitWarranty(){
       postal_code:zip,country:(document.getElementById('wty-ship-country')?.value||'US').trim()
     };
   }
-  const payload={pn,order_number:document.getElementById('wty-order').value.trim(),customer_name:document.getElementById('wty-name').value.trim(),customer_email:document.getElementById('wty-email').value.trim(),issue,resolution_type:resolution,shipping_details,status:'Open'};
+  // pn = assembly ref (first assembly item, then first item, then null)
+  const asmRef=document.getElementById('wty-asm-val')?.value||'';
+  const firstItem=items[0];
+  const pn=asmRef||(firstItem?.pn)||'';
+  const claim_items=items.map(function(i){return{pn:i.pn,type:i.type,qty:i.qty,description:i.description};});
+  const payload={pn,order_number:(document.getElementById('wty-order')?.value||'').trim(),customer_name:(document.getElementById('wty-name')?.value||'').trim(),customer_email:(document.getElementById('wty-email')?.value||'').trim(),issue,resolution_type:resolution,claim_items:claim_items.length?claim_items:null,shipping_details,status:'Open'};
   const{data,error}=await db.from('warranty_claims').insert(payload).select().single();
   if(error){toast('Error: '+error.message);return;}
+  S.wtyItems=[];
   S.warrantyClaims=[data,...S.warrantyClaims];
   closeModal();toast('Warranty claim logged');render();
+}
+
+// ── WARRANTY ITEM HELPERS ──────────────────────────────────────────────────
+function wtyShowItemsIfReplacement(){
+  const isRep=document.getElementById('wty-resolution')?.value==='replacement';
+  document.getElementById('wty-items-wrap').style.display=isRep?'block':'none';
+  document.getElementById('wty-ship-section').style.display=isRep?'block':'none';
+}
+function _wtyRenderItems(){
+  const el=document.getElementById('wty-item-rows');if(!el)return;
+  if(!S.wtyItems||!S.wtyItems.length){el.innerHTML='<div style="font-size:11px;color:var(--text3);padding:4px 0">No items yet — add from the assembly BOM above or enter manually below.</div>';return;}
+  el.innerHTML=S.wtyItems.map(function(item){
+    const typeClr=item.type==='assembly'?'var(--teal)':'var(--text2)';
+    const typeLbl=item.type==='assembly'?'assembly':'part';
+    return '<div id="wtyitem-'+item.idx+'" style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:6px">'
+      +'<span style="font-family:var(--mono);font-size:11px;color:'+typeClr+';min-width:80px">'+escHtml(item.pn)+'</span>'
+      +'<span style="font-size:10px;background:var(--bg4);color:var(--text3);border-radius:4px;padding:1px 5px">'+typeLbl+'</span>'
+      +'<span style="font-size:11px;color:var(--text2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(item.description||'')+'</span>'
+      +'<span style="font-size:11px;color:var(--text3);white-space:nowrap">×'
+        +'<input type="number" min="1" value="'+item.qty+'" style="width:46px;padding:2px 4px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:11px;margin-left:3px" onchange="wtyUpdateQty('+item.idx+',+this.value)">'
+      +'</span>'
+      +'<button type="button" onclick="wtyRemoveItem('+item.idx+')" style="background:transparent;border:none;color:var(--text3);cursor:pointer;font-size:16px;line-height:1;padding:2px;flex-shrink:0">×</button>'
+    +'</div>';
+  }).join('');
+}
+function wtyAddItem(){
+  const pnEl=document.getElementById('wty-add-pn');
+  const qtyEl=document.getElementById('wty-add-qty');
+  const pn=(pnEl?.value||'').trim();
+  const qty=parseInt(qtyEl?.value)||1;
+  if(!pn){toast('Enter a Part # or SKU');return;}
+  // Check if already in list
+  if(S.wtyItems.some(function(i){return i.pn===pn;})){toast(pn+' already in list — adjust qty directly');return;}
+  const asm=S.assemblies.find(function(a){return a.pn===pn;});
+  const part=S.parts.find(function(p){return p.pn===pn;});
+  const type=asm?'assembly':'part';
+  const description=(asm||part)?.description||'';
+  const idx=Date.now();
+  S.wtyItems.push({idx,pn,type,qty,description});
+  _wtyRenderItems();
+  if(pnEl)pnEl.value='';
+  if(qtyEl)qtyEl.value='1';
+  pnEl?.focus();
+}
+function wtyAddBOMItem(pn,qty,type,description){
+  if(S.wtyItems.some(function(i){return i.pn===pn;})){toast(pn+' already in list');return;}
+  S.wtyItems.push({idx:Date.now(),pn,qty,type,description});
+  _wtyRenderItems();
+}
+function wtyRemoveItem(idx){
+  S.wtyItems=S.wtyItems.filter(function(i){return i.idx!==idx;});
+  _wtyRenderItems();
+}
+function wtyUpdateQty(idx,qty){
+  S.wtyItems=S.wtyItems.map(function(i){return i.idx===idx?{...i,qty:Math.max(1,qty||1)}:i;});
+}
+
+// Assembly search combobox for warranty modal
+function wtyAsmOpen(inp){
+  const dd=document.getElementById('wty-asm-dd');if(!dd)return;
+  wtyAsmFilter(inp.value);
+  dd.style.display='block';
+  inp.select();
+  setTimeout(function(){
+    function outside(e){
+      const wrap=document.getElementById('wty-asmsel-wrap');
+      if(!wrap||!wrap.contains(e.target)){
+        dd.style.display='none';
+        document.removeEventListener('click',outside);
+        const val=document.getElementById('wty-asm-val')?.value||'';
+        if(inp&&!val)inp.value='';
+      }
+    }
+    document.addEventListener('click',outside);
+  },0);
+}
+function wtyAsmFilter(q){
+  const dd=document.getElementById('wty-asm-dd');if(!dd)return;
+  const lq=(q||'').toLowerCase().trim();
+  const pool=S.assemblies.map(function(a){return a.pn;}).sort();
+  const filtered=lq?pool.filter(function(k){
+    const a=S.assemblies.find(function(x){return x.pn===k;});
+    return k.toLowerCase().includes(lq)||(a?.description||'').toLowerCase().includes(lq);
+  }):pool;
+  if(!filtered.length){dd.innerHTML='<div style="padding:10px;font-size:12px;color:var(--text3)">No assemblies found</div>';return;}
+  dd.innerHTML=filtered.map(function(k){
+    const a=S.assemblies.find(function(x){return x.pn===k;});
+    return '<div class="_wty-asm-opt" onclick="wtyAsmPick(\''+k+'\')" style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border)" onmouseenter="this.style.background=\'var(--bg3)\'" onmouseleave="this.style.background=\'transparent\'">'
+      +'<div style="font-family:var(--mono);font-size:12px;color:var(--teal)">'+k+'</div>'
+      +(a?.description?'<div style="font-size:10px;color:var(--text3);margin-top:1px">'+escHtml(a.description)+'</div>':'')
+    +'</div>';
+  }).join('');
+}
+function wtyAsmKey(e){
+  const dd=document.getElementById('wty-asm-dd');
+  if(!dd||dd.style.display==='none')return;
+  const opts=Array.from(dd.querySelectorAll('._wty-asm-opt'));
+  const cur=dd.querySelector('._wty-asm-opt[data-active]');
+  let idx=cur?opts.indexOf(cur):-1;
+  if(e.key==='ArrowDown'){e.preventDefault();if(cur)cur.removeAttribute('data-active');idx=Math.min(idx+1,opts.length-1);opts[idx]?.setAttribute('data-active','1');opts[idx]?.scrollIntoView({block:'nearest'});}
+  else if(e.key==='ArrowUp'){e.preventDefault();if(cur)cur.removeAttribute('data-active');idx=Math.max(idx-1,0);opts[idx]?.setAttribute('data-active','1');opts[idx]?.scrollIntoView({block:'nearest'});}
+  else if(e.key==='Enter'){e.preventDefault();const act=dd.querySelector('._wty-asm-opt[data-active]')||opts[0];if(act)wtyAsmPick(act.querySelector('[style*="mono"]')?.textContent||'');}
+  else if(e.key==='Escape'){dd.style.display='none';}
+}
+function wtyAsmPick(pn){
+  const dd=document.getElementById('wty-asm-dd');if(dd)dd.style.display='none';
+  const inp=document.getElementById('wty-asm-input');const hidden=document.getElementById('wty-asm-val');
+  const asm=S.assemblies.find(function(a){return a.pn===pn;});
+  if(inp)inp.value=pn+(asm?.description?' — '+asm.description:'');
+  if(hidden)hidden.value=pn;
+  // Build BOM chips
+  const chips=document.getElementById('wty-bom-chips');
+  if(!chips)return;
+  const bomItems=S.boms[pn]||[];
+  const asmDesc=asm?.description||'';
+  let html='<div style="font-size:10px;color:var(--text3);margin-bottom:6px;width:100%">Quick-add from '+pn+' BOM:</div>'
+    +'<button type="button" class="filter-chip" onclick="wtyAddBOMItem(\''+pn+'\',1,\'assembly\',\''+escHtml(asmDesc)+'\')" style="background:var(--teal-dim);color:var(--teal);border-color:rgba(13,148,136,.3)">+ Entire Assembly</button>';
+  if(bomItems.length){
+    html+=bomItems.map(function(b){
+      const part=S.parts.find(function(p){return p.pn===b.child_pn;})||S.assemblies.find(function(a){return a.pn===b.child_pn;});
+      const desc=part?.description||'';
+      const type=b.item_type==='assembly'?'assembly':'part';
+      return '<button type="button" class="filter-chip" onclick="wtyAddBOMItem(\''+escHtml(b.child_pn)+'\','+b.qty+',\''+type+'\',\''+escHtml(desc)+'\')" title="'+escHtml(desc)+' (×'+b.qty+' per unit)">+ '+escHtml(b.child_pn)+'</button>';
+    }).join('');
+  } else {
+    html+='<span style="font-size:10px;color:var(--text3)">No BOM defined for this assembly</span>';
+  }
+  chips.innerHTML=html;
 }
 function addPriceBreak(){
   var qty=parseInt(document.getElementById('m-pb-qty')?.value)||0;
@@ -7779,17 +7945,21 @@ async function confirmShipWarranty(claimId, pn){
   const zip=(document.getElementById('ws-zip')?.value||'').trim();
   if(!addr1||!city||!zip){toast('Address, city and ZIP are required');return;}
   const shipTo={name,street1:addr1,street2:(document.getElementById('ws-addr2')?.value||'').trim(),city,state:(document.getElementById('ws-state')?.value||'').trim(),postal_code:zip,country:(document.getElementById('ws-country')?.value||'US').trim()};
-  const qty=parseInt(document.getElementById('ws-qty')?.value)||1;
-  const asm=S.assemblies.find(a=>a.pn===pn);
-  const claim=S.warrantyClaims.find(w=>w.id===claimId);
+  const claim=S.warrantyClaims.find(function(w){return w.id===claimId;});
 
-  // Update status UI
+  // Resolve items to ship — use claim_items if available, otherwise fall back to legacy single pn
+  const claimItems=(claim?.claim_items&&claim.claim_items.length)?claim.claim_items:[{pn,qty:1,type:S.assemblies.find(function(a){return a.pn===pn;})?'assembly':'part',description:S.assemblies.find(function(a){return a.pn===pn;})?.description||pn}];
+
   const statusEl=document.getElementById('wty-ship-status');
   const submitBtn=document.getElementById('ws-submit');
   if(statusEl){statusEl.style.display='block';statusEl.style.background='var(--bg3)';statusEl.style.color='var(--text2)';statusEl.textContent='⏳ Creating order in ShipStation…';}
   if(submitBtn){submitBtn.disabled=true;submitBtn.textContent='Creating…';}
 
   try{
+    // Build SS items array from claim_items
+    const ssItems=claimItems.map(function(item,i){
+      return{lineItemKey:String(i+1),sku:item.pn,name:item.description||item.pn,quantity:item.qty||1,unitPrice:0};
+    });
     const resp=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -7798,23 +7968,50 @@ async function confirmShipWarranty(claimId, pn){
         orderNumber:'WARRANTY-'+claimId,
         customerName:claim?.customer_name||name,
         customerEmail:claim?.customer_email||'',
-        pn,description:asm?.description||pn,qty,
+        // pass first item for legacy compat, but edge function uses ssItems if present
+        pn:claimItems[0]?.pn||pn,
+        description:claimItems[0]?.description||pn,
+        qty:claimItems[0]?.qty||1,
+        ssItems,
         shipTo,
-        internalNotes:'Warranty replacement — Claim #'+claimId+'. Issue: '+(claim?.issue||'')
+        internalNotes:'Warranty replacement ('+claimItems.length+' item'+(claimItems.length!==1?'s':'')+') — Claim #'+claimId+'. Issue: '+(claim?.issue||'')
       })
     });
     const json=await resp.json();
     if(!resp.ok||json.error){
-      if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='✗ '+( json.error||'Edge function error (HTTP '+resp.status+')');}
+      if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='✗ '+(json.error||'Edge function error (HTTP '+resp.status+')');}
       if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
       return;
     }
-    // Success — save SS order info to the claim
     const ssOrderId=json.orderId||json.orderNumber||'(created)';
+
+    // Deduct inventory for each claim item
+    for(const item of claimItems){
+      const qty=item.qty||1;
+      if(item.type==='assembly'){
+        const a=S.assemblies.find(function(x){return x.pn===item.pn;});
+        if(a){
+          const newOh=Math.max(0,(a.total_on_hand||0)-qty);
+          await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',a.id);
+          S.assemblies=S.assemblies.map(function(x){return x.pn===item.pn?{...x,total_on_hand:newOh}:x;});
+          await db.from('inv_corrections').insert({pn:item.pn,previous_qty:a.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Warranty replacement shipped (SS#'+ssOrderId+')',source:'warranty'});
+        }
+      } else {
+        const p=S.parts.find(function(x){return x.pn===item.pn;});
+        if(p){
+          const newQty=Math.max(0,(p.total_unpckgd||0)-qty);
+          await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
+          S.parts=S.parts.map(function(x){return x.pn===item.pn?{...x,total_unpckgd:newQty}:x;});
+          await db.from('inv_corrections').insert({pn:item.pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:-qty,reason:'Warranty part shipped (SS#'+ssOrderId+')',source:'warranty'});
+        }
+      }
+    }
+
+    // Save SS order ID and advance status
     const{error:dbErr}=await db.from('warranty_claims').update({ss_order_id:String(ssOrderId),status:'Shipped',resolved_at:new Date().toISOString(),shipping_details:shipTo}).eq('id',claimId);
-    if(!dbErr){S.warrantyClaims=S.warrantyClaims.map(w=>w.id===claimId?{...w,ss_order_id:String(ssOrderId),status:'Shipped',shipping_details:shipTo}:w);}
+    if(!dbErr){S.warrantyClaims=S.warrantyClaims.map(function(w){return w.id===claimId?{...w,ss_order_id:String(ssOrderId),status:'Shipped',shipping_details:shipTo}:w;});}
     document.getElementById('wty-ship-overlay')?.remove();
-    toast('✓ ShipStation order created — SS Order #'+ssOrderId,5000);
+    toast('✓ ShipStation order created — SS#'+ssOrderId+'. Inventory updated for '+claimItems.length+' item'+(claimItems.length!==1?'s':''),5000);
     render();
   }catch(err){
     if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='✗ Network error: '+err.message;}
