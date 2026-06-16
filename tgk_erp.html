@@ -525,6 +525,8 @@ const S = {
   mmSuggest:null, mmLoading:false,
   // Edge function live status
   fnStatus:null,
+  // Live activity feed — enriched events pushed by realtime handlers
+  liveActivity:[],
   // Custom standalone categories/vendors (persisted in settings table)
   customCats:{parts:[],assemblies:[]},
   customVendors:[],
@@ -745,6 +747,20 @@ async function loadAll(){
     (poLinesAll.data||[]).forEach(l=>{if(!S.poLines[l.po_id])S.poLines[l.po_id]=[];S.poLines[l.po_id].push(l);});
     S.poTracking={};
     (poTrackingAll.data||[]).forEach(t=>{if(!S.poTracking[t.po_id])S.poTracking[t.po_id]=[];S.poTracking[t.po_id].push(t);});
+    // Seed liveActivity from recent data on load (so feed is non-empty on first open)
+    S.liveActivity=[];
+    S.corrections.slice(0,20).forEach(c=>{
+      const icon={po_receipt:'📦',pack:'🔧',unpack:'↩',cycle_count:'📋',shipment:'🚚',manual:'✎'}[c.source]||'✎';
+      S.liveActivity.push({icon,type:'stock_movement',text:c.pn+' '+(c.adjustment>0?'+':'')+c.adjustment+' ('+fn(c.new_qty)+' on hand)',sub:c.reason||c.source,ts:c.created_at,cls:c.adjustment>0?'var(--green)':'var(--red)'});
+    });
+    S.sales.slice(0,15).forEach(s=>{
+      const fs=s.fulfillment_status||'Open';
+      const icon={Shipped:'📦',Delivered:'✅',Cancelled:'🚫','On Hold':'⏸',Open:'🛒'}[fs]||'🛒';
+      const cls={Shipped:'var(--teal)',Delivered:'var(--green)',Cancelled:'var(--red)','On Hold':'var(--yellow)',Open:'var(--teal)'}[fs]||'var(--teal)';
+      S.liveActivity.push({icon,type:'order',text:'#'+(s.order_number||'')+' '+fs,sub:s.pn+(s.qty>1?' ×'+s.qty:'')+(s.customer_name?' — '+s.customer_name:''),ts:s.sale_date,cls});
+    });
+    S.liveActivity.sort((a,b)=>new Date(b.ts||0)-new Date(a.ts||0));
+    S.liveActivity=S.liveActivity.slice(0,100);
     setSyncState('ok');
     updateBadge();
     render();
@@ -777,6 +793,7 @@ function setupRealtime(){
         if(!S.sales.find(s=>s.id===p.new.id)){
           S.sales=[p.new,...S.sales];
           showOrderAlert(p.new.order_number||'',p.new.pn||'');
+          pushActivity({icon:'🛒',type:'order',text:'New order #'+(p.new.order_number||''),sub:p.new.pn+(p.new.qty>1?' ×'+p.new.qty:'')+(p.new.customer_name?' — '+p.new.customer_name:''),ts:p.new.sale_date||new Date().toISOString(),cls:'var(--teal)'});
         }
       } else if(p.eventType==='UPDATE'){
         const prev=S.sales.find(s=>s.id===p.new.id);
@@ -785,6 +802,8 @@ function setupRealtime(){
         if(prev&&prev.fulfillment_status!==p.new.fulfillment_status){
           const statusEmoji={Shipped:'📦',Delivered:'✅',Cancelled:'🚫','On Hold':'⏸','Partial':'🔀',Refunded:'↩',Open:'🔓'}[p.new.fulfillment_status]||'🔄';
           toast(`${statusEmoji} #${p.new.order_number||''} → ${p.new.fulfillment_status}`,4000);
+          const cls={Shipped:'var(--teal)',Delivered:'var(--green)',Cancelled:'var(--red)','On Hold':'var(--yellow)',Partial:'var(--orange)'}[p.new.fulfillment_status]||'var(--text2)';
+          pushActivity({icon:statusEmoji,type:'order_status',text:'#'+(p.new.order_number||'')+' → '+p.new.fulfillment_status,sub:p.new.pn+(p.new.tracking_number?' · '+p.new.tracking_number:''),ts:new Date().toISOString(),cls});
           // Flash the row after next render
           setTimeout(()=>{
             const row=document.querySelector(`tr[data-order="${p.new.order_number}"]`);
@@ -798,8 +817,18 @@ function setupRealtime(){
       if(['sales','dashboard'].includes(S.view))scheduleRender();
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'purchases'},p=>{
-      if(p.eventType==='INSERT')S.purchases=[p.new,...S.purchases];
-      else if(p.eventType==='UPDATE')S.purchases=S.purchases.map(x=>x.id===p.new.id?p.new:x);
+      if(p.eventType==='INSERT'){
+        S.purchases=[p.new,...S.purchases];
+        pushActivity({icon:'📄',type:'po_created',text:'PO created — '+p.new.vendor,sub:(p.new.description||p.new.pn)+(p.new.status?' · '+p.new.status:''),ts:new Date().toISOString(),cls:'var(--orange)'});
+      } else if(p.eventType==='UPDATE'){
+        const prev=S.purchases.find(x=>x.id===p.new.id);
+        S.purchases=S.purchases.map(x=>x.id===p.new.id?p.new:x);
+        if(prev&&prev.status!==p.new.status){
+          const statusEmoji={Received:'✅','In Transit':'🚢',Ordered:'📋',Cancelled:'🚫',Draft:'📝','On Order':'📦',Partial:'🔀'}[p.new.status]||'🔄';
+          const cls={Received:'var(--teal)','In Transit':'var(--yellow)',Cancelled:'var(--red)','On Order':'var(--orange)'}[p.new.status]||'var(--text2)';
+          pushActivity({icon:statusEmoji,type:'po_status',text:'PO '+p.new.vendor+' → '+p.new.status,sub:p.new.description||p.new.pn,ts:new Date().toISOString(),cls});
+        }
+      }
       if(['purchases','dashboard'].includes(S.view))scheduleRender();
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'po_lines'},p=>{
@@ -817,6 +846,9 @@ function setupRealtime(){
     .on('postgres_changes',{event:'*',schema:'public',table:'inv_corrections'},p=>{
       if(p.eventType==='INSERT'){
         S.corrections=[p.new,...S.corrections].slice(0,1000);
+        const icon={po_receipt:'📦',pack:'🔧',unpack:'↩',cycle_count:'📋',shipment:'🚚',manual:'✎'}[p.new.source]||'✎';
+        const cls=p.new.adjustment>0?'var(--green)':'var(--red)';
+        pushActivity({icon,type:'stock_movement',text:p.new.pn+' '+(p.new.adjustment>0?'+':'')+p.new.adjustment+' ('+fn(p.new.new_qty)+' on hand)',sub:p.new.reason||p.new.source,ts:p.new.created_at,cls});
         if(S.view==='corrections')scheduleRender();
         // Silent — don't toast for every correction (too noisy with multiple users)
       }
@@ -990,6 +1022,20 @@ function carrierLabel(code){
 }
 
 function escHtml(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function timeAgo(ts){
+  if(!ts)return'';
+  const d=new Date(ts);if(isNaN(d))return'';
+  const sec=Math.floor((Date.now()-d)/1000);
+  if(sec<60)return'just now';
+  if(sec<3600)return Math.floor(sec/60)+'m ago';
+  if(sec<86400)return Math.floor(sec/3600)+'h ago';
+  if(sec<604800)return Math.floor(sec/86400)+'d ago';
+  return d.toLocaleDateString();
+}
+function pushActivity(evt){
+  S.liveActivity=[{...evt,ts:evt.ts||new Date().toISOString()},...S.liveActivity].slice(0,200);
+  if(S.view==='dashboard')scheduleRender();
+}
 
 // ── CATEGORY & VENDOR DROPDOWN BUILDERS ─────────────────────────────────
 function getCats(table){
@@ -1246,13 +1292,16 @@ function renderDashboard(){
   </div>
   <div>
     <div class="panel">
-      <div class="panel-title"><span class="panel-title-left">📋 Activity Feed</span><button class="btn btn-sm" onclick="nav('corrections')">Full Log →</button></div>
-      ${feed.map(e=>`<div class="margin-analysis-row" style="padding:7px 0">
-        <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:0">
-          <span style="flex-shrink:0">${e.icon}</span>
-          <span style="font-size:11px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${e.text}</span>
+      <div class="panel-title"><span class="panel-title-left">📋 Activity Feed <span style="font-size:9px;font-weight:400;color:var(--green);margin-left:6px">● LIVE</span></span><button class="btn btn-sm" onclick="nav('corrections')">Full Log →</button></div>
+      ${feed.map(e=>`<div class="margin-analysis-row" style="padding:6px 0;gap:8px">
+        <div style="display:flex;align-items:flex-start;gap:8px;flex:1;min-width:0">
+          <span style="flex-shrink:0;font-size:15px;line-height:1.2">${e.icon}</span>
+          <div style="min-width:0;flex:1">
+            <div style="font-size:11px;font-weight:600;color:${e.cls||'var(--text2)'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${e.text}</div>
+            ${e.sub?`<div style="font-size:10px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${e.sub}</div>`:''}
+          </div>
         </div>
-        <span style="font-size:9px;color:var(--text3);font-family:var(--mono);flex-shrink:0">${e.ts?new Date(e.ts).toLocaleDateString():''}</span>
+        <span style="font-size:9px;color:var(--text3);font-family:var(--mono);flex-shrink:0;white-space:nowrap">${timeAgo(e.ts)}</span>
       </div>`).join('')||'<div class="section-empty">No recent activity</div>'}
   <div style="text-align:right;padding:4px 8px"><button class="btn btn-sm" style="font-size:10px;color:var(--text3)" onclick="clearActivityFeed()">🗑 Clear feed</button></div>
     </div>
@@ -1785,6 +1834,9 @@ function renderPurchases(){
     <td onclick="event.stopPropagation()" style="display:flex;gap:4px;flex-wrap:nowrap">
       ${isPending?`<button class="btn btn-primary btn-sm" onclick="quickReceive('${p.id}')" title="Receive items">📦 Receive</button>`:''}
       ${isPending?`<button class="action-btn" onclick="quickAddTracking('${p.id}','${p.vendor.replace(/'/g,"\\'")}')" title="Add tracking number">${tracking.length?'🔗 +':'🔗 Track'}</button>`:''}
+      <select class="form-input" style="padding:3px 6px;font-size:10px;width:auto;border-radius:4px" onchange="updatePOStatus('${p.id}',this.value);this.blur()" onclick="event.stopPropagation()" title="Change PO status">
+        ${['Draft','Ordered','On Order','In Transit','Partial','Received','Cancelled'].map(s=>`<option value="${s}" ${p.status===s?'selected':''}>${s}</option>`).join('')}
+      </select>
       <button class="action-btn del" onclick="deletePO('${p.id}')">×</button>
     </td>
   </tr>`;}).join('')}
@@ -4551,9 +4603,14 @@ async function sendAI(){
 // MUTATIONS
 // ============================================================
 async function updatePOStatus(id,ns){
+  const prev=S.purchases.find(p=>p.id===id);
   const{error}=await db.from('purchases').update({status:ns,updated_at:new Date().toISOString()}).eq('id',id);
   if(error){toast('Error: '+error.message);return;}
   S.purchases=S.purchases.map(p=>p.id===id?{...p,status:ns}:p);
+  const po=S.purchases.find(p=>p.id===id);
+  const statusEmoji={Received:'✅','In Transit':'🚢',Ordered:'📋',Cancelled:'🚫',Draft:'📝','On Order':'📦',Partial:'🔀'}[ns]||'🔄';
+  const cls={Received:'var(--teal)','In Transit':'var(--yellow)',Cancelled:'var(--red)','On Order':'var(--orange)'}[ns]||'var(--text2)';
+  pushActivity({icon:statusEmoji,type:'po_status',text:'PO '+((po||prev)?.vendor||'')+' → '+ns,sub:((po||prev)?.description||(po||prev)?.pn)||'',ts:new Date().toISOString(),cls});
   toast(`PO → ${ns}`);render();
 }
 async function deletePO(id){
@@ -5897,12 +5954,54 @@ async function clearActivityFeed(){
 
 function buildActivityFeed(limit){
   const events=[];
-  S.corrections.slice(0,30).forEach(c=>events.push({ts:c.created_at,icon:c.source==='po_receipt'?'📦':c.source==='pack'?'🔧':c.source==='unpack'?'↩':c.source==='cycle_count'?'📋':c.source==='shipment'?'🚚':'✎',
-    text:c.pn+' '+(c.adjustment>0?'+':'')+c.adjustment+' — '+(c.reason||c.source),cls:c.adjustment>0?'var(--green)':'var(--red)'}));
-  S.sales.slice(0,15).forEach(s=>events.push({ts:s.sale_date,icon:'🛒',text:'Order '+(s.order_number||'')+' — '+s.pn+' ×'+(s.qty||1),cls:'var(--teal)'}));
-  S.purchases.slice(0,10).forEach(p=>events.push({ts:p.order_date,icon:'📄',text:'PO '+(p.vendor||'')+' — '+p.pn,cls:'var(--orange)'}));
-  events.sort((a,b)=>new Date(b.ts||0)-new Date(a.ts||0));
-  return events.slice(0,limit||12);
+  // 1. Live activity events (realtime-pushed, most recent first)
+  S.liveActivity.forEach(e=>events.push(e));
+
+  // 2. Recent inv_corrections (receipts, packs, counts, manual adjustments)
+  S.corrections.slice(0,40).forEach(c=>{
+    const src=c.source||'manual';
+    const icon={po_receipt:'📦',pack:'🔧',unpack:'↩',cycle_count:'📋',shipment:'🚚',manual:'✎'}[src]||'✎';
+    const cls=c.adjustment>0?'var(--green)':'var(--red)';
+    const label={po_receipt:'PO Receipt',pack:'Packed',unpack:'Unpacked',cycle_count:'Cycle Count',shipment:'Shipped',manual:'Adjustment'}[src]||src;
+    events.push({ts:c.created_at,icon,type:'stock_movement',
+      text:c.pn+' '+(c.adjustment>0?'+':'')+c.adjustment+' ('+fn(c.new_qty)+' on hand)',
+      sub:c.reason||(label+' · '+src),cls,isNew:false});
+  });
+
+  // 3. Recent sales orders (new orders + shipped)
+  const recentSales=[...S.sales].sort((a,b)=>new Date(b.sale_date||0)-new Date(a.sale_date||0)).slice(0,20);
+  recentSales.forEach(s=>{
+    const fs=s.fulfillment_status||'Open';
+    if(fs==='Shipped'||fs==='Delivered'){
+      events.push({ts:s.sale_date,icon:fs==='Delivered'?'✅':'📦',type:'order_status',
+        text:'#'+(s.order_number||'')+' '+fs,
+        sub:s.pn+(s.qty>1?' ×'+s.qty:'')+(s.customer_name?' — '+s.customer_name:''),
+        cls:fs==='Delivered'?'var(--green)':'var(--teal)'});
+    } else if(fs==='Open'||!fs){
+      events.push({ts:s.sale_date,icon:'🛒',type:'order',
+        text:'Order #'+(s.order_number||''),
+        sub:s.pn+(s.qty>1?' ×'+s.qty:'')+(s.customer_name?' — '+s.customer_name:''),
+        cls:'var(--teal)'});
+    }
+  });
+
+  // 4. Recent PO events
+  S.purchases.slice(0,15).forEach(p=>{
+    const icon={Received:'✅','In Transit':'🚢',Ordered:'📋',Draft:'📝','On Order':'📦'}[p.status]||'📄';
+    const cls={Received:'var(--teal)','In Transit':'var(--yellow)',Ordered:'var(--orange)'}[p.status]||'var(--text3)';
+    events.push({ts:p.order_date||p.updated_at,icon,type:'po',
+      text:'PO — '+p.vendor+(p.status?' · '+p.status:''),
+      sub:p.description||p.pn,cls});
+  });
+
+  // Dedupe by ts+text, sort by time, return top N
+  const seen=new Set();
+  const deduped=events.filter(e=>{
+    const k=(e.ts||'')+'|'+(e.text||'');
+    if(seen.has(k))return false;seen.add(k);return true;
+  });
+  deduped.sort((a,b)=>new Date(b.ts||0)-new Date(a.ts||0));
+  return deduped.slice(0,limit||12);
 }
 
 // ============================================================
@@ -6035,10 +6134,22 @@ function assemblyDossier(pn){
       <span class="pill ${w.status==='Open'?'pill-red':'pill-muted'}" style="font-size:9px">${w.status}</span></div>`).join('')}
     </div>
     <div class="panel" style="padding:0"><div class="section-header">Stock Movements</div>
-      ${corr.length===0?'<div class="section-empty">No recent movements</div>':corr.map(c=>`
-      <div class="check-row"><span style="font-size:10px;font-family:var(--mono);color:var(--text3)">${new Date(c.created_at).toLocaleDateString()}</span>
-      <span class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700;min-width:42px">${c.adjustment>0?'+':''}${c.adjustment}</span>
-      <span style="flex:1;font-size:11px;color:var(--text2)">${c.reason||c.source}</span></div>`).join('')}
+      ${corr.length===0?'<div class="section-empty">No recent movements</div>':corr.map(c=>{
+        const srcIcon={po_receipt:'📦',pack:'🔧',unpack:'↩',cycle_count:'📋',shipment:'🚚',manual:'✎'}[c.source]||'✎';
+        const srcLabel={po_receipt:'PO Receipt',pack:'Packed',unpack:'Unpacked',cycle_count:'Cycle Count',shipment:'Shipped',manual:'Adjustment'}[c.source]||c.source;
+        const poMatch=c.reason&&c.reason.match(/\[(.+?)\]/);const poVendorHint=poMatch?poMatch[1]:'';
+        return `<div class="check-row" style="gap:7px">
+          <span style="font-size:14px">${srcIcon}</span>
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:6px">
+              <span class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700;min-width:38px;font-size:12px">${c.adjustment>0?'+':''}${c.adjustment}</span>
+              <span style="font-size:10px;color:var(--text2)">${srcLabel}</span>
+              ${poVendorHint?`<span style="font-size:9px;background:var(--orange-dim);color:var(--orange);border-radius:3px;padding:1px 5px">${escHtml(poVendorHint)}</span>`:''}
+            </div>
+            <div style="font-size:9px;color:var(--text3)">→ ${c.new_qty} on hand</div>
+          </div>
+          <span style="font-size:9px;color:var(--text3);font-family:var(--mono)">${timeAgo(c.created_at)}</span>
+        </div>`;}).join('')}
     </div>
   </div></div>`;
 }
@@ -6075,18 +6186,46 @@ function partDossier(pn){
     </div>
     <div class="panel" style="padding:0"><div class="section-header">Incoming — Open POs (${openPOs.length+openLines.length})</div>
       ${openPOs.length===0&&openLines.length===0?'<div class="section-empty">Nothing on order</div>':[
-        ...openPOs.map(po=>`<div class="check-row"><span class="pn">${po.vendor}</span><span class="money-neutral">×${po.qty}</span><span style="flex:1"></span>${poPill(po.status)}</div>`),
-        ...openLines.map(l=>`<div class="check-row"><span style="font-size:11px;color:var(--text2)">PO line</span><span class="money-neutral">${l.qty_received}/${l.qty_ordered} recv</span></div>`)
+        ...openPOs.map(po=>`<div class="check-row" style="cursor:pointer" onclick="openPODetail('${po.id}');nav('purchases')">
+          <span class="pn" style="color:var(--orange)">${po.vendor}</span>
+          <span class="money-neutral">×${po.qty}</span>
+          ${po.order_date?`<span style="font-size:10px;color:var(--text3);font-family:var(--mono)">${po.order_date}</span>`:''}
+          <span style="flex:1"></span>${poPill(po.status)}
+        </div>`),
+        ...openLines.map(l=>{
+          const lpo=S.purchases.find(po=>po.id===l.po_id);
+          return `<div class="check-row" style="cursor:pointer" onclick="openPODetail('${l.po_id}');nav('purchases')">
+            <span class="pn" style="color:var(--orange)">${lpo?lpo.vendor:'PO'}</span>
+            <span style="font-size:10px;color:var(--text2)">${l.qty_received}/${l.qty_ordered} recv</span>
+            ${lpo?.order_date?`<span style="font-size:10px;color:var(--text3);font-family:var(--mono)">${lpo.order_date}</span>`:''}
+            <span style="flex:1"></span>${poPill(l.status)}
+          </div>`;
+        })
       ].join('')}
     </div>
   </div>
   <div>
     <div class="panel" style="padding:0"><div class="section-header">Stock Movement History</div>
-      ${corr.length===0?'<div class="section-empty">No movements logged</div>':corr.map(c=>`
-      <div class="check-row"><span style="font-size:10px;font-family:var(--mono);color:var(--text3)">${new Date(c.created_at).toLocaleDateString()}</span>
-      <span class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700;min-width:42px">${c.adjustment>0?'+':''}${c.adjustment}</span>
-      <span style="flex:1;font-size:11px;color:var(--text2)">${c.reason||c.source}</span>
-      <span class="pill pill-muted" style="font-size:8px">${c.source}</span></div>`).join('')}
+      ${corr.length===0?'<div class="section-empty">No movements logged</div>':corr.map(c=>{
+        const srcIcon={po_receipt:'📦',pack:'🔧',unpack:'↩',cycle_count:'📋',shipment:'🚚',manual:'✎'}[c.source]||'✎';
+        const srcLabel={po_receipt:'PO Receipt',pack:'Packed',unpack:'Unpacked',cycle_count:'Cycle Count',shipment:'Shipped',manual:'Adjustment'}[c.source]||c.source;
+        // Extract PO vendor from reason string like "PO Receipt [VendorName date]"
+        const poMatch=c.reason&&c.reason.match(/\[(.+?)\]/);
+        const poVendorHint=poMatch?poMatch[1]:'';
+        return `<div class="check-row" style="padding:7px 12px">
+          <span style="font-size:14px;line-height:1">${srcIcon}</span>
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:6px">
+              <span class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700;min-width:42px;font-size:12px">${c.adjustment>0?'+':''}${c.adjustment}</span>
+              <span style="font-size:10px;font-weight:600;color:var(--text2)">${srcLabel}</span>
+              ${poVendorHint?`<span style="font-size:9px;background:var(--orange-dim);color:var(--orange);border-radius:3px;padding:1px 5px">${escHtml(poVendorHint)}</span>`:''}
+            </div>
+            <div style="font-size:9px;color:var(--text3)">→ ${c.new_qty} on hand &nbsp;${c.reason&&c.reason!==srcLabel?'· '+escHtml(c.reason.replace(/\[.+?\]/,'').trim()):''}
+            </div>
+          </div>
+          <span style="font-size:9px;color:var(--text3);font-family:var(--mono);white-space:nowrap">${timeAgo(c.created_at)}</span>
+        </div>`;
+      }).join('')}
     </div>
   </div></div>`;
 }
@@ -6110,27 +6249,37 @@ function weeklySeries(pn, weeks){
 function statSuggest(p){
   const weeks=26;
   const series=weeklySeries(p.pn,weeks);
-  const n=series.length;
-  const avg=series.reduce((a,b)=>a+b,0)/n;
-  const sd=Math.sqrt(series.reduce((a,b)=>a+(b-avg)*(b-avg),0)/n);
+  // Primary demand: use live engine avgWk (handles BOM explosions + imported avg_sales_wk fallback)
+  const liveAvg=avgWk(p);
+  const seriesAvg=series.reduce((a,b)=>a+b,0)/weeks;
+  // Prefer live engine; if zero (no recent sales, no spreadsheet data), try series directly
+  const avg=liveAvg>0?liveAvg:(seriesAvg>0?seriesAvg:0);
+  // SD from series (variance around the live avg for accurate safety stock)
+  const sd=avg>0?Math.sqrt(series.reduce((a,b)=>a+(b-avg)*(b-avg),0)/weeks):0;
   const L=Math.max(1,p.lead_time_weeks||2);
-  const safety=Math.ceil(1.65*sd*Math.sqrt(L));          // ~95% service level
-  const min=Math.ceil(avg*L+safety);                      // reorder point
-  const max=Math.ceil(min+avg*(S.forecastWeeks||8));      // cover next cycle
-  return{min,max,safety,avg:+avg.toFixed(2),sd:+sd.toFixed(2)};
+  const safety=avg>0?Math.ceil(1.65*sd*Math.sqrt(L)):0;  // ~95% service level
+  const min=avg>0?Math.ceil(avg*L+safety):(p.min_qty||0);// reorder point
+  const max=avg>0?Math.ceil(min+avg*(S.forecastWeeks||8)):(p.max_qty||0); // cover next cycle
+  return{min,max,safety,avg:+avg.toFixed(3),sd:+sd.toFixed(3)};
 }
 
 async function aiSuggestMinMax(singlePn){
+  // Include parts with ANY demand signal: live sales, spreadsheet avg, or series data
   const tracked=singlePn
     ? S.parts.filter(p=>p.pn===singlePn)
-    : S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||weeklySeries(p.pn,12).some(x=>x>0)));
-  if(!tracked.length){toast('No items with sales history to analyze');return;}
+    : S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||(p.avg_sales_wk||0)>0||weeklySeries(p.pn,26).some(x=>x>0)));
+  if(!tracked.length){toast('No items with demand history to analyze');return;}
 
   // Statistical baseline for every item (always available)
   const base=tracked.map(p=>{
     const st=statSuggest(p);
-    return{pn:p.pn,curMin:p.min_qty||0,curMax:p.max_qty||0,curSafety:p.safety_stock||0,
-      lead:p.lead_time_weeks||2,onHand:p.total_unpckgd||0,...st,note:'Statistical: '+st.avg+'/wk avg, σ'+st.sd+', '+(p.lead_time_weeks||2)+'w lead'};
+    const importedAvg=p.avg_sales_wk||0;
+    // If both live and imported are 0, still include for AI with context
+    const effectiveAvg=st.avg>0?st.avg:importedAvg;
+    return{pn:p.pn,desc:p.description||'',curMin:p.min_qty||0,curMax:p.max_qty||0,curSafety:p.safety_stock||0,
+      lead:p.lead_time_weeks||2,onHand:p.total_unpckgd||0,moq:p.moq||0,importedAvg,...st,
+      avg:effectiveAvg>0?+effectiveAvg.toFixed(3):st.avg,
+      note:st.avg>0?('Live: '+st.avg+'/wk avg, σ'+st.sd+', '+(p.lead_time_weeks||2)+'w lead'):importedAvg>0?('Spreadsheet avg: '+importedAvg+'/wk'):'No sales data'};
   });
 
   const apiKey=S.settings.anthropic_api_key||'';
@@ -6147,11 +6296,11 @@ async function aiSuggestMinMax(singlePn){
   try{
     for(let i=0;i<base.length;i+=chunkSize){
       const chunk=base.slice(i,i+chunkSize);
-      const lines=chunk.map(b=>b.pn+' | avg/wk:'+b.avg+' | stdev:'+b.sd+' | lead:'+b.lead+'w | onhand:'+b.onHand+' | statMin:'+b.min+' | statMax:'+b.max).join('\n');
-      const prompt='You are an inventory planning expert for a motorsport parts manufacturer. For each part below, recommend min_qty (reorder point) and max_qty (order-up-to level) and safety_stock. The statistical baseline (95% service) is given; adjust it with judgment: round to sensible order quantities, raise mins for volatile items (high stdev vs avg), keep slow movers lean. Respond with ONLY a JSON array, no markdown: [{"pn":"...","min":N,"max":N,"safety":N,"note":"max 8 words"}]\n\nPARTS:\n'+lines;
+      const lines=chunk.map(b=>b.pn+(b.desc?' ('+b.desc.slice(0,30)+')':'')+' | avg/wk:'+b.avg+' | stdev:'+b.sd+' | lead:'+b.lead+'w | moq:'+b.moq+' | onhand:'+b.onHand+' | curMin:'+b.curMin+' | curMax:'+b.curMax+' | statMin:'+b.min+' | statMax:'+b.max).join('\n');
+      const prompt='You are an inventory planning expert for a motorsport parts manufacturer. For each part below, recommend min_qty (reorder point) and max_qty (order-up-to level) and safety_stock. The statistical baseline (95% service) is given as statMin/statMax; adjust with judgment: round to sensible order quantities (respect MOQ), raise mins for volatile items (high stdev vs avg), keep slow movers lean, raise if curMin/curMax was already higher (may reflect business rules). Respond with ONLY a JSON array, no markdown: [{"pn":"...","min":N,"max":N,"safety":N,"note":"max 8 words"}]\n\nPARTS:\n'+lines;
       let data=null;
       for(let attempt=0;attempt<3;attempt++){
-        const res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:4000,messages:[{role:'user',content:prompt}]})});
+        const res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:4000,messages:[{role:'user',content:prompt}]})});
         data=await res.json();
         if(data.error&&data.error.type==='overloaded_error'&&attempt<2){await new Promise(r=>setTimeout(r,(attempt+1)*2000));continue;}
         break;
@@ -6210,12 +6359,14 @@ function renderMMReview(){
     +'<div class="panel-title"><span>✨ Suggested Min/Max — Review &amp; Apply ('+list.length+')</span>'
     +'<div style="display:flex;gap:8px"><button class="btn btn-primary btn-sm" onclick="applyMMSuggestions()">Apply All</button>'
     +'<button class="btn btn-sm" onclick="S.mmSuggest=null;render()">Dismiss</button></div></div>'
-    +'<div class="tbl-wrap" style="max-height:340px;overflow-y:auto"><table><thead><tr><th>Part #</th><th>Avg/Wk</th><th>Min (cur → new)</th><th>Max (cur → new)</th><th>Safety</th><th>Rationale</th><th></th></tr></thead><tbody>'
+    +'<div class="tbl-wrap" style="max-height:340px;overflow-y:auto"><table><thead><tr><th>Part #</th><th>Avg/Wk</th><th>Source</th><th>Min (cur → new)</th><th>Max (cur → new)</th><th>Safety</th><th>Rationale</th><th></th></tr></thead><tbody>'
     +list.map(function(s){
       const minChg=s.min!==s.curMin, maxChg=s.max!==s.curMax;
+      const demandSrc=s.importedAvg>0&&s.avg<=s.importedAvg?'📋 Spreadsheet':s.avg>0?'📊 Live':'—';
       return '<tr>'
       +'<td class="pn">'+s.pn+'</td>'
       +'<td class="money-neutral">'+s.avg+'</td>'
+      +'<td style="font-size:9px;color:var(--text3)">'+demandSrc+'</td>'
       +'<td><span style="color:var(--text3);font-family:var(--mono);font-size:11px">'+s.curMin+'</span> <span style="color:var(--text3)">→</span> <span class="money" style="font-weight:700;color:'+(minChg?'var(--teal)':'var(--text3)')+'">'+s.min+'</span></td>'
       +'<td><span style="color:var(--text3);font-family:var(--mono);font-size:11px">'+s.curMax+'</span> <span style="color:var(--text3)">→</span> <span class="money" style="font-weight:700;color:'+(maxChg?'var(--teal)':'var(--text3)')+'">'+s.max+'</span></td>'
       +'<td class="money-neutral">'+s.safety+'</td>'
@@ -6933,6 +7084,12 @@ function renderPODetail(po) {
     ${!allDone?`<button class="btn btn-primary" onclick="receiveAllLines('${po.id}')">✓ Receive All</button>`:''}
     <button class="btn btn-teal" onclick="openAddPOLine('${po.id}')">+ Add Line</button>
   </div>
+  <div class="panel" style="padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+    <span style="font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--text3)">Update Status:</span>
+    ${['Draft','Ordered','On Order','In Transit','Partial','Received','Cancelled'].map(s=>`
+      <button class="btn btn-sm ${po.status===s?'btn-primary':''}" style="${po.status===s?'':'opacity:.7'}" onclick="updatePOStatus('${po.id}','${s}')">${s}</button>`).join('')}
+    <span style="margin-left:auto;font-size:10px;color:var(--text3)">PO ID: <span style="font-family:var(--mono)">${po.id}</span></span>
+  </div>
   <div class="kpi-grid kpi-grid-3" style="margin-bottom:16px">
     <div class="kpi"><div class="kpi-label">Lines</div><div class="kpi-value">${lines.length}</div></div>
     <div class="kpi kpi-orange"><div class="kpi-label">Ordered Value</div><div class="kpi-value" style="font-size:16px">${fc(totalOrdered)}</div></div>
@@ -7004,7 +7161,9 @@ async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
     undoOps.push({action:'update',table:'parts',data:{...part,total_unpckgd:newQty},prev:{...part}});
     await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
     S.parts = S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
-    const reason='PO Receipt'+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' ('+remaining+' auto-backordered)':'')+(note?' — '+note:'');
+    const po=S.purchases.find(p=>p.id===poId);
+    const poRef=po?(' ['+po.vendor+(po.order_date?' '+po.order_date:'')+']'):'';
+    const reason='PO Receipt'+poRef+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' ('+remaining+' auto-backordered)':'')+(note?' — '+note:'');
     const {data:corrRow}=await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,source:'po_receipt'}).select().single();
     if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
     S.corrections = [{pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,source:'po_receipt',created_at:new Date().toISOString()},...S.corrections];
@@ -7139,7 +7298,9 @@ async function checkInLineQuick(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived
     const newQty = (part.total_unpckgd||0)+qty;
     await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
     S.parts=S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
-    await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason:'PO Receipt — Bulk',source:'po_receipt'});
+    const po=S.purchases.find(p=>p.id===poId);
+    const poRef=po?(' ['+po.vendor+(po.order_date?' '+po.order_date:'')+']'):'';
+    await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason:'PO Receipt — Bulk'+poRef,source:'po_receipt'});
   }
   if(S.poLines[poId]) S.poLines[poId]=S.poLines[poId].map(l=>l.id===lineId?{...l,qty_received:newReceived,status:'Complete'}:l);
 }
@@ -8359,12 +8520,13 @@ function renderCorrections() {
   if(sf.source) list=list.filter(c=>(c.source||'manual')===sf.source);
   // Fixed source chips with friendly labels — always shown regardless of data
   const fixedSources=[
-    {key:'manual',label:'Manual'},
-    {key:'cycle_count',label:'Cycle Count'},
-    {key:'pack',label:'Pack / Build'},
-    {key:'unship',label:'Un-ship'},
-    {key:'return',label:'Return'},
-    {key:'shopify',label:'Shopify'},
+    {key:'manual',label:'✎ Manual'},
+    {key:'cycle_count',label:'📋 Cycle Count'},
+    {key:'po_receipt',label:'📦 PO Receipt'},
+    {key:'pack',label:'🔧 Pack / Build'},
+    {key:'unship',label:'↩ Un-ship'},
+    {key:'return',label:'↩ Return'},
+    {key:'shopify',label:'🛒 Shopify'},
   ];
   // Also pick up any sources in the data not covered by fixedSources
   const dataSources=[...new Set(S.corrections.map(c=>c.source||'manual'))];
@@ -8379,17 +8541,22 @@ function renderCorrections() {
     <span class="filter-count">${list.length} records</span>
   </div>
   <div class="tbl-wrap">
-  <table><thead><tr><th>Date</th><th>Part #</th><th>Previous</th><th>New Qty</th><th>Adjustment</th><th>Source</th><th>Reason</th><th></th></tr></thead><tbody>
-  ${list.map(c=>`<tr>
-    <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${new Date(c.created_at).toLocaleString()}</td>
-    <td class="pn" style="color:var(--text)">${c.pn}</td>
+  <table><thead><tr><th>Date</th><th>Part #</th><th>Adj</th><th>Previous</th><th>New Qty</th><th>Source</th><th>Reason / Reference</th><th></th></tr></thead><tbody>
+  ${list.map(c=>{
+    const srcIcon={po_receipt:'📦',pack:'🔧',unpack:'↩',cycle_count:'📋',shipment:'🚚',manual:'✎'}[c.source||'manual']||'✎';
+    const poMatch=c.reason&&c.reason.match(/\[(.+?)\]/);
+    const poRef=poMatch?`<span style="font-size:9px;background:var(--orange-dim);color:var(--orange);border:1px solid rgba(234,88,12,.2);border-radius:3px;padding:1px 5px;margin-left:4px">${escHtml(poMatch[1])}</span>`:'';
+    const cleanReason=c.reason?(c.reason.replace(/\[.+?\]/,'').trim()):'';
+    return `<tr>
+    <td style="font-size:10px;color:var(--text3);font-family:var(--mono);white-space:nowrap">${timeAgo(c.created_at)}<br><span style="font-size:8px">${new Date(c.created_at).toLocaleString()}</span></td>
+    <td class="pn" style="color:var(--text);cursor:pointer" onclick="lookupGo('part','${escHtml(c.pn)}')">${escHtml(c.pn)}</td>
+    <td class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700;font-size:13px">${c.adjustment>0?'+':''}${c.adjustment}</td>
     <td class="money-neutral">${c.previous_qty}</td>
     <td class="money-neutral">${c.new_qty}</td>
-    <td class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700">${c.adjustment>0?'+':''}${c.adjustment}</td>
-    <td><span class="pill pill-muted" style="font-size:9px">${c.source||'manual'}</span></td>
-    <td style="font-size:11px;color:var(--text2)">${c.reason||''}</td>
+    <td><span style="font-size:15px">${srcIcon}</span> <span class="pill pill-muted" style="font-size:9px">${c.source||'manual'}</span></td>
+    <td style="font-size:11px;color:var(--text2)">${escHtml(cleanReason)}${poRef}</td>
     <td><button class="action-btn del" title="Delete this entry" onclick="deleteCorrection('${c.id}')">×</button></td>
-  </tr>`).join('')}
+  </tr>`;}).join('')}
   </tbody></table></div>`;
 }
 
