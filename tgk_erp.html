@@ -386,7 +386,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 
     <div class="sidebar-section">Operations</div>
     <button class="nav-item" id="nav-planning" onclick="nav('planning')"><span class="nav-dot"></span>Inv. Planning</button>
-    <button class="nav-item" id="nav-inventory" onclick="nav('inventory')"><span class="nav-dot"></span>Inventory<span class="nav-badge" id="low-badge" style="display:none">0</span></button>
+    <button class="nav-item" id="nav-inventory" onclick="nav('inventory')"><span class="nav-dot"></span>Inventory</button>
     <button class="nav-item" id="nav-packqueue" onclick="nav('packqueue')"><span class="nav-dot"></span>Production</button>
     <button class="nav-item" id="nav-purchases" onclick="nav('purchases')"><span class="nav-dot"></span>Purchase Orders</button>
     <button class="nav-item" id="nav-vendors" onclick="nav('vendors')"><span class="nav-dot"></span>Vendors</button>
@@ -494,6 +494,8 @@ const S = {
   aiHistory:[{role:'assistant',text:'Hi — I\'m your TGK ERP assistant. Ask me about inventory levels, what needs reordering, BOM analysis, or pack planning.'}],
   aiLoading:false,
   undoStack:[], backups:[], lastBackup:null, autoBackupTimer:null,
+  backupTableOk:null, // null=unknown, true=exists, false=missing
+  backupError:null,   // last error string if backup failed
   // Planning
   forecastWeeks:8,
   // PO check-in
@@ -663,12 +665,6 @@ function setSyncState(state){
 }
 
 function updateBadge(){
-  const cnt=S.parts.filter(p=>avgWk(p)>0&&wks(p)!==null&&wks(p)<4).length;
-  const b=$('low-badge');
-  if(!b)return;
-  b.textContent=cnt;b.style.display=cnt?'inline':'none';
-  const navEl=$('nav-inventory');
-  if(navEl){navEl.classList.toggle('alert-nav',cnt>0);}
   // Customer Resolution badge (warranty Open + shipment errors Open)
   const openW=S.warrantyClaims.filter(w=>w.status==='Open').length;
   const openSE=(S.shipmentErrors||[]).filter(e=>e.status==='Open').length;
@@ -677,6 +673,10 @@ function updateBadge(){
   if(wb){wb.textContent=totalOpen;wb.style.display=totalOpen?'inline':'none';}
   const wEl=$('nav-warranty');
   if(wEl){wEl.classList.toggle('alert-nav',totalOpen>0);}
+  // Sales badge — open orders
+  const openSales=S.sales.filter(s=>!s.fulfillment_status||s.fulfillment_status==='Open').length;
+  const sb=$('sales-badge');
+  if(sb){sb.textContent=openSales;sb.style.display=openSales>0?'inline':'none';}
 }
 
 // ============================================================
@@ -6011,11 +6011,39 @@ async function createBackup(label) {
   const {error} = await db.from('backups').insert({label:lbl, data});
   if(!error) {
     S.lastBackup = new Date();
-    toast('Backup saved: ' + lbl);
+    S.backupTableOk = true;
+    S.backupError = null;
+    // Update sidebar footer backup time
+    const el = document.getElementById('backup-ts');
+    if(el) el.textContent = 'Backed up ' + timeAgo(S.lastBackup);
+    if(!label || label.startsWith('Auto')) {} else toast('✅ Backup saved: ' + lbl);
     if(S.view==='backups') loadBackups().then(render);
   } else {
-    toast('Backup failed — run the backups SQL first');
+    S.backupError = error.message || String(error);
+    // Detect missing table (Postgres code 42P01 or message contains "does not exist")
+    const isMissingTable = S.backupError.includes('42P01') || S.backupError.includes('does not exist') || S.backupError.includes('relation') || error.code === '42P01';
+    if(isMissingTable){
+      S.backupTableOk = false;
+      if(S.view==='backups') render();
+      else toast('⚠ Backups table not set up — go to Backups page for the SQL', 6000);
+    } else {
+      toast('Backup failed: ' + S.backupError, 5000);
+      if(S.view==='backups') render();
+    }
   }
+}
+
+async function checkBackupTable(){
+  // Quick probe — list with limit 0 to test table existence
+  const {error} = await db.from('backups').select('id').limit(1);
+  if(!error){
+    S.backupTableOk = true;
+  } else {
+    const msg = error.message || String(error);
+    S.backupTableOk = !(msg.includes('does not exist') || msg.includes('42P01') || msg.includes('relation'));
+    if(!S.backupTableOk) S.backupError = 'Table not found';
+  }
+  return S.backupTableOk;
 }
 
 async function loadBackups() {
@@ -6056,9 +6084,18 @@ function downloadBackup() {
   toast('Backup downloaded');
 }
 
-function startAutoBackup() {
+async function startAutoBackup() {
   if(S.autoBackupTimer) clearInterval(S.autoBackupTimer);
-  S.autoBackupTimer = setInterval(()=>createBackup('Auto'), 30*60*1000);
+  // Check table exists before scheduling
+  const ok = await checkBackupTable();
+  if(ok){
+    // Run one initial backup after 2 minutes, then every 30 min
+    setTimeout(()=>createBackup('Auto'), 2 * 60 * 1000);
+    S.autoBackupTimer = setInterval(()=>createBackup('Auto'), 30 * 60 * 1000);
+  }
+  // Update sidebar status regardless
+  const el = document.getElementById('backup-ts');
+  if(el) el.textContent = ok ? 'Auto-backup ready' : '⚠ Backups not set up';
 }
 
 // ============================================================
