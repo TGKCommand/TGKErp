@@ -405,6 +405,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 
     <div class="sidebar-section">Tools</div>
     <button class="nav-item" id="nav-ai" onclick="nav('ai')"><span class="nav-dot"></span>AI Assistant</button>
+    <button class="nav-item" id="nav-reports" onclick="nav('reports')"><span class="nav-dot"></span>Reports &amp; Export</button>
     <button class="nav-item" id="nav-integrations" onclick="nav('integrations')"><span class="nav-dot"></span>Integrations</button>
     <button class="nav-item" id="nav-import" onclick="nav('import')"><span class="nav-dot"></span>Import Data</button>
     <button class="nav-item" id="nav-backups" onclick="nav('backups')"><span class="nav-dot"></span>Backups</button>
@@ -527,6 +528,8 @@ const S = {
   fnStatus:null,
   // Live activity feed — enriched events pushed by realtime handlers
   liveActivity:[],
+  // Reports state
+  rptState:{sel:null,dateRange:'all',from:'',to:'',preview:null},
   // Custom standalone categories/vendors (persisted in settings table)
   customCats:{parts:[],assemblies:[]},
   customVendors:[],
@@ -896,10 +899,10 @@ function setupRealtime(){
 // ============================================================
 // NAV
 // ============================================================
-const PAGE_TITLES={dashboard:'Dashboard',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',planning:'Inventory Planning',purchases:'Purchase Orders',vendors:'Vendors',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Corrections Log',warranty:'Customer Resolution',import:'Import Data',pobuilder:'PO Builder'};
+const PAGE_TITLES={dashboard:'Dashboard',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',planning:'Inventory Planning',purchases:'Purchase Orders',vendors:'Vendors',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Corrections Log',warranty:'Customer Resolution',import:'Import Data',pobuilder:'PO Builder',reports:'Reports & Export'};
 
 function nav(v){
-  if(v!==S.view){S.activePO=null;S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.parentBuild=null;S.parentBuildQty=null;S.activeCount=null;if(v!=='packqueue')S.workOrderMode=false;S.searchQ='';}
+  if(v!==S.view){S.activePO=null;S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.parentBuild=null;S.parentBuildQty=null;S.activeCount=null;if(v!=='packqueue')S.workOrderMode=false;S.searchQ='';if(S.view==='reports')S.rptState={...S.rptState,preview:null};}
   S.view=v;
   document.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
   const el=$('nav-'+v);if(el)el.classList.add('active');
@@ -6058,6 +6061,515 @@ function startAutoBackup() {
   S.autoBackupTimer = setInterval(()=>createBackup('Auto'), 30*60*1000);
 }
 
+// ============================================================
+// REPORTS & EXPORT
+// ============================================================
+const REPORT_DEFS = [
+  // ── SALES ──
+  {id:'sales_orders',     cat:'Sales',     label:'Sales Orders',           icon:'🛒', desc:'All orders with status, customer, SKU, qty, dates'},
+  {id:'sales_shipped',    cat:'Sales',     label:'Shipped Orders',         icon:'📦', desc:'Fulfilled orders with tracking and ship date'},
+  {id:'sales_by_sku',     cat:'Sales',     label:'Revenue by SKU',         icon:'📊', desc:'Total units and revenue per product'},
+  {id:'sales_by_month',   cat:'Sales',     label:'Revenue by Month',       icon:'📅', desc:'Monthly order count, units and revenue'},
+  {id:'sales_by_customer',cat:'Sales',     label:'Revenue by Customer',    icon:'👤', desc:'Top customers ranked by spend'},
+  {id:'sales_by_dealer',  cat:'Sales',     label:'Dealer Sales',           icon:'🏪', desc:'Orders from dealer accounts'},
+  {id:'sales_open',       cat:'Sales',     label:'Open / Unfulfilled',     icon:'⏳', desc:'Orders still pending fulfillment'},
+  {id:'sales_on_hold',    cat:'Sales',     label:'On Hold Orders',         icon:'⏸', desc:'All orders in On Hold status'},
+  // ── INVENTORY ──
+  {id:'inv_snapshot',     cat:'Inventory', label:'Inventory Snapshot',     icon:'📋', desc:'All parts with current stock, cost, value'},
+  {id:'inv_valuation',    cat:'Inventory', label:'Inventory Valuation',    icon:'💰', desc:'Parts valued at cost — total asset value'},
+  {id:'inv_reorder',      cat:'Inventory', label:'Reorder Alerts',         icon:'⚠',  desc:'Parts at or below reorder point'},
+  {id:'inv_overstock',    cat:'Inventory', label:'Overstock Report',       icon:'↑',  desc:'Parts above max_qty threshold'},
+  {id:'inv_movements',    cat:'Inventory', label:'Stock Movements',        icon:'↕',  desc:'All inventory corrections and adjustments'},
+  {id:'inv_receipts',     cat:'Inventory', label:'PO Receipts',            icon:'📦', desc:'Parts received from purchase orders'},
+  {id:'inv_velocity',     cat:'Inventory', label:'Inventory Velocity',     icon:'⚡', desc:'Parts ranked by weekly demand rate'},
+  {id:'assemblies_stock', cat:'Inventory', label:'Assemblies On-Hand',     icon:'🔧', desc:'Finished goods and subassembly stock levels'},
+  // ── PURCHASING ──
+  {id:'po_all',           cat:'Purchasing',label:'All Purchase Orders',    icon:'📄', desc:'Complete PO history with status, vendor, total'},
+  {id:'po_open',          cat:'Purchasing',label:'Open Purchase Orders',   icon:'🔓', desc:'POs not yet fully received'},
+  {id:'po_draft',         cat:'Purchasing',label:'Draft POs',              icon:'📝', desc:'Drafts awaiting approval'},
+  {id:'po_received',      cat:'Purchasing',label:'Received POs',           icon:'✅', desc:'Completed POs with received values'},
+  {id:'po_by_vendor',     cat:'Purchasing',label:'Spend by Vendor',        icon:'💳', desc:'Total spend and PO count per vendor'},
+  {id:'po_lines',         cat:'Purchasing',label:'PO Line Items',          icon:'📋', desc:'Every line item across all POs with receipt status'},
+  // ── PARTS ──
+  {id:'parts_catalog',    cat:'Parts',     label:'Parts Catalog',          icon:'📦', desc:'All parts with cost, vendor, lead time, MOQ'},
+  {id:'parts_vendor',     cat:'Parts',     label:'Parts by Vendor',        icon:'🏭', desc:'Parts grouped by supplier'},
+  {id:'parts_pricing',    cat:'Parts',     label:'Price Breaks',           icon:'💲', desc:'Parts with tiered pricing breaks'},
+  {id:'bom_detail',       cat:'Parts',     label:'BOM Detail',             icon:'🔩', desc:'Full bill of materials for all assemblies'},
+  {id:'bom_cost_rollup',  cat:'Parts',     label:'BOM Cost Rollup',        icon:'🧮', desc:'Component costs rolled up per finished good'},
+  // ── CYCLE COUNTS ──
+  {id:'cycle_counts',     cat:'Counts',    label:'Cycle Count History',    icon:'📋', desc:'All count sessions with results and variances'},
+  {id:'corrections_log',  cat:'Counts',    label:'Corrections Log',        icon:'✎',  desc:'All manual and system stock adjustments'},
+  // ── WARRANTY ──
+  {id:'warranty_claims',  cat:'Warranty',  label:'Warranty Claims',        icon:'🔄', desc:'All warranty claims with status and resolution'},
+];
+
+function renderReports(){
+  const rs=S.rptState||{};
+  const selId=rs.sel||null;
+  const def=selId?REPORT_DEFS.find(d=>d.id===selId):null;
+  const cats=[...new Set(REPORT_DEFS.map(d=>d.cat))];
+
+  // Build report selector panel
+  const selectorHtml=cats.map(cat=>{
+    const items=REPORT_DEFS.filter(d=>d.cat===cat);
+    return `<div style="margin-bottom:14px">
+      <div style="font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text3);margin-bottom:6px">${cat}</div>
+      ${items.map(d=>`<button onclick="S.rptState={...S.rptState,sel:'${d.id}',preview:null};render()" style="display:flex;align-items:center;gap:8px;width:100%;padding:8px 10px;border-radius:6px;border:1px solid ${selId===d.id?'rgba(13,148,136,.35)':'transparent'};background:${selId===d.id?'var(--teal-dim)':'transparent'};cursor:pointer;text-align:left;transition:all .12s;margin-bottom:2px" onmouseenter="if('${d.id}'!=='${selId||''}')this.style.background='var(--bg3)'" onmouseleave="if('${d.id}'!=='${selId||''}')this.style.background='transparent'">
+        <span style="font-size:16px;flex-shrink:0">${d.icon}</span>
+        <div style="min-width:0">
+          <div style="font-size:12px;font-weight:${selId===d.id?'700':'500'};color:${selId===d.id?'var(--teal)':'var(--text2)'}">${d.label}</div>
+          <div style="font-size:10px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${d.desc}</div>
+        </div>
+      </button>`).join('')}
+    </div>`;
+  }).join('');
+
+  // If no report selected show welcome
+  if(!def){
+    return `<div style="display:grid;grid-template-columns:260px 1fr;gap:18px;height:calc(100vh - 100px);min-height:500px">
+      <div style="overflow-y:auto;padding-right:4px">${selectorHtml}</div>
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:var(--bg2);border:1px solid var(--border);border-radius:10px">
+        <div style="font-size:40px">📊</div>
+        <div style="font-size:15px;font-weight:700;color:var(--text2)">Pick a report from the left</div>
+        <div style="font-size:12px;color:var(--text3);text-align:center;max-width:320px">${REPORT_DEFS.length} built-in reports across Sales, Inventory, Purchasing, and more. Export to Excel or CSV with custom date ranges.</div>
+      </div>
+    </div>`;
+  }
+
+  // Date range picker
+  const dr=rs.dateRange||'all';
+  const customFrom=rs.from||'';
+  const customTo=rs.to||'';
+  const now=new Date();
+  const DATE_PRESETS=[
+    {key:'all',label:'All Time'},
+    {key:'today',label:'Today'},
+    {key:'7d',label:'Last 7 days'},
+    {key:'30d',label:'Last 30 days'},
+    {key:'90d',label:'Last 90 days'},
+    {key:'ytd',label:'Year to Date'},
+    {key:'thismonth',label:'This Month'},
+    {key:'lastmonth',label:'Last Month'},
+    {key:'custom',label:'Custom Range'},
+  ];
+  const salesCats=['Sales','Inventory','Counts','Warranty'];
+  const hasDates=['sales_orders','sales_shipped','sales_by_sku','sales_by_month','sales_by_customer','sales_by_dealer','sales_open','sales_on_hold','inv_movements','inv_receipts','cycle_counts','corrections_log','warranty_claims','po_all','po_open','po_draft','po_received','po_by_vendor','po_lines'].includes(def.id);
+
+  // Generate preview rows
+  const preview=rs.preview;
+  const rows=preview||buildReportRows(def.id,dr,customFrom,customTo);
+  if(!rs.preview){S.rptState={...S.rptState,preview:rows};}
+
+  const hasRows=rows&&rows.data&&rows.data.length>0;
+  const previewData=hasRows?rows.data.slice(0,50):[];
+  const cols=hasRows?rows.cols:[];
+
+  return `<div style="display:grid;grid-template-columns:260px 1fr;gap:18px;min-height:500px;align-items:start">
+    <div style="overflow-y:auto;max-height:calc(100vh - 100px);padding-right:4px;position:sticky;top:0">${selectorHtml}</div>
+    <div>
+      <!-- Header -->
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:16px 20px;margin-bottom:14px">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+          <span style="font-size:26px">${def.icon}</span>
+          <div style="flex:1">
+            <div style="font-size:16px;font-weight:700;color:var(--text)">${def.label}</div>
+            <div style="font-size:11px;color:var(--text3)">${def.desc}</div>
+          </div>
+          ${hasRows?`<div style="font-size:11px;color:var(--text3)">${rows.data.length.toLocaleString()} rows</div>`:''}
+          <button class="btn btn-teal" onclick="runExport('csv','${def.id}','${dr}','${customFrom}','${customTo}')">⬇ CSV</button>
+          <button class="btn btn-primary" onclick="runExport('xlsx','${def.id}','${dr}','${customFrom}','${customTo}')">⬇ Excel</button>
+        </div>
+        ${hasDates?`<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <span style="font-size:11px;color:var(--text3)">Range:</span>
+          ${DATE_PRESETS.map(p=>`<button class="filter-chip ${dr===p.key?'on-teal':''}" onclick="S.rptState={...S.rptState,dateRange:'${p.key}',preview:null};render()">${p.label}</button>`).join('')}
+          ${dr==='custom'?`<input type="date" class="form-input" style="width:130px;padding:4px 8px;font-size:11px" value="${customFrom}" onchange="S.rptState={...S.rptState,from:this.value,preview:null};render()">
+          <span style="color:var(--text3)">→</span>
+          <input type="date" class="form-input" style="width:130px;padding:4px 8px;font-size:11px" value="${customTo||new Date().toISOString().slice(0,10)}" onchange="S.rptState={...S.rptState,to:this.value,preview:null};render()">
+          <button class="btn btn-teal btn-sm" onclick="S.rptState={...S.rptState,preview:null};render()">Apply</button>`:''}
+        </div>`:''}
+      </div>
+
+      <!-- Preview table -->
+      ${!hasRows?`<div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:48px;text-align:center;color:var(--text3)">No data for this report with the current filters</div>`:`
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden">
+        <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:11px;color:var(--text3)">Preview — first ${Math.min(50,rows.data.length)} of ${rows.data.length.toLocaleString()} rows</span>
+          <span style="font-size:11px;color:var(--teal);font-weight:600">Export includes all rows</span>
+        </div>
+        <div class="tbl-wrap" style="max-height:calc(100vh - 340px);overflow-y:auto">
+        <table><thead class="sticky-header"><tr>${cols.map(c=>`<th style="white-space:nowrap">${c}</th>`).join('')}</tr></thead><tbody>
+        ${previewData.map(row=>`<tr>${cols.map(c=>{
+          const v=row[c];
+          const isNum=typeof v==='number';
+          const isMoney=typeof c==='string'&&(c.includes('$')||c.toLowerCase().includes('revenue')||c.toLowerCase().includes('cost')||c.toLowerCase().includes('value')||c.toLowerCase().includes('price')||c.toLowerCase().includes('extended')||c.toLowerCase().includes('spend'));
+          return `<td style="white-space:nowrap;${isNum?'text-align:right;font-family:var(--mono);font-size:11px':'font-size:11px'}">${v===null||v===undefined?'<span style="color:var(--text3)">—</span>':isMoney&&isNum?'<span class="money-cost">'+fc(v)+'</span>':escHtml(String(v))}</td>`;
+        }).join('')}</tr>`).join('')}
+        </tbody></table></div>
+      </div>`}
+    </div>
+  </div>`;
+}
+
+function getDateRange(preset, customFrom, customTo){
+  const now=new Date();
+  if(preset==='all')return{from:null,to:null};
+  if(preset==='today'){const d=now.toISOString().slice(0,10);return{from:d,to:d};}
+  if(preset==='7d')return{from:daysAgo(7),to:now.toISOString().slice(0,10)};
+  if(preset==='30d')return{from:daysAgo(30),to:now.toISOString().slice(0,10)};
+  if(preset==='90d')return{from:daysAgo(90),to:now.toISOString().slice(0,10)};
+  if(preset==='ytd'){const y=now.getFullYear();return{from:y+'-01-01',to:now.toISOString().slice(0,10)};}
+  if(preset==='thismonth'){const y=now.getFullYear(),m=String(now.getMonth()+1).padStart(2,'0');return{from:y+'-'+m+'-01',to:now.toISOString().slice(0,10)};}
+  if(preset==='lastmonth'){const d=new Date(now.getFullYear(),now.getMonth()-1,1);const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0');const last=new Date(now.getFullYear(),now.getMonth(),0).toISOString().slice(0,10);return{from:y+'-'+m+'-01',to:last};}
+  if(preset==='custom')return{from:customFrom||null,to:customTo||null};
+  return{from:null,to:null};
+}
+
+function filterByDate(rows, dateField, from, to){
+  if(!from&&!to)return rows;
+  return rows.filter(r=>{
+    const v=r[dateField];if(!v)return!from; // no date → include only if no start filter
+    const s=String(v).slice(0,10);
+    if(from&&s<from)return false;
+    if(to&&s>to)return false;
+    return true;
+  });
+}
+
+function buildReportRows(id, preset, customFrom, customTo){
+  const{from,to}=getDateRange(preset,customFrom,customTo);
+  const fd=(rows,field)=>filterByDate(rows,field,from,to);
+
+  switch(id){
+
+    case 'sales_orders':{
+      const rows=fd(S.sales,'sale_date');
+      const cols=['Order #','Date','Customer','SKU','Description','Qty','Status','Tracking','Carrier','Source'];
+      const data=rows.map(s=>{
+        const asm=S.assemblies.find(a=>a.pn===s.pn);
+        return {'Order #':s.order_number||'','Date':(s.sale_date||'').slice(0,10),'Customer':s.customer_name||'','SKU':s.pn,'Description':asm?.description||'','Qty':s.qty||1,'Status':s.fulfillment_status||'Open','Tracking':s.tracking_number||'','Carrier':s.carrier||'','Source':s.source||''};
+      });
+      return{cols,data};
+    }
+
+    case 'sales_shipped':{
+      const rows=fd(S.sales.filter(s=>s.fulfillment_status==='Shipped'||s.fulfillment_status==='Delivered'),'sale_date');
+      const cols=['Order #','Date','Customer','SKU','Qty','Status','Carrier','Tracking #'];
+      const data=rows.map(s=>({'Order #':s.order_number||'','Date':(s.sale_date||'').slice(0,10),'Customer':s.customer_name||'','SKU':s.pn,'Qty':s.qty||1,'Status':s.fulfillment_status,'Carrier':s.carrier||'','Tracking #':s.tracking_number||''}));
+      return{cols,data};
+    }
+
+    case 'sales_by_sku':{
+      const rows=fd(S.sales.filter(s=>s.fulfillment_status!=='Cancelled'),'sale_date');
+      const map={};
+      rows.forEach(s=>{
+        if(!map[s.pn])map[s.pn]={SKU:s.pn,Description:'',Units:0,'Revenue ($)':0,Orders:new Set()};
+        const asm=S.assemblies.find(a=>a.pn===s.pn);
+        map[s.pn].Description=asm?.description||'';
+        map[s.pn].Units+=(s.qty||1);
+        map[s.pn]['Revenue ($)']+=(s.qty||1)*(asm?.msrp||0);
+        map[s.pn].Orders.add(s.order_number||s.id);
+      });
+      const cols=['SKU','Description','Units Sold','Order Count','Revenue ($)'];
+      const data=Object.values(map).sort((a,b)=>b.Units-a.Units).map(r=>({'SKU':r.SKU,'Description':r.Description,'Units Sold':r.Units,'Order Count':r.Orders.size,'Revenue ($)':r['Revenue ($)']}));
+      return{cols,data};
+    }
+
+    case 'sales_by_month':{
+      const rows=fd(S.sales.filter(s=>s.fulfillment_status!=='Cancelled'),'sale_date');
+      const map={};
+      rows.forEach(s=>{
+        const mo=(s.sale_date||'').slice(0,7);if(!mo)return;
+        if(!map[mo])map[mo]={Month:mo,Orders:new Set(),Units:0,'Revenue ($)':0};
+        map[mo].Orders.add(s.order_number||s.id);
+        map[mo].Units+=(s.qty||1);
+        const asm=S.assemblies.find(a=>a.pn===s.pn);
+        map[mo]['Revenue ($)']+=(s.qty||1)*(asm?.msrp||0);
+      });
+      const cols=['Month','Order Count','Units Sold','Revenue ($)'];
+      const data=Object.values(map).sort((a,b)=>a.Month.localeCompare(b.Month)).map(r=>({'Month':r.Month,'Order Count':r.Orders.size,'Units Sold':r.Units,'Revenue ($)':r['Revenue ($)']}));
+      return{cols,data};
+    }
+
+    case 'sales_by_customer':{
+      const rows=fd(S.sales.filter(s=>s.fulfillment_status!=='Cancelled'),'sale_date');
+      const map={};
+      rows.forEach(s=>{
+        const k=s.customer_name||'(no name)';
+        if(!map[k])map[k]={Customer:k,Orders:new Set(),Units:0,'Revenue ($)':0,'First Order':'','Last Order':''};
+        map[k].Orders.add(s.order_number||s.id);
+        map[k].Units+=(s.qty||1);
+        const asm=S.assemblies.find(a=>a.pn===s.pn);
+        map[k]['Revenue ($)']+=(s.qty||1)*(asm?.msrp||0);
+        const d=(s.sale_date||'').slice(0,10);
+        if(d){if(!map[k]['First Order']||d<map[k]['First Order'])map[k]['First Order']=d;if(!map[k]['Last Order']||d>map[k]['Last Order'])map[k]['Last Order']=d;}
+      });
+      const cols=['Customer','Order Count','Units','Revenue ($)','First Order','Last Order'];
+      const data=Object.values(map).sort((a,b)=>b['Revenue ($)']-a['Revenue ($)']).map(r=>({...r,'Order Count':r.Orders.size}));
+      return{cols,data};
+    }
+
+    case 'sales_by_dealer':{
+      const dealerNames=new Set(S.dealers.map(d=>d.name));
+      const rows=fd(S.sales.filter(s=>s.customer_name&&dealerNames.has(s.customer_name)),'sale_date');
+      const cols=['Dealer','Order #','Date','SKU','Qty','Status'];
+      const data=rows.map(s=>({'Dealer':s.customer_name||'','Order #':s.order_number||'','Date':(s.sale_date||'').slice(0,10),'SKU':s.pn,'Qty':s.qty||1,'Status':s.fulfillment_status||'Open'}));
+      return{cols,data};
+    }
+
+    case 'sales_open':{
+      const rows=S.sales.filter(s=>!s.fulfillment_status||s.fulfillment_status==='Open'||s.fulfillment_status==='Packed');
+      const cols=['Order #','Date','Customer','SKU','Qty','Status','Days Open'];
+      const data=rows.map(s=>{
+        const open=s.sale_date?Math.floor((Date.now()-new Date(s.sale_date))/(86400000)):null;
+        return{'Order #':s.order_number||'','Date':(s.sale_date||'').slice(0,10),'Customer':s.customer_name||'','SKU':s.pn,'Qty':s.qty||1,'Status':s.fulfillment_status||'Open','Days Open':open};
+      }).sort((a,b)=>(b['Days Open']||0)-(a['Days Open']||0));
+      return{cols,data};
+    }
+
+    case 'sales_on_hold':{
+      const rows=S.sales.filter(s=>s.fulfillment_status==='On Hold');
+      const cols=['Order #','Date','Customer','SKU','Qty'];
+      const data=rows.map(s=>({'Order #':s.order_number||'','Date':(s.sale_date||'').slice(0,10),'Customer':s.customer_name||'','SKU':s.pn,'Qty':s.qty||1}));
+      return{cols,data};
+    }
+
+    case 'inv_snapshot':{
+      const cols=['Part #','Description','Category','Vendor','On Hand','Unit Cost ($)','Total Value ($)','Location','Min','Max','Safety','Lead Time (wks)'];
+      const data=S.parts.filter(p=>!p.discontinued).map(p=>({'Part #':p.pn,'Description':p.description||'','Category':p.category||'','Vendor':p.vendor||'','On Hand':p.total_unpckgd||0,'Unit Cost ($)':p.unit_cost||0,'Total Value ($)':(p.total_unpckgd||0)*(p.unit_cost||0),'Location':p.location||'','Min':p.min_qty||0,'Max':p.max_qty||0,'Safety':p.safety_stock||0,'Lead Time (wks)':p.lead_time_weeks||0})).sort((a,b)=>a['Part #'].localeCompare(b['Part #']));
+      return{cols,data};
+    }
+
+    case 'inv_valuation':{
+      const cols=['Part #','Description','Vendor','On Hand','Unit Cost ($)','Total Value ($)'];
+      const data=S.parts.filter(p=>!p.discontinued&&(p.total_unpckgd||0)>0).map(p=>({'Part #':p.pn,'Description':p.description||'','Vendor':p.vendor||'','On Hand':p.total_unpckgd||0,'Unit Cost ($)':+(p.unit_cost||0).toFixed(4),'Total Value ($)':+((p.total_unpckgd||0)*(p.unit_cost||0)).toFixed(2)})).sort((a,b)=>b['Total Value ($)']-a['Total Value ($)']);
+      const total=data.reduce((s,r)=>s+r['Total Value ($)'],0);
+      data.push({'Part #':'— TOTAL —','Description':'','Vendor':'','On Hand':'','Unit Cost ($)':'','Total Value ($)':+total.toFixed(2)});
+      return{cols,data};
+    }
+
+    case 'inv_reorder':{
+      const cols=['Part #','Description','Vendor','On Hand','Reorder Point','Shortage','Suggested Order','Unit Cost ($)'];
+      const data=S.parts.filter(p=>!p.discontinued).filter(p=>(p.total_unpckgd||0)<=calcReorderPoint(p)).map(p=>{
+        const rp=calcReorderPoint(p);const oh=p.total_unpckgd||0;const sq=calcSuggestedQty(p);
+        return{'Part #':p.pn,'Description':p.description||'','Vendor':p.vendor||'','On Hand':oh,'Reorder Point':rp,'Shortage':Math.max(0,rp-oh),'Suggested Order':sq,'Unit Cost ($)':+(p.unit_cost||0).toFixed(4)};
+      }).sort((a,b)=>a['On Hand']-b['On Hand']);
+      return{cols,data};
+    }
+
+    case 'inv_overstock':{
+      const cols=['Part #','Description','Vendor','On Hand','Max Qty','Excess','Value Excess ($)'];
+      const data=S.parts.filter(p=>!p.discontinued&&p.max_qty>0&&(p.total_unpckgd||0)>p.max_qty).map(p=>{
+        const excess=(p.total_unpckgd||0)-p.max_qty;
+        return{'Part #':p.pn,'Description':p.description||'','Vendor':p.vendor||'','On Hand':p.total_unpckgd||0,'Max Qty':p.max_qty,'Excess':excess,'Value Excess ($)':+(excess*(p.unit_cost||0)).toFixed(2)};
+      }).sort((a,b)=>b['Value Excess ($)']-a['Value Excess ($)']);
+      return{cols,data};
+    }
+
+    case 'inv_movements':{
+      const rows=fd(S.corrections,'created_at');
+      const cols=['Date','Part #','Source','Adjustment','Previous Qty','New Qty','Reason'];
+      const data=rows.map(c=>({'Date':new Date(c.created_at).toLocaleString(),'Part #':c.pn,'Source':c.source||'manual','Adjustment':c.adjustment,'Previous Qty':c.previous_qty,'New Qty':c.new_qty,'Reason':c.reason||''}));
+      return{cols,data};
+    }
+
+    case 'inv_receipts':{
+      const rows=fd(S.corrections.filter(c=>c.source==='po_receipt'),'created_at');
+      const cols=['Date','Part #','Qty Received','New Stock Level','PO Reference','Notes'];
+      const data=rows.map(c=>{
+        const poMatch=c.reason&&c.reason.match(/\[(.+?)\]/);
+        return{'Date':new Date(c.created_at).toLocaleDateString(),'Part #':c.pn,'Qty Received':c.adjustment,'New Stock Level':c.new_qty,'PO Reference':poMatch?poMatch[1]:'','Notes':(c.reason||'').replace(/\[.+?\]/,'').trim()};
+      });
+      return{cols,data};
+    }
+
+    case 'inv_velocity':{
+      const cols=['Part #','Description','Vendor','On Hand','Avg/Wk (4w)','Avg/Wk (12w)','Weeks of Stock','Unit Cost ($)'];
+      const data=S.parts.filter(p=>!p.discontinued).map(p=>{
+        const w=wks(p);return{'Part #':p.pn,'Description':p.description||'','Vendor':p.vendor||'','On Hand':p.total_unpckgd||0,'Avg/Wk (4w)':+avgWk4(p).toFixed(3),'Avg/Wk (12w)':+avgWk(p).toFixed(3),'Weeks of Stock':w,'Unit Cost ($)':+(p.unit_cost||0).toFixed(4)};
+      }).sort((a,b)=>(b['Avg/Wk (12w)']||0)-(a['Avg/Wk (12w)']||0));
+      return{cols,data};
+    }
+
+    case 'assemblies_stock':{
+      const cols=['Assembly','Description','Type','On Hand','Sold 30d','Sold 90d','MSRP ($)','BOM Cost ($)'];
+      const data=S.assemblies.filter(a=>!a.discontinued).map(a=>{
+        const s30=S.sales.filter(s=>s.pn===a.pn&&s.sale_date>=daysAgo(30)).reduce((t,s)=>t+(s.qty||1),0);
+        const s90=S.sales.filter(s=>s.pn===a.pn&&s.sale_date>=daysAgo(90)).reduce((t,s)=>t+(s.qty||1),0);
+        return{'Assembly':a.pn,'Description':a.description||'','Type':a.is_subassembly?'Subassembly':'Finished Good','On Hand':a.total_on_hand||0,'Sold 30d':s30,'Sold 90d':s90,'MSRP ($)':a.msrp||0,'BOM Cost ($)':+bomCostOf(a.pn,0).toFixed(2)};
+      }).sort((a,b)=>a.Assembly.localeCompare(b.Assembly));
+      return{cols,data};
+    }
+
+    case 'po_all':{
+      const rows=fd(S.purchases,'order_date');
+      const cols=['Date','Vendor','Description','Lines','Qty','Extended ($)','Status'];
+      const data=rows.map(p=>{
+        const lines=S.poLines[p.id]||[];
+        return{'Date':p.order_date||'','Vendor':p.vendor,'Description':p.description||p.pn||'','Lines':lines.length||1,'Qty':lines.length?lines.reduce((s,l)=>s+(l.qty_ordered||0),0):p.qty||0,'Extended ($)':+poExtended(p).toFixed(2),'Status':p.status||''};
+      });
+      return{cols,data};
+    }
+
+    case 'po_open':{
+      const rows=fd(S.purchases.filter(p=>p.status!=='Received'&&p.status!=='Cancelled'),'order_date');
+      const cols=['Date','Vendor','Description','Extended ($)','Status'];
+      const data=rows.map(p=>({'Date':p.order_date||'','Vendor':p.vendor,'Description':p.description||p.pn||'','Extended ($)':+poExtended(p).toFixed(2),'Status':p.status||''}));
+      return{cols,data};
+    }
+
+    case 'po_draft':{
+      const rows=S.purchases.filter(p=>p.status==='Draft');
+      const cols=['Date','Vendor','Lines','Extended ($)'];
+      const data=rows.map(p=>{const lines=S.poLines[p.id]||[];return{'Date':p.order_date||'','Vendor':p.vendor,'Lines':lines.length,'Extended ($)':+poExtended(p).toFixed(2)};});
+      return{cols,data};
+    }
+
+    case 'po_received':{
+      const rows=fd(S.purchases.filter(p=>p.status==='Received'),'order_date');
+      const cols=['Date','Vendor','Description','Lines','Received Value ($)'];
+      const data=rows.map(p=>{
+        const lines=S.poLines[p.id]||[];
+        const recv=lines.reduce((s,l)=>s+(l.qty_received||0)*(l.unit_cost||0),0);
+        return{'Date':p.order_date||'','Vendor':p.vendor,'Description':p.description||p.pn||'','Lines':lines.length,'Received Value ($)':+recv.toFixed(2)};
+      });
+      return{cols,data};
+    }
+
+    case 'po_by_vendor':{
+      const rows=fd(S.purchases,'order_date');
+      const map={};
+      rows.forEach(p=>{
+        if(!map[p.vendor])map[p.vendor]={Vendor:p.vendor,'Total POs':0,'Open POs':0,'Total Spend ($)':0,'Received ($)':0};
+        map[p.vendor]['Total POs']++;
+        if(p.status!=='Received'&&p.status!=='Cancelled')map[p.vendor]['Open POs']++;
+        map[p.vendor]['Total Spend ($)']+=poExtended(p);
+        if(p.status==='Received'){const lines=S.poLines[p.id]||[];map[p.vendor]['Received ($)']+=lines.reduce((s,l)=>s+(l.qty_received||0)*(l.unit_cost||0),0);}
+      });
+      const cols=['Vendor','Total POs','Open POs','Total Spend ($)','Received ($)'];
+      const data=Object.values(map).sort((a,b)=>b['Total Spend ($)']-a['Total Spend ($)']).map(r=>({...r,'Total Spend ($)':+r['Total Spend ($)'].toFixed(2),'Received ($)':+r['Received ($)'].toFixed(2)}));
+      return{cols,data};
+    }
+
+    case 'po_lines':{
+      const pos=fd(S.purchases,'order_date');
+      const poMap={};pos.forEach(p=>poMap[p.id]=p);
+      const allLines=[];
+      pos.forEach(p=>{(S.poLines[p.id]||[]).forEach(l=>allLines.push({po:p,line:l}));});
+      const cols=['PO Date','Vendor','Part #','Description','Qty Ordered','Qty Received','Unit Cost ($)','Extended ($)','Line Status'];
+      const data=allLines.map(({po,line})=>({'PO Date':po.order_date||'','Vendor':po.vendor,'Part #':line.pn,'Description':line.description||'','Qty Ordered':line.qty_ordered||0,'Qty Received':line.qty_received||0,'Unit Cost ($)':+(line.unit_cost||0).toFixed(4),'Extended ($)':+((line.qty_ordered||0)*(line.unit_cost||0)).toFixed(2),'Line Status':line.status||''}));
+      return{cols,data};
+    }
+
+    case 'parts_catalog':{
+      const cols=['Part #','Description','Category','Vendor','On Hand','Unit Cost ($)','MOQ','Lead Time (wks)','Location','Avg/Wk','Min','Max'];
+      const data=S.parts.filter(p=>!p.discontinued).map(p=>({'Part #':p.pn,'Description':p.description||'','Category':p.category||'','Vendor':p.vendor||'','On Hand':p.total_unpckgd||0,'Unit Cost ($)':+(p.unit_cost||0).toFixed(4),'MOQ':p.moq||0,'Lead Time (wks)':p.lead_time_weeks||0,'Location':p.location||'','Avg/Wk':+avgWk(p).toFixed(3),'Min':p.min_qty||0,'Max':p.max_qty||0}));
+      return{cols,data};
+    }
+
+    case 'parts_vendor':{
+      const cols=['Vendor','Part #','Description','On Hand','Unit Cost ($)','Lead Time (wks)'];
+      const data=S.parts.filter(p=>!p.discontinued).sort((a,b)=>(a.vendor||'').localeCompare(b.vendor||'')||a.pn.localeCompare(b.pn)).map(p=>({'Vendor':p.vendor||'(none)','Part #':p.pn,'Description':p.description||'','On Hand':p.total_unpckgd||0,'Unit Cost ($)':+(p.unit_cost||0).toFixed(4),'Lead Time (wks)':p.lead_time_weeks||0}));
+      return{cols,data};
+    }
+
+    case 'parts_pricing':{
+      const withBreaks=S.parts.filter(p=>Array.isArray(p.price_breaks)&&p.price_breaks.length>0);
+      const rows=[];
+      withBreaks.forEach(p=>{
+        rows.push({'Part #':p.pn,'Description':p.description||'','Vendor':p.vendor||'','Break Level':'Base','Min Qty':1,'Unit Cost ($)':+(p.unit_cost||0).toFixed(4)});
+        (p.price_breaks||[]).forEach((b,i)=>rows.push({'Part #':p.pn,'Description':p.description||'','Vendor':p.vendor||'','Break Level':'Tier '+(i+1),'Min Qty':b.qty,'Unit Cost ($)':+(b.price||0).toFixed(4)}));
+      });
+      return{cols:['Part #','Description','Vendor','Break Level','Min Qty','Unit Cost ($)'],data:rows};
+    }
+
+    case 'bom_detail':{
+      const rows=[];
+      Object.entries(S.boms).forEach(([parent,items])=>{
+        const asm=S.assemblies.find(a=>a.pn===parent);
+        items.forEach(i=>rows.push({'Assembly':parent,'Asm Description':asm?.description||'','Child PN':i.child_pn,'Child Type':i.item_type||'part','Qty Per':i.qty||1,'Unit Cost ($)':+(i.unit_cost||0).toFixed(4),'Extended ($)':+((i.qty||1)*(i.unit_cost||0)).toFixed(4)}));
+      });
+      rows.sort((a,b)=>a.Assembly.localeCompare(b.Assembly)||a['Child PN'].localeCompare(b['Child PN']));
+      return{cols:['Assembly','Asm Description','Child PN','Child Type','Qty Per','Unit Cost ($)','Extended ($)'],data:rows};
+    }
+
+    case 'bom_cost_rollup':{
+      const cols=['Assembly','Description','Type','On Hand','MSRP ($)','BOM Cost ($)','Gross Margin ($)','Gross Margin %'];
+      const data=S.assemblies.filter(a=>!a.discontinued&&S.boms[a.pn]?.length).map(a=>{
+        const bc=bomCostOf(a.pn,0);const msrp=a.msrp||0;const gm=msrp-bc;const gmp=msrp>0?(gm/msrp*100):0;
+        return{'Assembly':a.pn,'Description':a.description||'','Type':a.is_subassembly?'Subassembly':'Finished Good','On Hand':a.total_on_hand||0,'MSRP ($)':msrp,'BOM Cost ($)':+bc.toFixed(2),'Gross Margin ($)':+gm.toFixed(2),'Gross Margin %':+gmp.toFixed(1)};
+      }).sort((a,b)=>b['Gross Margin %']-a['Gross Margin %']);
+      return{cols,data};
+    }
+
+    case 'cycle_counts':{
+      const rows=fd(S.cycleCounts,'created_at');
+      const cols=['Date','Name','Type','Status','Items','Variances','Completed'];
+      const data=rows.map(c=>{
+        const lines=S.countLines.filter(l=>l.count_id===c.id);
+        const vars=lines.filter(l=>l.actual_qty!=null&&l.actual_qty!==(l.expected_qty||0)).length;
+        return{'Date':new Date(c.created_at).toLocaleDateString(),'Name':c.name||'','Type':c.count_type||'','Status':c.status||'','Items':lines.length||0,'Variances':vars,'Completed':c.completed_at?new Date(c.completed_at).toLocaleDateString():''};
+      });
+      return{cols,data};
+    }
+
+    case 'corrections_log':{
+      const rows=fd(S.corrections,'created_at');
+      const cols=['Date','Part #','Source','Adjustment','Previous Qty','New Qty','Reason'];
+      const data=rows.map(c=>({'Date':new Date(c.created_at).toLocaleString(),'Part #':c.pn,'Source':c.source||'manual','Adjustment':c.adjustment,'Previous Qty':c.previous_qty,'New Qty':c.new_qty,'Reason':c.reason||''}));
+      return{cols,data};
+    }
+
+    case 'warranty_claims':{
+      const rows=fd(S.warrantyClaims,'created_at');
+      const cols=['Date','SKU','Customer','Order #','Issue','Status','Resolution','Tracking'];
+      const data=rows.map(w=>({'Date':new Date(w.created_at).toLocaleDateString(),'SKU':w.pn||'','Customer':w.customer_name||'','Order #':w.order_number||'','Issue':w.issue||'','Status':w.status||'','Resolution':w.resolution_type||'','Tracking':w.tracking_number||''}));
+      return{cols,data};
+    }
+
+    default:return{cols:[],data:[]};
+  }
+}
+
+function runExport(fmt, reportId, preset, customFrom, customTo){
+  const def=REPORT_DEFS.find(d=>d.id===reportId);
+  if(!def)return;
+  const{cols,data}=buildReportRows(reportId,preset,customFrom,customTo);
+  if(!data.length){toast('No data to export');return;}
+  const filename=def.label.replace(/[^a-z0-9]+/gi,'-').toLowerCase()+'_'+new Date().toISOString().slice(0,10);
+  if(fmt==='csv'){
+    const esc=v=>{const s=String(v===null||v===undefined?'':v);return s.includes(',')||s.includes('"')||s.includes('\n')?'"'+s.replace(/"/g,'""')+'"':s;};
+    const lines=[cols.map(esc).join(','),...data.map(row=>cols.map(c=>esc(row[c]??'')).join(','))];
+    const blob=new Blob([lines.join('\r\n')],{type:'text/csv'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=filename+'.csv';a.click();
+    toast('✅ Downloaded '+filename+'.csv ('+data.length.toLocaleString()+' rows)');
+    return;
+  }
+  // Excel via SheetJS (loaded on demand)
+  function doXlsx(XLSX){
+    const wsData=[cols,...data.map(row=>cols.map(c=>row[c]??''))];
+    const ws=XLSX.utils.aoa_to_sheet(wsData);
+    // Column widths
+    ws['!cols']=cols.map(c=>({wch:Math.max(c.length,12,Math.min(40,...data.slice(0,20).map(r=>String(r[c]??'').length)))}));
+    // Style header row bold
+    cols.forEach((_,ci)=>{const cell=XLSX.utils.encode_cell({r:0,c:ci});if(ws[cell]){ws[cell].s={font:{bold:true},fill:{fgColor:{rgb:'1F3864'}}};}});
+    const wb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,def.label.slice(0,31));
+    // Add a metadata sheet
+    const meta=[['Report','Date Generated','Date Range','Total Rows'],[def.label,new Date().toLocaleString(),preset==='all'?'All Time':preset==='custom'?customFrom+' to '+(customTo||'today'):preset,data.length]];
+    const wsMeta=XLSX.utils.aoa_to_sheet(meta);
+    XLSX.utils.book_append_sheet(wb,wsMeta,'Info');
+    XLSX.writeFile(wb,filename+'.xlsx');
+    toast('✅ Downloaded '+filename+'.xlsx ('+data.length.toLocaleString()+' rows)');
+  }
+  if(window.XLSX){doXlsx(window.XLSX);return;}
+  toast('Loading Excel library…');
+  const s=document.createElement('script');
+  s.src='https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+  s.onload=()=>doXlsx(window.XLSX);
+  s.onerror=()=>toast('Failed to load Excel library — try CSV instead');
+  document.head.appendChild(s);
+}
+
 function renderBackups() {
   const last = S.lastBackup ? S.lastBackup.toLocaleString() : 'Never this session';
   let undoRows = '';
@@ -9665,7 +10177,7 @@ function scheduleRender(){
 }
 function render(){
   // Hide loader on first render  if(_sh)_sh.style.display='flex';}
-  const views={dashboard:renderDashboard,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder};
+  const views={dashboard:renderDashboard,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder,reports:renderReports};
   if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length)computeDemand();
   // Preserve focused input + caret across re-render
   const active=document.activeElement;
