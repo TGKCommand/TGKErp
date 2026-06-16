@@ -390,7 +390,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
     <div class="sidebar-section">Sales</div>
     <button class="nav-item" id="nav-sales" onclick="nav('sales')"><span class="nav-dot"></span>Sales Orders<span class="nav-badge" id="sales-badge" style="display:none">0</span></button>
     <button class="nav-item" id="nav-dealers" onclick="nav('dealers')"><span class="nav-dot"></span>Dealers</button>
-    <button class="nav-item" id="nav-warranty" onclick="nav('warranty')"><span class="nav-dot"></span>Warranty<span class="nav-badge" id="warranty-badge" style="display:none">0</span></button>
+    <button class="nav-item" id="nav-warranty" onclick="nav('warranty')"><span class="nav-dot"></span>Customer Resolution<span class="nav-badge" id="warranty-badge" style="display:none">0</span></button>
 
     <div class="sidebar-section">Tools</div>
     <button class="nav-item" id="nav-ai" onclick="nav('ai')"><span class="nav-dot"></span>AI Assistant</button>
@@ -496,6 +496,10 @@ const S = {
   corrections:[],
   // Warranty
   warrantyClaims:[],
+  // Shipment Errors
+  shipmentErrors:[],
+  // Customer Resolution tab: 'claims' | 'errors'
+  wtyTab:'claims',
   // Production
   activeBuild:null, buildQty:null, buildCoverage:4,
   parentBuild:null, parentBuildQty:null,
@@ -648,12 +652,14 @@ function updateBadge(){
   b.textContent=cnt;b.style.display=cnt?'inline':'none';
   const navEl=$('nav-inventory');
   if(navEl){navEl.classList.toggle('alert-nav',cnt>0);}
-  // Warranty open badge
+  // Customer Resolution badge (warranty Open + shipment errors Open)
   const openW=S.warrantyClaims.filter(w=>w.status==='Open').length;
+  const openSE=(S.shipmentErrors||[]).filter(e=>e.status==='Open').length;
+  const totalOpen=openW+openSE;
   const wb=$('warranty-badge');
-  if(wb){wb.textContent=openW;wb.style.display=openW?'inline':'none';}
+  if(wb){wb.textContent=totalOpen;wb.style.display=totalOpen?'inline':'none';}
   const wEl=$('nav-warranty');
-  if(wEl){wEl.classList.toggle('alert-nav',openW>0);}
+  if(wEl){wEl.classList.toggle('alert-nav',totalOpen>0);}
 }
 
 // ============================================================
@@ -688,7 +694,7 @@ function normalizeAssemblies(rows){
 
 async function loadAll(){
   try{
-    const[parts,assemblies,sales,purchases,dealers,settings,bomItems,warrantyClaims,corrections,cycleCounts,poLinesAll,poTrackingAll]=await Promise.all([
+    const[parts,assemblies,sales,purchases,dealers,settings,bomItems,warrantyClaims,shipmentErrors,corrections,cycleCounts,poLinesAll,poTrackingAll]=await Promise.all([
       db.from('parts').select('*').order('pn'),
       db.from('assemblies').select('*').order('pn'),
       db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000),
@@ -697,6 +703,7 @@ async function loadAll(){
       db.from('settings').select('*'),
       fetchAll((f,t)=>db.from('bom_items').select('*').order('parent_pn').order('sort_order').range(f,t)),
       db.from('warranty_claims').select('*').order('created_at',{ascending:false}).limit(100),
+      db.from('shipment_errors').select('*').order('created_at',{ascending:false}).limit(200),
       db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
       db.from('cycle_counts').select('*').order('created_at',{ascending:false}).limit(50),
       db.from('po_lines').select('*').order('po_id'),
@@ -717,6 +724,7 @@ async function loadAll(){
     (Array.isArray(bomItems)?bomItems:(bomItems.data||[])).forEach(i=>{if(!S.boms[i.parent_pn])S.boms[i.parent_pn]=[];S.boms[i.parent_pn].push(i);});
     if(!S.selBOM&&Object.keys(S.boms).length)S.selBOM=Object.keys(S.boms)[0];
     S.warrantyClaims=warrantyClaims.data||[];
+    S.shipmentErrors=shipmentErrors.data||[];
     S.corrections=corrections.data||[];
     S.cycleCounts=cycleCounts.data||[];
     S.poLines={};
@@ -805,6 +813,13 @@ function setupRealtime(){
         if(S.view==='cyclecounts')scheduleRender();
       }
     })
+    .on('postgres_changes',{event:'*',schema:'public',table:'shipment_errors'},p=>{
+      if(p.eventType==='INSERT')S.shipmentErrors=[p.new,...S.shipmentErrors];
+      else if(p.eventType==='UPDATE')S.shipmentErrors=S.shipmentErrors.map(e=>e.id===p.new.id?p.new:e);
+      else if(p.eventType==='DELETE')S.shipmentErrors=S.shipmentErrors.filter(e=>e.id!==p.old.id);
+      updateBadge();
+      if(S.view==='warranty')scheduleRender();
+    })
     .subscribe((status)=>{
       _rtStatus=status;
       const dot=document.getElementById('sync-dot');
@@ -820,7 +835,7 @@ function setupRealtime(){
 // ============================================================
 // NAV
 // ============================================================
-const PAGE_TITLES={dashboard:'Dashboard',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',planning:'Inventory Planning',purchases:'Purchase Orders',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Corrections Log',warranty:'Warranty',import:'Import Data',pobuilder:'PO Builder'};
+const PAGE_TITLES={dashboard:'Dashboard',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',planning:'Inventory Planning',purchases:'Purchase Orders',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Corrections Log',warranty:'Customer Resolution',import:'Import Data',pobuilder:'PO Builder'};
 
 function nav(v){
   if(v!==S.view){S.activePO=null;S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.parentBuild=null;S.parentBuildQty=null;S.activeCount=null;if(v!=='packqueue')S.workOrderMode=false;S.searchQ='';}
@@ -1804,7 +1819,6 @@ function renderSales(){
     <button class="filter-chip ${!sf.fstatus?'on-teal':''}" onclick="setFilter('sales','fstatus','')">All</button>
     ${fstats.map(s=>`<button class="filter-chip ${sf.fstatus===s?'on-teal':''}" onclick="setFilter('sales','fstatus','${s}')">${s}</button>`).join('')}
     <button class="btn btn-sm" style="margin-left:auto" title="Remove duplicate order lines (same order # + SKU). Tracking numbers on surviving rows are always preserved — tracking is rescued from duplicates before they are deleted." onclick="dedupeOrders()">🧽 Dedupe & Recover Tracking</button>
-    <button class="btn btn-sm" title="Mark pre-system Open orders as Delivered" onclick="closeHistoricalOrders()">🧹 Close pre-system orders</button>
     <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="syncOrdersNow()" title="Pull new orders from Shopify + check ShipStation for holds/splits">🔄 Sync Orders</button>
     <button class="btn btn-primary btn-sm" onclick='openModal("addSale",{})'>+ Manual Order</button>
     <span class="filter-count">${list.length} orders</span>
@@ -2626,7 +2640,27 @@ ALTER TABLE warranty_claims
   ADD COLUMN IF NOT EXISTS resolution_type text DEFAULT 'no_action',
   ADD COLUMN IF NOT EXISTS shipping_details jsonb,
   ADD COLUMN IF NOT EXISTS ss_order_id text,
-  ADD COLUMN IF NOT EXISTS resolved_at timestamptz;</pre>
+  ADD COLUMN IF NOT EXISTS resolved_at timestamptz;
+
+-- Shipment errors table (Customer Resolution → Shipment Errors tab)
+CREATE TABLE IF NOT EXISTS shipment_errors (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_number text,
+  customer_name text,
+  customer_email text,
+  error_type text DEFAULT 'wrong_item',
+  expected_pn text,
+  expected_qty int DEFAULT 1,
+  actual_pn text,
+  actual_qty int DEFAULT 1,
+  resolution text DEFAULT 'none',
+  notes text,
+  status text DEFAULT 'Open',
+  ss_order_id text,
+  resolved_at timestamptz,
+  created_at timestamptz DEFAULT now()
+);
+ALTER TABLE shipment_errors DISABLE ROW LEVEL SECURITY;</pre>
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">1 — Install Supabase CLI & login</div>
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto">npm install -g supabase
@@ -4391,6 +4425,9 @@ async function saveShipStation(){
 // MODALS
 // ============================================================
 function openModal(type,data){
+  // Shipment error uses its own overlay
+  if(type==='addShipmentError'){openShipmentErrorModal(data?.id||null);return;}
+
   const overlay=$('modal-overlay'),box=$('modal-box');
   let title='',body='';
   const fi=(id,label,val,extra='')=>`<div class="form-group"><label class="form-label">${label}</label><input id="${id}" class="form-input" value="${String(val||'').replace(/"/g,'&quot;')}" ${extra}></div>`;
@@ -8118,6 +8155,17 @@ async function submitManualCorrection(pn, newQty, reason) {
 // WARRANTY CLAIMS
 // ============================================================
 function renderWarranty() {
+  const tab=S.wtyTab||'claims';
+  const openClaims=S.warrantyClaims.filter(w=>w.status==='Open').length;
+  const openErrors=(S.shipmentErrors||[]).filter(e=>e.status==='Open').length;
+  const tabBar=`<div class="tab-bar" style="margin-bottom:16px">
+    <div class="tab ${tab==='claims'?'active':''}" onclick="S.wtyTab='claims';render()">Warranty${openClaims?` <span class="nav-badge" style="display:inline-flex;background:var(--red);color:#fff;margin-left:4px">${openClaims}</span>`:''}
+    </div>
+    <div class="tab ${tab==='errors'?'active':''}" onclick="S.wtyTab='errors';render()">Shipment Errors${openErrors?` <span class="nav-badge" style="display:inline-flex;background:var(--orange);color:#fff;margin-left:4px">${openErrors}</span>`:''}
+    </div>
+  </div>`;
+  if(tab==='errors') return tabBar+renderShipmentErrors();
+
   const sf=S.filters.warranty||{};
   let list=S.warrantyClaims;
   const q=(sf.search||'').toLowerCase();
@@ -8126,7 +8174,7 @@ function renderWarranty() {
   const statuses=['Open','In Review','Approved','Shipped','Denied','Resolved'];
   const counts={};statuses.forEach(s=>{counts[s]=S.warrantyClaims.filter(w=>w.status===s).length;});
   const resLabel={'no_action':'','replacement':'🔄 Replace','repair':'🔧 Repair','refund':'💰 Refund'};
-  return `
+  return tabBar+`
   <div class="kpi-grid" style="grid-template-columns:repeat(6,1fr)">
     ${statuses.map(s=>`<div class="kpi ${s==='Open'?'kpi-red':s==='Shipped'?'kpi-teal':s==='Resolved'?'kpi-green':''}"><div class="kpi-label">${s}</div><div class="kpi-value">${counts[s]||0}</div></div>`).join('')}
   </div>
@@ -8165,6 +8213,60 @@ function renderWarranty() {
   </tbody></table></div>`;
 }
 
+function renderShipmentErrors(){
+  const sf=S.filters.shiperror||{};
+  let list=S.shipmentErrors||[];
+  const q=(sf.search||'').toLowerCase();
+  if(q) list=list.filter(e=>(e.order_number||'').toLowerCase().includes(q)||(e.customer_name||'').toLowerCase().includes(q)||(e.expected_pn||'').toLowerCase().includes(q));
+  if(sf.status) list=list.filter(e=>e.status===sf.status);
+  if(sf.etype) list=list.filter(e=>e.error_type===sf.etype);
+  const statuses=['Open','Reshipping','Resolved'];
+  const counts={Open:0,Reshipping:0,Resolved:0};
+  (S.shipmentErrors||[]).forEach(e=>{if(counts[e.status]!==undefined)counts[e.status]++;});
+  const etypeLabel={wrong_item:'Wrong Item',wrong_qty:'Wrong Qty',missing_item:'Missing Item',extra_item:'Extra Item',damaged:'Damaged'};
+  const etypeColor={wrong_item:'var(--orange)',wrong_qty:'var(--yellow)',missing_item:'var(--red)',extra_item:'var(--blue)',damaged:'var(--purple)'};
+  const resLabel={none:'Pending',reship_correct:'🚚 Reship',send_additional:'➕ Send More',customer_keeps:'✓ Keep',return_required:'↩ Return'};
+  const nextStatus={Open:'Reshipping',Reshipping:'Resolved'};
+  return `
+  <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr)">
+    <div class="kpi kpi-red"><div class="kpi-label">Open</div><div class="kpi-value">${counts.Open}</div></div>
+    <div class="kpi kpi-orange"><div class="kpi-label">Reshipping</div><div class="kpi-value">${counts.Reshipping}</div></div>
+    <div class="kpi kpi-green"><div class="kpi-label">Resolved</div><div class="kpi-value">${counts.Resolved}</div></div>
+  </div>
+  <div class="filter-bar">
+    <div class="search-wrap"><span class="search-icon">⌕</span><input placeholder="Order #, customer, SKU…" value="${sf.search||''}" oninput="setFilter('shiperror','search',this.value)"></div>
+    <button class="filter-chip ${!sf.status?'on-teal':''}" onclick="setFilter('shiperror','status','')">All</button>
+    ${statuses.map(s=>`<button class="filter-chip ${sf.status===s?'on-teal':''}" onclick="setFilter('shiperror','status','${s}')">${s}</button>`).join('')}
+    <select class="form-input" style="width:140px;padding:5px 9px;font-size:12px" onchange="setFilter('shiperror','etype',this.value)">
+      <option value="">All Error Types</option>
+      ${Object.entries(etypeLabel).map(([v,l])=>`<option value="${v}" ${sf.etype===v?'selected':''}>${l}</option>`).join('')}
+    </select>
+    <button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="openModal('addShipmentError',{})">+ Log Error</button>
+  </div>
+  <div class="tbl-wrap">
+  <table><thead><tr><th>Date</th><th>Order #</th><th>Customer</th><th>Error Type</th><th>Expected</th><th>Shipped</th><th>Resolution</th><th>Status</th><th>Action</th></tr></thead><tbody>
+  ${list.length===0?'<tr><td colspan="9" class="section-empty">No shipment errors logged</td></tr>':list.map(e=>{
+    const wrongItem=e.error_type!=='missing_item'&&e.actual_pn&&e.actual_pn!==e.expected_pn;
+    const wrongQty=e.error_type!=='missing_item'&&e.actual_qty!==e.expected_qty;
+    return `<tr>
+      <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${new Date(e.created_at).toLocaleDateString()}</td>
+      <td class="pn">${escHtml(e.order_number||'—')}</td>
+      <td style="font-size:11px">${escHtml(e.customer_name||'—')}</td>
+      <td><span class="pill" style="background:${etypeColor[e.error_type]||'var(--text3)'};color:#fff;font-size:10px">${etypeLabel[e.error_type]||e.error_type}</span></td>
+      <td style="font-size:11px;color:var(--teal)">${escHtml(e.expected_pn||'—')} ×${e.expected_qty||1}</td>
+      <td style="font-size:11px;color:${wrongItem||wrongQty?'var(--orange)':'var(--text2)'}">${e.error_type==='missing_item'?'<span style="color:var(--red);font-style:italic">Not shipped</span>':`${escHtml(e.actual_pn||e.expected_pn||'—')} ×${e.actual_qty??e.expected_qty??1}`}</td>
+      <td style="font-size:11px">${resLabel[e.resolution]||e.resolution||'—'}${e.ss_order_id?`<div style="font-size:9px;color:var(--teal);font-family:var(--mono)">SS#${e.ss_order_id}</div>`:''}</td>
+      <td><span class="pill ${e.status==='Open'?'pill-red':e.status==='Reshipping'?'pill-yellow':'pill-green'}">${e.status}</span></td>
+      <td style="display:flex;gap:4px;flex-wrap:wrap">
+        ${nextStatus[e.status]?`<button class="action-btn" onclick="advanceShipmentError('${e.id}','${nextStatus[e.status]}')">→ ${nextStatus[e.status]}</button>`:''}
+        <button class="action-btn" onclick="openModal('addShipmentError',{id:'${e.id}'})">✎</button>
+        <button class="action-btn del" onclick="deleteShipmentError('${e.id}')">×</button>
+      </td>
+    </tr>`;
+  }).join('')}
+  </tbody></table></div>`;
+}
+
 async function advanceWarranty(id, newStatus) {
   const {error}=await db.from('warranty_claims').update({status:newStatus,resolved_at:['Resolved','Denied','Shipped'].includes(newStatus)?new Date().toISOString():null}).eq('id',id);
   if(error){toast('Error');return;}
@@ -8177,6 +8279,153 @@ async function deleteWarranty(id) {
   await db.from('warranty_claims').delete().eq('id',id);
   S.warrantyClaims=S.warrantyClaims.filter(w=>w.id!==id);
   toast('Claim deleted');render();
+}
+
+// ── Shipment Errors modal opener ──
+function openShipmentErrorModal(editId){
+  const se=editId?(S.shipmentErrors||[]).find(e=>e.id===editId):null;
+  const errTypes=[['wrong_item','Wrong Item shipped'],['wrong_qty','Wrong Quantity shipped'],['missing_item','Item missing / not shipped'],['extra_item','Extra item included'],['damaged','Damaged in transit']];
+  const resolutions=[['none','No resolution yet'],['reship_correct','Reship correct item'],['send_additional','Send additional qty'],['customer_keeps','Customer keeps — no action'],['return_required','Return required from customer']];
+  const statuses=['Open','Reshipping','Resolved'];
+  const allPNs=[...S.assemblies.filter(a=>!a.discontinued).map(a=>a.pn),...S.parts.filter(p=>!p.discontinued).map(p=>p.pn)].sort();
+  const overlay=document.createElement('div');
+  overlay.id='se-overlay';
+  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto';
+  overlay.innerHTML=`<div class="modal" style="width:600px;max-width:96vw">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+      <div style="font-size:15px;font-weight:700;color:var(--text)">${se?'✎ Edit':'📦 Log'} Shipment Error</div>
+      <button onclick="document.getElementById('se-overlay').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">×</button>
+    </div>
+    <div class="form-row cols-2">
+      <div class="form-group">
+        <label class="form-label">Order #</label>
+        <div style="display:flex;gap:6px">
+          <input id="se-order" class="form-input" value="${escHtml(se?.order_number||'')}" placeholder="e.g. #8525" style="flex:1" oninput="seLookupOrder()">
+          <button type="button" class="btn btn-sm" onclick="seLookupOrder(true)" title="Auto-fill from order">↻ Fill</button>
+        </div>
+      </div>
+      <div class="form-group"><label class="form-label">Customer Name</label><input id="se-customer" class="form-input" value="${escHtml(se?.customer_name||'')}" placeholder="Customer name"></div>
+    </div>
+    <div class="form-row"><div class="form-group"><label class="form-label">Customer Email</label><input id="se-email" class="form-input" type="email" value="${escHtml(se?.customer_email||'')}" placeholder="customer@email.com"></div></div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Error Type</label>
+        <select id="se-type" class="form-input" onchange="seToggleActual()">
+          ${errTypes.map(([v,l])=>`<option value="${v}" ${(se?.error_type||'wrong_item')===v?'selected':''}>${l}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+      <div style="padding:12px;background:var(--teal-dim);border-radius:8px;border:1px solid rgba(13,148,136,.2)">
+        <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">✓ Expected (ordered)</div>
+        <div class="form-group" style="margin-bottom:8px"><label class="form-label">SKU</label>
+          <input id="se-exp-pn" class="form-input" list="se-all-pns" value="${escHtml(se?.expected_pn||'')}" placeholder="Expected SKU" autocomplete="off">
+          <datalist id="se-all-pns">${allPNs.map(p=>`<option value="${escHtml(p)}">`).join('')}</datalist>
+        </div>
+        <div class="form-group"><label class="form-label">Qty</label><input id="se-exp-qty" type="number" min="1" value="${se?.expected_qty||1}" class="form-input"></div>
+      </div>
+      <div id="se-actual-col" style="padding:12px;background:var(--orange-dim);border-radius:8px;border:1px solid rgba(234,88,12,.2)">
+        <div style="font-size:10px;font-weight:700;color:var(--orange);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">⚠ Actually Shipped</div>
+        <div class="form-group" style="margin-bottom:8px"><label class="form-label">SKU</label>
+          <input id="se-act-pn" class="form-input" list="se-all-pns" value="${escHtml(se?.actual_pn||'')}" placeholder="What was shipped" autocomplete="off">
+        </div>
+        <div class="form-group"><label class="form-label">Qty</label><input id="se-act-qty" type="number" min="0" value="${se?.actual_qty??1}" class="form-input"></div>
+      </div>
+    </div>
+    <div class="form-row cols-2">
+      <div class="form-group"><label class="form-label">Resolution</label>
+        <select id="se-resolution" class="form-input">
+          ${resolutions.map(([v,l])=>`<option value="${v}" ${(se?.resolution||'none')===v?'selected':''}>${l}</option>`).join('')}
+        </select>
+      </div>
+      ${se?`<div class="form-group"><label class="form-label">Status</label>
+        <select id="se-status" class="form-input">
+          ${statuses.map(s=>`<option value="${s}" ${se.status===s?'selected':''}>${s}</option>`).join('')}
+        </select>
+      </div>`:'<div></div>'}
+    </div>
+    <div class="form-group"><label class="form-label">Notes</label><textarea id="se-notes" class="form-input" rows="2" placeholder="Additional context…">${escHtml(se?.notes||'')}</textarea></div>
+    <div class="modal-footer">
+      <button class="btn" onclick="document.getElementById('se-overlay').remove()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitShipmentError('${se?.id||''}')">Save Error</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  setTimeout(()=>seToggleActual(),50);
+}
+
+function seToggleActual(){
+  const t=document.getElementById('se-type')?.value;
+  const col=document.getElementById('se-actual-col');
+  if(col)col.style.opacity=t==='missing_item'?'0.4':'1';
+}
+
+function seLookupOrder(force){
+  const q=(document.getElementById('se-order')?.value||'').trim().replace(/^#/,'');
+  if(!q||(!force&&q.length<3))return;
+  const match=S.sales.find(s=>(s.order_number||'').replace(/^#/,'')===q)
+    ||S.sales.find(s=>(s.order_number||'').includes(q));
+  if(!match)return;
+  const custName=match.customer_name||S.sales.find(s=>s.order_number===match.order_number&&s.customer_name)?.customer_name||'';
+  const custEmail=match.customer_email||S.sales.find(s=>s.order_number===match.order_number&&s.customer_email)?.customer_email||'';
+  const cEl=document.getElementById('se-customer');
+  const eEl=document.getElementById('se-email');
+  const pEl=document.getElementById('se-exp-pn');
+  const qEl=document.getElementById('se-exp-qty');
+  if(cEl&&!cEl.value&&custName)cEl.value=custName;
+  if(eEl&&!eEl.value&&custEmail)eEl.value=custEmail;
+  if(pEl&&!pEl.value&&match.pn)pEl.value=match.pn;
+  if(qEl&&(parseInt(qEl.value)||1)===1&&match.qty)qEl.value=match.qty;
+  if(custName||match.pn)toast(`✓ Loaded: ${custName||match.pn}`,2000);
+}
+
+async function submitShipmentError(editId){
+  const order_number=(document.getElementById('se-order')?.value||'').trim();
+  const customer_name=(document.getElementById('se-customer')?.value||'').trim();
+  const customer_email=(document.getElementById('se-email')?.value||'').trim();
+  const error_type=document.getElementById('se-type')?.value||'wrong_item';
+  const expected_pn=(document.getElementById('se-exp-pn')?.value||'').trim();
+  const expected_qty=parseInt(document.getElementById('se-exp-qty')?.value)||1;
+  const actual_pn=(document.getElementById('se-act-pn')?.value||'').trim()||null;
+  const actual_qty=parseInt(document.getElementById('se-act-qty')?.value)||0;
+  const resolution=document.getElementById('se-resolution')?.value||'none';
+  const status=document.getElementById('se-status')?.value||'Open';
+  const notes=(document.getElementById('se-notes')?.value||'').trim();
+  if(!expected_pn){toast('Expected SKU is required');return;}
+  const payload={order_number,customer_name,customer_email,error_type,expected_pn,expected_qty,
+    actual_pn:error_type==='missing_item'?null:actual_pn,
+    actual_qty:error_type==='missing_item'?0:actual_qty,
+    resolution,notes,
+    status:editId?(status||'Open'):'Open'};
+  if(editId&&status==='Resolved') payload.resolved_at=new Date().toISOString();
+  if(editId){
+    const{error}=await db.from('shipment_errors').update({...payload}).eq('id',editId);
+    if(error){toast('Error: '+error.message);return;}
+    S.shipmentErrors=(S.shipmentErrors||[]).map(e=>e.id===editId?{...e,...payload}:e);
+    document.getElementById('se-overlay')?.remove();
+    toast('Shipment error updated');render();
+  }else{
+    const{data,error}=await db.from('shipment_errors').insert(payload).select().single();
+    if(error){toast('Error: '+error.message);return;}
+    S.shipmentErrors=[data,...(S.shipmentErrors||[])];
+    document.getElementById('se-overlay')?.remove();
+    toast('Shipment error logged');updateBadge();render();
+  }
+}
+
+async function advanceShipmentError(id,newStatus){
+  const updates={status:newStatus};
+  if(newStatus==='Resolved')updates.resolved_at=new Date().toISOString();
+  const{error}=await db.from('shipment_errors').update(updates).eq('id',id);
+  if(error){toast('Error: '+error.message);return;}
+  S.shipmentErrors=(S.shipmentErrors||[]).map(e=>e.id===id?{...e,...updates}:e);
+  toast('Status → '+newStatus);updateBadge();render();
+}
+
+async function deleteShipmentError(id){
+  if(!confirm('Delete this shipment error record?'))return;
+  await db.from('shipment_errors').delete().eq('id',id);
+  S.shipmentErrors=(S.shipmentErrors||[]).filter(e=>e.id!==id);
+  toast('Deleted');updateBadge();render();
 }
 
 function shipWarrantyReplacement(id){
