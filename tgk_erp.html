@@ -2329,25 +2329,37 @@ Deno.serve(async (req) => {
     let fetched = 0
 
     while (true) {
+      // NOTE: cannot add &fields= when using page_info - Shopify rejects it
       const url = page_info
-        ? 'https://' + store + '/admin/api/2024-01/products.json?limit=250&page_info=' + page_info + '&fields=id,variants,images'
-        : 'https://' + store + '/admin/api/2024-01/products.json?limit=250&fields=id,variants,images'
+        ? 'https://' + store + '/admin/api/2024-01/products.json?limit=250&page_info=' + page_info
+        : 'https://' + store + '/admin/api/2024-01/products.json?limit=250&fields=id,title,variants,images'
       const res = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
-      if (!res.ok) return new Response(JSON.stringify({error:'Shopify ' + res.status}), {status:res.status, headers:{...CORS,'Content-Type':'application/json'}})
+      if (!res.ok) return new Response(JSON.stringify({error:'Shopify ' + res.status + ' - check API key has read_products scope'}), {status:res.status, headers:{...CORS,'Content-Type':'application/json'}})
       const data = await res.json()
       const products = data.products || []
       fetched += products.length
 
       for (const product of products) {
-        const imgSrc = product.images?.[0]?.src || ''
-        if (!imgSrc) continue
+        // Build image-id to src lookup for variant-specific images
+        const imgById: any = {}
+        for (const img of (product.images || [])) {
+          if (img.id && img.src) imgById[img.id] = img.src
+        }
+        const defaultImg = product.images?.[0]?.src || ''
+
         for (const variant of (product.variants || [])) {
           const sku = (variant.sku || '').trim()
-          if (sku) skuMap[sku] = imgSrc
+          if (!sku) continue
+          // Prefer variant-specific image, fall back to first product image
+          const img = (variant.image_id && imgById[variant.image_id]) ? imgById[variant.image_id] : defaultImg
+          if (img) {
+            skuMap[sku] = img                    // exact case
+            skuMap[sku.toUpperCase()] = img       // uppercase for case-insensitive match
+            skuMap[sku.toLowerCase()] = img       // lowercase
+          }
         }
       }
 
-      // Shopify cursor pagination via Link header
       const link = res.headers.get('link') || ''
       const next = link.match(/<[^>]+page_info=([^>&"]+)[^>]*>;\s*rel="next"/)
       if (!next || products.length < 250) break
@@ -2741,7 +2753,8 @@ async function syncShopifyImages(){
     let matched=0,updated=0,colMissing=false;
 
     for(const asm of S.assemblies){
-      const img=skuMap[asm.pn];
+      // Try exact match, then uppercase, then lowercase
+      const img=skuMap[asm.pn]||skuMap[asm.pn.toUpperCase()]||skuMap[asm.pn.toLowerCase()]||skuMap[(asm.pn||'').replace(/-/g,'')]||null;
       if(img&&img!==asm.image_url){
         const{error}=await db.from('assemblies').update({image_url:img}).eq('id',asm.id);
         if(error){
@@ -2755,16 +2768,22 @@ async function syncShopifyImages(){
     }
 
     if(colMissing){
-      // Add the column via a raw SQL call through edge function, or prompt user
       toast('⚠ Column missing — run this SQL in Supabase SQL Editor, then sync again:',6000);
       setTimeout(()=>alert('Run in Supabase → SQL Editor:\n\nALTER TABLE assemblies ADD COLUMN IF NOT EXISTS image_url text;\n\nThen click 🖼 Sync Images again.'),500);
       return;
     }
 
     render();
-    if(updated>0)toast('🖼 '+updated+' images saved — '+matched+' SKUs matched from Shopify',5000);
-    else if(matched>0)toast('🖼 All matching images already up to date ('+matched+' matched)',4000);
-    else toast('🖼 Sync complete — no SKU matches found. Check that your Shopify product variants have SKUs matching your assembly part numbers.',6000);
+    const noMatch=S.assemblies.filter(a=>!a.image_url&&!skuMap[a.pn]&&!skuMap[a.pn.toUpperCase()]&&!skuMap[a.pn.toLowerCase()]);
+    if(updated>0){
+      toast('🖼 '+updated+' images saved ('+data.fetched+' Shopify products scanned)',5000);
+    }else if(matched>0){
+      toast('🖼 Already up to date — '+matched+' images current',4000);
+    }else{
+      const shopifySkus=Object.keys(skuMap).filter(k=>k===k.toUpperCase()).slice(0,5);
+      toast('🖼 No matches — '+data.fetched+' products fetched. Sample Shopify SKUs: '+shopifySkus.join(', ')+'. Check your assembly part numbers match Shopify variant SKUs.',8000);
+    }
+    if(noMatch.length>0)console.log('Assemblies with no Shopify image match:',noMatch.map(a=>a.pn));
   }catch(e){toast('Image sync error: '+e.message);}
 }
 
