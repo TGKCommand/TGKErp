@@ -612,6 +612,7 @@ const FS_MAP={
   'Shipped':'pill-teal',
   'Delivered':'pill-green',
   'Refunded':'pill-purple',
+  'Returned':'pill-red',
   'Cancelled':'pill-muted',
 };
 function fsPill(fs){
@@ -1588,6 +1589,7 @@ function renderSaleDetail(s){
         ${lfs==='Packed'?`<button class="action-btn" onclick="unpackSaleOrder('${line.id}','${line.pn}',${line.qty||1})">↩ Unpack</button>`:''}
         ${lfs==='Shipped'?`<button class="action-btn" onclick="markDelivered('${line.id}')">✓ Delivered</button>`:''}
         ${lfs==='Shipped'?`<button class="action-btn" style="color:var(--orange);border-color:rgba(234,88,12,.3)" title="Un-ship: restore inventory and revert this line to Open or On Hold" onclick="unshipLine('${line.id}','${line.pn}',${line.qty||1})">↩ Un-ship</button>`:''}
+        ${(lfs==='Shipped'||lfs==='Delivered')?`<button class="action-btn" style="color:var(--red);border-color:rgba(220,38,38,.3)" title="Process a return for this item" onclick="openReturnModal('${line.id}','${line.pn}',${line.qty||1},'${line.order_number||s.order_number||''}')">↩ Return</button>`:''}
       </td>
     </tr>`;}).join('')}
   </tbody></table></div>
@@ -1654,8 +1656,98 @@ async function unpackSaleOrder(saleId, pn, qty){
 }
 
 // ── UN-SHIP: reverses a Shipped line — restores inventory, clears tracking, resets status ──
-async function unshipLine(saleId, pn, qty){
+function openReturnModal(saleId, pn, qty, orderNum){
+  const reasons=['Wrong item shipped','Customer changed mind','Defective / not working','Damaged in shipping','Duplicate order','Other'];
+  openModal('custom', {
+    title: 'Process Return — '+pn,
+    html: `
+      <div class="form-row">
+        <label class="form-label">Order #</label>
+        <div style="font-size:12px;color:var(--text2);padding:6px 0">${orderNum} · ${pn} × ${qty}</div>
+      </div>
+      <div class="form-row">
+        <label class="form-label">Return Reason</label>
+        <select id="ret-reason" class="form-input">
+          ${reasons.map(r=>`<option value="${r}">${r}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row">
+        <label class="form-label">Item Condition</label>
+        <select id="ret-condition" class="form-input" onchange="document.getElementById('ret-condition-note').textContent=this.value==='Resellable'?'Stock will be restored +'+${qty}:this.value==='Defective'?'Stock will NOT be restored — create warranty claim?':'Stock will NOT be restored'">
+          <option value="Resellable">Resellable — goes back to stock</option>
+          <option value="Defective">Defective — do not restock</option>
+          <option value="Damaged">Damaged — do not restock</option>
+        </select>
+        <div id="ret-condition-note" style="font-size:10px;color:var(--teal);margin-top:4px">Stock will be restored +${qty}</div>
+      </div>
+      <div class="form-row">
+        <label class="form-label">Notes (optional)</label>
+        <input id="ret-notes" class="form-input" placeholder="e.g. Customer sent back wrong part, RMA #12345">
+      </div>
+      <div class="form-row" id="ret-warranty-row" style="display:none">
+        <label style="display:flex;gap:8px;align-items:center;font-size:12px;cursor:pointer">
+          <input type="checkbox" id="ret-create-warranty"> Create warranty claim for this return
+        </label>
+      </div>`,
+    onConfirm: `processReturn('${saleId}','${pn}',${qty},'${orderNum}')`
+  });
+}
+
+async function processReturn(saleId, pn, qty, orderNum){
+  const reason=document.getElementById('ret-reason')?.value||'Return';
+  const condition=document.getElementById('ret-condition')?.value||'Resellable';
+  const notes=document.getElementById('ret-notes')?.value.trim()||'';
+  const createWarranty=document.getElementById('ret-create-warranty')?.checked||false;
   const line=S.sales.find(s=>s.id===saleId);
+  if(!line){toast('Order line not found');return;}
+
+  const undoOps=[];
+
+  // 1. Restore inventory if resellable
+  if(condition==='Resellable'){
+    const asm=S.assemblies.find(a=>a.pn===pn);
+    if(asm){
+      const prev=asm.total_on_hand||0;
+      const newOh=prev+qty;
+      await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
+      S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
+      undoOps.push({action:'update',table:'assemblies',data:{...asm,total_on_hand:newOh},prev:{...asm}});
+      const{data:corr}=await db.from('inv_corrections').insert({
+        pn,previous_qty:prev,new_qty:newOh,adjustment:qty,
+        reason:'Return — '+reason+' (order '+orderNum+')',
+        source:'return'
+      }).select().single();
+      if(corr){S.corrections=[corr,...S.corrections];}
+    }
+  }
+
+  // 2. Mark the sale line as Returned
+  await db.from('sales').update({fulfillment_status:'Returned'}).eq('id',saleId);
+  S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Returned'}:s);
+  undoOps.push({action:'update',table:'sales',data:{id:saleId,fulfillment_status:'Returned'},prev:{id:saleId,fulfillment_status:line.fulfillment_status}});
+
+  // 3. Optionally create warranty claim
+  if(createWarranty||(condition==='Defective'&&confirm('Create a warranty claim for this defective return?'))){
+    const{data:wc}=await db.from('warranty_claims').insert({
+      order_number:orderNum,pn,qty,
+      issue:reason+(notes?': '+notes:''),
+      status:'Open',
+      created_at:new Date().toISOString()
+    }).select().single();
+    if(wc)S.warrantyClaims=[wc,...S.warrantyClaims];
+    toast('Return processed + warranty claim created',4000);
+  }else{
+    toast('↩ Return processed — '+(condition==='Resellable'?qty+' unit(s) restored to stock':'no stock change'),4000);
+  }
+
+  pushUndoMulti('Return '+pn+' on order '+orderNum,undoOps);
+  closeModal();
+  await refreshSales();
+  render();
+}
+
+// ── UN-SHIP: reverses a Shipped line — restores inventory, clears tracking, resets status ──
+async function unshipLine(saleId, pn, qty){
   if(!line||line.fulfillment_status!=='Shipped'){toast('Line is not Shipped');return;}
 
   const targetStatus=confirm(
@@ -2370,6 +2462,33 @@ Deno.serve(async (req) => {
     }
   }
 
+  // New order created in ShipStation (manually or from a non-Shopify source)
+  // Shopify orders already come in via shopify-orders webhook - skip those to avoid duplicates
+  if (resource_type === 'NEW_ORDER') {
+    const order = data
+    const orderNum = order.orderNumber
+    const source = (order.orderSource || order.advancedOptions?.source || '').toLowerCase()
+    const isShopify = source.includes('shopify') || source.includes('api')
+
+    // Only process manually-created ShipStation orders, not Shopify ones (already handled)
+    if (!isShopify && orderNum) {
+      const { data: existing } = await db.from('sales').select('id').eq('order_number', orderNum).limit(1)
+      if (!existing?.length) {
+        for (const item of (order.items || [])) {
+          await db.from('sales').insert({
+            order_number: orderNum,
+            pn: item.sku || item.name,
+            qty: item.quantity || 1,
+            fulfillment_status: 'Open',
+            source: 'ShipStation Manual',
+            sale_date: (order.orderDate || new Date().toISOString()).slice(0, 10)
+          })
+        }
+        console.log('[SS] NEW_ORDER: created', orderNum, 'from ShipStation (source:', source || 'manual', ')')
+      }
+    }
+  }
+
   if (resource_type === 'ORDER_CANCELLED') {
     const rawNum = data.orderNumber
     const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
@@ -2406,6 +2525,9 @@ supabase functions deploy shipstation-ship --no-verify-jwt</pre>
       &nbsp;· <b>orders/cancelled</b> → same URL<br>
       &nbsp;· <b>orders/updated</b> → same URL (catches refunds)<br><br>
       <b>ShipStation</b> → Account Settings → Webhooks → Add Webhook:<br>
+      &nbsp;· <b>On Items Shipped</b> → <span class="pn" style="color:var(--teal)">${edgeUrl}/shipstation-ship</span><br>
+      &nbsp;· <b>On New Orders</b> → same URL (catches manually-created SS orders)<br>
+      &nbsp;· <b>Order_Cancelled</b> → same URL<br>
       &nbsp;· Event: <b>SHIP_NOTIFY</b> (fires when label created = split-aware)<br>
       &nbsp;· Event: <b>ORDER_CANCELLED</b><br>
       &nbsp;· Event: <b>ORDER_ON_HOLD</b> and <b>ORDER_HOLD_RELEASED</b><br>
@@ -2560,7 +2682,9 @@ async function checkDelivery(orderNum, saleId){
 }
 
 async function runHoldSync(){
-  toast('Checking ShipStation for held/released orders…');
+  const el=document.getElementById('ss-diag-result');
+  if(el){el.style.display='block';el.innerHTML='<div style="color:var(--text3);font-size:11px">⏳ Checking ShipStation for held / released orders…</div>';}
+  else toast('Checking ShipStation for held/released orders…');
   try{
     const res=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
       method:'POST',headers:{'Content-Type':'application/json'},
@@ -2569,13 +2693,24 @@ async function runHoldSync(){
     const data=await res.json().catch(()=>({}));
     if(res.ok){
       await refreshSales();render();
-      toast('Hold sync done — '+data.markedHold+' on hold, '+data.markedOpen+' released',4000);
-    }else toast('Hold sync error: '+(data.error||res.status));
-  }catch(e){toast('Hold sync error: '+e.message);}
+      const msg='Hold sync done — '+data.markedHold+' marked On Hold, '+data.markedOpen+' released to Open';
+      toast(msg,5000);
+      if(el)el.innerHTML='<div style="color:var(--green);font-size:11px;font-weight:700">✓ '+msg+'</div>';
+    }else{
+      const err='Hold sync error: '+(data.error||res.status);
+      toast(err);
+      if(el)el.innerHTML='<div style="color:var(--red);font-size:11px">✗ '+err+'</div>';
+    }
+  }catch(e){
+    toast('Hold sync error: '+e.message);
+    if(el)el.innerHTML='<div style="color:var(--red);font-size:11px">✗ '+escHtml(e.message)+'</div>';
+  }
 }
 
 async function runDeliverySync(){
-  toast('Checking ShipStation for delivered packages…');
+  const el=document.getElementById('ss-diag-result');
+  if(el){el.style.display='block';el.innerHTML='<div style="color:var(--text3);font-size:11px">⏳ Checking ShipStation for delivered packages (last 45 days)…</div>';}
+  else toast('Checking ShipStation for delivered packages…');
   try{
     const res=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
       method:'POST',headers:{'Content-Type':'application/json'},
@@ -2584,9 +2719,18 @@ async function runDeliverySync(){
     const data=await res.json().catch(()=>({}));
     if(res.ok){
       await refreshSales();render();
-      toast('Delivery sync done — '+data.delivered+' marked Delivered',4000);
-    }else toast('Delivery sync error: '+(data.error||res.status));
-  }catch(e){toast('Delivery sync error: '+e.message);}
+      const msg='Delivery sync done — '+data.delivered+' marked Delivered (checked '+data.checked+' shipped orders)';
+      toast(msg,5000);
+      if(el)el.innerHTML='<div style="color:var(--green);font-size:11px;font-weight:700">✓ '+msg+'</div>';
+    }else{
+      const err='Delivery sync error: '+(data.error||res.status);
+      toast(err);
+      if(el)el.innerHTML='<div style="color:var(--red);font-size:11px">✗ '+err+'</div>';
+    }
+  }catch(e){
+    toast('Delivery sync error: '+e.message);
+    if(el)el.innerHTML='<div style="color:var(--red);font-size:11px">✗ '+escHtml(e.message)+'</div>';
+  }
 }
 
 // ──────────────────────────────────────────────────────────────
