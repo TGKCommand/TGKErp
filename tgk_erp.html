@@ -794,6 +794,13 @@ function setupRealtime(){
         toast('🚚 Warranty shipped! '+(p.new.carrier?p.new.carrier+' ':'')+p.new.tracking_number,6000);
       }
     })
+    .on('postgres_changes',{event:'UPDATE',schema:'public',table:'shipment_errors'},p=>{
+      S.shipmentErrors=S.shipmentErrors.map(e=>e.id===p.new.id?p.new:e);
+      if(S.view==='warranty')scheduleRender();
+      if(p.new.tracking_number&&!S.shipmentErrors.find(e=>e.id===p.new.id&&e.tracking_number)){
+        toast('📦 Reship tracking: '+(p.new.carrier?p.new.carrier+' ':'')+p.new.tracking_number,6000);
+      }
+    })
     .subscribe((status)=>{
       _rtStatus=status;
       const dot=document.getElementById('sync-dot');
@@ -2674,8 +2681,11 @@ CREATE TABLE IF NOT EXISTS shipment_errors (
   notes text,
   status text DEFAULT 'Open',
   ss_order_id text,
+  tracking_number text,
+  carrier text,
   resolved_at timestamptz
-);</pre>
+);
+ALTER TABLE shipment_errors DISABLE ROW LEVEL SECURITY;</pre>
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">1 — Install Supabase CLI & login</div>
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto">npm install -g supabase
@@ -3094,6 +3104,19 @@ Deno.serve(async (req) => {
           status: 'Shipped',
           resolved_at: shippedAt
         }).eq('id', claimId)
+        continue
+      }
+
+      // SHERROR orders: update shipment_errors table directly
+      if (orderNum && orderNum.startsWith('SHERROR-')) {
+        const errorId = orderNum.replace('SHERROR-', '')
+        console.log('[SS] shipment error', errorId, 'reshipped, tracking', tracking)
+        await db.from('shipment_errors').update({
+          tracking_number: tracking || null,
+          carrier: carrier || null,
+          status: 'Reshipping',
+          updated_at: shippedAt
+        }).eq('id', errorId)
         continue
       }
 
@@ -8218,10 +8241,13 @@ function renderShipmentErrors(){
           :`<span class="pn" style="color:${e.actual_pn!==e.expected_pn?'var(--orange)':'var(--text2)'}">${escHtml(e.actual_pn||e.expected_pn||'—')}</span>`
           +`<span style="color:${e.actual_qty!==e.expected_qty?'var(--orange)':'var(--text3)'}"> ×${e.actual_qty||1}</span>`}
         ${e.ss_order_id?`<div style="font-size:9px;color:var(--teal);font-family:var(--mono);margin-top:1px">SS#${escHtml(e.ss_order_id)}</div>`:''}
+        ${e.tracking_number?`<div style="font-size:9px;margin-top:1px"><a href="${trackingUrl(e.carrier||'',e.tracking_number)}" target="_blank" style="color:var(--teal);text-decoration:none;font-family:var(--mono)">${e.carrier?e.carrier+' ':''}${escHtml(e.tracking_number)} ↗</a></div>`:''}
       </td>
       <td style="font-size:11px">${resolutionLabel[e.resolution||'none']||''}</td>
       <td><span class="pill ${statusPill[e.status]||'pill-muted'}">${e.status}</span></td>
       <td style="display:flex;gap:4px;flex-wrap:wrap">
+        ${(e.resolution==='reship_correct'||e.resolution==='send_additional')&&!e.ss_order_id?`<button class="btn btn-teal btn-sm" onclick="shipShipmentError('${e.id}')">🚚 Ship</button>`:''}
+        ${e.ss_order_id?`<button class="action-btn" onclick="fetchShipmentErrorTracking('${e.id}')" title="Check ShipStation for tracking">📡</button>`:''}
         ${nextStatus[e.status]?`<button class="action-btn" onclick="advanceShipmentError('${e.id}','${nextStatus[e.status]}')">→ ${nextStatus[e.status]}</button>`:''}
         <button class="action-btn" onclick="openModal('editShipmentError',{id:'${e.id}'})" title="Edit">✎</button>
         <button class="action-btn del" onclick="deleteShipmentError('${e.id}')">×</button>
@@ -8335,6 +8361,135 @@ async function advanceShipmentError(id,newStatus){
   if(error){toast('Error: '+error.message);return;}
   S.shipmentErrors=S.shipmentErrors.map(e=>e.id===id?{...e,...updates}:e);
   toast('Status → '+newStatus);render();
+}
+
+function shipShipmentError(errorId){
+  const e=S.shipmentErrors.find(x=>x.id===errorId);
+  if(!e){toast('Error record not found');return;}
+  const isSendAdditional=e.resolution==='send_additional';
+  const defaultQty=isSendAdditional?Math.max(1,(e.expected_qty||1)-(e.actual_qty||0)):e.expected_qty||1;
+  const pnDesc=S.assemblies.find(a=>a.pn===e.expected_pn)?.description||S.parts.find(p=>p.pn===e.expected_pn)?.description||e.expected_pn||'';
+  document.getElementById('se-ship-overlay')?.remove();
+  const overlay=document.createElement('div');
+  overlay.id='se-ship-overlay';
+  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:center;justify-content:center;padding:20px';
+  overlay.innerHTML='<div class="modal" style="width:560px;max-width:95vw">'
+    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">'
+      +'<div><div style="font-size:15px;font-weight:700;color:var(--text)">🚚 '+(isSendAdditional?'Ship Additional Items':'Reship Correct Item')+'</div>'
+      +'<div style="font-size:11px;color:var(--text3);margin-top:2px">Order '+escHtml(e.order_number||'—')+' — '+escHtml(e.customer_name||'')+'</div></div>'
+      +'<button onclick="document.getElementById(\'se-ship-overlay\').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">×</button>'
+    +'</div>'
+    +'<div style="padding:10px 12px;background:var(--bg3);border-radius:6px;border:1px solid var(--border);font-size:11px;color:var(--text2);margin-bottom:14px">'
+      +'<strong>Error:</strong> '+(e.error_type==='wrong_item'?'Wrong item shipped — expected <b>'+escHtml(e.expected_pn||'')+'</b>':e.error_type==='wrong_qty'?'Wrong qty — expected <b>'+e.expected_qty+'</b> shipped <b>'+e.actual_qty+'</b>':e.error_type==='missing_item'?'Item not shipped — <b>'+escHtml(e.expected_pn||'')+'</b>':'Error: '+e.error_type)+'<br>'
+      +(e.notes?'<strong>Notes:</strong> '+escHtml(e.notes):'')
+    +'</div>'
+    +'<div style="display:flex;gap:10px;margin-bottom:12px">'
+      +'<div class="form-group" style="flex:2"><label class="form-label">SKU to Ship</label>'
+        +'<input id="se-ship-pn" class="form-input" style="font-family:var(--mono)" value="'+escHtml(e.expected_pn||'')+'" placeholder="SKU"></div>'
+      +'<div class="form-group" style="flex:1"><label class="form-label">Qty</label>'
+        +'<input id="se-ship-qty" type="number" min="1" class="form-input" value="'+defaultQty+'"></div>'
+    +'</div>'
+    +'<div style="font-size:10px;color:var(--text3);margin:-6px 0 12px">'+escHtml(pnDesc)+'</div>'
+    +'<div class="form-group" style="margin-bottom:10px"><label class="form-label">Ship-to Name</label>'
+      +'<input id="se-ship-name" class="form-input" value="'+escHtml(e.customer_name||'')+'" placeholder="Full name"></div>'
+    +'<div class="form-group" style="margin-bottom:10px"><label class="form-label">Address Line 1</label>'
+      +'<input id="se-ship-addr1" class="form-input" value="" placeholder="123 Main St"></div>'
+    +'<div class="form-group" style="margin-bottom:10px"><label class="form-label">Address Line 2 (optional)</label>'
+      +'<input id="se-ship-addr2" class="form-input" value="" placeholder="Apt, suite…"></div>'
+    +'<div style="display:flex;gap:10px;margin-bottom:10px">'
+      +'<div class="form-group" style="flex:2"><label class="form-label">City</label><input id="se-ship-city" class="form-input" value=""></div>'
+      +'<div class="form-group" style="flex:1"><label class="form-label">State</label><input id="se-ship-state" class="form-input" value=""></div>'
+      +'<div class="form-group" style="flex:1"><label class="form-label">ZIP</label><input id="se-ship-zip" class="form-input" value=""></div>'
+    +'</div>'
+    +'<div class="form-group" style="margin-bottom:14px"><label class="form-label">Country</label>'
+      +'<input id="se-ship-country" class="form-input" value="US" style="max-width:80px"></div>'
+    +'<div id="se-ship-status" style="display:none;padding:10px;border-radius:6px;margin-bottom:10px;font-size:12px"></div>'
+    +'<div style="display:flex;gap:8px;justify-content:flex-end;padding-top:12px;border-top:1px solid var(--border)">'
+      +'<button class="btn" onclick="document.getElementById(\'se-ship-overlay\').remove()">Cancel</button>'
+      +'<button id="se-ship-submit" class="btn btn-teal" onclick="confirmShipShipmentError(\''+errorId+'\')">🚚 Create ShipStation Order</button>'
+    +'</div>'
+  +'</div>';
+  document.body.appendChild(overlay);
+  setTimeout(function(){document.getElementById('se-ship-addr1')?.focus();},50);
+}
+
+async function confirmShipShipmentError(errorId){
+  const e=S.shipmentErrors.find(x=>x.id===errorId);
+  if(!e){toast('Error record not found');return;}
+  const pn=(document.getElementById('se-ship-pn')?.value||'').trim();
+  const qty=parseInt(document.getElementById('se-ship-qty')?.value)||1;
+  const name=(document.getElementById('se-ship-name')?.value||'').trim();
+  const addr1=(document.getElementById('se-ship-addr1')?.value||'').trim();
+  const city=(document.getElementById('se-ship-city')?.value||'').trim();
+  const zip=(document.getElementById('se-ship-zip')?.value||'').trim();
+  if(!pn){toast('SKU is required');return;}
+  if(!addr1||!city||!zip){toast('Address, city and ZIP are required');return;}
+  const shipTo={name,street1:addr1,street2:(document.getElementById('se-ship-addr2')?.value||'').trim()||null,city,state:(document.getElementById('se-ship-state')?.value||'').trim(),postal_code:zip,country:(document.getElementById('se-ship-country')?.value||'US').trim()};
+  const statusEl=document.getElementById('se-ship-status');
+  const submitBtn=document.getElementById('se-ship-submit');
+  if(statusEl){statusEl.style.display='block';statusEl.style.background='var(--bg3)';statusEl.style.color='var(--text2)';statusEl.textContent='⏳ Creating order in ShipStation…';}
+  if(submitBtn){submitBtn.disabled=true;submitBtn.textContent='Creating…';}
+  const desc=S.assemblies.find(a=>a.pn===pn)?.description||S.parts.find(p=>p.pn===pn)?.description||pn;
+  try{
+    const resp=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        action:'create_order',
+        orderNumber:'SHERROR-'+errorId,
+        customerName:name||e.customer_name||'Customer',
+        customerEmail:e.customer_email||'',
+        pn,description:desc,qty,
+        ssItems:[{lineItemKey:'1',sku:pn,name:desc,quantity:qty,unitPrice:0}],
+        shipTo,
+        internalNotes:(e.resolution==='send_additional'?'Send additional qty':'Reship correct item')+' — Original order '+e.order_number+'. Error: '+e.error_type+(e.notes?'. '+e.notes:'')
+      })
+    });
+    const rawText=await resp.text();
+    let json;
+    try{json=JSON.parse(rawText);}catch(_){
+      if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.innerHTML='<b>✗ Edge function error (HTTP '+resp.status+')</b><br><pre style="font-size:9px;margin-top:4px">'+rawText.slice(0,300).replace(/</g,'&lt;')+'</pre>';}
+      if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
+      return;
+    }
+    if(!resp.ok||json.error){
+      if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='✗ '+(json.error||'ShipStation error');}
+      if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
+      return;
+    }
+    const ssOrderId=String(json.orderId||json.orderNumber||'created');
+    // Save SS order ID and advance to Reshipping
+    const{error:dbErr}=await db.from('shipment_errors').update({ss_order_id:ssOrderId,status:'Reshipping',updated_at:new Date().toISOString()}).eq('id',errorId);
+    if(!dbErr){S.shipmentErrors=S.shipmentErrors.map(x=>x.id===errorId?{...x,ss_order_id:ssOrderId,status:'Reshipping'}:x);}
+    document.getElementById('se-ship-overlay')?.remove();
+    toast('✓ ShipStation order created — SS#'+ssOrderId+'. Use 📡 to pull tracking once shipped.');
+    render();
+  }catch(err){
+    if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='✗ '+err.message;}
+    if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
+  }
+}
+
+async function fetchShipmentErrorTracking(errorId){
+  const e=S.shipmentErrors.find(x=>x.id===errorId);
+  if(!e){toast('Error record not found');return;}
+  const ssOrderNum='SHERROR-'+errorId;
+  toast('Checking ShipStation for '+ssOrderNum+'…');
+  const edgeUrl=SUPA_URL+'/functions/v1/shipstation-ship';
+  const resourceUrl='https://ssapi.shipstation.com/shipments?orderNumber='+encodeURIComponent(ssOrderNum)+'&pageSize=5&sortBy=ShipDate&sortDir=DESC&includeShipmentItems=true';
+  try{
+    const res=await fetch(edgeUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resource_type:'SHIP_NOTIFY',resource_url:resourceUrl})});
+    if(res.ok){
+      const{data}=await db.from('shipment_errors').select('*').eq('id',errorId).single();
+      if(data){
+        S.shipmentErrors=S.shipmentErrors.map(x=>x.id===errorId?data:x);
+        render();
+        if(data.tracking_number) toast('✓ '+(data.carrier?data.carrier+' ':'')+'Tracking: '+data.tracking_number,5000);
+        else toast('No shipment found yet for '+ssOrderNum+'. Try again after it ships.',5000);
+      }
+    }else{
+      toast('ShipStation check failed — check edge function is deployed');
+    }
+  }catch(err){toast('Error: '+err.message);}
 }
 
 async function deleteShipmentError(id){
