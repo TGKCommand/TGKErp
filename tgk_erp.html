@@ -836,6 +836,19 @@ function setupRealtime(){
       updateBadge();
       if(S.view==='warranty')scheduleRender();
     })
+    .on('postgres_changes',{event:'*',schema:'public',table:'warranty_claims'},p=>{
+      if(p.eventType==='INSERT')S.warrantyClaims=[p.new,...(S.warrantyClaims||[])];
+      else if(p.eventType==='UPDATE'){
+        const prev=(S.warrantyClaims||[]).find(w=>w.id===p.new.id);
+        S.warrantyClaims=(S.warrantyClaims||[]).map(w=>w.id===p.new.id?p.new:w);
+        if(!prev?.tracking_number&&p.new.tracking_number){
+          toast(`🔄 Warranty shipped — ${p.new.pn||p.new.id}: ${p.new.carrier||''} ${p.new.tracking_number}`,6000);
+        }
+      }
+      else if(p.eventType==='DELETE')S.warrantyClaims=(S.warrantyClaims||[]).filter(w=>w.id!==p.old.id);
+      updateBadge();
+      if(S.view==='warranty')scheduleRender();
+    })
     .subscribe((status)=>{
       _rtStatus=status;
       const dot=document.getElementById('sync-dot');
@@ -2673,7 +2686,10 @@ ALTER TABLE warranty_claims
   ADD COLUMN IF NOT EXISTS resolution_type text DEFAULT 'no_action',
   ADD COLUMN IF NOT EXISTS shipping_details jsonb,
   ADD COLUMN IF NOT EXISTS ss_order_id text,
-  ADD COLUMN IF NOT EXISTS resolved_at timestamptz;
+  ADD COLUMN IF NOT EXISTS resolved_at timestamptz,
+  ADD COLUMN IF NOT EXISTS tracking_number text,
+  ADD COLUMN IF NOT EXISTS carrier text,
+  ADD COLUMN IF NOT EXISTS shipped_at timestamptz;
 
 -- Shipment errors table (Customer Resolution → Shipment Errors tab)
 CREATE TABLE IF NOT EXISTS shipment_errors (
@@ -3078,6 +3094,14 @@ Deno.serve(async (req) => {
         continue
       }
 
+      // --- WARRANTY: warranty replacement order ---
+      if (orderNum?.startsWith('WARRANTY-')) {
+        const claimId = orderNum.replace('WARRANTY-', '')
+        await db.from('warranty_claims').update({ tracking_number: tracking, carrier, shipped_at: shippedAt, status: 'Shipped' }).eq('id', claimId)
+        console.log('[SS] WARRANTY tracking saved for', claimId, tracking)
+        continue
+      }
+
       const { data: orderLines } = await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', orderNum)
       const erpLines = orderLines?.length ? orderLines : (await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', '#' + orderNum)).data ?? []
       const resolvedOrderNum = erpLines.length && !orderLines?.length ? '#' + orderNum : orderNum
@@ -3184,6 +3208,35 @@ Deno.serve(async (req) => {
     try { ssData = JSON.parse(ssRaw) } catch (_) { /* ShipStation returned non-JSON */ }
     if (!ssRes.ok) return json({ error: 'ShipStation ' + ssRes.status + ': ' + (ssData.ExceptionMessage || ssData.message || ssRaw.slice(0, 300)) }, 502)
     return json({ orderId: ssData.orderId, orderNumber: ssData.orderNumber, status: ssData.orderStatus })
+  }
+
+  // --- CHECK_TRACKING: manually poll SS for tracking on untracked resolution orders ---
+  if (body.action === 'check_tracking') {
+    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
+    const auth = ssAuth()
+    const orders: Array<{type: string, id: string, orderNumber: string}> = body.orders || []
+    const results: Array<{id: string, type: string, tracking: string, carrier: string}> = []
+    for (const ord of orders) {
+      try {
+        const res = await fetch(`https://ssapi.shipstation.com/shipments?orderNumber=${encodeURIComponent(ord.orderNumber)}&pageSize=10`, {
+          headers: { Authorization: 'Basic ' + auth }
+        })
+        if (!res.ok) continue
+        const payload = await res.json()
+        const ship = (payload.shipments || [])[0]
+        if (!ship?.trackingNumber) continue
+        const tracking = ship.trackingNumber
+        const carrier = (ship.carrierCode || '').toUpperCase()
+        const shippedAt = ship.shipDate || new Date().toISOString()
+        if (ord.type === 'warranty') {
+          await db.from('warranty_claims').update({ tracking_number: tracking, carrier, shipped_at: shippedAt, status: 'Shipped' }).eq('id', ord.id)
+        } else {
+          await db.from('shipment_errors').update({ tracking_number: tracking, carrier, shipped_at: shippedAt }).eq('id', ord.id)
+        }
+        results.push({ id: ord.id, type: ord.type, tracking, carrier })
+      } catch (_) { /* skip individual errors */ }
+    }
+    return json({ updated: results.length, results })
   }
 
   return ok('ok')
@@ -8231,26 +8284,29 @@ function renderWarranty() {
     <div class="search-wrap"><span class="search-icon">⌕</span><input placeholder="SKU, customer, order #…" value="${sf.search||''}" oninput="setFilter('warranty','search',this.value)"></div>
     <button class="filter-chip ${!sf.status?'on-teal':''}" onclick="setFilter('warranty','status','')">All</button>
     ${statuses.map(s=>`<button class="filter-chip ${sf.status===s?'on-teal':''}" onclick="setFilter('warranty','status','${s}')">${s}</button>`).join('')}
-    <button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="openModal('addWarranty',{})">+ Log Claim</button>
+    <button class="btn btn-sm" style="margin-left:auto;color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="checkResolutionTracking()" title="Poll ShipStation for tracking on all untracked replacement orders">🔄 Check Tracking</button>
+    <button class="btn btn-primary btn-sm" onclick="openModal('addWarranty',{})">+ Log Claim</button>
   </div>
   <div class="tbl-wrap">
-  <table><thead><tr><th>Date</th><th>SKU</th><th>Customer</th><th>Order #</th><th>Issue</th><th>Resolution</th><th>Status</th><th>Action</th></tr></thead><tbody>
-  ${list.length===0?'<tr><td colspan="8" class="section-empty">No warranty claims</td></tr>':list.map(w=>{
+  <table><thead><tr><th>Date</th><th>SKU</th><th>Customer</th><th>Order #</th><th>Issue</th><th>Resolution</th><th>Tracking</th><th>Status</th><th>Action</th></tr></thead><tbody>
+  ${list.length===0?'<tr><td colspan="9" class="section-empty">No warranty claims</td></tr>':list.map(w=>{
     const statusMap={'Open':'pill-red','In Review':'pill-yellow','Approved':'pill-teal','Shipped':'pill-teal','Denied':'pill-muted','Resolved':'pill-green'};
     const nextStatus={'Open':'In Review','In Review':'Approved','Approved':'Resolved','Denied':'Resolved'};
     const isReplacement=w.resolution_type==='replacement';
     const canShip=isReplacement&&w.status==='Approved'&&!w.ss_order_id;
     const shipped=w.ss_order_id||w.status==='Shipped';
+    const wtyTrackUrl=w.carrier&&w.tracking_number?`https://www.google.com/search?q=${encodeURIComponent((w.carrier||'')+' '+w.tracking_number+' tracking')}`:'';
     return `<tr>
       <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${new Date(w.created_at).toLocaleDateString()}</td>
       <td class="pn" style="color:var(--teal)">${w.pn}</td>
       <td style="font-size:11px">${escHtml(w.customer_name||'—')}</td>
       <td class="pn">${w.order_number||'—'}</td>
-      <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px" title="${escHtml(w.issue)}">${escHtml(w.issue)}</td>
+      <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px" title="${escHtml(w.issue)}">${escHtml(w.issue)}</td>
       <td style="font-size:11px">
         ${resLabel[w.resolution_type||'no_action']||''}
-        ${shipped&&w.ss_order_id?`<div style="font-size:9px;color:var(--teal);font-family:var(--mono);margin-top:2px" title="ShipStation Order ID">SS#${w.ss_order_id}</div>`:''}
+        ${shipped&&w.ss_order_id?`<div style="font-size:9px;color:var(--teal);font-family:var(--mono);margin-top:2px">SS#${w.ss_order_id}</div>`:''}
       </td>
+      <td style="font-size:10px">${w.tracking_number?`<a href="${wtyTrackUrl}" target="_blank" style="color:var(--teal);text-decoration:none">${w.carrier?w.carrier+' ':''}<b>${w.tracking_number}</b> ↗</a>`:`<span style="color:var(--text3)">${w.ss_order_id?'Pending…':'—'}</span>`}</td>
       <td><span class="pill ${statusMap[w.status]||'pill-muted'}">${w.status}</span></td>
       <td style="display:flex;gap:4px;flex-wrap:wrap">
         ${canShip?`<button class="btn btn-teal btn-sm" onclick="shipWarrantyReplacement('${w.id}')">🚚 Ship</button>`:''}
@@ -8292,6 +8348,7 @@ function renderShipmentErrors(){
       ${Object.entries(etypeLabel).map(([v,l])=>`<option value="${v}" ${sf.etype===v?'selected':''}>${l}</option>`).join('')}
     </select>
     <button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="openModal('addShipmentError',{})">+ Log Error</button>
+    <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="checkResolutionTracking()" title="Poll ShipStation for tracking on all untracked correction orders">🔄 Check Tracking</button>
   </div>
   <div class="tbl-wrap">
   <table><thead><tr><th>Date</th><th>Order #</th><th>Customer</th><th>Error Type</th><th>Expected</th><th>Shipped</th><th>Resolution</th><th>Tracking</th><th>Status</th><th>Action</th></tr></thead><tbody>
@@ -8482,8 +8539,44 @@ async function deleteShipmentError(id){
   toast('Deleted');updateBadge();render();
 }
 
-// ── Ship Correction via ShipStation ──
-function shipShipmentError(id){
+// ── Manual tracking check against ShipStation ──
+async function checkResolutionTracking(){
+  // Collect all warranty + shipment error orders that have SS order IDs but no tracking yet
+  const wtyOrders=(S.warrantyClaims||[])
+    .filter(w=>w.ss_order_id&&!w.tracking_number&&w.status!=='Resolved')
+    .map(w=>({type:'warranty',id:w.id,orderNumber:'WARRANTY-'+w.id}));
+  const seOrders=(S.shipmentErrors||[])
+    .filter(e=>e.ss_order_id&&!e.tracking_number&&e.status!=='Resolved')
+    .map(e=>({type:'shiperror',id:e.id,orderNumber:'SHERROR-'+e.id}));
+  const orders=[...wtyOrders,...seOrders];
+  if(!orders.length){toast('No untracked orders to check');return;}
+  toast(`⏳ Checking ${orders.length} order${orders.length!==1?'s':''} in ShipStation…`,3000);
+  try{
+    const resp=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'check_tracking',orders})
+    });
+    const raw=await resp.text();
+    let json;
+    try{json=JSON.parse(raw);}catch(_){toast('✗ Edge function error — redeploy shipstation-ship');return;}
+    if(!resp.ok||json.error){toast('✗ '+(json.error||'Error checking tracking'));return;}
+    const updated=json.results||[];
+    if(!updated.length){toast('No new tracking found — orders may not have shipped yet');return;}
+    // Update in-memory state
+    updated.forEach(r=>{
+      if(r.type==='warranty'){
+        S.warrantyClaims=(S.warrantyClaims||[]).map(w=>w.id===r.id?{...w,tracking_number:r.tracking,carrier:r.carrier,status:'Shipped'}:w);
+      } else {
+        S.shipmentErrors=(S.shipmentErrors||[]).map(e=>e.id===r.id?{...e,tracking_number:r.tracking,carrier:r.carrier}:e);
+      }
+    });
+    toast(`✓ Found tracking for ${updated.length} order${updated.length!==1?'s':''}`,4000);
+    render();
+  }catch(err){
+    toast('✗ Network error: '+err.message);
+  }
+}
   const e=(S.shipmentErrors||[]).find(x=>x.id===id);
   if(!e){toast('Record not found');return;}
   // Try to pre-fill address from the original sale
