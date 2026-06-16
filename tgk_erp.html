@@ -56,6 +56,8 @@ input,button,select,textarea{font-family:var(--font)}
 .sync-dot.busy{background:var(--orange);animation:pulse 1s infinite}
 .sync-dot.err{background:var(--red)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+@keyframes rt-flash{0%{background:rgba(13,148,136,.22)}100%{background:transparent}}
+.rt-flash{animation:rt-flash 2s ease-out}
 .sync-label{font-size:11px;color:var(--text2);flex:1;font-weight:500}
 .sync-sub{font-size:10px;color:var(--text3)}
 
@@ -388,7 +390,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
     <div class="sidebar-section">Sales</div>
     <button class="nav-item" id="nav-sales" onclick="nav('sales')"><span class="nav-dot"></span>Sales Orders<span class="nav-badge" id="sales-badge" style="display:none">0</span></button>
     <button class="nav-item" id="nav-dealers" onclick="nav('dealers')"><span class="nav-dot"></span>Dealers</button>
-    <button class="nav-item" id="nav-warranty" onclick="nav('warranty')"><span class="nav-dot"></span>Warranty Claims</button>
+    <button class="nav-item" id="nav-warranty" onclick="nav('warranty')"><span class="nav-dot"></span>Warranty<span class="nav-badge" id="warranty-badge" style="display:none">0</span></button>
 
     <div class="sidebar-section">Tools</div>
     <button class="nav-item" id="nav-ai" onclick="nav('ai')"><span class="nav-dot"></span>AI Assistant</button>
@@ -494,8 +496,6 @@ const S = {
   corrections:[],
   // Warranty
   warrantyClaims:[],
-  shipmentErrors:[],
-  wtyTab:'claims',
   // Production
   activeBuild:null, buildQty:null, buildCoverage:4,
   parentBuild:null, parentBuildQty:null,
@@ -645,6 +645,12 @@ function updateBadge(){
   b.textContent=cnt;b.style.display=cnt?'inline':'none';
   const navEl=$('nav-inventory');
   if(navEl){navEl.classList.toggle('alert-nav',cnt>0);}
+  // Warranty open badge
+  const openW=S.warrantyClaims.filter(w=>w.status==='Open').length;
+  const wb=$('warranty-badge');
+  if(wb){wb.textContent=openW;wb.style.display=openW?'inline':'none';}
+  const wEl=$('nav-warranty');
+  if(wEl){wEl.classList.toggle('alert-nav',openW>0);}
 }
 
 // ============================================================
@@ -679,7 +685,7 @@ function normalizeAssemblies(rows){
 
 async function loadAll(){
   try{
-    const[parts,assemblies,sales,purchases,dealers,settings,bomItems,warrantyClaims,shipmentErrors,corrections,cycleCounts,poLinesAll,poTrackingAll]=await Promise.all([
+    const[parts,assemblies,sales,purchases,dealers,settings,bomItems,warrantyClaims,corrections,cycleCounts,poLinesAll,poTrackingAll]=await Promise.all([
       db.from('parts').select('*').order('pn'),
       db.from('assemblies').select('*').order('pn'),
       db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000),
@@ -688,7 +694,6 @@ async function loadAll(){
       db.from('settings').select('*'),
       fetchAll((f,t)=>db.from('bom_items').select('*').order('parent_pn').order('sort_order').range(f,t)),
       db.from('warranty_claims').select('*').order('created_at',{ascending:false}).limit(100),
-      db.from('shipment_errors').select('*').order('created_at',{ascending:false}).limit(200),
       db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
       db.from('cycle_counts').select('*').order('created_at',{ascending:false}).limit(50),
       db.from('po_lines').select('*').order('po_id'),
@@ -707,7 +712,6 @@ async function loadAll(){
     (Array.isArray(bomItems)?bomItems:(bomItems.data||[])).forEach(i=>{if(!S.boms[i.parent_pn])S.boms[i.parent_pn]=[];S.boms[i.parent_pn].push(i);});
     if(!S.selBOM&&Object.keys(S.boms).length)S.selBOM=Object.keys(S.boms)[0];
     S.warrantyClaims=warrantyClaims.data||[];
-    S.shipmentErrors=shipmentErrors.data||[];
     S.corrections=corrections.data||[];
     S.cycleCounts=cycleCounts.data||[];
     S.poLines={};
@@ -747,7 +751,23 @@ function setupRealtime(){
           S.sales=[p.new,...S.sales];
           showOrderAlert(p.new.order_number||'',p.new.pn||'');
         }
+      } else if(p.eventType==='UPDATE'){
+        const prev=S.sales.find(s=>s.id===p.new.id);
+        S.sales=S.sales.map(s=>s.id===p.new.id?p.new:s);
+        // Flash the row and toast if status changed externally (e.g. ShipStation webhook)
+        if(prev&&prev.fulfillment_status!==p.new.fulfillment_status){
+          const statusEmoji={Shipped:'📦',Delivered:'✅',Cancelled:'🚫','On Hold':'⏸','Partial':'🔀',Refunded:'↩',Open:'🔓'}[p.new.fulfillment_status]||'🔄';
+          toast(`${statusEmoji} #${p.new.order_number||''} → ${p.new.fulfillment_status}`,4000);
+          // Flash the row after next render
+          setTimeout(()=>{
+            const row=document.querySelector(`tr[data-order="${p.new.order_number}"]`);
+            if(row){row.classList.remove('rt-flash');void row.offsetWidth;row.classList.add('rt-flash');}
+          },100);
+        }
+      } else if(p.eventType==='DELETE'){
+        S.sales=S.sales.filter(s=>s.id!==p.old.id);
       }
+      updateBadge();
       if(['sales','dashboard'].includes(S.view))scheduleRender();
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'purchases'},p=>{
@@ -774,31 +794,10 @@ function setupRealtime(){
         // Silent — don't toast for every correction (too noisy with multiple users)
       }
     })
-    .on('postgres_changes',{event:'*',schema:'public',table:'sales'},p=>{
-      // Catch updates from other users (ShipStation webhook, other browser)
-      if(p.eventType==='UPDATE'){
-        S.sales=S.sales.map(s=>s.id===p.new.id?p.new:s);
-        if(['sales','dashboard'].includes(S.view))render();
-      }
-    })
     .on('postgres_changes',{event:'*',schema:'public',table:'cycle_count_lines'},p=>{
       if(p.eventType==='UPDATE'&&S.activeCount){
         S.countLines=S.countLines.map(l=>l.id===p.new.id?p.new:l);
         if(S.view==='cyclecounts')scheduleRender();
-      }
-    })
-    .on('postgres_changes',{event:'UPDATE',schema:'public',table:'warranty_claims'},p=>{
-      S.warrantyClaims=S.warrantyClaims.map(w=>w.id===p.new.id?p.new:w);
-      if(S.view==='warranty')scheduleRender();
-      if(p.new.tracking_number&&p.new.status==='Shipped'&&!S.warrantyClaims.find(w=>w.id===p.new.id&&w.tracking_number)){
-        toast('🚚 Warranty shipped! '+(p.new.carrier?p.new.carrier+' ':'')+p.new.tracking_number,6000);
-      }
-    })
-    .on('postgres_changes',{event:'UPDATE',schema:'public',table:'shipment_errors'},p=>{
-      S.shipmentErrors=S.shipmentErrors.map(e=>e.id===p.new.id?p.new:e);
-      if(S.view==='warranty')scheduleRender();
-      if(p.new.tracking_number&&!S.shipmentErrors.find(e=>e.id===p.new.id&&e.tracking_number)){
-        toast('📦 Reship tracking: '+(p.new.carrier?p.new.carrier+' ':'')+p.new.tracking_number,6000);
       }
     })
     .subscribe((status)=>{
@@ -816,7 +815,7 @@ function setupRealtime(){
 // ============================================================
 // NAV
 // ============================================================
-const PAGE_TITLES={dashboard:'Dashboard',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',planning:'Inventory Planning',purchases:'Purchase Orders',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Corrections Log',warranty:'Warranty Claims',import:'Import Data',pobuilder:'PO Builder'};
+const PAGE_TITLES={dashboard:'Dashboard',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',planning:'Inventory Planning',purchases:'Purchase Orders',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Corrections Log',warranty:'Warranty',import:'Import Data',pobuilder:'PO Builder'};
 
 function nav(v){
   if(v!==S.view){S.activePO=null;S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.parentBuild=null;S.parentBuildQty=null;S.activeCount=null;if(v!=='packqueue')S.workOrderMode=false;S.searchQ='';}
@@ -828,6 +827,12 @@ function nav(v){
     const b=$('sales-badge');
     if(b){b.textContent='0';b.style.display='none';}
     $('nav-sales')?.classList.remove('alert-nav');
+  }
+  // Clear warranty badge when visiting Warranty
+  if(v==='warranty'){
+    const wb=$('warranty-badge');
+    if(wb){wb.style.display='none';}
+    $('nav-warranty')?.classList.remove('alert-nav');
   }
   $('page-title').textContent=PAGE_TITLES[v]||v;
   pushHist();render();
@@ -1802,7 +1807,7 @@ function renderSales(){
     const repCarrier=s.carrier||(allOrderLines.find(x=>x.tracking_number)?.carrier)||'';
     const multiTrack=s._grouped&&allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length>1;
     const custName=s.customer_name||(s._grouped?S.sales.find(x=>x.order_number===s.order_number&&x.customer_name)?.customer_name:'');
-    return `<tr class="rowlink" onclick="rowClick(event,function(){S.activeSale='${s.id}';pushHist();render()})">
+    return `<tr class="rowlink" data-order="${escHtml(s.order_number||s.id)}" onclick="rowClick(event,function(){S.activeSale='${s.id}';pushHist();render()})">
     <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${s.sale_date?s.sale_date.slice(0,10):''}</td>
     <td class="pn">${s.order_number||''}${s._grouped?` <span style="font-size:9px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 5px;border-radius:8px;font-family:var(--mono);font-weight:600">${s._lineCount} items</span>`:''}</td>
     <td style="font-size:11px;color:var(--text2);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(custName||'—')}</td>
@@ -2356,125 +2361,70 @@ function openEditOrderModal(orderNumOrId){
   const lines=S.sales.filter(function(s){return s.order_number===orderNumOrId||s.id===orderNumOrId;}).sort(function(a,b){return a.pn.localeCompare(b.pn);});
   if(!lines.length){toast('Order not found');return;}
   const first=lines[0];
-  const statuses=['Open','On Hold','Pre-order','Packed','Shipped','Delivered','Partial','Cancelled','Returned','Refunded'];
-  document.getElementById('edit-order-overlay')?.remove();
   const overlay=document.createElement('div');
   overlay.id='edit-order-overlay';
   overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:center;justify-content:center;padding:20px';
 
-  const allPNs=[...S.assemblies.filter(function(a){return !a.discontinued;}).map(function(a){return a.pn;}),...S.parts.filter(function(p){return !p.discontinued;}).map(function(p){return p.pn;})].sort();
-
   const lineRows=lines.map(function(l){
     const la=S.assemblies.find(function(a){return a.pn===l.pn;});
     const fs=l.fulfillment_status||'Open';
-    const showTracking=(fs==='Shipped'||fs==='Delivered');
-    return '<div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:8px">'
-      +'<div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:8px">'
-        +'<div style="flex:2;min-width:0">'
-          +'<label style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:3px">SKU</label>'
-          +'<input id="eo-pn-'+l.id+'" class="form-input" style="font-family:var(--mono);font-size:12px" value="'+escHtml(l.pn)+'" list="eo-all-pns">'
-        +'</div>'
-        +'<div style="width:70px">'
-          +'<label style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:3px">Qty</label>'
-          +'<input id="eo-qty-'+l.id+'" type="number" min="1" class="form-input" style="font-size:12px" value="'+(l.qty||1)+'">'
-        +'</div>'
-        +'<div style="width:130px">'
-          +'<label style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:3px">Status</label>'
-          +'<select id="eo-status-'+l.id+'" class="form-input" style="font-size:11px" onchange="eoToggleTracking(\''+l.id+'\')">'
-            +statuses.map(function(s){return '<option value="'+s+'" '+(fs===s?'selected':'')+'>'+s+'</option>';}).join('')
-          +'</select>'
-        +'</div>'
-      +'</div>'
-      +'<div id="eo-tracking-row-'+l.id+'" style="display:'+(showTracking?'flex':'none')+';gap:8px;margin-bottom:6px">'
-        +'<div style="flex:2">'
-          +'<label style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:3px">Tracking #</label>'
-          +'<input id="eo-tracking-'+l.id+'" class="form-input" style="font-family:var(--mono);font-size:12px" value="'+escHtml(l.tracking_number||'')+'" placeholder="Tracking number">'
-        +'</div>'
-        +'<div style="width:100px">'
-          +'<label style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:3px">Carrier</label>'
-          +'<input id="eo-carrier-'+l.id+'" class="form-input" style="font-size:12px" value="'+escHtml(l.carrier||'')+'" placeholder="UPS/USPS">'
-        +'</div>'
-      +'</div>'
-      +(la?.description?'<div style="font-size:10px;color:var(--text3);margin-top:2px">'+escHtml(la.description)+'</div>':'')
+    const editable=(fs==='Open'||fs==='On Hold'||fs==='Pre-order');
+    return '<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:var(--bg3);border-radius:6px;margin-bottom:6px">'
+      +'<span style="font-family:var(--mono);font-size:12px;color:var(--teal);min-width:90px">'+escHtml(l.pn)+'</span>'
+      +'<span style="font-size:11px;color:var(--text3);flex:1">'+escHtml(la?.description||'')+'</span>'
+      +'<span style="font-size:10px;background:var(--bg4);border-radius:4px;padding:1px 7px;color:var(--text3);margin-right:4px">'+fs+'</span>'
+      +'<label style="font-size:11px;color:var(--text2);white-space:nowrap">Qty '
+        +(editable
+          ?'<input type="number" min="1" step="1" value="'+(l.qty||1)+'" id="eo-qty-'+l.id+'" style="width:60px;padding:3px 6px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px">'
+          :'<strong style="color:var(--text2)">'+(l.qty||1)+'</strong> <span style="color:var(--text3)">(locked)</span>')
+      +'</label>'
     +'</div>';
   }).join('');
 
-  const lineIdsList=lines.map(function(l){return l.id;}).join(',');
-
-  overlay.innerHTML='<div class="modal" style="width:620px;max-width:95vw;max-height:90vh;display:flex;flex-direction:column">'
-    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-shrink:0">'
-      +'<div style="font-size:15px;font-weight:700;color:var(--text)">Edit Order</div>'
+  overlay.innerHTML='<div class="modal" style="width:520px;max-width:95vw">'
+    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">'
+      +'<div style="font-size:15px;font-weight:700;color:var(--text)">Edit Order '+escHtml(orderNumOrId)+'</div>'
       +'<button onclick="document.getElementById(\'edit-order-overlay\').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">×</button>'
     +'</div>'
-    +'<div style="overflow-y:auto;flex:1">'
-      +'<datalist id="eo-all-pns">'+allPNs.map(function(p){return '<option value="'+escHtml(p)+'">'; }).join('')+'</datalist>'
-      +'<div style="display:flex;gap:10px;margin-bottom:12px">'
-        +'<div class="form-group" style="flex:1"><label class="form-label">Order #</label>'
-          +'<input id="eo-ordernum" class="form-input" style="font-family:var(--mono);font-weight:700" value="'+escHtml(first.order_number||'')+'"></div>'
-        +'<div class="form-group" style="flex:2"><label class="form-label">Customer Name</label>'
-          +'<input id="eo-customer" class="form-input" value="'+escHtml(first.customer_name||'')+'" placeholder="Customer name"></div>'
-      +'</div>'
-      +'<div style="display:flex;gap:10px;margin-bottom:14px">'
-        +'<div class="form-group" style="flex:1"><label class="form-label">Sale Date</label>'
-          +'<input id="eo-date" type="date" class="form-input" value="'+(first.sale_date?first.sale_date.slice(0,10):'')+'"></div>'
-        +'<div class="form-group" style="flex:2"><label class="form-label">Source</label>'
-          +'<input id="eo-source" class="form-input" value="'+escHtml(first.source||'')+'"></div>'
-      +'</div>'
-      +'<div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Line Items ('+lines.length+')</div>'
-      +lineRows
+    +'<div class="form-group" style="margin-bottom:12px"><label class="form-label">Customer Name</label>'
+      +'<input id="eo-customer" class="form-input" value="'+escHtml(first.customer_name||'')+'" placeholder="Customer name…"></div>'
+    +'<div style="display:flex;gap:10px;margin-bottom:12px">'
+      +'<div class="form-group" style="flex:1"><label class="form-label">Sale Date</label>'
+        +'<input id="eo-date" type="date" class="form-input" value="'+(first.sale_date?first.sale_date.slice(0,10):'')+'"></div>'
+      +'<div class="form-group" style="flex:1"><label class="form-label">Source</label>'
+        +'<input id="eo-source" class="form-input" value="'+escHtml(first.source||'')+'"></div>'
     +'</div>'
-    +'<div style="display:flex;gap:8px;justify-content:flex-end;padding-top:14px;border-top:1px solid var(--border);flex-shrink:0;margin-top:8px">'
+    +'<div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Line Items</div>'
+    +lineRows
+    +'<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">'
       +'<button class="btn" onclick="document.getElementById(\'edit-order-overlay\').remove()">Cancel</button>'
-      +'<button class="btn btn-primary" onclick="submitEditOrder(\''+escHtml(first.order_number||'')+'\',\''+lineIdsList+'\')">Save Changes</button>'
+      +'<button class="btn btn-primary" onclick="submitEditOrder(\''+escHtml(orderNumOrId)+'\')">Save Changes</button>'
     +'</div>'
   +'</div>';
   document.body.appendChild(overlay);
-  setTimeout(function(){document.getElementById('eo-ordernum')?.focus();},50);
+  setTimeout(function(){document.getElementById('eo-customer')?.focus();},50);
 }
 
-function eoToggleTracking(lineId){
-  const status=document.getElementById('eo-status-'+lineId)?.value||'';
-  const row=document.getElementById('eo-tracking-row-'+lineId);
-  if(row) row.style.display=(status==='Shipped'||status==='Delivered')?'flex':'none';
-}
-
-async function submitEditOrder(originalOrderNum,lineIdsCsv){
-  const lineIds=(lineIdsCsv||'').split(',').map(function(x){return x.trim();}).filter(Boolean);
-  if(!lineIds.length){toast('No lines to save');return;}
-  const newOrderNum=(document.getElementById('eo-ordernum')?.value||'').trim();
+async function submitEditOrder(orderNumOrId){
+  const lines=S.sales.filter(function(s){return s.order_number===orderNumOrId||s.id===orderNumOrId;});
+  if(!lines.length){toast('Order not found');return;}
   const customer=(document.getElementById('eo-customer')?.value||'').trim();
   const date=document.getElementById('eo-date')?.value||'';
   const source=(document.getElementById('eo-source')?.value||'').trim();
-  if(!newOrderNum){toast('Order number is required');return;}
+  const basePayload={customer_name:customer,sale_date:date||null,source:source,updated_at:new Date().toISOString()};
 
   let errors=0;
-  for(const lid of lineIds){
-    const pn=(document.getElementById('eo-pn-'+lid)?.value||'').trim();
-    const qty=parseInt(document.getElementById('eo-qty-'+lid)?.value)||1;
-    const status=document.getElementById('eo-status-'+lid)?.value||'Open';
-    const tracking=(document.getElementById('eo-tracking-'+lid)?.value||'').trim();
-    const carrier=(document.getElementById('eo-carrier-'+lid)?.value||'').trim();
-    if(!pn){toast('SKU cannot be empty');errors++;continue;}
-    const existing=S.sales.find(function(s){return s.id===lid;});
-    const payload={
-      order_number:newOrderNum,pn,qty,
-      customer_name:customer,sale_date:date||null,source,
-      fulfillment_status:status,
-      tracking_number:tracking||null,
-      carrier:carrier||null,
-      updated_at:new Date().toISOString()
-    };
-    if((status==='Shipped'||status==='Delivered')&&!existing?.shipped_at&&tracking){
-      payload.shipped_at=new Date().toISOString();
-    }
-    const{error}=await db.from('sales').update(payload).eq('id',lid);
-    if(error){errors++;console.error('Line '+lid+':',error.message);}
-    else{S.sales=S.sales.map(function(s){return s.id===lid?Object.assign({},s,payload):s;});}
+  for(const line of lines){
+    const qtyEl=document.getElementById('eo-qty-'+line.id);
+    const qty=qtyEl?parseInt(qtyEl.value)||line.qty||1:line.qty||1;
+    const payload=Object.assign({},basePayload,{qty:qty});
+    const{error}=await db.from('sales').update(payload).eq('id',line.id);
+    if(error){errors++;console.error(line.id,error.message);}
+    else{S.sales=S.sales.map(function(s){return s.id===line.id?Object.assign({},s,payload):s;});}
   }
   document.getElementById('edit-order-overlay')?.remove();
-  if(errors) toast('Saved with '+errors+' error(s) — check console');
-  else if(newOrderNum!==originalOrderNum) toast('Renumbered '+originalOrderNum+' \u2192 '+newOrderNum+' \u2713');
-  else toast('Order updated \u2713');
+  if(errors)toast('Saved with '+errors+' error(s) — check console');
+  else toast('Order updated');
   render();
 }
 
@@ -2633,7 +2583,8 @@ function renderIntegrations(){
           <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="ssBulkSync()">📦 Bulk Sync Shipments</button>
           <button class="btn btn-sm" onclick="ssCheckSecrets()">🔑 Check Secrets</button>
           <button class="btn btn-sm" onclick="ssManualShipPrompt()">✈ Manual Ship Override</button>
-        <button class="btn btn-sm" onclick="importOrdersFromShopify()">📥 Import All Shopify Orders</button>
+          <button class="btn btn-sm" onclick="importOrdersFromShopify()">📥 Import All Shopify Orders</button>
+          <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="syncCustomerNames()" title="Fill in missing customer names on existing orders from Shopify">👤 Sync Customer Names</button>
         </div>
         <div id="ss-diag-result" style="display:none;font-size:10px;font-family:var(--mono);background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px;max-height:280px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;color:var(--text2)"></div>
       </div>
@@ -2660,32 +2611,7 @@ ALTER TABLE warranty_claims
   ADD COLUMN IF NOT EXISTS resolution_type text DEFAULT 'no_action',
   ADD COLUMN IF NOT EXISTS shipping_details jsonb,
   ADD COLUMN IF NOT EXISTS ss_order_id text,
-  ADD COLUMN IF NOT EXISTS resolved_at timestamptz,
-  ADD COLUMN IF NOT EXISTS tracking_number text,
-  ADD COLUMN IF NOT EXISTS carrier text;
-
--- Shipment errors (wrong item / wrong qty shipped)
-CREATE TABLE IF NOT EXISTS shipment_errors (
-  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
-  created_at timestamptz DEFAULT now(),
-  updated_at timestamptz DEFAULT now(),
-  order_number text,
-  customer_name text,
-  customer_email text,
-  error_type text DEFAULT 'wrong_item',
-  expected_pn text,
-  expected_qty int DEFAULT 1,
-  actual_pn text,
-  actual_qty int DEFAULT 1,
-  resolution text DEFAULT 'none',
-  notes text,
-  status text DEFAULT 'Open',
-  ss_order_id text,
-  tracking_number text,
-  carrier text,
-  resolved_at timestamptz
-);
-ALTER TABLE shipment_errors DISABLE ROW LEVEL SECURITY;</pre>
+  ADD COLUMN IF NOT EXISTS resolved_at timestamptz;</pre>
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">1 — Install Supabase CLI & login</div>
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto">npm install -g supabase
@@ -2751,55 +2677,53 @@ Deno.serve(async (req) => {
     return new Response(await shopRes.text(), {headers:{...CORS,'Content-Type':'application/json'}})
   }
 
-  // Image sync: fetch product images from Shopify and match to assembly SKUs
-  if (body.action === 'sync_images') {
+  // Image sync (single page): frontend calls repeatedly with page_info until done
+  if (body.action === 'sync_images' || body.action === 'sync_images_page') {
     const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
     const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
     if (!store || !key) return new Response(JSON.stringify({error:'Missing Shopify credentials'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
 
+    const page_info = body.page_info || ''
+    // NOTE: cannot add &fields= when using page_info - Shopify rejects it
+    const url = page_info
+      ? 'https://' + store + '/admin/api/2024-01/products.json?limit=250&page_info=' + page_info
+      : 'https://' + store + '/admin/api/2024-01/products.json?limit=250&fields=id,title,variants,images'
+    const res = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
+    if (!res.ok) return new Response(JSON.stringify({error:'Shopify ' + res.status + ' - check API key has read_products scope'}), {status:res.status, headers:{...CORS,'Content-Type':'application/json'}})
+    const data = await res.json()
+    const products = data.products || []
+
     const skuMap: any = {}
-    let page_info = ''
-    let fetched = 0
-
-    while (true) {
-      // NOTE: cannot add &fields= when using page_info - Shopify rejects it
-      const url = page_info
-        ? 'https://' + store + '/admin/api/2024-01/products.json?limit=250&page_info=' + page_info
-        : 'https://' + store + '/admin/api/2024-01/products.json?limit=250&fields=id,title,variants,images'
-      const res = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
-      if (!res.ok) return new Response(JSON.stringify({error:'Shopify ' + res.status + ' - check API key has read_products scope'}), {status:res.status, headers:{...CORS,'Content-Type':'application/json'}})
-      const data = await res.json()
-      const products = data.products || []
-      fetched += products.length
-
-      for (const product of products) {
-        // Build image-id to src lookup for variant-specific images
-        const imgById: any = {}
-        for (const img of (product.images || [])) {
-          if (img.id && img.src) imgById[img.id] = img.src
-        }
-        const defaultImg = product.images?.[0]?.src || ''
-
-        for (const variant of (product.variants || [])) {
-          const sku = (variant.sku || '').trim()
-          if (!sku) continue
-          // Prefer variant-specific image, fall back to first product image
-          const img = (variant.image_id && imgById[variant.image_id]) ? imgById[variant.image_id] : defaultImg
-          if (img) {
-            skuMap[sku] = img                    // exact case
-            skuMap[sku.toUpperCase()] = img       // uppercase for case-insensitive match
-            skuMap[sku.toLowerCase()] = img       // lowercase
-          }
+    for (const product of products) {
+      const imgById: any = {}
+      for (const img of (product.images || [])) {
+        if (img.id && img.src) imgById[img.id] = img.src
+      }
+      const defaultImg = product.images?.[0]?.src || ''
+      for (const variant of (product.variants || [])) {
+        const sku = (variant.sku || '').trim()
+        if (!sku) continue
+        const img = (variant.image_id && imgById[variant.image_id]) ? imgById[variant.image_id] : defaultImg
+        if (img) {
+          skuMap[sku] = img
+          skuMap[sku.toUpperCase()] = img
+          skuMap[sku.toLowerCase()] = img
         }
       }
-
-      const link = res.headers.get('link') || ''
-      const next = link.match(/<[^>]+page_info=([^>&"]+)[^>]*>;\s*rel="next"/)
-      if (!next || products.length < 250) break
-      page_info = next[1]
     }
 
-    return new Response(JSON.stringify({skuMap, count: Object.keys(skuMap).length, fetched}), {headers:{...CORS,'Content-Type':'application/json'}})
+    // Parse next page_info from Link header
+    const link = res.headers.get('link') || ''
+    let next_page_info = ''
+    const linkParts = link.split(',')
+    for (const part of linkParts) {
+      if (part.includes('rel="next"')) {
+        const m = part.match(/page_info=([^&>"]+)/)
+        if (m) { next_page_info = m[1]; break }
+      }
+    }
+
+    return new Response(JSON.stringify({skuMap, count: products.length, next_page_info}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
 
   // Shopify webhook handling
@@ -3040,39 +2964,6 @@ Deno.serve(async (req) => {
     return json({ delivered, checked: shipped?.length || 0, message: delivered + ' orders marked Delivered' })
   }
 
-  // --- CREATE ORDER: fire a new order into ShipStation (used by warranty replacements) ---
-  if (body.action === 'create_order') {
-    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
-    const auth = ssAuth()
-    const { orderNumber, customerName, customerEmail, pn, description, qty, shipTo, internalNotes, ssItems } = body
-    if (!orderNumber || !pn || !shipTo?.street1) return json({ error: 'orderNumber, pn and shipTo.street1 required' }, 400)
-    const items = (Array.isArray(ssItems) && ssItems.length)
-      ? ssItems.map((it, i) => ({ lineItemKey: String(i + 1), sku: it.sku || it.pn || pn, name: it.name || it.description || it.sku || pn, quantity: it.quantity || it.qty || 1, unitPrice: 0 }))
-      : [{ lineItemKey: '1', sku: pn, name: description || pn, quantity: qty || 1, unitPrice: 0 }]
-    const ssPayload = {
-      orderNumber,
-      orderDate: new Date().toISOString(),
-      orderStatus: 'awaiting_shipment',
-      customerUsername: customerEmail || undefined,
-      customerEmail: customerEmail || undefined,
-      billTo: { name: shipTo.name || customerName || 'Customer', street1: shipTo.street1, city: shipTo.city, state: shipTo.state, postalCode: shipTo.postal_code, country: shipTo.country || 'US' },
-      shipTo: { name: shipTo.name || customerName || 'Customer', street1: shipTo.street1, street2: shipTo.street2 || undefined, city: shipTo.city, state: shipTo.state, postalCode: shipTo.postal_code, country: shipTo.country || 'US' },
-      items,
-      internalNotes: internalNotes || ('Warranty replacement order from TGK ERP — ' + orderNumber),
-      advancedOptions: { source: 'TGK ERP Warranty' }
-    }
-    const ssRes = await fetch('https://ssapi.shipstation.com/orders/createorder', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Basic ' + auth },
-      body: JSON.stringify(ssPayload)
-    })
-    const ssRaw = await ssRes.text()
-    let ssData = {}
-    try { ssData = JSON.parse(ssRaw) } catch (_) { /* ShipStation returned non-JSON */ }
-    if (!ssRes.ok) return json({ error: 'ShipStation ' + ssRes.status + ': ' + (ssData.ExceptionMessage || ssData.message || ssRaw.slice(0, 300)) }, 502)
-    return json({ orderId: ssData.orderId, orderNumber: ssData.orderNumber, status: ssData.orderStatus })
-  }
-
   const { resource_url, resource_type } = body
   console.log('[SS]', resource_type, resource_url)
   if (!resource_url) return new Response('no resource_url', { status: 400, headers: CORS })
@@ -3093,32 +2984,6 @@ Deno.serve(async (req) => {
       const shippedAt = new Date().toISOString()
       const rawSkus = (ship.shipmentItems ?? []).flatMap((i: any) => [i.sku, i.name, i.lineItemKey].filter(Boolean))
       console.log('[SS] order', orderNum, 'tracking', tracking, 'rawSkus', JSON.stringify(rawSkus))
-
-      // WARRANTY orders: update warranty_claims table directly, skip sales lookup
-      if (orderNum && orderNum.startsWith('WARRANTY-')) {
-        const claimId = orderNum.replace('WARRANTY-', '')
-        console.log('[SS] warranty claim', claimId, 'shipped, tracking', tracking)
-        await db.from('warranty_claims').update({
-          tracking_number: tracking || null,
-          carrier: carrier || null,
-          status: 'Shipped',
-          resolved_at: shippedAt
-        }).eq('id', claimId)
-        continue
-      }
-
-      // SHERROR orders: update shipment_errors table directly
-      if (orderNum && orderNum.startsWith('SHERROR-')) {
-        const errorId = orderNum.replace('SHERROR-', '')
-        console.log('[SS] shipment error', errorId, 'reshipped, tracking', tracking)
-        await db.from('shipment_errors').update({
-          tracking_number: tracking || null,
-          carrier: carrier || null,
-          status: 'Reshipping',
-          updated_at: shippedAt
-        }).eq('id', errorId)
-        continue
-      }
 
       const { data: orderLines } = await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', orderNum)
       const erpLines = orderLines?.length ? orderLines : (await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', '#' + orderNum)).data ?? []
@@ -3193,6 +3058,41 @@ Deno.serve(async (req) => {
     await db.from('sales').update({ fulfillment_status: 'Open' }).eq('order_number', ex?.length ? rawNum : '#' + rawNum)
   }
 
+  // --- CREATE ORDER: fire a new order into ShipStation (used by warranty replacements) ---
+  if (body.action === 'create_order') {
+    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
+    const auth = ssAuth()
+    const { orderNumber, customerName, customerEmail, pn, description, qty, shipTo, internalNotes, ssItems } = body
+    if (!orderNumber || !pn || !shipTo?.street1) return json({ error: 'orderNumber, pn and shipTo.street1 required' }, 400)
+    // Use ssItems array if provided (multi-item warranty), otherwise fall back to single item
+    const items = (Array.isArray(ssItems) && ssItems.length)
+      ? ssItems.map((it: any, i: number) => ({ lineItemKey: String(i + 1), sku: it.sku || it.pn || pn, name: it.name || it.description || it.sku || pn, quantity: it.quantity || it.qty || 1, unitPrice: 0 }))
+      : [{ lineItemKey: '1', sku: pn, name: description || pn, quantity: qty || 1, unitPrice: 0 }]
+    const ssPayload = {
+      orderNumber,
+      orderDate: new Date().toISOString(),
+      orderStatus: 'awaiting_shipment',
+      customerUsername: customerEmail || undefined,
+      customerEmail: customerEmail || undefined,
+      billTo: { name: shipTo.name || customerName || 'Customer', street1: shipTo.street1, city: shipTo.city, state: shipTo.state, postalCode: shipTo.postal_code, country: shipTo.country || 'US' },
+      shipTo: { name: shipTo.name || customerName || 'Customer', street1: shipTo.street1, street2: shipTo.street2 || undefined, city: shipTo.city, state: shipTo.state, postalCode: shipTo.postal_code, country: shipTo.country || 'US' },
+      items,
+      internalNotes: internalNotes || ('Warranty replacement order from TGK ERP — ' + orderNumber),
+      advancedOptions: { source: 'TGK ERP Warranty' }
+    }
+    const ssRes = await fetch('https://ssapi.shipstation.com/orders/createorder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Basic ' + auth },
+      body: JSON.stringify(ssPayload)
+    })
+    // Read as text first — ShipStation sometimes returns non-JSON errors which would crash .json()
+    const ssRaw = await ssRes.text()
+    let ssData: any = {}
+    try { ssData = JSON.parse(ssRaw) } catch (_) { /* ShipStation returned non-JSON */ }
+    if (!ssRes.ok) return json({ error: 'ShipStation ' + ssRes.status + ': ' + (ssData.ExceptionMessage || ssData.message || ssRaw.slice(0, 300)) }, 502)
+    return json({ orderId: ssData.orderId, orderNumber: ssData.orderNumber, status: ssData.orderStatus })
+  }
+
   return ok('ok')
 })
 </pre>
@@ -3237,17 +3137,33 @@ async function testShopify(){
 
 async function syncShopifyImages(){
   if(!S.shopify.key){toast('Save Shopify credentials first');return;}
-  toast('Fetching product images from Shopify...');
+  const norm=function(s){return s.toUpperCase().replace(/[\s_]+/g,'-').replace(/[^A-Z0-9-]/g,'');};
+  const skuMap={};
+  let page_info='';
+  let totalFetched=0;
+  let pageNum=0;
+  toast('Fetching product images from Shopify…');
   try{
-    const res=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'sync_images',store:S.shopify.store,key:S.shopify.key})});
-    const data=await res.json().catch(()=>({}));
-    if(!res.ok){toast('Error: '+(data.error||res.status));return;}
-    const{skuMap={}}=data;
-    const norm=function(s){return s.toUpperCase().replace(/[\s_]+/g,'-').replace(/[^A-Z0-9-]/g,'');};
+    // Paginate through ALL Shopify products page by page
+    while(true){
+      pageNum++;
+      const body={action:'sync_images_page',store:S.shopify.store,key:S.shopify.key};
+      if(page_info)body.page_info=page_info;
+      const res=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const data=await res.json().catch(()=>({}));
+      if(!res.ok){toast('Error: '+(data.error||res.status));return;}
+      const{skuMap:pageMap={},next_page_info='',count=0}=data;
+      Object.assign(skuMap,pageMap);
+      totalFetched+=count;
+      if(pageNum>1)toast(`Scanning Shopify products… ${totalFetched} fetched`,1200);
+      if(!next_page_info)break;
+      page_info=next_page_info;
+    }
     const normMap={};
     Object.keys(skuMap).forEach(function(sku){var k=norm(sku);if(!normMap[k])normMap[k]={img:skuMap[sku],sku:sku};});
     var updated=0,alreadyCurrent=0,colMissing=false;
     var unmatchedPns=[];
+    // Sync assemblies
     for(var i=0;i<S.assemblies.length;i++){
       var asm=S.assemblies[i];
       var img=skuMap[asm.pn]||skuMap[asm.pn.toUpperCase()]||skuMap[asm.pn.toLowerCase()]||(normMap[norm(asm.pn)]&&normMap[norm(asm.pn)].img)||null;
@@ -3261,19 +3177,27 @@ async function syncShopifyImages(){
       }else{unmatchedPns.push(asm.pn);}
     }
     if(colMissing){toast('Column missing - run: ALTER TABLE assemblies ADD COLUMN IF NOT EXISTS image_url text; in Supabase SQL Editor',8000);return;}
+    // Also sync parts
+    for(var j=0;j<S.parts.length;j++){
+      var pt=S.parts[j];
+      var pimg=skuMap[pt.pn]||skuMap[pt.pn.toUpperCase()]||skuMap[pt.pn.toLowerCase()]||(normMap[norm(pt.pn)]&&normMap[norm(pt.pn)].img)||null;
+      if(pimg&&pimg!==pt.image_url){
+        var pr=await db.from('parts').update({image_url:pimg}).eq('id',pt.id);
+        if(!pr.error){S.parts=S.parts.map(function(p){return p.id===pt.id?Object.assign({},p,{image_url:pimg}):p;});updated++;}
+      }
+    }
     render();
-    var totalSkus=Object.keys(skuMap).length;
-    var sampleSkus=Object.keys(skuMap).filter(function(k){return k.match(/^TGK/i);}).slice(0,5).join(', ')||Object.keys(skuMap).slice(0,5).join(', ');
     if(updated>0){
-      toast('Saved '+updated+' images. '+unmatchedPns.length+' assemblies have no Shopify match.',6000);
+      toast(`✓ Saved ${updated} images (${totalFetched} Shopify products scanned). ${unmatchedPns.length} assemblies have no Shopify match.`,6000);
     }else if(alreadyCurrent>0){
-      toast('All images already current ('+alreadyCurrent+' matched). '+unmatchedPns.length+' have no Shopify match.',5000);
+      toast(`All images already current (${alreadyCurrent} matched, ${totalFetched} products scanned). ${unmatchedPns.length} have no Shopify match.`,5000);
     }else{
-      toast('No matches. '+totalSkus+' Shopify SKUs scanned. Examples: '+sampleSkus+'. Check Shopify variant SKUs match your assembly part numbers.',8000);
+      const sampleSkus=Object.keys(skuMap).filter(function(k){return k.match(/^TGK/i);}).slice(0,5).join(', ')||Object.keys(skuMap).slice(0,5).join(', ');
+      toast(`No matches. ${totalFetched} Shopify SKUs scanned. Examples: ${sampleSkus}. Check Shopify variant SKUs match your assembly part numbers.`,8000);
     }
     if(unmatchedPns.length>0){
       console.log('Unmatched assemblies (no Shopify image):',unmatchedPns);
-      console.log('Shopify SKUs found:',Object.keys(skuMap).slice(0,30));
+      console.log('Sample Shopify SKUs found:',Object.keys(skuMap).slice(0,30));
     }
   }catch(e){toast('Image sync error: '+e.message);}
 }
@@ -3397,37 +3321,6 @@ async function fetchOrderTracking(orderNum){
         const shipped2=S.sales.filter(s=>(s.order_number===orderNum||s.order_number===clean||s.order_number==='#'+clean)&&s.fulfillment_status==='Shipped'&&s.tracking_number);
         if(shipped2.length){toast('Tracking found! '+shipped2.map(l=>(l.carrier?l.carrier+' ':'')+l.tracking_number).join(', '),5000);}
         else{toast('No shipment found for order '+orderNum+' in ShipStation. If it shipped recently, try Bulk Sync Shipments.',5000);}
-      }
-    }else{
-      toast('ShipStation check failed — check edge function is deployed and SS_KEY/SS_SECRET are set');
-    }
-  }catch(e){toast('Error: '+e.message);}
-}
-
-async function fetchWarrantyTracking(claimId){
-  const claim=S.warrantyClaims.find(w=>w.id===claimId);
-  if(!claim){toast('Claim not found');return;}
-  const ssOrderNum='WARRANTY-'+claimId;
-  toast('Checking ShipStation for '+ssOrderNum+'…');
-  const edgeUrl=SUPA_URL+'/functions/v1/shipstation-ship';
-  const resourceUrl='https://ssapi.shipstation.com/shipments?orderNumber='+encodeURIComponent(ssOrderNum)+'&pageSize=5&sortBy=ShipDate&sortDir=DESC&includeShipmentItems=true';
-  try{
-    const res=await fetch(edgeUrl,{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({resource_type:'SHIP_NOTIFY',resource_url:resourceUrl})
-    });
-    if(res.ok){
-      // Re-fetch this specific claim from DB to get latest tracking
-      const{data}=await db.from('warranty_claims').select('*').eq('id',claimId).single();
-      if(data){
-        S.warrantyClaims=S.warrantyClaims.map(w=>w.id===claimId?data:w);
-        render();
-        if(data.tracking_number){
-          toast('✓ '+(data.carrier?data.carrier+' ':'')+'Tracking: '+data.tracking_number,5000);
-        }else{
-          // ShipStation might not have shipped it yet
-          toast('No shipment found yet for '+ssOrderNum+'. If it shipped recently, wait a minute and try again.',5000);
-        }
       }
     }else{
       toast('ShipStation check failed — check edge function is deployed and SS_KEY/SS_SECRET are set');
@@ -4051,6 +3944,53 @@ async function importOrdersFromShopify(){
   toast(`✓ Shopify import done — ${imported} new orders, ${skipped} already existed`);
 }
 
+// Fill in missing customer_name / customer_email on all existing orders from Shopify
+async function syncCustomerNames(){
+  if(!S.shopify?.key){toast('Save Shopify credentials first (Integrations → Shopify)');return;}
+  // Build a set of order numbers that need names
+  const needsName=new Set(
+    S.sales.filter(s=>!s.customer_name).map(s=>(s.order_number||'').replace(/^#/,''))
+  );
+  if(needsName.size===0){toast('All orders already have customer names ✓');return;}
+  toast(`Looking up names for ${needsName.size} orders…`);
+  let filled=0,page=1,keepGoing=true;
+  const EDGE=SUPA_URL+'/functions/v1/shopify-orders';
+  const since=new Date(Date.now()-365*24*60*60*1000).toISOString();// last 1 year
+  while(keepGoing&&needsName.size>0){
+    let orders=[];
+    try{
+      const resp=await fetch(EDGE,{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({action:'sync',store:S.shopify.store,key:S.shopify.key,since,page})});
+      if(!resp.ok){toast('Shopify error '+resp.status);break;}
+      const j=await resp.json();
+      orders=j.orders||[];
+    }catch(e){toast('Network error: '+e.message);break;}
+    if(!orders.length)break;
+    for(const order of orders){
+      const num=(order.name||'').replace(/^#/,'');
+      if(!needsName.has(num))continue;
+      const custName=((order.shipping_address?.name||order.billing_address?.name||(order.customer?(order.customer.first_name||'')+' '+(order.customer.last_name||''):''))||'').trim()||null;
+      const custEmail=(order.email||order.customer?.email||'')||null;
+      if(!custName&&!custEmail)continue;
+      // Update all lines for this order
+      const{error}=await db.from('sales').update({
+        ...(custName?{customer_name:custName}:{}),
+        ...(custEmail?{customer_email:custEmail}:{})
+      }).eq('order_number',order.name);
+      if(!error){
+        S.sales=S.sales.map(s=>s.order_number===order.name?{...s,...(custName?{customer_name:custName}:{}),...(custEmail?{customer_email:custEmail}:{})}:s);
+        needsName.delete(num);
+        filled++;
+      }
+    }
+    page++;
+    if(orders.length<250)keepGoing=false;
+    if(filled>0)toast(`Syncing names… ${filled} filled so far`,1200);
+  }
+  render();
+  toast(filled>0?`✓ Filled ${filled} customer names. ${needsName.size} orders still missing (not in Shopify last year).`:`No new names found — try Import All Shopify Orders for older history.`,6000);
+}
+
 async function verifyOrdersWithShipStation(){
   const token=document.getElementById('ss-test-order')?.value?.trim();
   const msg=`Paste a ShipStation order number in the "Test Order Sync" box above and click 🔍 — it will show whether that order exists in both ShipStation and the ERP, and what status each thinks it's in.
@@ -4588,7 +4528,7 @@ function openModal(type,data){
     S.wtyItems=[];
     const allPNs=[...S.parts.filter(p=>!p.discontinued).map(p=>p.pn),...S.assemblies.filter(a=>!a.discontinued).map(a=>a.pn)].sort();
     const discPNsWty=[...S.parts.filter(p=>p.discontinued).map(p=>p.pn),...S.assemblies.filter(a=>a.discontinued).map(a=>a.pn)].sort();
-    body=`<div class="form-row cols-2">${fi('wty-order','Order #','')} ${fi('wty-name','Customer Name','')}</div>
+    body=`<div class="form-row cols-2">${fi('wty-order','Order #','',' oninput="wtyLookupOrder(this.value)"')} ${fi('wty-name','Customer Name','')}</div>
     <div class="form-row">${fi('wty-email','Customer Email','','type="email"')}</div>
     <div class="form-row"><div class="form-group"><label class="form-label">Issue Description</label><textarea class="form-input" id="wty-issue" rows="2" placeholder="Describe the issue…"></textarea></div></div>
     <div class="form-row"><div class="form-group"><label class="form-label">Resolution Type</label>
@@ -4640,135 +4580,7 @@ function openModal(type,data){
     </div>
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitWarranty()">Log Claim</button></div>`;
   }
-  else if(type==='editWarranty'){
-    const w=S.warrantyClaims.find(x=>x.id===data.id);
-    if(!w){toast('Claim not found');return;}
-    title='Edit Warranty Claim';
-    const statuses=['Open','In Review','Approved','Shipped','Denied','Resolved'];
-    const sd=w.shipping_details||{};
-    const claimItemsHtml=(w.claim_items&&w.claim_items.length)
-      ?`<div style="margin-top:4px;padding:8px 12px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)">
-          <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Replacement Items</div>
-          ${w.claim_items.map((item,i)=>`<div style="display:flex;align-items:center;gap:8px;padding:4px 0;${i?'border-top:1px solid var(--border)':''}">
-            <span class="pn" style="color:var(--teal)">${escHtml(item.pn)}</span>
-            <span style="font-size:10px;color:var(--text3)">${escHtml(item.type||'')}</span>
-            <span style="font-size:11px;color:var(--text2);flex:1">${escHtml(item.description||'')}</span>
-            <span style="font-size:11px;font-weight:600">×${item.qty||1}</span>
-          </div>`).join('')}
-        </div>`
-      :'';
-    const shippingHtml=(w.resolution_type==='replacement')
-      ?`<div style="margin-top:10px;padding:12px;background:var(--bg3);border-radius:8px;border:1px solid var(--border)">
-          <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">🚚 Shipping Address</div>
-          <div class="form-row">${fi('wty-e-ship-name','Ship-to Name',sd.name||w.customer_name||'','placeholder="Customer full name"')}</div>
-          <div class="form-row">${fi('wty-e-addr1','Address Line 1',sd.street1||'','placeholder="123 Main St"')}</div>
-          <div class="form-row">${fi('wty-e-addr2','Address Line 2 (optional)',sd.street2||'','placeholder="Apt, Suite…"')}</div>
-          <div class="form-row cols-2">${fi('wty-e-city','City',sd.city||'')} ${fi('wty-e-state','State',sd.state||'')}</div>
-          <div class="form-row cols-2">${fi('wty-e-zip','ZIP',sd.postal_code||'')} ${fi('wty-e-country','Country',sd.country||'US')}</div>
-        </div>`
-      :'';
-    body=`
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;padding:8px 12px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)">
-      <span class="pn" style="color:var(--teal);font-size:13px">${escHtml(w.pn)}</span>
-      <span style="font-size:10px;color:var(--text3)">logged ${new Date(w.created_at).toLocaleDateString()}</span>
-      ${w.ss_order_id?`<span style="font-size:10px;color:var(--teal);font-family:var(--mono);margin-left:auto">SS#${escHtml(w.ss_order_id)}</span>`:''}
-      ${w.tracking_number?`<a href="${trackingUrl(w.carrier||'',w.tracking_number)}" target="_blank" style="font-size:10px;color:var(--teal);font-family:var(--mono);text-decoration:none">${w.carrier?w.carrier+' ':''}${escHtml(w.tracking_number)} ↗</a>`:''}
-    </div>
-    <div class="form-row cols-2">${fi('wty-e-order','Order #',w.order_number||'')} ${fi('wty-e-name','Customer Name',w.customer_name||'')}</div>
-    <div class="form-row">${fi('wty-e-email','Customer Email',w.customer_email||'','type="email"')}</div>
-    <div class="form-row"><div class="form-group"><label class="form-label">Issue Description</label><textarea class="form-input" id="wty-e-issue" rows="3">${escHtml(w.issue||'')}</textarea></div></div>
-    <div class="form-row cols-2">
-      <div class="form-group"><label class="form-label">Resolution Type</label>
-        <select id="wty-e-resolution" class="form-input">
-          <option value="no_action" ${w.resolution_type==='no_action'?'selected':''}>No Action</option>
-          <option value="replacement" ${w.resolution_type==='replacement'?'selected':''}>🔄 Replacement</option>
-          <option value="repair" ${w.resolution_type==='repair'?'selected':''}>🔧 Repair</option>
-          <option value="refund" ${w.resolution_type==='refund'?'selected':''}>💰 Refund</option>
-        </select>
-      </div>
-      <div class="form-group"><label class="form-label">Status</label>
-        <select id="wty-e-status" class="form-input">
-          ${statuses.map(s=>`<option value="${s}" ${w.status===s?'selected':''}>${s}</option>`).join('')}
-        </select>
-      </div>
-    </div>
-    ${claimItemsHtml}
-    ${shippingHtml}
-    <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitWarrantyEdit('${w.id}')">Save Changes</button></div>`;
-  }
-  else if(type==='addShipmentError'||type==='editShipmentError'){
-    const isEdit=(type==='editShipmentError');
-    const se=isEdit?S.shipmentErrors.find(x=>x.id===data.id):null;
-    if(isEdit&&!se){toast('Error not found');return;}
-    title=isEdit?'Edit Shipment Error':'Log Shipment Error';
-    const allPNs=[...S.assemblies.filter(a=>!a.discontinued).map(a=>a.pn),...S.parts.filter(p=>!p.discontinued).map(p=>p.pn)].sort();
-    const errTypes=[['wrong_item','Wrong Item shipped'],['wrong_qty','Wrong Quantity shipped'],['missing_item','Item missing / not shipped'],['extra_item','Extra item included'],['damaged','Damaged in transit']];
-    const resolutions=[['none','No resolution yet'],['reship_correct','Reship correct item'],['send_additional','Send additional qty'],['customer_keeps','Customer keeps — no action'],['return_required','Return required from customer']];
-    const statuses=['Open','Reshipping','Resolved'];
-    body=`
-    <div class="form-row cols-2">
-      <div class="form-group">
-        <label class="form-label">Order #</label>
-        <div style="display:flex;gap:6px">
-          <input id="se-order" class="form-input" value="${escHtml(se?.order_number||data.order_number||'')}" placeholder="e.g. #8525" style="flex:1">
-          <button type="button" class="btn btn-sm" onclick="seLookupOrder()" title="Auto-fill from order">↻ Fill</button>
-        </div>
-      </div>
-      ${fi('se-customer','Customer Name',se?.customer_name||data.customer_name||'')}
-    </div>
-    <div class="form-row">${fi('se-email','Customer Email',se?.customer_email||'','type="email"')}</div>
-    <div class="form-row">
-      <div class="form-group"><label class="form-label">Error Type</label>
-        <select id="se-type" class="form-input" onchange="seToggleActual()">
-          ${errTypes.map(([v,l])=>`<option value="${v}" ${(se?.error_type||'wrong_item')===v?'selected':''}>${l}</option>`).join('')}
-        </select>
-      </div>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;padding:12px;background:var(--bg3);border-radius:8px;border:1px solid var(--border)">
-      <div>
-        <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">✓ Expected (ordered)</div>
-        <div class="form-group" style="margin-bottom:8px"><label class="form-label">SKU</label>
-          <input id="se-exp-pn" class="form-input" style="font-family:var(--mono)" value="${escHtml(se?.expected_pn||data.expected_pn||'')}" list="se-all-pns" placeholder="Expected SKU">
-        </div>
-        <div class="form-group"><label class="form-label">Qty</label>
-          <input id="se-exp-qty" type="number" min="1" class="form-input" value="${se?.expected_qty||data.expected_qty||1}">
-        </div>
-      </div>
-      <div id="se-actual-col">
-        <div style="font-size:10px;font-weight:700;color:var(--orange);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">✗ Actually Shipped</div>
-        <div class="form-group" style="margin-bottom:8px"><label class="form-label">SKU</label>
-          <input id="se-act-pn" class="form-input" style="font-family:var(--mono)" value="${escHtml(se?.actual_pn||data.actual_pn||'')}" list="se-all-pns" placeholder="What was shipped">
-        </div>
-        <div class="form-group"><label class="form-label">Qty</label>
-          <input id="se-act-qty" type="number" min="0" class="form-input" value="${se?.actual_qty!=null?se.actual_qty:(data.actual_qty!=null?data.actual_qty:1)}">
-        </div>
-      </div>
-    </div>
-    <datalist id="se-all-pns">${allPNs.map(p=>`<option value="${escHtml(p)}">`).join('')}</datalist>
-    <div class="form-row">
-      <div class="form-group"><label class="form-label">Resolution</label>
-        <select id="se-resolution" class="form-input">
-          ${resolutions.map(([v,l])=>`<option value="${v}" ${(se?.resolution||'none')===v?'selected':''}>${l}</option>`).join('')}
-        </select>
-      </div>
-    </div>
-    ${isEdit?`<div class="form-row">
-      <div class="form-group"><label class="form-label">Status</label>
-        <select id="se-status" class="form-input">
-          ${statuses.map(s=>`<option value="${s}" ${(se?.status||'Open')===s?'selected':''}>${s}</option>`).join('')}
-        </select>
-      </div>
-    </div>`:''}
-    <div class="form-row"><div class="form-group"><label class="form-label">Notes</label>
-      <textarea class="form-input" id="se-notes" rows="2" placeholder="Any additional details…">${escHtml(se?.notes||data.notes||'')}</textarea>
-    </div></div>
-    <div class="modal-footer">
-      <button class="btn" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="submitShipmentError('${isEdit?se.id:''}')">${isEdit?'Save Changes':'Log Error'}</button>
-    </div>`;
-    setTimeout(seToggleActual,30);
-  }
-    else if(type==='custom'){
+  else if(type==='custom'){
     title=data.title||'';
     body=(data.html||'');
     if(data.onConfirm){
@@ -5128,6 +4940,26 @@ async function submitManualSale(){
   if(error){toast('Error: '+error.message);return;}
   S.sales=[data,...S.sales];
   closeModal();toast('Order '+orderNum+' created');render();
+}
+// Auto-fill warranty form from order number lookup
+function wtyLookupOrder(orderNum){
+  const q=(orderNum||'').trim().replace(/^#/,'');
+  if(q.length<3)return;
+  // Search sales for a matching order (try with and without # prefix)
+  const match=S.sales.find(s=>{
+    const n=(s.order_number||'').replace(/^#/,'');
+    return n===q||n===(('#'+q).replace(/^#+/,'#'));
+  })||S.sales.find(s=>(s.order_number||'').includes(q));
+  if(!match)return;
+  const nameEl=document.getElementById('wty-name');
+  const emailEl=document.getElementById('wty-email');
+  const shipNameEl=document.getElementById('wty-ship-name');
+  const custName=match.customer_name||S.sales.find(s=>s.order_number===match.order_number&&s.customer_name)?.customer_name||'';
+  const custEmail=match.customer_email||S.sales.find(s=>s.order_number===match.order_number&&s.customer_email)?.customer_email||'';
+  if(nameEl&&!nameEl.value&&custName)nameEl.value=custName;
+  if(emailEl&&!emailEl.value&&custEmail)emailEl.value=custEmail;
+  if(shipNameEl&&!shipNameEl.value&&custName)shipNameEl.value=custName;
+  if(custName)toast('✓ Loaded customer: '+custName,2500);
 }
 async function submitWarranty(){
   const issue=(document.getElementById('wty-issue')?.value||'').trim();
@@ -8132,17 +7964,6 @@ async function submitManualCorrection(pn, newQty, reason) {
 // WARRANTY CLAIMS
 // ============================================================
 function renderWarranty() {
-  const tab=S.wtyTab||'claims';
-  const openClaims=S.warrantyClaims.filter(w=>w.status==='Open').length;
-  const openErrors=S.shipmentErrors.filter(e=>e.status==='Open').length;
-  const tabBar=`<div class="tabs-row" style="margin-bottom:16px">
-    <div class="tab ${tab==='claims'?'active':''}" onclick="S.wtyTab='claims';render()">Warranty Claims${openClaims?` <span class="nav-badge" style="display:inline-flex;background:var(--red)">${openClaims}</span>`:''}
-    </div>
-    <div class="tab ${tab==='errors'?'active':''}" onclick="S.wtyTab='errors';render()">Shipment Errors${openErrors?` <span class="nav-badge" style="display:inline-flex;background:var(--orange)">${openErrors}</span>`:''}
-    </div>
-  </div>`;
-  if(tab==='errors') return tabBar+renderShipmentErrors();
-
   const sf=S.filters.warranty||{};
   let list=S.warrantyClaims;
   const q=(sf.search||'').toLowerCase();
@@ -8151,7 +7972,7 @@ function renderWarranty() {
   const statuses=['Open','In Review','Approved','Shipped','Denied','Resolved'];
   const counts={};statuses.forEach(s=>{counts[s]=S.warrantyClaims.filter(w=>w.status===s).length;});
   const resLabel={'no_action':'','replacement':'🔄 Replace','repair':'🔧 Repair','refund':'💰 Refund'};
-  return tabBar+`
+  return `
   <div class="kpi-grid" style="grid-template-columns:repeat(6,1fr)">
     ${statuses.map(s=>`<div class="kpi ${s==='Open'?'kpi-red':s==='Shipped'?'kpi-teal':s==='Resolved'?'kpi-green':''}"><div class="kpi-label">${s}</div><div class="kpi-value">${counts[s]||0}</div></div>`).join('')}
   </div>
@@ -8178,79 +7999,12 @@ function renderWarranty() {
       <td style="font-size:11px">
         ${resLabel[w.resolution_type||'no_action']||''}
         ${shipped&&w.ss_order_id?`<div style="font-size:9px;color:var(--teal);font-family:var(--mono);margin-top:2px" title="ShipStation Order ID">SS#${w.ss_order_id}</div>`:''}
-        ${w.tracking_number?`<div style="font-size:9px;margin-top:2px"><a href="${trackingUrl(w.carrier||'',w.tracking_number)}" target="_blank" style="color:var(--teal);text-decoration:none;font-family:var(--mono)" title="Track ${w.carrier||''} ${w.tracking_number}">${w.carrier?w.carrier+' ':''}${w.tracking_number} ↗</a></div>`:''}
       </td>
       <td><span class="pill ${statusMap[w.status]||'pill-muted'}">${w.status}</span></td>
       <td style="display:flex;gap:4px;flex-wrap:wrap">
         ${canShip?`<button class="btn btn-teal btn-sm" onclick="shipWarrantyReplacement('${w.id}')">🚚 Ship</button>`:''}
         ${!canShip&&nextStatus[w.status]?`<button class="action-btn" onclick="advanceWarranty('${w.id}','${nextStatus[w.status]}')">→ ${nextStatus[w.status]}</button>`:''}
-        ${w.ss_order_id?`<button class="action-btn" onclick="fetchWarrantyTracking('${w.id}')" title="Check ShipStation for tracking update">📡</button>`:''}
-        <button class="action-btn" onclick="openModal('editWarranty',{id:'${w.id}'})" title="Edit claim">✎</button>
         <button class="action-btn del" onclick="deleteWarranty('${w.id}')">×</button>
-      </td>
-    </tr>`;
-  }).join('')}
-  </tbody></table></div>`;
-}
-
-function renderShipmentErrors(){
-  const sf=S.filters.shipErr||{};
-  let list=S.shipmentErrors;
-  const q=(sf.search||'').toLowerCase();
-  if(q) list=list.filter(e=>(e.order_number||'').toLowerCase().includes(q)||(e.customer_name||'').toLowerCase().includes(q)||(e.expected_pn||'').toLowerCase().includes(q)||(e.actual_pn||'').toLowerCase().includes(q));
-  if(sf.status) list=list.filter(e=>e.status===sf.status);
-  if(sf.type) list=list.filter(e=>e.error_type===sf.type);
-
-  const statuses=['Open','Reshipping','Resolved'];
-  const counts={};
-  statuses.forEach(s=>{counts[s]=S.shipmentErrors.filter(e=>e.status===s).length;});
-  const errTypeLabel={'wrong_item':'Wrong Item','wrong_qty':'Wrong Qty','missing_item':'Missing Item','extra_item':'Extra Item','damaged':'Damaged in Transit'};
-  const errTypePill={'wrong_item':'pill-red','wrong_qty':'pill-yellow','missing_item':'pill-orange','extra_item':'pill-muted','damaged':'pill-orange'};
-  const statusPill={'Open':'pill-red','Reshipping':'pill-teal','Resolved':'pill-green'};
-  const resolutionLabel={'reship_correct':'🔄 Reship','send_additional':'📦 Send Add\'l','customer_keeps':'✓ Customer Keeps','return_required':'↩ Return Req\'d','none':''};
-
-  return `
-  <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr)">
-    ${statuses.map(s=>`<div class="kpi ${s==='Open'?'kpi-red':s==='Reshipping'?'kpi-teal':s==='Resolved'?'kpi-green':''}"><div class="kpi-label">${s}</div><div class="kpi-value">${counts[s]||0}</div></div>`).join('')}
-  </div>
-  <div class="filter-bar">
-    <div class="search-wrap"><span class="search-icon">⌕</span><input placeholder="Order #, customer, SKU…" value="${sf.search||''}" oninput="setFilter('shipErr','search',this.value)"></div>
-    <button class="filter-chip ${!sf.status?'on-teal':''}" onclick="setFilter('shipErr','status','')">All</button>
-    ${statuses.map(s=>`<button class="filter-chip ${sf.status===s?'on-teal':''}" onclick="setFilter('shipErr','status','${s}')">${s}</button>`).join('')}
-    <select class="form-input" style="width:140px" onchange="setFilter('shipErr','type',this.value)">
-      <option value="">All Error Types</option>
-      ${Object.entries(errTypeLabel).map(([v,l])=>`<option value="${v}" ${sf.type===v?'selected':''}>${l}</option>`).join('')}
-    </select>
-    <button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="openModal('addShipmentError',{})">+ Log Error</button>
-  </div>
-  <div class="tbl-wrap">
-  <table><thead><tr><th>Date</th><th>Order #</th><th>Customer</th><th>Error</th><th>Expected</th><th>Actual Shipped</th><th>Resolution</th><th>Status</th><th>Action</th></tr></thead><tbody>
-  ${list.length===0?'<tr><td colspan="9" class="section-empty">No shipment errors logged</td></tr>':list.map(e=>{
-    const nextStatus={'Open':'Reshipping','Reshipping':'Resolved'};
-    return `<tr>
-      <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${new Date(e.created_at).toLocaleDateString()}</td>
-      <td class="pn">${escHtml(e.order_number||'—')}</td>
-      <td style="font-size:11px">${escHtml(e.customer_name||'—')}</td>
-      <td><span class="pill ${errTypePill[e.error_type]||'pill-muted'}" style="font-size:9px">${errTypeLabel[e.error_type]||e.error_type}</span></td>
-      <td style="font-size:11px">
-        <span class="pn" style="color:var(--teal)">${escHtml(e.expected_pn||'—')}</span>
-        <span style="color:var(--text3)"> ×${e.expected_qty||1}</span>
-      </td>
-      <td style="font-size:11px">
-        ${e.error_type==='missing_item'?'<span style="color:var(--red)">Nothing shipped</span>'
-          :`<span class="pn" style="color:${e.actual_pn!==e.expected_pn?'var(--orange)':'var(--text2)'}">${escHtml(e.actual_pn||e.expected_pn||'—')}</span>`
-          +`<span style="color:${e.actual_qty!==e.expected_qty?'var(--orange)':'var(--text3)'}"> ×${e.actual_qty||1}</span>`}
-        ${e.ss_order_id?`<div style="font-size:9px;color:var(--teal);font-family:var(--mono);margin-top:1px">SS#${escHtml(e.ss_order_id)}</div>`:''}
-        ${e.tracking_number?`<div style="font-size:9px;margin-top:1px"><a href="${trackingUrl(e.carrier||'',e.tracking_number)}" target="_blank" style="color:var(--teal);text-decoration:none;font-family:var(--mono)">${e.carrier?e.carrier+' ':''}${escHtml(e.tracking_number)} ↗</a></div>`:''}
-      </td>
-      <td style="font-size:11px">${resolutionLabel[e.resolution||'none']||''}</td>
-      <td><span class="pill ${statusPill[e.status]||'pill-muted'}">${e.status}</span></td>
-      <td style="display:flex;gap:4px;flex-wrap:wrap">
-        ${(e.resolution==='reship_correct'||e.resolution==='send_additional')&&!e.ss_order_id?`<button class="btn btn-teal btn-sm" onclick="shipShipmentError('${e.id}')">🚚 Ship</button>`:''}
-        ${e.ss_order_id?`<button class="action-btn" onclick="fetchShipmentErrorTracking('${e.id}')" title="Check ShipStation for tracking">📡</button>`:''}
-        ${nextStatus[e.status]?`<button class="action-btn" onclick="advanceShipmentError('${e.id}','${nextStatus[e.status]}')">→ ${nextStatus[e.status]}</button>`:''}
-        <button class="action-btn" onclick="openModal('editShipmentError',{id:'${e.id}'})" title="Edit">✎</button>
-        <button class="action-btn del" onclick="deleteShipmentError('${e.id}')">×</button>
       </td>
     </tr>`;
   }).join('')}
@@ -8269,253 +8023,6 @@ async function deleteWarranty(id) {
   await db.from('warranty_claims').delete().eq('id',id);
   S.warrantyClaims=S.warrantyClaims.filter(w=>w.id!==id);
   toast('Claim deleted');render();
-}
-
-async function submitWarrantyEdit(id){
-  const order_number=(document.getElementById('wty-e-order')?.value||'').trim();
-  const customer_name=(document.getElementById('wty-e-name')?.value||'').trim();
-  const customer_email=(document.getElementById('wty-e-email')?.value||'').trim();
-  const issue=(document.getElementById('wty-e-issue')?.value||'').trim();
-  const resolution_type=document.getElementById('wty-e-resolution')?.value||'no_action';
-  const status=document.getElementById('wty-e-status')?.value||'Open';
-  if(!issue){toast('Issue description required');return;}
-  const updates={order_number,customer_name,customer_email,issue,resolution_type,status,
-    resolved_at:['Resolved','Denied','Shipped'].includes(status)?new Date().toISOString():null};
-  // If resolution is replacement, save updated shipping address
-  const addr1=(document.getElementById('wty-e-addr1')?.value||'').trim();
-  if(resolution_type==='replacement'&&addr1){
-    updates.shipping_details={
-      name:(document.getElementById('wty-e-ship-name')?.value||'').trim(),
-      street1:addr1,
-      street2:(document.getElementById('wty-e-addr2')?.value||'').trim()||null,
-      city:(document.getElementById('wty-e-city')?.value||'').trim(),
-      state:(document.getElementById('wty-e-state')?.value||'').trim(),
-      postal_code:(document.getElementById('wty-e-zip')?.value||'').trim(),
-      country:(document.getElementById('wty-e-country')?.value||'US').trim()
-    };
-  }
-  const{error}=await db.from('warranty_claims').update(updates).eq('id',id);
-  if(error){toast('Error: '+error.message);return;}
-  S.warrantyClaims=S.warrantyClaims.map(w=>w.id===id?{...w,...updates}:w);
-  closeModal();toast('Claim updated');render();
-}
-
-function seToggleActual(){
-  const t=document.getElementById('se-type')?.value||'';
-  const col=document.getElementById('se-actual-col');
-  if(col) col.style.opacity=(t==='missing_item')?'0.35':'1';
-}
-
-function seLookupOrder(){
-  const raw=(document.getElementById('se-order')?.value||'').trim();
-  if(!raw){toast('Enter an order number first');return;}
-  const nums=[raw,raw.replace(/^#/,''),'#'+raw.replace(/^#/,'')];
-  let lines=[];
-  for(const n of nums){lines=S.sales.filter(s=>s.order_number===n);if(lines.length)break;}
-  if(!lines.length){toast('Order '+raw+' not found in ERP');return;}
-  const first=lines[0];
-  if(document.getElementById('se-customer'))document.getElementById('se-customer').value=first.customer_name||'';
-  if(document.getElementById('se-email'))document.getElementById('se-email').value=first.customer_email||'';
-  // Fill expected from first line
-  if(document.getElementById('se-exp-pn'))document.getElementById('se-exp-pn').value=first.pn||'';
-  if(document.getElementById('se-exp-qty'))document.getElementById('se-exp-qty').value=first.qty||1;
-  toast('Filled from order '+raw+(lines.length>1?' ('+lines.length+' lines — check SKU)':''));
-}
-
-async function submitShipmentError(editId){
-  const order_number=(document.getElementById('se-order')?.value||'').trim();
-  const customer_name=(document.getElementById('se-customer')?.value||'').trim();
-  const customer_email=(document.getElementById('se-email')?.value||'').trim();
-  const error_type=document.getElementById('se-type')?.value||'wrong_item';
-  const expected_pn=(document.getElementById('se-exp-pn')?.value||'').trim();
-  const expected_qty=parseInt(document.getElementById('se-exp-qty')?.value)||1;
-  const actual_pn=(document.getElementById('se-act-pn')?.value||'').trim()||null;
-  const actual_qty=parseInt(document.getElementById('se-act-qty')?.value)||0;
-  const resolution=document.getElementById('se-resolution')?.value||'none';
-  const status=document.getElementById('se-status')?.value||'Open';
-  const notes=(document.getElementById('se-notes')?.value||'').trim();
-  if(!expected_pn){toast('Expected SKU is required');return;}
-  const payload={order_number,customer_name,customer_email,error_type,expected_pn,expected_qty,
-    actual_pn:error_type==='missing_item'?null:actual_pn,
-    actual_qty:error_type==='missing_item'?0:actual_qty,
-    resolution,notes,
-    status:editId?(status||'Open'):'Open'};
-  if(editId&&['Resolved'].includes(status)) payload.resolved_at=new Date().toISOString();
-  if(editId){
-    const{error}=await db.from('shipment_errors').update({...payload,updated_at:new Date().toISOString()}).eq('id',editId);
-    if(error){toast('Error: '+error.message);return;}
-    S.shipmentErrors=S.shipmentErrors.map(e=>e.id===editId?{...e,...payload}:e);
-    closeModal();toast('Error updated');render();
-  } else {
-    const{data,error}=await db.from('shipment_errors').insert(payload).select().single();
-    if(error){toast('Error: '+error.message);return;}
-    S.shipmentErrors=[data,...S.shipmentErrors];
-    closeModal();toast('Shipment error logged');render();
-  }
-}
-
-async function advanceShipmentError(id,newStatus){
-  const updates={status:newStatus,updated_at:new Date().toISOString()};
-  if(newStatus==='Resolved') updates.resolved_at=new Date().toISOString();
-  const{error}=await db.from('shipment_errors').update(updates).eq('id',id);
-  if(error){toast('Error: '+error.message);return;}
-  S.shipmentErrors=S.shipmentErrors.map(e=>e.id===id?{...e,...updates}:e);
-  toast('Status → '+newStatus);render();
-}
-
-function shipShipmentError(errorId){
-  const e=S.shipmentErrors.find(x=>x.id===errorId);
-  if(!e){toast('Error record not found');return;}
-  const isSendAdditional=e.resolution==='send_additional';
-  const defaultQty=isSendAdditional?Math.max(1,(e.expected_qty||1)-(e.actual_qty||0)):e.expected_qty||1;
-  const pnDesc=S.assemblies.find(a=>a.pn===e.expected_pn)?.description||S.parts.find(p=>p.pn===e.expected_pn)?.description||e.expected_pn||'';
-  document.getElementById('se-ship-overlay')?.remove();
-  const overlay=document.createElement('div');
-  overlay.id='se-ship-overlay';
-  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:center;justify-content:center;padding:20px';
-  overlay.innerHTML='<div class="modal" style="width:560px;max-width:95vw">'
-    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">'
-      +'<div><div style="font-size:15px;font-weight:700;color:var(--text)">🚚 '+(isSendAdditional?'Ship Additional Items':'Reship Correct Item')+'</div>'
-      +'<div style="font-size:11px;color:var(--text3);margin-top:2px">Order '+escHtml(e.order_number||'—')+' — '+escHtml(e.customer_name||'')+'</div></div>'
-      +'<button onclick="document.getElementById(\'se-ship-overlay\').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">×</button>'
-    +'</div>'
-    +'<div style="padding:10px 12px;background:var(--bg3);border-radius:6px;border:1px solid var(--border);font-size:11px;color:var(--text2);margin-bottom:14px">'
-      +'<strong>Error:</strong> '+(e.error_type==='wrong_item'?'Wrong item shipped — expected <b>'+escHtml(e.expected_pn||'')+'</b>':e.error_type==='wrong_qty'?'Wrong qty — expected <b>'+e.expected_qty+'</b> shipped <b>'+e.actual_qty+'</b>':e.error_type==='missing_item'?'Item not shipped — <b>'+escHtml(e.expected_pn||'')+'</b>':'Error: '+e.error_type)+'<br>'
-      +(e.notes?'<strong>Notes:</strong> '+escHtml(e.notes):'')
-    +'</div>'
-    +'<div style="display:flex;gap:10px;margin-bottom:12px">'
-      +'<div class="form-group" style="flex:2"><label class="form-label">SKU to Ship</label>'
-        +'<input id="se-ship-pn" class="form-input" style="font-family:var(--mono)" value="'+escHtml(e.expected_pn||'')+'" placeholder="SKU"></div>'
-      +'<div class="form-group" style="flex:1"><label class="form-label">Qty</label>'
-        +'<input id="se-ship-qty" type="number" min="1" class="form-input" value="'+defaultQty+'"></div>'
-    +'</div>'
-    +'<div style="font-size:10px;color:var(--text3);margin:-6px 0 12px">'+escHtml(pnDesc)+'</div>'
-    +'<div class="form-group" style="margin-bottom:10px"><label class="form-label">Ship-to Name</label>'
-      +'<input id="se-ship-name" class="form-input" value="'+escHtml(e.customer_name||'')+'" placeholder="Full name"></div>'
-    +'<div class="form-group" style="margin-bottom:10px"><label class="form-label">Address Line 1</label>'
-      +'<input id="se-ship-addr1" class="form-input" value="" placeholder="123 Main St"></div>'
-    +'<div class="form-group" style="margin-bottom:10px"><label class="form-label">Address Line 2 (optional)</label>'
-      +'<input id="se-ship-addr2" class="form-input" value="" placeholder="Apt, suite…"></div>'
-    +'<div style="display:flex;gap:10px;margin-bottom:10px">'
-      +'<div class="form-group" style="flex:2"><label class="form-label">City</label><input id="se-ship-city" class="form-input" value=""></div>'
-      +'<div class="form-group" style="flex:1"><label class="form-label">State</label><input id="se-ship-state" class="form-input" value=""></div>'
-      +'<div class="form-group" style="flex:1"><label class="form-label">ZIP</label><input id="se-ship-zip" class="form-input" value=""></div>'
-    +'</div>'
-    +'<div class="form-group" style="margin-bottom:14px"><label class="form-label">Country</label>'
-      +'<input id="se-ship-country" class="form-input" value="US" style="max-width:80px"></div>'
-    +'<div id="se-ship-status" style="display:none;padding:10px;border-radius:6px;margin-bottom:10px;font-size:12px"></div>'
-    +'<div style="display:flex;gap:8px;justify-content:flex-end;padding-top:12px;border-top:1px solid var(--border)">'
-      +'<button class="btn" onclick="document.getElementById(\'se-ship-overlay\').remove()">Cancel</button>'
-      +'<button id="se-ship-submit" class="btn btn-teal" onclick="confirmShipShipmentError(\''+errorId+'\')">🚚 Create ShipStation Order</button>'
-    +'</div>'
-  +'</div>';
-  document.body.appendChild(overlay);
-  setTimeout(function(){document.getElementById('se-ship-addr1')?.focus();},50);
-}
-
-async function confirmShipShipmentError(errorId){
-  const e=S.shipmentErrors.find(x=>x.id===errorId);
-  if(!e){toast('Error record not found');return;}
-  const pn=(document.getElementById('se-ship-pn')?.value||'').trim();
-  const qty=parseInt(document.getElementById('se-ship-qty')?.value)||1;
-  const name=(document.getElementById('se-ship-name')?.value||'').trim();
-  const addr1=(document.getElementById('se-ship-addr1')?.value||'').trim();
-  const city=(document.getElementById('se-ship-city')?.value||'').trim();
-  const zip=(document.getElementById('se-ship-zip')?.value||'').trim();
-  if(!pn){toast('SKU is required');return;}
-  if(!addr1||!city||!zip){toast('Address, city and ZIP are required');return;}
-  const shipTo={name,street1:addr1,street2:(document.getElementById('se-ship-addr2')?.value||'').trim()||null,city,state:(document.getElementById('se-ship-state')?.value||'').trim(),postal_code:zip,country:(document.getElementById('se-ship-country')?.value||'US').trim()};
-  const statusEl=document.getElementById('se-ship-status');
-  const submitBtn=document.getElementById('se-ship-submit');
-  if(statusEl){statusEl.style.display='block';statusEl.style.background='var(--bg3)';statusEl.style.color='var(--text2)';statusEl.textContent='⏳ Creating order in ShipStation…';}
-  if(submitBtn){submitBtn.disabled=true;submitBtn.textContent='Creating…';}
-  const desc=S.assemblies.find(a=>a.pn===pn)?.description||S.parts.find(p=>p.pn===pn)?.description||pn;
-  try{
-    const resp=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({
-        action:'create_order',
-        orderNumber:'SHERROR-'+errorId,
-        customerName:name||e.customer_name||'Customer',
-        customerEmail:e.customer_email||'',
-        pn,description:desc,qty,
-        ssItems:[{lineItemKey:'1',sku:pn,name:desc,quantity:qty,unitPrice:0}],
-        shipTo,
-        internalNotes:(e.resolution==='send_additional'?'Send additional qty':'Reship correct item')+' — Original order '+e.order_number+'. Error: '+e.error_type+(e.notes?'. '+e.notes:'')
-      })
-    });
-    const rawText=await resp.text();
-    let json;
-    try{json=JSON.parse(rawText);}catch(_){
-      if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.innerHTML='<b>✗ Edge function error (HTTP '+resp.status+')</b><br><pre style="font-size:9px;margin-top:4px">'+rawText.slice(0,300).replace(/</g,'&lt;')+'</pre>';}
-      if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
-      return;
-    }
-    if(!resp.ok||json.error){
-      if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='✗ '+(json.error||'ShipStation error');}
-      if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
-      return;
-    }
-    const ssOrderId=String(json.orderId||json.orderNumber||'created');
-    // Deduct inventory for the reshipped item
-    const isAsm=!!S.assemblies.find(function(a){return a.pn===pn;});
-    if(isAsm){
-      const a=S.assemblies.find(function(a){return a.pn===pn;});
-      if(a){
-        const newOh=Math.max(0,(a.total_on_hand||0)-qty);
-        await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',a.id);
-        S.assemblies=S.assemblies.map(function(x){return x.pn===pn?{...x,total_on_hand:newOh}:x;});
-        await db.from('inv_corrections').insert({pn,previous_qty:a.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Shipment error reship (SS#'+ssOrderId+') — original order '+e.order_number,source:'shipment_error'});
-      }
-    } else {
-      const p=S.parts.find(function(x){return x.pn===pn;});
-      if(p){
-        const newQty=Math.max(0,(p.total_unpckgd||0)-qty);
-        await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
-        S.parts=S.parts.map(function(x){return x.pn===pn?{...x,total_unpckgd:newQty}:x;});
-        await db.from('inv_corrections').insert({pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:-qty,reason:'Shipment error reship (SS#'+ssOrderId+') — original order '+e.order_number,source:'shipment_error'});
-      }
-    }
-    // Save SS order ID and advance to Reshipping
-    const{error:dbErr}=await db.from('shipment_errors').update({ss_order_id:ssOrderId,status:'Reshipping',updated_at:new Date().toISOString()}).eq('id',errorId);
-    if(!dbErr){S.shipmentErrors=S.shipmentErrors.map(x=>x.id===errorId?{...x,ss_order_id:ssOrderId,status:'Reshipping'}:x);}
-    document.getElementById('se-ship-overlay')?.remove();
-    toast('✓ ShipStation order created — SS#'+ssOrderId+'. Inventory deducted: '+pn+' ×'+qty+'. Use 📡 to pull tracking once shipped.');
-    render();
-  }catch(err){
-    if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='✗ '+err.message;}
-    if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
-  }
-}
-
-async function fetchShipmentErrorTracking(errorId){
-  const e=S.shipmentErrors.find(x=>x.id===errorId);
-  if(!e){toast('Error record not found');return;}
-  const ssOrderNum='SHERROR-'+errorId;
-  toast('Checking ShipStation for '+ssOrderNum+'…');
-  const edgeUrl=SUPA_URL+'/functions/v1/shipstation-ship';
-  const resourceUrl='https://ssapi.shipstation.com/shipments?orderNumber='+encodeURIComponent(ssOrderNum)+'&pageSize=5&sortBy=ShipDate&sortDir=DESC&includeShipmentItems=true';
-  try{
-    const res=await fetch(edgeUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resource_type:'SHIP_NOTIFY',resource_url:resourceUrl})});
-    if(res.ok){
-      const{data}=await db.from('shipment_errors').select('*').eq('id',errorId).single();
-      if(data){
-        S.shipmentErrors=S.shipmentErrors.map(x=>x.id===errorId?data:x);
-        render();
-        if(data.tracking_number) toast('✓ '+(data.carrier?data.carrier+' ':'')+'Tracking: '+data.tracking_number,5000);
-        else toast('No shipment found yet for '+ssOrderNum+'. Try again after it ships.',5000);
-      }
-    }else{
-      toast('ShipStation check failed — check edge function is deployed');
-    }
-  }catch(err){toast('Error: '+err.message);}
-}
-
-async function deleteShipmentError(id){
-  if(!confirm('Delete this shipment error record?'))return;
-  await db.from('shipment_errors').delete().eq('id',id);
-  S.shipmentErrors=S.shipmentErrors.filter(e=>e.id!==id);
-  toast('Deleted');render();
 }
 
 function shipWarrantyReplacement(id){
