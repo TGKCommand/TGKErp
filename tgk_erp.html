@@ -641,26 +641,19 @@ function updateBadge(){
 // ============================================================
 // DATA LOADING
 // ============================================================
-// Paginate a Supabase table past the server-side max_rows (default 1000)
-// Fetches all pages in parallel once we know there are more rows
+// Paginate past Supabase's server-side max_rows (default 1000) — sequential, safe
 async function fetchAll(query){
   const PAGE=1000;
-  // First page
-  const{data:first,error}=await query(0,PAGE-1);
-  if(error)throw error;
-  if(!first?.length||first.length<PAGE)return first||[];
-  // Need more pages — estimate and fetch remaining in parallel
-  // We fetch up to 20 pages (20k rows) max to avoid runaway queries
-  const extraPages=[];
-  for(let p=1;p<20;p++)extraPages.push(query(p*PAGE,p*PAGE+PAGE-1));
-  const results=await Promise.all(extraPages);
-  let all=[...first];
-  for(const{data}of results){
+  let rows=[],from=0;
+  while(from<50000){
+    const{data,error}=await query(from,from+PAGE-1);
+    if(error)throw error;
     if(!data?.length)break;
-    all=[...all,...data];
+    rows=[...rows,...data];
     if(data.length<PAGE)break;
+    from+=PAGE;
   }
-  return all;
+  return rows;
 }
 
 function normalizeAssemblies(rows){
@@ -670,21 +663,23 @@ function normalizeAssemblies(rows){
   });
 }
 
-// ── PHASE 1: fast critical data → shows the app immediately (~1-2s) ──
 async function loadAll(){
-  _bgLoaded=false; // reset so background data reloads on next call
   try{
-    const[parts,assemblies,sales,purchases,dealers,settings,cycleCounts]=await Promise.all([
-      fetchAll((f,t)=>db.from('parts').select('*').order('pn').range(f,t)),
-      db.from('assemblies').select('*').order('pn').limit(1000),
-      db.from('sales').select('*').order('sale_date',{ascending:false}).limit(1000),
-      db.from('purchases').select('*').order('order_date',{ascending:false}).limit(500),
-      db.from('dealers').select('*').order('name').limit(500),
+    const[parts,assemblies,sales,purchases,dealers,settings,bomItems,warrantyClaims,corrections,cycleCounts,poLinesAll]=await Promise.all([
+      db.from('parts').select('*').order('pn'),
+      db.from('assemblies').select('*').order('pn'),
+      db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000),
+      db.from('purchases').select('*').order('order_date',{ascending:false}),
+      db.from('dealers').select('*').order('name'),
       db.from('settings').select('*'),
+      db.from('bom_items').select('*').order('parent_pn').order('sort_order'),
+      db.from('warranty_claims').select('*').order('created_at',{ascending:false}).limit(100),
+      db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
       db.from('cycle_counts').select('*').order('created_at',{ascending:false}).limit(50),
+      db.from('po_lines').select('*').order('po_id'),
     ]);
-    if(assemblies.error)throw assemblies.error;
-    S.parts=parts;
+    if(parts.error)throw parts.error;
+    S.parts=parts.data||[];
     S.assemblies=normalizeAssemblies(assemblies.data);
     S.sales=sales.data||[];
     S.purchases=purchases.data||[];
@@ -692,46 +687,21 @@ async function loadAll(){
     (settings.data||[]).forEach(s=>S.settings[s.key]=s.value);
     if(S.settings.shopify)Object.assign(S.shopify,S.settings.shopify);
     if(S.settings.shipstation)Object.assign(S.shipstation,S.settings.shipstation);
+    S.boms={};
+    (bomItems.data||[]).forEach(i=>{if(!S.boms[i.parent_pn])S.boms[i.parent_pn]=[];S.boms[i.parent_pn].push(i);});
+    if(!S.selBOM&&Object.keys(S.boms).length)S.selBOM=Object.keys(S.boms)[0];
+    S.warrantyClaims=warrantyClaims.data||[];
+    S.corrections=corrections.data||[];
     S.cycleCounts=cycleCounts.data||[];
+    S.poLines={};
+    (poLinesAll.data||[]).forEach(l=>{if(!S.poLines[l.po_id])S.poLines[l.po_id]=[];S.poLines[l.po_id].push(l);});
     setSyncState('ok');
     updateBadge();
     render();
-    // Phase 2 loads in background — doesn't block the user
-    loadBackground();
   }catch(e){
     setSyncState('err');
     console.error('loadAll error:',e);
     throw e;
-  }
-}
-
-// ── PHASE 2: heavy data loads after the UI is visible ──
-let _bgLoaded=false;
-async function loadBackground(){
-  if(_bgLoaded)return;
-  try{
-    const[bomItems,allSales,allPurchases,poLinesAll,corrections,warrantyClaims]=await Promise.all([
-      fetchAll((f,t)=>db.from('bom_items').select('*').order('parent_pn').order('sort_order').range(f,t)),
-      fetchAll((f,t)=>db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000).range(f,t)),
-      fetchAll((f,t)=>db.from('purchases').select('*').order('order_date',{ascending:false}).range(f,t)),
-      fetchAll((f,t)=>db.from('po_lines').select('*').order('po_id').range(f,t)),
-      db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
-      db.from('warranty_claims').select('*').order('created_at',{ascending:false}).limit(100),
-    ]);
-    S.boms={};
-    bomItems.forEach(i=>{if(!S.boms[i.parent_pn])S.boms[i.parent_pn]=[];S.boms[i.parent_pn].push(i);});
-    if(!S.selBOM&&Object.keys(S.boms).length)S.selBOM=Object.keys(S.boms)[0];
-    S.sales=allSales;
-    S.purchases=allPurchases;
-    S.poLines={};
-    poLinesAll.forEach(l=>{if(!S.poLines[l.po_id])S.poLines[l.po_id]=[];S.poLines[l.po_id].push(l);});
-    S.corrections=corrections.data||[];
-    S.warrantyClaims=warrantyClaims.data||[];
-    _bgLoaded=true;
-    computeDemand();
-    scheduleRender();
-  }catch(e){
-    console.warn('Background load error (non-fatal):',e.message);
   }
 }
 
@@ -1036,6 +1006,7 @@ function renderParts(){
       <td style="display:flex;gap:4px">
         <button class="action-btn" onclick='openModal("editPart",${JSON.stringify(p)})'>Edit</button>
         ${w!==null&&w<(p.lead_time_weeks+2)?`<button class="action-btn" style="color:var(--orange);border-color:rgba(224,123,40,.3)" onclick='openModal("addPO",{item:"${p.pn}",desc:${JSON.stringify(p.description||'')},vendor:"${p.vendor||''}",qty:${Math.ceil((p.avg_sales_wk||1)*12)},unitCost:${p.unit_cost||0}})'>Order</button>`:''}
+        <button class="action-btn" style="color:var(--red);border-color:rgba(220,38,38,.25)" onclick="deletePart('${p.pn}','${p.id}')">✕</button>
       </td>
     </tr>`;}).join('')}
   </tbody></table></div>`;
@@ -1087,6 +1058,7 @@ function renderAssemblies(){
     <td style="display:flex;gap:4px">
       ${S.boms[a.pn]?`<button class="action-btn" onclick="S.selBOM='${a.pn}';nav('boms')">BOM</button>`:''}
       <button class="action-btn" onclick='openModal("editAsm",${JSON.stringify(a)})'>Edit</button>
+      <button class="action-btn" style="color:var(--red);border-color:rgba(220,38,38,.25)" onclick="deleteAsm('${a.pn}','${a.id}')">✕</button>
     </td>
   </tr>`).join('')}
   </tbody></table></div>`;
@@ -3723,6 +3695,36 @@ async function submitPart(eid){
   else S.parts=S.parts.map(p=>p.id===eid?{...p,...payload}:p);
   closeModal();updateBadge();toast('Part saved');render();
 }
+
+async function deletePart(pn, id){
+  // Check if part is used in any BOM
+  const inBOMs=Object.entries(S.boms).filter(([,lines])=>lines.some(l=>l.child_pn===pn)).map(([k])=>k);
+  const hasStock=(S.parts.find(p=>p.id===id)?.total_unpckgd||0)>0;
+  let msg=`Delete part ${pn}?`;
+  if(inBOMs.length)msg+=`\n\n⚠ This part is used in ${inBOMs.length} BOM(s): ${inBOMs.slice(0,3).join(', ')}${inBOMs.length>3?' …':''}. BOM references will remain but the part will be gone.`;
+  if(hasStock)msg+=`\n\n⚠ This part has stock on hand. Deleting it will remove the inventory record.`;
+  msg+='\n\nThis cannot be undone.';
+  if(!confirm(msg))return;
+  const{error}=await db.from('parts').delete().eq('id',id);
+  if(error){toast('Error: '+error.message);return;}
+  S.parts=S.parts.filter(p=>p.id!==id);
+  toast('Part '+pn+' deleted');render();
+}
+
+async function deleteAsm(pn, id){
+  const inBOMs=Object.entries(S.boms).filter(([,lines])=>lines.some(l=>l.child_pn===pn)).map(([k])=>k);
+  const openOrders=S.sales.filter(s=>s.pn===pn&&!['Delivered','Cancelled','Refunded','Returned'].includes(s.fulfillment_status||'Open'));
+  let msg=`Delete assembly ${pn}?`;
+  if(openOrders.length)msg+=`\n\n⚠ There are ${openOrders.length} open/in-progress orders for this assembly.`;
+  if(inBOMs.length)msg+=`\n\n⚠ Used as a subassembly in: ${inBOMs.slice(0,3).join(', ')}${inBOMs.length>3?' …':''}`;
+  msg+='\n\nThis cannot be undone.';
+  if(!confirm(msg))return;
+  const{error}=await db.from('assemblies').delete().eq('id',id);
+  if(error){toast('Error: '+error.message);return;}
+  S.assemblies=S.assemblies.filter(a=>a.id!==id);
+  if(S.boms[pn])delete S.boms[pn];
+  toast('Assembly '+pn+' deleted');render();
+}
 async function submitManualSale(){
   const pn=document.getElementById('ms-pn').value;
   const orderNum=document.getElementById('ms-order').value.trim()||('MANUAL-'+Date.now().toString().slice(-6));
@@ -5214,12 +5216,14 @@ function renderBuildPlanner(asm){
     <div class="panel" style="padding:0">
       <div class="section-header">Component Requirements — for ${want} unit${want>1?'s':''}</div>
       ${b.checks.length===0?'<div class="section-empty">No BOM — nothing will be deducted</div>':''}
-      <table><thead><tr><th>Part #</th><th>Bin</th><th>Per Unit</th><th>Need</th><th>Have</th><th>Short</th><th>OK?</th></tr></thead><tbody>
+      <table><thead><tr><th>Part #</th><th>Description</th><th>Bin</th><th>Per Unit</th><th>Need</th><th>Have</th><th>Short</th><th>OK?</th></tr></thead><tbody>
       ${b.checks.map(c=>{
         const totNeed=c.need*want;
         const short=Math.max(0,totNeed-c.avail);
+        const desc=c.isSub?(S.assemblies.find(a=>a.pn===c.pn)?.description||''):(S.parts.find(p=>p.pn===c.pn)?.description||'');
         return `<tr class="rowlink" style="${short>0?'background:rgba(224,85,85,.05)':''}" onclick="rowClick(event,function(){lookupGo('${c.isSub?'assembly':'part'}','${c.pn}')})">
           <td class="pn">${c.pn}<br>${bomTag(c.pn,c.isSub?'assembly':'part')}</td>
+          <td style="font-size:10px;color:var(--text2);max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escHtml(desc)}">${escHtml(desc)||'—'}</td>
           <td style="font-size:10px;font-family:var(--mono);color:var(--text3)">${c.loc||'—'}</td>
           <td class="money-neutral">${c.need}</td>
           <td class="money-neutral" style="font-weight:700">${totNeed}</td>
@@ -6526,12 +6530,16 @@ async function refreshAssemblies(){
     loadAll()
       .then(()=>{
         clearTimeout(tHard);
-        computeDemand();setupRealtime();loadBackups();startAutoBackup();
-        try{history.replaceState(snapState(),'','#dashboard');}catch(e){}
+        // Always hide loader first — errors below should not keep app stuck loading
         const loader=document.getElementById('tgk-loader');
         const app=document.getElementById('tgk-app');
         if(loader)loader.style.display='none';
         if(app)app.style.display='';
+        try{computeDemand();}catch(e){console.error('computeDemand error:',e);}
+        try{setupRealtime();}catch(e){console.error('setupRealtime error:',e);}
+        try{loadBackups();}catch(e){console.error('loadBackups error:',e);}
+        try{startAutoBackup();}catch(e){console.error('startAutoBackup error:',e);}
+        try{history.replaceState(snapState(),'','#dashboard');}catch(e){}
         render();
       })
       .catch(err=>{
