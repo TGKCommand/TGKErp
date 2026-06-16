@@ -2942,6 +2942,39 @@ Deno.serve(async (req) => {
     return json({ delivered, checked: shipped?.length || 0, message: delivered + ' orders marked Delivered' })
   }
 
+  // --- CREATE ORDER: fire a new order into ShipStation (used by warranty replacements) ---
+  if (body.action === 'create_order') {
+    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
+    const auth = ssAuth()
+    const { orderNumber, customerName, customerEmail, pn, description, qty, shipTo, internalNotes, ssItems } = body
+    if (!orderNumber || !pn || !shipTo?.street1) return json({ error: 'orderNumber, pn and shipTo.street1 required' }, 400)
+    const items = (Array.isArray(ssItems) && ssItems.length)
+      ? ssItems.map((it, i) => ({ lineItemKey: String(i + 1), sku: it.sku || it.pn || pn, name: it.name || it.description || it.sku || pn, quantity: it.quantity || it.qty || 1, unitPrice: 0 }))
+      : [{ lineItemKey: '1', sku: pn, name: description || pn, quantity: qty || 1, unitPrice: 0 }]
+    const ssPayload = {
+      orderNumber,
+      orderDate: new Date().toISOString(),
+      orderStatus: 'awaiting_shipment',
+      customerUsername: customerEmail || undefined,
+      customerEmail: customerEmail || undefined,
+      billTo: { name: shipTo.name || customerName || 'Customer', street1: shipTo.street1, city: shipTo.city, state: shipTo.state, postalCode: shipTo.postal_code, country: shipTo.country || 'US' },
+      shipTo: { name: shipTo.name || customerName || 'Customer', street1: shipTo.street1, street2: shipTo.street2 || undefined, city: shipTo.city, state: shipTo.state, postalCode: shipTo.postal_code, country: shipTo.country || 'US' },
+      items,
+      internalNotes: internalNotes || ('Warranty replacement order from TGK ERP — ' + orderNumber),
+      advancedOptions: { source: 'TGK ERP Warranty' }
+    }
+    const ssRes = await fetch('https://ssapi.shipstation.com/orders/createorder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Basic ' + auth },
+      body: JSON.stringify(ssPayload)
+    })
+    const ssRaw = await ssRes.text()
+    let ssData = {}
+    try { ssData = JSON.parse(ssRaw) } catch (_) { /* ShipStation returned non-JSON */ }
+    if (!ssRes.ok) return json({ error: 'ShipStation ' + ssRes.status + ': ' + (ssData.ExceptionMessage || ssData.message || ssRaw.slice(0, 300)) }, 502)
+    return json({ orderId: ssData.orderId, orderNumber: ssData.orderNumber, status: ssData.orderStatus })
+  }
+
   const { resource_url, resource_type } = body
   console.log('[SS]', resource_type, resource_url)
   if (!resource_url) return new Response('no resource_url', { status: 400, headers: CORS })
@@ -3034,41 +3067,6 @@ Deno.serve(async (req) => {
     const rawNum = data.orderNumber
     const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
     await db.from('sales').update({ fulfillment_status: 'Open' }).eq('order_number', ex?.length ? rawNum : '#' + rawNum)
-  }
-
-  // --- CREATE ORDER: fire a new order into ShipStation (used by warranty replacements) ---
-  if (body.action === 'create_order') {
-    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
-    const auth = ssAuth()
-    const { orderNumber, customerName, customerEmail, pn, description, qty, shipTo, internalNotes, ssItems } = body
-    if (!orderNumber || !pn || !shipTo?.street1) return json({ error: 'orderNumber, pn and shipTo.street1 required' }, 400)
-    // Use ssItems array if provided (multi-item warranty), otherwise fall back to single item
-    const items = (Array.isArray(ssItems) && ssItems.length)
-      ? ssItems.map((it: any, i: number) => ({ lineItemKey: String(i + 1), sku: it.sku || it.pn || pn, name: it.name || it.description || it.sku || pn, quantity: it.quantity || it.qty || 1, unitPrice: 0 }))
-      : [{ lineItemKey: '1', sku: pn, name: description || pn, quantity: qty || 1, unitPrice: 0 }]
-    const ssPayload = {
-      orderNumber,
-      orderDate: new Date().toISOString(),
-      orderStatus: 'awaiting_shipment',
-      customerUsername: customerEmail || undefined,
-      customerEmail: customerEmail || undefined,
-      billTo: { name: shipTo.name || customerName || 'Customer', street1: shipTo.street1, city: shipTo.city, state: shipTo.state, postalCode: shipTo.postal_code, country: shipTo.country || 'US' },
-      shipTo: { name: shipTo.name || customerName || 'Customer', street1: shipTo.street1, street2: shipTo.street2 || undefined, city: shipTo.city, state: shipTo.state, postalCode: shipTo.postal_code, country: shipTo.country || 'US' },
-      items,
-      internalNotes: internalNotes || ('Warranty replacement order from TGK ERP — ' + orderNumber),
-      advancedOptions: { source: 'TGK ERP Warranty' }
-    }
-    const ssRes = await fetch('https://ssapi.shipstation.com/orders/createorder', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Basic ' + auth },
-      body: JSON.stringify(ssPayload)
-    })
-    // Read as text first — ShipStation sometimes returns non-JSON errors which would crash .json()
-    const ssRaw = await ssRes.text()
-    let ssData: any = {}
-    try { ssData = JSON.parse(ssRaw) } catch (_) { /* ShipStation returned non-JSON */ }
-    if (!ssRes.ok) return json({ error: 'ShipStation ' + ssRes.status + ': ' + (ssData.ExceptionMessage || ssData.message || ssRaw.slice(0, 300)) }, 502)
-    return json({ orderId: ssData.orderId, orderNumber: ssData.orderNumber, status: ssData.orderStatus })
   }
 
   return ok('ok')
@@ -4486,6 +4484,61 @@ function openModal(type,data){
       <div class="form-row cols-2">${fi('wty-ship-zip','ZIP / Postal Code','')} ${fi('wty-ship-country','Country','US')}</div>
     </div>
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitWarranty()">Log Claim</button></div>`;
+  }
+  else if(type==='editWarranty'){
+    const w=S.warrantyClaims.find(x=>x.id===data.id);
+    if(!w){toast('Claim not found');return;}
+    title='Edit Warranty Claim';
+    const statuses=['Open','In Review','Approved','Shipped','Denied','Resolved'];
+    const sd=w.shipping_details||{};
+    const claimItemsHtml=(w.claim_items&&w.claim_items.length)
+      ?`<div style="margin-top:4px;padding:8px 12px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)">
+          <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Replacement Items</div>
+          ${w.claim_items.map((item,i)=>`<div style="display:flex;align-items:center;gap:8px;padding:4px 0;${i?'border-top:1px solid var(--border)':''}">
+            <span class="pn" style="color:var(--teal)">${escHtml(item.pn)}</span>
+            <span style="font-size:10px;color:var(--text3)">${escHtml(item.type||'')}</span>
+            <span style="font-size:11px;color:var(--text2);flex:1">${escHtml(item.description||'')}</span>
+            <span style="font-size:11px;font-weight:600">×${item.qty||1}</span>
+          </div>`).join('')}
+        </div>`
+      :'';
+    const shippingHtml=(w.resolution_type==='replacement')
+      ?`<div style="margin-top:10px;padding:12px;background:var(--bg3);border-radius:8px;border:1px solid var(--border)">
+          <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">🚚 Shipping Address</div>
+          <div class="form-row">${fi('wty-e-ship-name','Ship-to Name',sd.name||w.customer_name||'','placeholder="Customer full name"')}</div>
+          <div class="form-row">${fi('wty-e-addr1','Address Line 1',sd.street1||'','placeholder="123 Main St"')}</div>
+          <div class="form-row">${fi('wty-e-addr2','Address Line 2 (optional)',sd.street2||'','placeholder="Apt, Suite…"')}</div>
+          <div class="form-row cols-2">${fi('wty-e-city','City',sd.city||'')} ${fi('wty-e-state','State',sd.state||'')}</div>
+          <div class="form-row cols-2">${fi('wty-e-zip','ZIP',sd.postal_code||'')} ${fi('wty-e-country','Country',sd.country||'US')}</div>
+        </div>`
+      :'';
+    body=`
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;padding:8px 12px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)">
+      <span class="pn" style="color:var(--teal);font-size:13px">${escHtml(w.pn)}</span>
+      <span style="font-size:10px;color:var(--text3)">logged ${new Date(w.created_at).toLocaleDateString()}</span>
+      ${w.ss_order_id?`<span style="font-size:10px;color:var(--teal);font-family:var(--mono);margin-left:auto">SS#${escHtml(w.ss_order_id)}</span>`:''}
+    </div>
+    <div class="form-row cols-2">${fi('wty-e-order','Order #',w.order_number||'')} ${fi('wty-e-name','Customer Name',w.customer_name||'')}</div>
+    <div class="form-row">${fi('wty-e-email','Customer Email',w.customer_email||'','type="email"')}</div>
+    <div class="form-row"><div class="form-group"><label class="form-label">Issue Description</label><textarea class="form-input" id="wty-e-issue" rows="3">${escHtml(w.issue||'')}</textarea></div></div>
+    <div class="form-row cols-2">
+      <div class="form-group"><label class="form-label">Resolution Type</label>
+        <select id="wty-e-resolution" class="form-input">
+          <option value="no_action" ${w.resolution_type==='no_action'?'selected':''}>No Action</option>
+          <option value="replacement" ${w.resolution_type==='replacement'?'selected':''}>🔄 Replacement</option>
+          <option value="repair" ${w.resolution_type==='repair'?'selected':''}>🔧 Repair</option>
+          <option value="refund" ${w.resolution_type==='refund'?'selected':''}>💰 Refund</option>
+        </select>
+      </div>
+      <div class="form-group"><label class="form-label">Status</label>
+        <select id="wty-e-status" class="form-input">
+          ${statuses.map(s=>`<option value="${s}" ${w.status===s?'selected':''}>${s}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    ${claimItemsHtml}
+    ${shippingHtml}
+    <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitWarrantyEdit('${w.id}')">Save Changes</button></div>`;
   }
   else if(type==='custom'){
     title=data.title||'';
@@ -7891,6 +7944,7 @@ function renderWarranty() {
       <td style="display:flex;gap:4px;flex-wrap:wrap">
         ${canShip?`<button class="btn btn-teal btn-sm" onclick="shipWarrantyReplacement('${w.id}')">🚚 Ship</button>`:''}
         ${!canShip&&nextStatus[w.status]?`<button class="action-btn" onclick="advanceWarranty('${w.id}','${nextStatus[w.status]}')">→ ${nextStatus[w.status]}</button>`:''}
+        <button class="action-btn" onclick="openModal('editWarranty',{id:'${w.id}'})" title="Edit claim">✎</button>
         <button class="action-btn del" onclick="deleteWarranty('${w.id}')">×</button>
       </td>
     </tr>`;
@@ -7910,6 +7964,35 @@ async function deleteWarranty(id) {
   await db.from('warranty_claims').delete().eq('id',id);
   S.warrantyClaims=S.warrantyClaims.filter(w=>w.id!==id);
   toast('Claim deleted');render();
+}
+
+async function submitWarrantyEdit(id){
+  const order_number=(document.getElementById('wty-e-order')?.value||'').trim();
+  const customer_name=(document.getElementById('wty-e-name')?.value||'').trim();
+  const customer_email=(document.getElementById('wty-e-email')?.value||'').trim();
+  const issue=(document.getElementById('wty-e-issue')?.value||'').trim();
+  const resolution_type=document.getElementById('wty-e-resolution')?.value||'no_action';
+  const status=document.getElementById('wty-e-status')?.value||'Open';
+  if(!issue){toast('Issue description required');return;}
+  const updates={order_number,customer_name,customer_email,issue,resolution_type,status,
+    resolved_at:['Resolved','Denied','Shipped'].includes(status)?new Date().toISOString():null};
+  // If resolution is replacement, save updated shipping address
+  const addr1=(document.getElementById('wty-e-addr1')?.value||'').trim();
+  if(resolution_type==='replacement'&&addr1){
+    updates.shipping_details={
+      name:(document.getElementById('wty-e-ship-name')?.value||'').trim(),
+      street1:addr1,
+      street2:(document.getElementById('wty-e-addr2')?.value||'').trim()||null,
+      city:(document.getElementById('wty-e-city')?.value||'').trim(),
+      state:(document.getElementById('wty-e-state')?.value||'').trim(),
+      postal_code:(document.getElementById('wty-e-zip')?.value||'').trim(),
+      country:(document.getElementById('wty-e-country')?.value||'US').trim()
+    };
+  }
+  const{error}=await db.from('warranty_claims').update(updates).eq('id',id);
+  if(error){toast('Error: '+error.message);return;}
+  S.warrantyClaims=S.warrantyClaims.map(w=>w.id===id?{...w,...updates}:w);
+  closeModal();toast('Claim updated');render();
 }
 
 function shipWarrantyReplacement(id){
