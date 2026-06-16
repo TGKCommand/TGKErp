@@ -510,6 +510,9 @@ const S = {
   mmSuggest:null, mmLoading:false,
   // Edge function live status
   fnStatus:null,
+  // Custom standalone categories/vendors (persisted in settings table)
+  customCats:{parts:[],assemblies:[]},
+  customVendors:[],
 };
 
 // ============================================================
@@ -708,6 +711,8 @@ async function loadAll(){
     (settings.data||[]).forEach(s=>S.settings[s.key]=s.value);
     if(S.settings.shopify)Object.assign(S.shopify,S.settings.shopify);
     if(S.settings.shipstation)Object.assign(S.shipstation,S.settings.shipstation);
+    if(S.settings.custom_cats){try{Object.assign(S.customCats,S.settings.custom_cats);}catch(e){}}
+    if(S.settings.custom_vendors){try{S.customVendors=S.settings.custom_vendors||[];}catch(e){}}
     S.boms={};
     (Array.isArray(bomItems)?bomItems:(bomItems.data||[])).forEach(i=>{if(!S.boms[i.parent_pn])S.boms[i.parent_pn]=[];S.boms[i.parent_pn].push(i);});
     if(!S.selBOM&&Object.keys(S.boms).length)S.selBOM=Object.keys(S.boms)[0];
@@ -912,8 +917,16 @@ function trackingUrl(carrier, tracking){
 function escHtml(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
 // ── CATEGORY & VENDOR DROPDOWN BUILDERS ─────────────────────────────────
-function getCats(table){var src=table==='parts'?S.parts:S.assemblies;return[...new Set(src.map(function(x){return x.category||'';}).filter(Boolean))].sort();}
-function getVendors(){return[...new Set(S.parts.map(function(p){return p.vendor||'';}).filter(Boolean))].sort();}
+function getCats(table){
+  var src=table==='parts'?S.parts:S.assemblies;
+  var itemCats=src.map(function(x){return x.category||'';}).filter(Boolean);
+  var custom=(S.customCats&&S.customCats[table])||[];
+  return[...new Set([...itemCats,...custom])].sort();
+}
+function getVendors(){
+  var partVendors=S.parts.map(function(p){return p.vendor||'';}).filter(Boolean);
+  return[...new Set([...partVendors,...(S.customVendors||[])])].sort();
+}
 
 function handleSelNew(el){if(el.value==='__new'){el.value='';showNewCat(el.id);}}
 function handleVendorSelNew(el){if(el.value==='__new'){el.value='';showNewVendor(el.id);}}
@@ -1209,6 +1222,7 @@ function renderParts(){
     </select>
     <button class="filter-chip ${sf.showDisc?'on-teal':''}" onclick="setFilter('parts','showDisc',${sf.showDisc?'false':'true'})">🗄 Discontinued (${S.parts.filter(p=>p.discontinued).length})</button>
     <button class="btn btn-sm" style="margin-left:auto" onclick="openModal('manageCategories',{table:'parts'})">⚙ Categories</button>
+    <button class="btn btn-sm" onclick="openModal('manageVendors',{})">⚙ Vendors</button>
     <span class="filter-count">${list.length} parts</span>
   </div>
   <div id="parts-bulk-bar" style="display:${selCount>0?'flex':'none'};align-items:center;gap:10px;padding:8px 12px;background:var(--teal-dim);border-radius:6px;margin-bottom:8px;flex-wrap:wrap">
@@ -1668,6 +1682,7 @@ function renderPurchases(){
     </div>
     ${['','On Order','In Transit','Ordered','Partial','Received','Cancelled'].map(s=>`<button class="filter-chip ${sf.status===s&&s?'on-teal':''}" onclick="setFilter('po','status','${s}')">${s||'All'}</button>`).join('')}
     <button class="btn btn-sm" style="margin-left:auto" title="Remove duplicate POs (same vendor + date)" onclick="deduplicatePOs()">🧽 Dedupe POs</button>
+    <button class="btn btn-sm" onclick="openModal('manageVendors',{})">⚙ Vendors</button>
     <button class="btn btn-primary btn-sm" onclick="nav('pobuilder')">+ New PO</button>
   </div>
   <div class="tbl-wrap">
@@ -4383,7 +4398,10 @@ function openModal(type,data){
 
   if(type==='addPO'||type==='editPO'){
     title=type==='addPO'?'Create Purchase Order':'Edit PO';
-    body=`<div class="form-row cols-2">${fi('m-vendor','Vendor',data.vendor||'')} ${fi('m-pn','Part #',data.item||data.pn||'')}</div>
+    body=`<div class="form-row cols-2">
+    <div class="form-group"><label class="form-label">Vendor</label>${buildVendorSelect('m-vendor',data.vendor||'')}</div>
+    ${fi('m-pn','Part #',data.item||data.pn||'')}
+    </div>
     <div class="form-row">${fi('m-desc','Description',data.desc||data.description||'')}</div>
     <div class="form-row cols-2">${fi('m-qty','Quantity',data.qty||1,'type="number" min="1"')} ${fi('m-cost','Unit Cost',data.unitCost||data.unit_cost||0,'type="number" step="0.0001"')}</div>
     <div class="form-row cols-2">${fi('m-arrival','Expected Arrival',data.arrival_date||'','type="date"')} ${fi('m-notes','Notes',data.notes||'')}</div>
@@ -4590,30 +4608,91 @@ function openModal(type,data){
   else if(type==='manageCategories'){
     const table=data.table||'parts';
     const items=table==='parts'?S.parts:S.assemblies;
-    const cats=[...new Set(items.map(x=>x.category||'').filter(Boolean))].sort();
+    const allCats=getCats(table);
+    // Build tree: tops = cats with no slash, children grouped under parent
+    const tops=[...new Set(allCats.map(c=>c.split('/')[0]))].sort();
+    const childMap={};
+    allCats.filter(c=>c.includes('/')).forEach(c=>{
+      const slash=c.indexOf('/');const top=c.slice(0,slash);const sub=c.slice(slash+1);
+      if(!childMap[top])childMap[top]=[];childMap[top].push(sub);
+    });
     title='Manage Categories — '+(table==='parts'?'Parts':'Assemblies');
-    body=`<div style="margin-bottom:12px">
-      <div style="font-size:11px;color:var(--text3);margin-bottom:8px">Current categories (${cats.length})</div>
-      <div style="display:flex;flex-direction:column;gap:6px;max-height:280px;overflow-y:auto">
-        ${cats.map(c=>{
-          const count=items.filter(x=>x.category===c).length;
-          return `<div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--bg1);border-radius:6px;border:1px solid var(--border)">
-            <span style="flex:1;font-size:12px;font-weight:600">${escHtml(c)}</span>
-            <span style="font-size:10px;color:var(--text3)">${count} items</span>
-            <button class="action-btn" onclick="renameCategory('${table}','${escHtml(c)}')">Rename</button>
-            <button class="action-btn" style="color:var(--orange)" onclick="mergeCategoryPrompt('${table}','${escHtml(c)}')">Merge into…</button>
-            <button class="action-btn" style="color:var(--red)" onclick="deleteCategory('${table}','${escHtml(c)}')">Delete</button>
-          </div>`;
-        }).join('')}
-      </div>
+    const catRows=tops.map(top=>{
+      const topCount=items.filter(x=>(x.category||'').split('/')[0]===top).length;
+      const subs=childMap[top]||[];
+      const subsHtml=subs.map(sub=>{
+        const full=top+'/'+sub;const cnt=items.filter(x=>x.category===full).length;
+        return `<div style="display:flex;align-items:center;gap:8px;padding:5px 10px 5px 28px;background:var(--bg2);border-radius:6px;border:1px solid var(--border);margin-top:3px">
+          <span style="font-size:10px;color:var(--text3)">↳</span>
+          <span style="flex:1;font-size:12px;color:var(--text2)">${escHtml(sub)}</span>
+          <span style="font-size:10px;color:var(--text3)">${cnt} items</span>
+          <button class="action-btn" onclick="renameCategory('${table}','${escHtml(full)}')">Rename</button>
+          <button class="action-btn" style="color:var(--red)" onclick="deleteCategory('${table}','${escHtml(full)}')">Delete</button>
+        </div>`;
+      }).join('');
+      return `<div style="margin-bottom:4px">
+        <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--bg3);border-radius:6px;border:1px solid var(--border2)">
+          <span style="flex:1;font-size:12px;font-weight:700;color:var(--text)">${escHtml(top)}</span>
+          <span style="font-size:10px;color:var(--text3)">${topCount} total</span>
+          <button class="action-btn" onclick="renameCategory('${table}','${escHtml(top)}')">Rename</button>
+          <button class="action-btn" style="color:var(--orange)" onclick="mergeCategoryPrompt('${table}','${escHtml(top)}')">Merge→</button>
+          <button class="action-btn" style="color:var(--red)" onclick="deleteCategory('${table}','${escHtml(top)}')">Delete</button>
+        </div>
+        ${subsHtml}
+      </div>`;
+    }).join('');
+    const topOpts=tops.map(t=>`<option value="${escHtml(t)}">${escHtml(t)}</option>`).join('');
+    body=`<div style="max-height:320px;overflow-y:auto;margin-bottom:12px">
+      ${allCats.length===0?`<div style="text-align:center;padding:24px;color:var(--text3);font-size:12px">No categories yet — add one below</div>`:catRows}
     </div>
-    <div style="display:flex;gap:8px;padding-top:12px;border-top:1px solid var(--border)">
-      <input id="new-cat-name" class="form-input" placeholder="New category name…" style="flex:1">
-      <button class="btn btn-primary btn-sm" onclick="addCategory('${table}')">+ Add</button>
+    <div style="border-top:1px solid var(--border);padding-top:12px">
+      <div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Add Category</div>
+      <div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap">
+        <div style="flex:1;min-width:140px">
+          <div style="font-size:10px;color:var(--text3);margin-bottom:4px">Name</div>
+          <input id="new-cat-name" class="form-input" placeholder="Category name…">
+        </div>
+        <div style="flex:1;min-width:140px">
+          <div style="font-size:10px;color:var(--text3);margin-bottom:4px">Parent (optional)</div>
+          <select id="new-cat-parent" class="form-input">
+            <option value="">— Top level —</option>
+            ${topOpts}
+          </select>
+        </div>
+        <div style="align-self:flex-end">
+          <button class="btn btn-primary btn-sm" onclick="addCategory('${table}')">+ Add</button>
+        </div>
+      </div>
     </div>
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Done</button></div>`;
   }
-  else return;
+  else if(type==='manageVendors'){
+    const vendors=getVendors();
+    title='Manage Vendors';
+    const rows=vendors.map(v=>{
+      const partCount=S.parts.filter(p=>p.vendor===v).length;
+      const poCount=S.purchases.filter(p=>p.vendor===v).length;
+      const isCustom=(S.customVendors||[]).includes(v);
+      return `<div style="display:flex;align-items:center;gap:8px;padding:7px 10px;background:var(--bg3);border-radius:6px;border:1px solid var(--border);margin-bottom:4px">
+        <span style="flex:1;font-size:12px;font-weight:600;color:var(--text)">${escHtml(v)}</span>
+        <span style="font-size:10px;color:var(--text3)">${partCount} part${partCount!==1?'s':''}</span>
+        <span style="font-size:10px;color:var(--text3);margin-left:4px">${poCount} PO${poCount!==1?'s':''}</span>
+        <button class="action-btn" onclick="renameVendor('${escHtml(v)}')">Rename</button>
+        ${isCustom?`<button class="action-btn" style="color:var(--red)" onclick="deleteVendor('${escHtml(v)}')">Delete</button>`:'<span style="font-size:10px;color:var(--text3);padding:0 4px">via parts</span>'}
+      </div>`;
+    }).join('');
+    body=`<div style="max-height:300px;overflow-y:auto;margin-bottom:12px">
+      ${vendors.length===0?`<div style="text-align:center;padding:24px;color:var(--text3);font-size:12px">No vendors yet</div>`:rows}
+    </div>
+    <div style="border-top:1px solid var(--border);padding-top:12px">
+      <div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Add Vendor</div>
+      <div style="display:flex;gap:8px">
+        <input id="new-vendor-name" class="form-input" placeholder="Vendor name…" style="flex:1" onkeydown="if(event.key==='Enter')addVendor()">
+        <button class="btn btn-primary btn-sm" onclick="addVendor()">+ Add</button>
+      </div>
+    </div>
+    <div class="modal-footer"><button class="btn" onclick="closeModal()">Done</button></div>`;
+  }
 
   box.innerHTML=`<div class="modal-title">${title}<button class="modal-close" onclick="closeModal()">✕</button></div>${body}`;
   overlay.classList.remove('hidden');
@@ -4862,24 +4941,93 @@ async function saveBulkEdit(table){
   render();
 }
 async function addCategory(table){
-  const name=document.getElementById('new-cat-name')?.value.trim();
+  const name=(document.getElementById('new-cat-name')?.value||'').trim();
   if(!name){toast('Enter a category name');return;}
-  toast('Category "'+name+'" added — assign parts to it via Edit');
-  document.getElementById('new-cat-name').value='';
-  closeModal();
+  const parent=(document.getElementById('new-cat-parent')?.value||'').trim();
+  const full=parent?parent+'/'+name:name;
+  // Check for duplicate
+  if(getCats(table).includes(full)){toast(`"${full}" already exists`);return;}
+  // Add to in-memory custom list
+  if(!S.customCats[table])S.customCats[table]=[];
+  if(!S.customCats[table].includes(full))S.customCats[table].push(full);
+  // Persist to settings
+  S.settings.custom_cats=S.customCats;
+  const{error}=await db.from('settings').upsert({key:'custom_cats',value:S.customCats},{onConflict:'key'});
+  if(error){toast('Saved in session only — DB error: '+error.message);} 
+  else toast(`✓ Category "${full}" created`);
+  // Re-open modal to show updated list
+  openModal('manageCategories',{table});
+}
+
+async function addVendor(){
+  const name=(document.getElementById('new-vendor-name')?.value||'').trim();
+  if(!name){toast('Enter a vendor name');return;}
+  if(getVendors().includes(name)){toast(`"${name}" already exists`);return;}
+  if(!S.customVendors)S.customVendors=[];
+  S.customVendors.push(name);
+  S.settings.custom_vendors=S.customVendors;
+  const{error}=await db.from('settings').upsert({key:'custom_vendors',value:S.customVendors},{onConflict:'key'});
+  if(error)toast('Saved in session only — DB error: '+error.message);
+  else toast(`✓ Vendor "${name}" added`);
+  openModal('manageVendors',{});
+}
+
+async function renameVendor(oldName){
+  const newName=prompt('Rename vendor "'+oldName+'" to:',oldName);
+  if(!newName||newName===oldName)return;
+  // Update all parts
+  const partsToUpdate=S.parts.filter(p=>p.vendor===oldName);
+  if(partsToUpdate.length){
+    const{error}=await db.from('parts').update({vendor:newName}).eq('vendor',oldName);
+    if(error){toast('Error updating parts: '+error.message);return;}
+    S.parts=S.parts.map(p=>p.vendor===oldName?{...p,vendor:newName}:p);
+  }
+  // Update all POs
+  const posToUpdate=S.purchases.filter(p=>p.vendor===oldName);
+  if(posToUpdate.length){
+    await db.from('purchases').update({vendor:newName}).eq('vendor',oldName);
+    S.purchases=S.purchases.map(p=>p.vendor===oldName?{...p,vendor:newName}:p);
+  }
+  // Update customVendors
+  if(S.customVendors){
+    S.customVendors=S.customVendors.map(v=>v===oldName?newName:v);
+    S.settings.custom_vendors=S.customVendors;
+    await db.from('settings').upsert({key:'custom_vendors',value:S.customVendors},{onConflict:'key'});
+  }
+  toast(`Renamed "${oldName}" → "${newName}"${partsToUpdate.length?' ('+partsToUpdate.length+' parts, '+posToUpdate.length+' POs updated)':''}`);
+  openModal('manageVendors',{});
+}
+
+async function deleteVendor(name){
+  const partsCount=S.parts.filter(p=>p.vendor===name).length;
+  if(partsCount>0){toast(`Cannot delete — ${partsCount} part${partsCount!==1?'s':''} use "${name}". Reassign them first.`);return;}
+  if(!confirm(`Remove vendor "${name}" from the list?`))return;
+  S.customVendors=(S.customVendors||[]).filter(v=>v!==name);
+  S.settings.custom_vendors=S.customVendors;
+  await db.from('settings').upsert({key:'custom_vendors',value:S.customVendors},{onConflict:'key'});
+  toast(`Vendor "${name}" removed`);
+  openModal('manageVendors',{});
 }
 
 async function renameCategory(table,oldName){
-  const newName=prompt('Rename category "'+oldName+'" to:',oldName);
+  const newName=prompt('Rename "'+oldName+'" to:',oldName);
   if(!newName||newName===oldName)return;
   const items=(table==='parts'?S.parts:S.assemblies).filter(x=>x.category===oldName);
-  if(!items.length){toast('No items in that category');return;}
   const dbTable=table==='parts'?'parts':'assemblies';
-  const{error}=await db.from(dbTable).update({category:newName}).eq('category',oldName);
-  if(error){toast('Error: '+error.message);return;}
-  if(table==='parts')S.parts=S.parts.map(p=>p.category===oldName?{...p,category:newName}:p);
-  else S.assemblies=S.assemblies.map(a=>a.category===oldName?{...a,category:newName}:a);
-  closeModal();toast('Renamed "'+oldName+'" → "'+newName+'" ('+items.length+' items updated)');render();
+  if(items.length){
+    const{error}=await db.from(dbTable).update({category:newName}).eq('category',oldName);
+    if(error){toast('Error: '+error.message);return;}
+    if(table==='parts')S.parts=S.parts.map(p=>p.category===oldName?{...p,category:newName}:p);
+    else S.assemblies=S.assemblies.map(a=>a.category===oldName?{...a,category:newName}:a);
+  }
+  // Update customCats
+  if(S.customCats&&S.customCats[table]){
+    S.customCats[table]=S.customCats[table].map(c=>c===oldName?newName:c);
+    S.settings.custom_cats=S.customCats;
+    await db.from('settings').upsert({key:'custom_cats',value:S.customCats},{onConflict:'key'});
+  }
+  toast('Renamed "'+oldName+'" → "'+newName+'"'+(items.length?' ('+items.length+' items updated)':''));
+  openModal('manageCategories',{table});
 }
 
 async function mergeCategoryPrompt(table,fromName){
@@ -4913,7 +5061,13 @@ async function deleteCategory(table,name){
     else S.assemblies=S.assemblies.map(a=>a.category===name?{...a,category:into||null}:a);
     toast('Category "'+name+'" deleted — '+count+' items '+(into?'moved to "'+into+'"':'uncategorised'));
   }else toast('Category "'+name+'" removed (was empty)');
-  closeModal();render();
+  // Remove from custom list if present
+  if(S.customCats&&S.customCats[table]){
+    S.customCats[table]=S.customCats[table].filter(c=>c!==name);
+    S.settings.custom_cats=S.customCats;
+    await db.from('settings').upsert({key:'custom_cats',value:S.customCats},{onConflict:'key'});
+  }
+  openModal('manageCategories',{table});
 }
 
 async function deleteAsm(pn, id){
