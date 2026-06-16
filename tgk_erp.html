@@ -3537,12 +3537,22 @@ Deno.serve(async (req) => {
   if (resource_type === 'ORDER_ON_HOLD') {
     const rawNum = data.orderNumber
     const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
-    await db.from('sales').update({ fulfillment_status: 'On Hold' }).eq('order_number', ex?.length ? rawNum : '#' + rawNum)
+    const resolvedHold = ex?.length ? rawNum : '#' + rawNum
+    // Only hold lines still awaiting shipment — never overwrite already-Shipped/Delivered lines
+    await db.from('sales').update({ fulfillment_status: 'On Hold' })
+      .eq('order_number', resolvedHold)
+      .in('fulfillment_status', ['Open', 'Packed', 'Partial'])
+    console.log('[SS] ORDER_ON_HOLD', resolvedHold)
   }
   if (resource_type === 'ORDER_HOLD_RELEASED') {
     const rawNum = data.orderNumber
     const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
-    await db.from('sales').update({ fulfillment_status: 'Open' }).eq('order_number', ex?.length ? rawNum : '#' + rawNum)
+    const resolvedRel = ex?.length ? rawNum : '#' + rawNum
+    // Only release lines that are actually On Hold — never touch Shipped/Delivered lines
+    await db.from('sales').update({ fulfillment_status: 'Open' })
+      .eq('order_number', resolvedRel)
+      .eq('fulfillment_status', 'On Hold')
+    console.log('[SS] ORDER_HOLD_RELEASED', resolvedRel)
   }
 
   return ok('ok')
@@ -3563,14 +3573,13 @@ supabase functions deploy shipstation-ship --no-verify-jwt</pre>
       &nbsp;· <b>orders/create</b> → <span class="pn" style="color:var(--teal)">${edgeUrl}/shopify-orders</span><br>
       &nbsp;· <b>orders/cancelled</b> → same URL<br>
       &nbsp;· <b>orders/updated</b> → same URL (catches refunds)<br><br>
-      <b>ShipStation</b> → Account Settings → Webhooks → Add Webhook:<br>
-      &nbsp;· <b>On Items Shipped</b> → <span class="pn" style="color:var(--teal)">${edgeUrl}/shipstation-ship</span><br>
-      &nbsp;· <b>On New Orders</b> → same URL (catches manually-created SS orders)<br>
-      &nbsp;· <b>Order_Cancelled</b> → same URL<br>
-      &nbsp;· Event: <b>SHIP_NOTIFY</b> (fires when label created = split-aware)<br>
-      &nbsp;· Event: <b>ORDER_CANCELLED</b><br>
-      &nbsp;· Event: <b>ORDER_ON_HOLD</b> and <b>ORDER_HOLD_RELEASED</b><br>
-      &nbsp;· URL for all: <span class="pn" style="color:var(--teal)">${edgeUrl}/shipstation-ship</span>
+      <b>ShipStation</b> → Account Settings → Webhooks → Add Webhook — create one webhook per event, all pointing to the same URL:<br>
+      &nbsp;· Event: <b>SHIP_NOTIFY</b> (items shipped / partial shipment) → <span class="pn" style="color:var(--teal)">${edgeUrl}/shipstation-ship</span><br>
+      &nbsp;· Event: <b>ORDER_ON_HOLD</b> → same URL <span style="color:var(--yellow);font-weight:600">⚠ required for hold to update ERP</span><br>
+      &nbsp;· Event: <b>ORDER_HOLD_RELEASED</b> → same URL<br>
+      &nbsp;· Event: <b>NEW_ORDER</b> → same URL (manually-created SS orders)<br>
+      &nbsp;· Event: <b>ORDER_CANCELLED</b> → same URL<br>
+      <span style="color:var(--text3);font-size:10px">Each event needs its own webhook entry in ShipStation — they cannot be combined into one.</span>
     </div>
   </div>`:''}`;
 }
@@ -4327,26 +4336,20 @@ async function syncOrdersNow(){
     if(newCount+updatedCount>0)toast(`🔄 ${newCount} new, ${updatedCount} updated so far…`,1500);
   }
 
-  // ── Step 3: Check ShipStation for held orders ──
-  const ssKey=(S.shipstation?.key||S.settings?.shipstation?.key||'').trim();
-  const ssSec=(S.shipstation?.secret||S.settings?.shipstation?.secret||'').trim();
-  if(ssKey&&ssSec){
+  // ── Step 3: Check ShipStation for held/released orders via edge function ──
+  const ssKeyCheck=(S.shipstation?.key||S.settings?.shipstation?.key||'').trim();
+  if(ssKeyCheck){
     try{
-      const ssRes=await fetch('https://ssapi.shipstation.com/orders?orderStatus=on_hold&pageSize=100',{
-        headers:{Authorization:'Basic '+btoa(ssKey+':'+ssSec)}
+      const holdRes=await fetch(edgeBase+'/shipstation-ship',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+        body:JSON.stringify({action:'hold_sync'})
       });
-      if(ssRes.ok){
-        const{orders:held=[]}=await ssRes.json();
-        for(const ho of held){
-          const erpLines=S.sales.filter(s=>s.order_number===ho.orderNumber&&s.fulfillment_status==='Open');
-          for(const line of erpLines){
-            await db.from('sales').update({fulfillment_status:'On Hold'}).eq('id',line.id);
-            S.sales=S.sales.map(s=>s.id===line.id?{...s,fulfillment_status:'On Hold'}:s);
-            updatedCount++;
-          }
-        }
+      if(holdRes.ok){
+        const hd=await holdRes.json();
+        updatedCount+=(hd.markedHold||0)+(hd.markedOpen||0);
       }
-    }catch(e){console.warn('ShipStation hold check skipped:',e.message);}
+    }catch(e){console.warn('ShipStation hold sync skipped:',e.message);}
   }
 
   await refreshSales();render();
