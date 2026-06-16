@@ -2176,16 +2176,19 @@ function renderIntegrations(){
     </div>
     <div class="form-row cols-2">
       <div class="form-group"><label class="form-label">Store URL</label><input id="sh-store" class="form-input" value="${S.shopify.store||''}" placeholder="your-store.myshopify.com"></div>
-      <div class="form-group"><label class="form-label">Admin API Token (for Edge Function)</label><input id="sh-key" class="form-input" type="password" value="${S.shopify.key||''}" placeholder="shpat_••••••••"></div>
+      <div class="form-group"><label class="form-label">Client ID <span style="font-size:9px;color:var(--text3)">(from Dev Dashboard → Settings)</span></label><input id="sh-client-id" class="form-input" value="${S.shopify.clientId||''}" placeholder="ec9c55349f…"></div>
     </div>
-    <div class="form-row">
+    <div class="form-row cols-2">
+      <div class="form-group"><label class="form-label">Admin API Token <span style="font-size:9px;color:var(--text3)">(auto-filled after OAuth, or paste manually)</span></label><input id="sh-key" class="form-input" type="password" value="${S.shopify.key||''}" placeholder="shpat_••••••••"></div>
       <div class="form-group"><label class="form-label">Webhook Signing Secret</label><input id="sh-wh" class="form-input" type="password" value="${S.shopify.webhook||''}" placeholder="From Shopify webhook settings"></div>
     </div>
-    <div style="display:flex;gap:8px">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <button class="btn btn-primary" onclick="saveShopify()">Save Credentials</button>
+      <button class="btn btn-teal" onclick="startShopifyOAuth()" title="Opens Shopify OAuth to automatically get your access token">🔗 Connect via OAuth</button>
       <button class="btn btn-teal" onclick="testShopify()">Test Connection</button>
       <button class="btn btn-sm" style="color:var(--purple);border-color:rgba(124,58,237,.3)" onclick="syncShopifyImages()" title="Pull product images from Shopify and attach them to matching assembly SKUs">🖼 Sync Images</button>
     </div>
+    <div style="font-size:10px;color:var(--text3);margin-top:6px">🔗 OAuth: enter Store URL + Client ID → click Connect → approve in Shopify → token auto-saves. Requires redirect URI <code>https://tgkcommand.github.io/TGKErp/tgk_erp.html</code> added in your Dev Dashboard app version.</div>
     <div class="divider"></div>
     <div style="font-size:11px;color:var(--text3)">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span style="font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.06em;font-size:9px">Integration status</span><button class="btn btn-sm" onclick="checkEdgeFunctions()">↻ Check Live Status</button></div>
@@ -2276,6 +2279,26 @@ Deno.serve(async (req) => {
   try { body = await req.json() } catch (_) {}
 
   if (body.ping) return new Response('pong', { headers: CORS })
+
+  // OAuth code exchange: browser sends code, edge fn exchanges for permanent token using secret
+  if (body.action === 'oauth_exchange') {
+    const clientId = Deno.env.get('SHOPIFY_CLIENT_ID') || ''
+    const clientSecret = Deno.env.get('SHOPIFY_CLIENT_SECRET') || ''
+    if (!clientId || !clientSecret) return new Response(JSON.stringify({error:'SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET not set in edge function secrets'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
+    const shop = (body.shop || '').replace('https://','').replace('http://','')
+    const code = body.code || ''
+    if (!shop || !code) return new Response(JSON.stringify({error:'Missing shop or code'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
+    const tokenRes = await fetch('https://'+shop+'/admin/oauth/access_token', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({client_id: clientId, client_secret: clientSecret, code})
+    })
+    const tokenData = await tokenRes.json()
+    if (!tokenRes.ok || !tokenData.access_token) {
+      return new Response(JSON.stringify({error: tokenData.error_description || tokenData.error || 'Token exchange failed'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
+    }
+    return new Response(JSON.stringify({access_token: tokenData.access_token, scope: tokenData.scope}), {headers:{...CORS,'Content-Type':'application/json'}})
+  }
 
   // Sync proxy: browser calls this to pull orders from Shopify (avoids CORS)
   if (body.action === 'sync') {
@@ -3733,11 +3756,60 @@ async function recordPack(pn,asmId){
 }
 async function saveShopify(){
   const store=$('sh-store').value.trim(),key=$('sh-key').value.trim(),webhook=$('sh-wh').value.trim();
-  const val={connected:!!(store&&key),store,key,webhook};
-  const{error}=await db.from('settings').upsert({key:'shopify',value:val},{onConflict:'key'});
-  if(error){toast('Save failed: '+error.message);return;}
-  S.shopify=val;S.settings.shopify=val;
-  toast(val.connected?'Shopify credentials saved ✓':'Settings saved');render();
+  const clientId=($('sh-client-id')?.value||'').trim();
+  if(!store){toast('Enter your store URL');return;}
+  Object.assign(S.shopify,{store,key,webhook,clientId,connected:!!(store&&key)});
+  await db.from('settings').upsert({key:'shopify',value:S.shopify},{onConflict:'key'});
+  toast('Shopify credentials saved');render();
+}
+
+// ── SHOPIFY OAUTH FLOW ────────────────────────────────────────────────────
+function startShopifyOAuth(){
+  const store=($('sh-store')?.value||S.shopify.store||'').trim().replace(/^https?:\/\//,'');
+  const clientId=($('sh-client-id')?.value||S.shopify.clientId||'').trim();
+  if(!store){toast('Enter your store URL first');return;}
+  if(!clientId){toast('Enter your Client ID first');return;}
+  // Save store + clientId before redirecting
+  S.shopify.store=store;S.shopify.clientId=clientId;
+  db.from('settings').upsert({key:'shopify',value:S.shopify},{onConflict:'key'});
+  const redirect=encodeURIComponent('https://tgkcommand.github.io/TGKErp/tgk_erp.html');
+  const scopes='read_orders,write_orders,read_products,read_inventory';
+  const state=Math.random().toString(36).slice(2);
+  localStorage.setItem('shopify_oauth_state',state);
+  const url='https://'+store+'/admin/oauth/authorize?client_id='+clientId
+    +'&scope='+scopes+'&redirect_uri='+redirect+'&state='+state;
+  window.location.href=url;
+}
+
+async function handleShopifyOAuthCallback(){
+  const params=new URLSearchParams(window.location.search);
+  const code=params.get('code');
+  const shop=params.get('shop');
+  const state=params.get('state');
+  if(!code||!shop)return;
+  // Clean URL without reloading
+  history.replaceState({},'','#dashboard');
+  const saved=localStorage.getItem('shopify_oauth_state');
+  if(saved&&state!==saved){toast('OAuth state mismatch — try again');return;}
+  localStorage.removeItem('shopify_oauth_state');
+  toast('Exchanging OAuth code for access token…');
+  try{
+    const res=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'oauth_exchange',code,shop})
+    });
+    const data=await res.json().catch(()=>({}));
+    if(data.access_token){
+      S.shopify.key=data.access_token;
+      S.shopify.store=shop.replace('https://','');
+      S.shopify.connected=true;
+      await db.from('settings').upsert({key:'shopify',value:S.shopify},{onConflict:'key'});
+      toast('✓ Shopify connected! Access token saved.',5000);
+      nav('integrations');render();
+    }else{
+      toast('OAuth error: '+(data.error||'could not exchange code'));
+    }
+  }catch(e){toast('OAuth error: '+e.message);}
 }
 async function saveShipStation(){
   const key=$('ss-key').value.trim(),secret=$('ss-secret').value.trim();
@@ -7161,6 +7233,7 @@ async function refreshAssemblies(){
         try{loadBackups();}catch(e){console.error('loadBackups error:',e);}
         try{startAutoBackup();}catch(e){console.error('startAutoBackup error:',e);}
         try{history.replaceState(snapState(),'','#dashboard');}catch(e){}
+        if(window.location.search.includes('code=')&&window.location.search.includes('shop='))handleShopifyOAuthCallback();
         render();
       })
       .catch(err=>{
