@@ -3077,13 +3077,28 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({error:'Missing credentials'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
     }
     const since = body.since || new Date(Date.now() - 30*24*60*60*1000).toISOString()
-    const page = body.page || 1
-    const url = 'https://' + store + '/admin/api/2024-01/orders.json?status=any&limit=250&updated_at_min=' + since + '&page=' + page
+    const page_info = body.page_info || ''
+    // Shopify 2024-01 uses cursor-based pagination — page= is rejected with 400
+    // When using page_info cursor, only limit= is allowed (cursor encodes all filters)
+    const url = page_info
+      ? 'https://' + store + '/admin/api/2024-01/orders.json?limit=250&page_info=' + encodeURIComponent(page_info)
+      : 'https://' + store + '/admin/api/2024-01/orders.json?status=any&limit=250&updated_at_min=' + encodeURIComponent(since)
     const shopRes = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
     if (!shopRes.ok) {
-      return new Response(JSON.stringify({error:'Shopify ' + shopRes.status}), {status:shopRes.status, headers:{...CORS,'Content-Type':'application/json'}})
+      const errText = await shopRes.text().catch(() => '')
+      return new Response(JSON.stringify({error:'Shopify ' + shopRes.status + ': ' + errText.slice(0, 300)}), {status:shopRes.status, headers:{...CORS,'Content-Type':'application/json'}})
     }
-    return new Response(await shopRes.text(), {headers:{...CORS,'Content-Type':'application/json'}})
+    // Parse cursor for next page from Link header
+    const link = shopRes.headers.get('link') || ''
+    let next_page_info = ''
+    for (const part of link.split(',')) {
+      if (part.includes('rel="next"')) {
+        const m = part.match(/page_info=([^&>"]+)/)
+        if (m) { next_page_info = m[1]; break }
+      }
+    }
+    const shopData = await shopRes.json()
+    return new Response(JSON.stringify({...shopData, next_page_info}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
 
   // Image sync (single page): frontend calls repeatedly with page_info until done
@@ -4291,7 +4306,7 @@ async function syncOrdersNow(){
   // ── Step 2: Fetch orders via edge function (avoids browser CORS block on Shopify API) ──
   toast('🔄 Fetching from Shopify via edge function…');
   const cutoff=new Date(Date.now()-30*24*60*60*1000).toISOString();
-  let newCount=0,updatedCount=0,page=1,keepGoing=true;
+  let newCount=0,updatedCount=0,pageInfo='',keepGoing=true;
 
   while(keepGoing){
     let resp,orders=[];
@@ -4299,7 +4314,7 @@ async function syncOrdersNow(){
       resp=await fetch(edgeBase+'/shopify-orders',{
         method:'POST',
         headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
-        body:JSON.stringify({action:'sync',store,key,since:cutoff,page})
+        body:JSON.stringify({action:'sync',store,key,since:cutoff,...(pageInfo?{page_info:pageInfo}:{})})
       });
       if(!resp.ok){
         const txt=await resp.text().catch(()=>'');
@@ -4307,7 +4322,7 @@ async function syncOrdersNow(){
           toast('⚠ Shopify rejected the API key — go to Integrations → Shopify, re-enter your Admin API token (starts with shpat_) and save',7000);
           return;
         }
-        if((resp.status===400&&txt.includes('Missing action'))||resp.status===404){
+        if(resp.status===404){
           toast('⚠ Edge function needs updating — copy the new shopify-orders code from Integrations → Setup Guide and redeploy',6000);
           return;
         }
@@ -4323,6 +4338,7 @@ async function syncOrdersNow(){
         toast('Shopify error: '+json.error);break;
       }
       orders=json.orders||[];
+      pageInfo=json.next_page_info||'';
     }catch(e){toast('Network error calling edge function: '+e.message);break;}
 
     if(!orders.length){keepGoing=false;break;}
@@ -4358,8 +4374,7 @@ async function syncOrdersNow(){
         }
       }
     }
-    page++;
-    if(orders.length<250)keepGoing=false;
+    if(!pageInfo)keepGoing=false; // no next_page_info = last page
     if(newCount+updatedCount>0)toast(`🔄 ${newCount} new, ${updatedCount} updated so far…`,1500);
   }
 
@@ -4386,17 +4401,23 @@ async function syncOrdersNow(){
 async function importOrdersFromShopify(){
   const token=prompt('Paste your Shopify Admin API token (Settings → Apps → Private apps or API credentials):\nNeeded one-time to pull historical orders.');
   if(!token)return;
-  const store=S.shopify?.store||prompt('Your store URL (e.g. mystore.myshopify.com):');
+  const store=(S.shopify?.store||prompt('Your store URL (e.g. mystore.myshopify.com):')||'').trim();
   if(!store)return;
   toast('Fetching orders from Shopify… this may take a moment');
-  let imported=0,skipped=0,page=1,keepGoing=true;
+  let imported=0,skipped=0,importPageInfo='',keepGoing=true;
   while(keepGoing){
     try{
-      const res=await fetch(`https://${store.replace(/^https?:\/\//,'')}/admin/api/2024-01/orders.json?status=any&limit=250&page=${page}`,{
-        headers:{'X-Shopify-Access-Token':token,'Content-Type':'application/json'}
+      // Route through edge function — direct browser calls are CORS-blocked by Shopify
+      const res=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+        body:JSON.stringify({action:'sync',store,key:token,...(importPageInfo?{page_info:importPageInfo}:{since:'2000-01-01T00:00:00Z'})})
       });
       if(!res.ok){toast('Shopify error '+res.status+' — check token and store URL');break;}
-      const {orders=[]}=await res.json();
+      const json=await res.json().catch(()=>({}));
+      if(json.error){toast('Shopify error: '+json.error);break;}
+      const orders=json.orders||[];
+      importPageInfo=json.next_page_info||'';
       if(!orders.length){keepGoing=false;break;}
       for(const order of orders){
         const orderNum=order.name;
@@ -4417,9 +4438,8 @@ async function importOrdersFromShopify(){
           if(data){S.sales=[data,...S.sales];imported++;}
         }
       }
-      page++;
-      if(orders.length<250)keepGoing=false;
-      toast(`Importing… ${imported} orders pulled so far (page ${page-1})`);
+      if(!importPageInfo)keepGoing=false;
+      toast(`Importing… ${imported} orders pulled so far…`);
     }catch(e){toast('Error: '+e.message);keepGoing=false;}
   }
   await loadAll();render();
