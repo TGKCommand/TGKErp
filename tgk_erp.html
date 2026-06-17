@@ -506,6 +506,7 @@ const S = {
   activePO:null, poLines:{}, poTracking:{},
   selectedParts:new Set(), selectedAsms:new Set(), bulkEditMode:null,
   workOrderMode:false, workOrderBuilds:{},
+  customPackMode:false, customPackLines:[],
   pendingBOMLines:[],
   syncLocked:new Set(), // order numbers locked from Shopify sync overwrite
   pendingPriceBreaks:[],
@@ -944,7 +945,7 @@ function setupRealtime(){
 const PAGE_TITLES={dashboard:'Dashboard',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',planning:'Inventory Planning',purchases:'Purchase Orders',vendors:'Vendors',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Corrections Log',warranty:'Customer Resolution',import:'Import Data',pobuilder:'PO Builder',reports:'Reports & Export'};
 
 function nav(v){
-  if(v!==S.view){S.activePO=null;S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.parentBuild=null;S.parentBuildQty=null;S.activeCount=null;if(v!=='packqueue')S.workOrderMode=false;S.searchQ='';if(S.view==='reports')S.rptState={...S.rptState,preview:null};}
+  if(v!==S.view){S.activePO=null;S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.parentBuild=null;S.parentBuildQty=null;S.activeCount=null;if(v!=='packqueue'){S.workOrderMode=false;S.customPackMode=false;}S.searchQ='';if(S.view==='reports')S.rptState={...S.rptState,preview:null};}
   S.view=v;
   document.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
   const el=$('nav-'+v);if(el)el.classList.add('active');
@@ -8989,6 +8990,7 @@ function openOrderDemand(pn){
 function renderPackQueue(){
   if(S.activeBuild){const asm=S.assemblies.find(a=>a.pn===S.activeBuild);if(asm)return renderBuildPlanner(asm);}
   if(S.workOrderMode)return renderWorkOrder();
+  if(S.customPackMode)return renderCustomPackList();
 
   const cov=S.buildCoverage||4;
   const sf=S.filters.production||{};
@@ -9043,6 +9045,7 @@ function renderPackQueue(){
       <span style="font-size:10px;color:var(--text3);margin-left:auto">Target:</span>
       ${[2,4,8,12].map(w=>`<button class="filter-chip ${cov===w?'on-teal':''}" onclick="S.buildCoverage=${w};render()">${w}w</button>`).join('')}
       <button class="btn btn-primary btn-sm" onclick="startWorkOrder()" title="Select assemblies to build today — see combined pick list and print shop floor sheet">📋 Work Order</button>
+      <button class="btn btn-sm" onclick="S.customPackMode=true;S.customPackLines=[];render()" title="Manually record packed units for any SKU and quantity">📦 Custom Pack</button>
     </div>
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-top:8px;border-top:1px solid var(--border)">
       <span style="font-size:11px;color:var(--text3)">Type:</span>
@@ -9080,6 +9083,174 @@ function renderPackQueue(){
 }
 
 // ─── WORK ORDER MODE ────────────────────────────────────────────────────────
+function renderCustomPackList(){
+  const asmMap={};S.assemblies.forEach(a=>asmMap[a.pn]=a);
+  const asmPNs=S.assemblies.filter(a=>!a.discontinued).map(a=>a.pn).sort();
+
+  const rows=S.customPackLines.map((line,i)=>{
+    const asm=asmMap[line.pn];
+    const desc=asm?(asm.description||''):'Unknown SKU';
+    const oh=asm?(asm.total_on_hand||0):null;
+    const valid=!!asm;
+    const bom=S.boms[line.pn]||[];
+    return `<tr>
+      <td style="font-family:var(--mono);font-size:12px;font-weight:700;color:${valid?'var(--teal)':'var(--red)'}">${escHtml(line.pn)}</td>
+      <td style="font-size:12px;color:var(--text2)">${escHtml(desc)}</td>
+      <td style="font-size:12px;text-align:center">${oh!==null?oh:'—'}</td>
+      <td style="text-align:center">
+        <input type="number" min="1" value="${line.qty}" style="width:60px;text-align:center;font-size:12px;padding:3px 6px;background:var(--bg3);border:1px solid var(--border2);border-radius:4px;color:var(--text1)" onchange="S.customPackLines[${i}].qty=Math.max(1,parseInt(this.value)||1);render()">
+      </td>
+      <td style="text-align:center;font-weight:700;color:var(--teal);font-size:12px">${oh!==null?oh+line.qty:'—'}</td>
+      <td style="font-size:10px;color:var(--text3)">${bom.length?bom.length+' components':'No BOM'}</td>
+      <td><button class="btn btn-sm" style="color:var(--red);padding:2px 8px;font-size:11px" onclick="S.customPackLines.splice(${i},1);render()">✕</button></td>
+    </tr>`;
+  }).join('');
+
+  const allValid=S.customPackLines.length>0&&S.customPackLines.every(l=>!!asmMap[l.pn]);
+  const totalLines=S.customPackLines.length;
+
+  return `
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap">
+    <button class="btn btn-sm" onclick="S.customPackMode=false;render()">← Production</button>
+    <span style="font-size:16px;font-weight:700">📦 Custom Pack List</span>
+    <span style="font-size:12px;color:var(--text3)">Manually record packed units — updates on-hand inventory for each SKU</span>
+  </div>
+  <div class="panel" style="margin-bottom:12px">
+    <div style="font-size:12px;font-weight:700;color:var(--text2);margin-bottom:10px">Add SKU to List</div>
+    <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+      <div style="flex:1;min-width:200px">
+        <label style="font-size:11px;color:var(--text3);display:block;margin-bottom:4px">SKU</label>
+        <input id="cpl-pn" class="form-input" placeholder="Type or scan SKU…" list="cpl-pn-list" autocomplete="off" style="font-family:var(--mono)" onkeydown="if(event.key==='Enter'){event.preventDefault();cplAddRow();}">
+        <datalist id="cpl-pn-list">${asmPNs.map(p=>`<option value="${escHtml(p)}">`).join('')}</datalist>
+      </div>
+      <div style="width:80px">
+        <label style="font-size:11px;color:var(--text3);display:block;margin-bottom:4px">Qty</label>
+        <input id="cpl-qty" class="form-input" type="number" min="1" value="1" style="text-align:center" onkeydown="if(event.key==='Enter'){event.preventDefault();cplAddRow();}">
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="cplAddRow()" style="margin-bottom:1px">+ Add</button>
+    </div>
+    <div style="font-size:11px;color:var(--text3);margin-top:8px">If a SKU is already in the list, the quantity will be added to the existing line.</div>
+  </div>
+  ${totalLines>0?`
+  <div class="panel" style="padding:0;overflow:hidden;margin-bottom:12px">
+    <div class="section-header" style="display:flex;align-items:center">
+      <span>Pack List — ${totalLines} line${totalLines!==1?'s':''}</span>
+      <button class="btn btn-sm" style="margin-left:auto;color:var(--red);font-size:11px" onclick="if(confirm('Clear all lines?')){S.customPackLines=[];render();}">✕ Clear All</button>
+    </div>
+    <div class="tbl-wrap">
+    <table><thead class="sticky-header"><tr>
+      <th>SKU</th><th>Description</th><th>Current On Hand</th><th>Qty to Pack</th><th>New On Hand</th><th>BOM</th><th></th>
+    </tr></thead><tbody>
+    ${rows}
+    </tbody></table>
+    </div>
+  </div>
+  <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:4px">
+    <button class="btn btn-sm" onclick="S.customPackMode=false;S.customPackLines=[];render()">Cancel</button>
+    <button class="btn btn-primary" onclick="submitCustomPackList()" ${allValid?'':'disabled'}>📦 Confirm & Pack All (${totalLines} SKU${totalLines!==1?'s':''})</button>
+  </div>
+  `:`<div class="panel"><div class="section-empty">Add SKUs above to build your pack list</div></div>`}`;
+}
+
+function cplAddRow(){
+  const pnEl=document.getElementById('cpl-pn');
+  const qtyEl=document.getElementById('cpl-qty');
+  if(!pnEl||!qtyEl)return;
+  const pn=pnEl.value.trim().toUpperCase();
+  const qty=parseInt(qtyEl.value)||1;
+  if(!pn){toast('Enter a SKU');return;}
+  const asm=S.assemblies.find(a=>a.pn===pn);
+  if(!asm){toast('SKU not found: '+pn);return;}
+  if(qty<1){toast('Qty must be ≥ 1');return;}
+  const existing=S.customPackLines.find(l=>l.pn===pn);
+  if(existing){existing.qty+=qty;}
+  else{S.customPackLines.push({pn,qty});}
+  pnEl.value='';
+  qtyEl.value='1';
+  pnEl.focus();
+  render();
+}
+
+async function submitCustomPackList(){
+  if(!S.customPackLines.length)return;
+  const asmMap={};S.assemblies.forEach(a=>asmMap[a.pn]=a);
+  const invalid=S.customPackLines.filter(l=>!asmMap[l.pn]);
+  if(invalid.length){toast('Unknown SKU(s): '+invalid.map(l=>l.pn).join(', '));return;}
+  const totalUnits=S.customPackLines.reduce((t,l)=>t+l.qty,0);
+  if(!confirm('Pack '+S.customPackLines.length+' SKU(s) ('+totalUnits+' total units)?\n\nInventory will be updated and BOM components deducted where applicable.'))return;
+
+  const partMap={};S.parts.forEach(p=>partMap[p.pn]=p);
+  const allUndo=[];
+  let packed=0;
+
+  for(const line of S.customPackLines){
+    const {pn,qty}=line;
+    // Refresh from live S.assemblies each iteration (prior iterations may have changed sub on-hand)
+    const asm=S.assemblies.find(a=>a.pn===pn);
+    if(!asm){toast('SKU disappeared mid-pack: '+pn);break;}
+    const bom=S.boms[pn]||[];
+    const liveAsmMap={};S.assemblies.forEach(a=>liveAsmMap[a.pn]=a);
+
+    // Check component availability
+    if(bom.length>0){
+      for(const item of bom){
+        const isSub=item.item_type==='assembly';
+        const src=isSub?liveAsmMap[item.child_pn]:partMap[item.child_pn];
+        const avail=src?(isSub?(src.total_on_hand||0):(src.total_unpckgd||0)):0;
+        const need=item.qty*qty;
+        if(avail<need){
+          toast('Stopped at '+pn+': not enough '+item.child_pn+' — need '+need+', have '+avail);
+          if(packed>0)toast(packed+' SKU'+(packed!==1?'s':'')+' already packed before this line');
+          pushUndoMulti('Custom Pack List — partial ('+packed+' SKUs)',allUndo);
+          updateBadge();render();return;
+        }
+      }
+    }
+
+    // Deduct BOM components
+    if(bom.length>0){
+      for(const item of bom){
+        const delta=-(item.qty*qty);
+        if(item.item_type==='assembly'){
+          const sa=liveAsmMap[item.child_pn];if(!sa)continue;
+          const newOh=(sa.total_on_hand||0)+delta;
+          allUndo.push({action:'update',table:'assemblies',data:{...sa,total_on_hand:newOh},prev:{...sa}});
+          await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',sa.id);
+          S.assemblies=S.assemblies.map(x=>x.pn===item.child_pn?{...x,total_on_hand:newOh}:x);
+          await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:sa.total_on_hand||0,new_qty:newOh,adjustment:delta,reason:'Custom Pack '+qty+'×'+pn+' (sub)',source:'pack'});
+        } else {
+          const p=partMap[item.child_pn];if(!p)continue;
+          const newQty=(p.total_unpckgd||0)+delta;
+          allUndo.push({action:'update',table:'parts',data:{...p,total_unpckgd:newQty},prev:{...p}});
+          await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
+          S.parts=S.parts.map(x=>x.pn===item.child_pn?{...x,total_unpckgd:newQty}:x);
+          partMap[item.child_pn]={...partMap[item.child_pn],total_unpckgd:newQty};
+          await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:delta,reason:'Custom Pack '+qty+'×'+pn,source:'pack'});
+        }
+      }
+    }
+
+    // Update assembly on-hand
+    const newOh=(asm.total_on_hand||0)+qty;
+    const newAssembled=(asm.total_assembled||0)+qty;
+    allUndo.push({action:'update',table:'assemblies',data:{...asm,total_on_hand:newOh},prev:{...asm}});
+    await db.from('assemblies').update({total_on_hand:newOh,total_assembled:newAssembled,updated_at:new Date().toISOString()}).eq('id',asm.id);
+    S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh,total_assembled:newAssembled}:a);
+
+    // Log
+    await db.from('pack_log').insert({pn,qty,pack_date:new Date().toISOString(),type:'pack',notes:'Custom pack list: '+qty+'× '+pn});
+    await db.from('inv_corrections').insert({pn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:qty,reason:'Custom Pack List',source:'pack'});
+    packed++;
+  }
+
+  pushUndoMulti('Custom Pack List ('+packed+' SKU'+(packed!==1?'s':'')+')',allUndo);
+  updateBadge();
+  toast('✓ Packed '+packed+' SKU'+(packed!==1?'s':'')+' from custom list');
+  S.customPackMode=false;
+  S.customPackLines=[];
+  render();
+}
+
 function startWorkOrder(){
   // Pre-populate with all assemblies that have suggested > 0
   S.workOrderBuilds=S.workOrderBuilds||{};
