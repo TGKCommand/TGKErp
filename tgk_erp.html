@@ -3473,7 +3473,7 @@ Deno.serve(async (req) => {
       erpFound: erpFound.size,
       missingCount: missing.length,
       imported,
-      missing: missing.slice(0, 300).map((o: any) => ({
+      missing: missing.map((o: any) => ({
         orderNumber: o.orderNumber,
         date: (o.orderDate || '').slice(0, 10),
         customer: o.shipTo?.name || '',
@@ -3481,6 +3481,33 @@ Deno.serve(async (req) => {
         items: (o.items || []).map((i: any) => ({ sku: i.sku || i.name, qty: i.quantity || 1 }))
       }))
     })
+  }
+
+  // --- SS IMPORT BATCH: insert a pre-audited list of orders — no SS re-fetch needed ---
+  if (body.action === 'ss_import_batch') {
+    const orders = body.orders || []
+    const fsMap: any = { awaiting_shipment: 'Open', on_hold: 'On Hold', shipped: 'Shipped', cancelled: 'Cancelled', awaiting_payment: 'Open', pending_fulfillment: 'Open' }
+    let imported = 0
+    for (const order of orders) {
+      const fs = fsMap[order.status] || 'Open'
+      for (const item of (order.items || [])) {
+        const pn = item.sku
+        if (!pn) continue
+        const { data: ex } = await db.from('sales').select('id')
+          .in('order_number', [order.orderNumber, '#' + order.orderNumber])
+          .eq('pn', pn).limit(1)
+        if (ex?.length) continue
+        await db.from('sales').insert({
+          order_number: order.orderNumber, pn,
+          qty: item.qty || 1, fulfillment_status: fs,
+          source: 'ShipStation Import',
+          sale_date: order.date || new Date().toISOString().slice(0, 10),
+          customer_name: order.customer || null,
+        })
+        imported++
+      }
+    }
+    return json({ imported })
   }
 
   const { resource_url, resource_type } = body
@@ -4104,29 +4131,48 @@ async function ssOrderAudit(){
 async function ssImportMissing(){
   const missing=window._ssAuditMissing||[];
   if(!missing.length){closeModal();return;}
+
   const b=document.getElementById('ss-audit-body');
-  if(b)b.innerHTML=`<div style="color:var(--text3);font-size:12px;display:flex;align-items:center;gap:8px"><div class="sync-dot busy" style="flex-shrink:0"></div> Importing ${missing.length} order${missing.length!==1?'s':''} into ERP…</div>`;
-  try{
-    const res=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
-      method:'POST',
-      headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
-      body:JSON.stringify({action:'ss_order_audit',days:90,import:true})
-    });
-    const data=await res.json().catch(()=>({}));
-    await refreshSales();render();
-    if(res.ok){
-      if(b)b.innerHTML=
-        `<div style="color:var(--green);font-size:13px;font-weight:700;margin-bottom:6px">✓ Imported ${data.imported} line${data.imported!==1?'s':''} across ${missing.length} order${missing.length!==1?'s':''}</div>`+
-        `<div style="font-size:11px;color:var(--text3)">Orders are now visible in Sales Orders.</div>`+
-        `<div class="modal-footer"><button class="btn btn-primary" onclick="closeModal()">Done</button></div>`;
-    }else{
-      if(b)b.innerHTML=`<div style="color:var(--red);font-size:12px">✗ Import failed: ${escHtml(data.error||res.status)}</div>`+
-        `<div class="modal-footer"><button class="btn" onclick="closeModal()">Close</button></div>`;
-    }
-  }catch(e){
-    if(b)b.innerHTML=`<div style="color:var(--red);font-size:12px">✗ ${escHtml(e.message)}</div>`+
-      `<div class="modal-footer"><button class="btn" onclick="closeModal()">Close</button></div>`;
+  const total=missing.length;
+  const BATCH=50; // well within 60s edge function limit even for multi-item orders
+  let imported=0,failed=0,done=0;
+
+  function prog(){
+    if(b)b.innerHTML=`
+      <div style="font-size:13px;font-weight:700;color:var(--text2);margin-bottom:10px">
+        ⬇ Importing ${total} orders into ERP…
+      </div>
+      <div style="background:var(--bg3);border-radius:20px;height:8px;overflow:hidden;margin-bottom:10px">
+        <div style="height:100%;background:var(--teal);border-radius:20px;transition:width .3s;width:${Math.round(done/total*100)}%"></div>
+      </div>
+      <div style="font-size:11px;color:var(--text3)">${done} of ${total} orders processed · ${imported} lines inserted${failed?' · '+failed+' failed':''}</div>`;
   }
+  prog();
+
+  for(let i=0;i<missing.length;i+=BATCH){
+    const batch=missing.slice(i,i+BATCH);
+    try{
+      const res=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+        body:JSON.stringify({action:'ss_import_batch',orders:batch})
+      });
+      const data=await res.json().catch(()=>({}));
+      if(res.ok){imported+=data.imported||0;}
+      else{failed+=batch.length;}
+    }catch(e){failed+=batch.length;}
+    done=Math.min(i+BATCH,total);
+    prog();
+  }
+
+  await refreshSales();render();
+  if(b)b.innerHTML=`
+    <div style="color:var(--green);font-size:13px;font-weight:700;margin-bottom:8px">
+      ✓ Import complete — ${imported} line${imported!==1?'s':''} added across ${total} order${total!==1?'s':''}
+    </div>
+    ${failed?`<div style="color:var(--yellow);font-size:11px;margin-bottom:8px">⚠ ${failed} orders had errors — run SS Audit again to retry.</div>`:''}
+    <div style="font-size:11px;color:var(--text3)">Orders are now visible in Sales Orders.</div>
+    <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal()">Done</button></div>`;
 }
 
 
