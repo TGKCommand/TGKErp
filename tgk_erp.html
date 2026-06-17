@@ -686,7 +686,9 @@ function countGroupedStatus(status){
     if(lines.length===1)return(lines[0].fulfillment_status||'Open')===status;
     const shippedLines=lines.filter(l=>l.fulfillment_status==='Shipped'||l.fulfillment_status==='Delivered');
     const pendingLines=lines.filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
-    const effectiveStatus=shippedLines.length>0&&pendingLines.length>0?'Partial':
+    const allPendingOnHold=pendingLines.length>0&&pendingLines.every(l=>l.fulfillment_status==='On Hold');
+    const effectiveStatus=allPendingOnHold?'On Hold':
+      shippedLines.length>0&&pendingLines.length>0&&!allPendingOnHold?'Partial':
       lines.reduce((best,x)=>(rank[x.fulfillment_status||'Open']||0)>(rank[best]||0)?x.fulfillment_status:best,lines[0].fulfillment_status||'Open');
     return effectiveStatus===status;
   }).length;
@@ -1931,13 +1933,18 @@ function renderSales(){
         // Partial shipment: some lines shipped/delivered, others still pending
         const shippedLines=lines.filter(l=>l.fulfillment_status==='Shipped'||l.fulfillment_status==='Delivered');
         const pendingLines=lines.filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
-        const isPartial=shippedLines.length>0&&pendingLines.length>0;
+        // If every pending item is On Hold the order is On Hold, not Partial —
+        // it's a split that's blocked, not one that needs active fulfillment
+        const allPendingOnHold=pendingLines.length>0&&pendingLines.every(l=>l.fulfillment_status==='On Hold');
+        const isPartial=shippedLines.length>0&&pendingLines.length>0&&!allPendingOnHold;
+        const effectiveStatus=allPendingOnHold?'On Hold':isPartial?'Partial':lead.fulfillment_status;
         // Use earliest created_at across all lines as the order timestamp
         // Use earliest sale_date (actual order date) across lines; fall back to created_at (DB insert time)
         const orderTs=lines.reduce((earliest,s)=>{const ts=s.sale_date||s.created_at;return ts&&(!earliest||ts<earliest)?ts:earliest;},'');
         return{...lead,_grouped:true,_lineCount:lines.length,_allLines:lines,qty:totalQty,pn:'Multiple',
-          fulfillment_status:isPartial?'Partial':lead.fulfillment_status,
-          _isPartialShip:isPartial,_shippedCount:shippedLines.length,_pendingCount:pendingLines.length,
+          fulfillment_status:effectiveStatus,
+          _isPartialShip:shippedLines.length>0&&pendingLines.length>0,_allPendingOnHold:allPendingOnHold,
+          _shippedCount:shippedLines.length,_pendingCount:pendingLines.length,
           created_at:orderTs||lead.created_at};
       }),
       ...noNum
@@ -2061,7 +2068,7 @@ function renderSales(){
     <td class="pn" style="color:${s._grouped?'var(--text3)':'var(--teal)'}">${s._grouped?'Multiple SKUs':s.pn}</td>
     <td class="money-neutral" style="font-weight:700">${s._grouped?s.qty+' total':(s.qty||1)}</td>
     <td>${stock===null?'<span style="font-size:10px;color:var(--text3)">n/a</span>':`<span class="money" style="color:${canFill?'var(--green)':'var(--red)'};font-weight:700">${stock}</span>`}</td>
-    <td>${fsPill(s.fulfillment_status||'Open')}${s._isPartialShip?` <span style="font-size:9px;color:var(--yellow);font-weight:700">✂ ${s._shippedCount} of ${s._lineCount} shipped</span>`:''}${s.on_hold&&!s._isPartialShip?` <span style="font-size:9px;color:var(--orange);font-weight:700">⏸ Hold</span>`:''}</td>
+    <td>${fsPill(s.fulfillment_status||'Open')}${s._isPartialShip?` <span style="font-size:9px;color:${s._allPendingOnHold?'var(--orange)':'var(--yellow)'};font-weight:700">✂ ${s._shippedCount} shipped · ${s._pendingCount} ${s._allPendingOnHold?'on hold':'pending'}</span>`:''}${s.on_hold&&!s._isPartialShip?` <span style="font-size:9px;color:var(--orange);font-weight:700">⏸ Hold</span>`:''}</td>
     <td style="font-size:10px;font-family:var(--mono)">${multiTrack?`<span style="color:var(--yellow)" title="${allOrderLines.filter(x=>x.tracking_number).map(x=>(x.carrier?x.carrier+' ':'')+x.tracking_number).join('\n')}">🔀 ${allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length} shipments</span>`:repTracking?`<a href="${trackingUrl(repCarrier,repTracking)}" target="_blank" style="color:var(--teal);text-decoration:none" title="Track ${repCarrier} ${repTracking}">${repCarrier?repCarrier+' ':''}${repTracking} ↗</a>`:'<span style="color:var(--text3)">—</span>'}</td>
     <td style="display:flex;gap:4px">
       ${fs==='Open'?`<button class="btn btn-teal btn-sm" ${canFill?'':'disabled title="Insufficient stock"'} onclick="markPacked('${s.id}','${s.pn}',${s.qty||1})">Pack</button>`:''}
