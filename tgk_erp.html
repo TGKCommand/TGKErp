@@ -1266,7 +1266,6 @@ function addAction(){const m={parts:'addPart',assemblies:'addAsm',purchases:'add
 // ============================================================
 function renderDashboard(){
   const critical=S.assemblies.filter(a=>!a.discontinued&&liveStatus(a)==='critical').length;
-  const lowStock=S.assemblies.filter(a=>!a.discontinued&&liveStatus(a)==='low').length;
   const needsReorder=S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||calcForecast(p.pn)>0)&&(p.total_unpckgd||0)<=calcReorderPoint(p)).length;
   const invVal=S.parts.reduce((s,p)=>s+Math.max(0,p.total_unpckgd||0)*(p.unit_cost||0),0);
   // Use grouped counts so numbers match exactly what the Sales page shows
@@ -1274,8 +1273,8 @@ function renderDashboard(){
   const onHoldCount =countGroupedStatus('On Hold');
   const packedCount =countGroupedStatus('Packed');
   const partialCount=countGroupedStatus('Partial');
-  const preorderCount=countGroupedStatus('Pre-order');
   // Stale: grouped open orders where the lead line's sale_date is older than 60 days
+  // (approximation: count raw Open lines with stale dates, then deduplicate by order#)
   const staleOpenNums=new Set(S.sales.filter(s=>!isInternal(s.order_number)&&(!s.fulfillment_status||s.fulfillment_status==='Open')&&s.sale_date&&s.sale_date<daysAgo(60)).map(s=>s.order_number||('__noid__'+s.id)));
   const staleOpen=staleOpenNums.size;
   const freshOpen=Math.max(0,openOrders-staleOpen);
@@ -1284,55 +1283,20 @@ function renderDashboard(){
   const packedLines   =S.sales.filter(s=>!isInternal(s.order_number)&&s.fulfillment_status==='Packed');
   const openWarranty=S.warrantyClaims.filter(w=>w.status==='Open').length;
   const openCounts=S.cycleCounts.filter(c=>c.status==='Open').length;
+  const weekOrds=S.sales.filter(s=>s.sale_date>=daysAgo(7)).length;
   const openPOs=S.purchases.filter(p=>p.status!=='Received');
   const openPOAmt=openPOs.reduce((s,p)=>s+poExtended(p),0);
   const feed=buildActivityFeed(12);
-  // Revenue — MSRP * qty for non-internal orders
-  function calcRev(arr){return arr.reduce(function(s,x){var a=S.assemblies.find(function(z){return z.pn===x.pn;});return s+(x.qty||1)*(a?a.msrp||0:0);},0);}
-  const now=new Date();
-  const monthStart=new Date(now.getFullYear(),now.getMonth(),1).toISOString().slice(0,10);
-  const lastMonthStart=new Date(now.getFullYear(),now.getMonth()-1,1).toISOString().slice(0,10);
-  const thisMonthSales=S.sales.filter(s=>!isInternal(s.order_number)&&(s.sale_date||'')>=monthStart);
-  const lastMonthSales=S.sales.filter(s=>!isInternal(s.order_number)&&(s.sale_date||'')>=lastMonthStart&&(s.sale_date||'')<monthStart);
-  const revThisMonth=calcRev(thisMonthSales);
-  const revLastMonth=calcRev(lastMonthSales);
-  const revChange=revLastMonth>0?((revThisMonth-revLastMonth)/revLastMonth*100):null;
-  const revChangeTxt=revChange!==null
-    ?'<span style="color:'+(revChange>=0?'var(--green)':'var(--red)')+'\">'+(revChange>=0?'&#9650;':'&#9660;')+Math.abs(revChange).toFixed(0)+'%</span> vs last month'
-    :'first month of data';
-  const thisMonthOrderCount=new Set(thisMonthSales.map(s=>s.order_number||s.id)).size;
   return `
-  <div class="kpi-grid kpi-grid-3">
-    <div class="kpi kpi-green" style="cursor:pointer" onclick="nav('sales')" title="MSRP \xd7 qty for all orders this calendar month">
-      <div class="kpi-label">Revenue This Month</div>
-      <div class="kpi-value" style="font-size:${revThisMonth>=100000?'16px':revThisMonth>=10000?'18px':'22px'}">${fc(revThisMonth)}</div>
-      <div class="kpi-sub">${revChangeTxt} &middot; ${thisMonthOrderCount} order${thisMonthOrderCount!==1?'s':''}</div>
-    </div>
-    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','Open|Partial');nav('sales')" title="Open + Partial orders needing to be packed">
+  <div class="kpi-grid kpi-grid-4">
+    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','Open|Partial');nav('sales')" title="Open + Partial orders">
       <div class="kpi-label">Orders to Fulfill</div>
       <div class="kpi-value">${freshOpen+partialCount}</div>
-      <div class="kpi-sub">${freshOpen} open &middot; ${partialCount} partial${onHoldCount>0?' &middot; '+onHoldCount+' on hold':''}</div>
+      <div class="kpi-sub">${packedCount} packed · ${onHoldCount} on hold</div>
     </div>
-    <div class="kpi kpi-teal" style="cursor:pointer" onclick="setFilter('sales','fstatus','Packed');nav('sales')" title="Packed orders ready to ship now">
-      <div class="kpi-label">Packed \u2014 Ready to Ship</div>
-      <div class="kpi-value">${packedCount}</div>
-      <div class="kpi-sub">${preorderCount>0?preorderCount+' pre-order &middot; ':''}${staleOpen>0?staleOpen+' stale open':'all orders current'}</div>
-    </div>
-    <div class="kpi kpi-yellow" style="cursor:pointer" onclick="nav('assemblies')" title="Assemblies at critical or low stock levels">
-      <div class="kpi-label">Assembly Stock Alerts</div>
-      <div class="kpi-value">${critical+lowStock}</div>
-      <div class="kpi-sub">${critical} critical &middot; ${lowStock} low</div>
-    </div>
-    <div class="kpi kpi-orange" style="cursor:pointer" onclick="nav('planning')" title="Parts below their reorder point">
-      <div class="kpi-label">Parts to Reorder</div>
-      <div class="kpi-value">${needsReorder}</div>
-      <div class="kpi-sub">Below reorder point &middot; ${fc(invVal,0)} value</div>
-    </div>
-    <div class="kpi" style="cursor:pointer" onclick="nav('purchases')" title="Total value of all open purchase orders">
-      <div class="kpi-label">Open PO Spend</div>
-      <div class="kpi-value" style="font-size:${openPOAmt>=100000?'16px':openPOAmt>=10000?'18px':'22px'};color:var(--text)">${fc(openPOAmt)}</div>
-      <div class="kpi-sub">${openPOs.length} open PO${openPOs.length!==1?'s':''}</div>
-    </div>
+    <div class="kpi kpi-orange" style="cursor:pointer" onclick="nav('planning')"><div class="kpi-label">Parts Need Reorder</div><div class="kpi-value">${needsReorder}</div><div class="kpi-sub">Below reorder point</div></div>
+    <div class="kpi kpi-yellow" style="cursor:pointer" onclick="nav('assemblies')"><div class="kpi-label">Critical Assemblies</div><div class="kpi-value">${critical}</div></div>
+    <div class="kpi kpi-teal"><div class="kpi-label">Parts Inventory Value</div><div class="kpi-value" style="font-size:17px">${fc(invVal)}</div><div class="kpi-sub">${weekOrds} orders this week</div></div>
   </div>
   ${staleOpen>20?`<div class="panel" style="padding:10px 18px;display:flex;gap:12px;align-items:center;border-left:3px solid var(--red);flex-wrap:wrap">
     <span style="font-size:12px;color:var(--red);font-weight:700">⚠ ${staleOpen} stale Open orders</span>
@@ -1541,8 +1505,8 @@ function renderAssemblies(){
 // BOMs
 // ============================================================
 function renderBOMs(){
-  const keys=Object.keys(S.boms).sort();
-  const sel=S.selBOM||keys[0]||'';
+  const keys=Object.keys(S.boms).sort(); // assemblies with existing BOMs
+  const sel=S.selBOM||keys[0]||''; // default to first BOM assembly if nothing selected
   const items=sel?S.boms[sel]||[]:[];
   const totalCost=items.reduce((s,i)=>s+lineCost(i),0);
   const asm=S.assemblies.find(a=>a.pn===sel);
@@ -1570,13 +1534,9 @@ function renderBOMs(){
       </div>
     </div>
     ${sel?`<div class="panel" style="padding:0">
-      <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">
-        <div style="flex:1">
-          <div style="font-size:11px;font-weight:700;letter-spacing:.06em;color:var(--teal)">${sel}</div>
-          <div style="font-size:12px;color:var(--text2);margin-top:2px">${asm?.description||''}</div>
-        </div>
-        <button class="btn btn-sm" onclick="printBOM('${sel}')" title="Print BOM" style="flex-shrink:0">🖨 Print</button>
-        <button class="btn btn-sm" onclick='openModal("editAsm",${JSON.stringify(asm||{}).replace(/'/g,"&#39;")})' title="Edit assembly" style="flex-shrink:0">Edit Assembly</button>
+      <div style="padding:14px 18px;border-bottom:1px solid var(--border)">
+        <div style="font-size:11px;font-weight:700;letter-spacing:.06em;color:var(--teal)">${sel}</div>
+        <div style="font-size:12px;color:var(--text2);margin-top:2px">${asm?.description||''}</div>
       </div>
       ${items.map(item=>{
         const part=partMap[item.child_pn];
@@ -1650,91 +1610,15 @@ function renderBOMs(){
   </div></div>`;
 }
 
-function printBOM(pn){
-  const asm=S.assemblies.find(function(a){return a.pn===pn;});
-  const items=S.boms[pn]||[];
-  if(!items.length&&!asm){toast('No BOM found for '+pn);return;}
-  const totalCost=items.reduce(function(s,i){return s+lineCost(i);},0);
-  const msrp=asm?.msrp||0;
-  const margin=msrp?((msrp-totalCost-(asm.shipping_cost||10)-msrp*0.03)/msrp*100):null;
-  const typeColor={part:'#0891b2',subassembly:'#ea7c28',packaging:'#a855f7'};
-  const rows=items.map(function(item,i){
-    const part=S.parts.find(function(p){return p.pn===item.child_pn;})||S.assemblies.find(function(a){return a.pn===item.child_pn;});
-    const cost=lineCost(item);
-    return '<tr style="border-bottom:1px solid #e5e7eb">'
-      +'<td style="padding:6px 10px;font-size:12px;color:#374151">'+(i+1)+'</td>'
-      +'<td style="padding:6px 10px;font-family:monospace;font-size:12px;font-weight:600;color:'+((typeColor[item.item_type])||'#0891b2')+'">'+escHtml(item.child_pn)+'</td>'
-      +'<td style="padding:6px 10px;font-size:12px;color:#374151">'+escHtml(part?part.description||'':'—')+'</td>'
-      +'<td style="padding:6px 10px;font-size:11px;color:#6b7280;text-transform:capitalize">'+escHtml(item.item_type||'part')+'</td>'
-      +'<td style="padding:6px 10px;font-size:12px;text-align:right">'+item.qty+'</td>'
-      +'<td style="padding:6px 10px;font-size:12px;text-align:right;font-family:monospace">$'+((item.unit_cost||0).toFixed(4))+'</td>'
-      +'<td style="padding:6px 10px;font-size:12px;text-align:right;font-family:monospace;font-weight:600">$'+cost.toFixed(4)+'</td>'
-      +'<td style="padding:6px 10px;font-size:11px;color:#6b7280">'+escHtml((S.parts.find(function(p){return p.pn===item.child_pn;})||{}).location||'')+'</td>'
-      +'</tr>';
-  }).join('');
-
-  const html='<!DOCTYPE html><html><head><meta charset="utf-8">'
-    +'<title>BOM — '+escHtml(pn)+'</title>'
-    +'<style>'
-    +'*{box-sizing:border-box;margin:0;padding:0}'
-    +'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827;padding:24px;background:#fff}'
-    +'h1{font-size:18px;font-weight:700;margin-bottom:2px}'
-    +'h2{font-size:13px;font-weight:400;color:#6b7280;margin-bottom:16px}'
-    +'table{width:100%;border-collapse:collapse;margin-top:12px}'
-    +'thead th{background:#f3f4f6;padding:6px 10px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#374151;text-align:left;border-bottom:2px solid #d1d5db}'
-    +'thead th:nth-child(n+5){text-align:right}'
-    +'.totals{margin-top:16px;padding:12px 16px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;max-width:360px;margin-left:auto}'
-    +'.totals .row{display:flex;justify-content:space-between;font-size:12px;padding:2px 0}'
-    +'.totals .row.total{border-top:1px solid #d1d5db;margin-top:6px;padding-top:6px;font-weight:700;font-size:13px}'
-    +'.meta{font-size:11px;color:#9ca3af;margin-top:20px;border-top:1px solid #e5e7eb;padding-top:10px}'
-    +'@media print{'
-    +'body{padding:12px}'
-    +'button{display:none}'
-    +'}'
-    +'</style></head><body>'
-    +'<div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:16px">'
-      +'<div>'
-        +'<h1>Bill of Materials — '+escHtml(pn)+'</h1>'
-        +'<h2>'+escHtml(asm?asm.description||'':'')+'</h2>'
-      +'</div>'
-      +'<button onclick="window.print()" style="padding:7px 16px;background:#0891b2;color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600">🖨 Print / Save PDF</button>'
-    +'</div>'
-    +'<table>'
-    +'<thead><tr>'
-    +'<th style="width:36px">#</th>'
-    +'<th>Part #</th><th>Description</th><th>Type</th>'
-    +'<th style="text-align:right">Qty</th>'
-    +'<th style="text-align:right">Unit Cost</th>'
-    +'<th style="text-align:right">Ext Cost</th>'
-    +'<th>Bin / Location</th>'
-    +'</tr></thead>'
-    +'<tbody>'+rows+'</tbody>'
-    +'</table>'
-    +'<div class="totals">'
-      +(msrp?'<div class="row"><span>MSRP</span><span>$'+msrp.toFixed(2)+'</span></div>':'')
-      +'<div class="row"><span>Part Cost</span><span>$'+totalCost.toFixed(4)+'</span></div>'
-      +(asm?'<div class="row"><span>Shipping</span><span>$'+((asm.shipping_cost||10).toFixed(2))+'</span></div>':'')
-      +(msrp?'<div class="row"><span>Fees (3%)</span><span>$'+(msrp*0.03).toFixed(2)+'</span></div>':'')
-      +(msrp?'<div class="row total"><span>Gross Profit</span><span>$'+(msrp-totalCost-(asm.shipping_cost||10)-msrp*0.03).toFixed(2)+'</span></div>':'')
-      +(margin!==null?'<div class="row total"><span>Margin</span><span style="color:'+(margin>40?'#059669':margin>25?'#d97706':'#dc2626')+'">'+margin.toFixed(1)+'%</span></div>':'')
-    +'</div>'
-    +'<div class="meta">Printed '+new Date().toLocaleString()+' · TGK Motorsport ERP · '+items.length+' component'+(items.length!==1?'s':'')+'</div>'
-    +'</body></html>';
-
-  var w=window.open('','_blank','width=900,height=700');
-  if(w){w.document.write(html);w.document.close();setTimeout(function(){w.focus();},200);}
-  else{toast('Pop-up blocked — please allow pop-ups for this page');}
-}
-
 // ── BOM SEARCHABLE COMBOBOX ──────────────────────────────────────────────────
 // Shared dropdown builder for both the "Select Assembly" and "Parent" pickers
 function _bomDdBuild(dd, q, currentVal, onSelect) {
-  const keys=Object.keys(S.boms).sort();
+  const bomKeys=new Set(Object.keys(S.boms));
   // For parent picker we want ALL assemblies, not just those with BOMs
   const active=S.assemblies.filter(function(a){return !a.discontinued;}).map(function(a){return a.pn;}).sort();
   const disc=S.assemblies.filter(function(a){return a.discontinued;}).map(function(a){return a.pn;}).sort();
   const all=[...active,...disc];
-  const pool=(dd.id==='bom-par-dd')?all:keys;
+  const pool=all; // both pickers show all assemblies (BOM badge distinguishes)
   const lq=(q||'').toLowerCase().trim();
   const filtered=lq?pool.filter(function(k){
     const a=S.assemblies.find(function(x){return x.pn===k;});
@@ -1745,13 +1629,12 @@ function _bomDdBuild(dd, q, currentVal, onSelect) {
     const a=S.assemblies.find(function(x){return x.pn===k;});
     const isSel=k===currentVal;
     const isDisc=a?.discontinued;
+    const hasBOM=bomKeys.has(k);
     return '<div class="_bom-opt" data-val="'+k+'" data-idx="'+i+'"'
       +' onclick="'+onSelect+'(\''+k+'\')"'
       +' style="padding:8px 12px;cursor:pointer;background:'+(isSel?'var(--bg4)':'transparent')+';border-bottom:1px solid var(--border);opacity:'+(isDisc?'.5':'1')+'"'
       +' onmouseenter="this.style.background=\'var(--bg3)\'" onmouseleave="this.style.background=\''+(isSel?'var(--bg4)':'transparent')+'\'">'
-      +'<div style="font-family:var(--mono);font-size:12px;color:'+(isDisc?'var(--text3)':'var(--teal)')+'">'+k+(isDisc?' <span style="font-size:9px">🗄 disc.</span>':'')+'</div>'
-      +(a?.description?'<div style="font-size:10px;color:var(--text3);margin-top:1px">'+escHtml(a.description)+'</div>':'')
-    +'</div>';
+      +'<div style="display:flex;align-items:center;gap:6px">'        +'<span style="font-family:var(--mono);font-size:12px;color:'+(isDisc?'var(--text3)':'var(--teal)')+'">'+k+(isDisc?' <span style="font-size:9px">🗄 disc.</span>':'')+'</span>'        +(hasBOM?'<span style="font-size:9px;font-weight:700;background:var(--teal-dim);color:var(--teal);border-radius:3px;padding:1px 5px">BOM ✓</span>':'<span style="font-size:9px;color:var(--text3);border-radius:3px;padding:1px 5px;border:1px solid var(--border)">no BOM yet</span>')      +'</div>'      +(a?.description?'<div style="font-size:10px;color:var(--text3);margin-top:1px">'+escHtml(a.description)+'</div>':'')    +'</div>';
   }).join('');
 }
 function _bomDdKey(e, ddId, inputId, onSelect){
@@ -1806,8 +1689,9 @@ function bomParFilter(q){var dd=document.getElementById('bom-par-dd');if(dd)_bom
 function bomParKey(e){_bomDdKey(e,'bom-par-dd','bom-parent-input','bomParPick');}
 function bomParPick(pn){
   var dd=document.getElementById('bom-par-dd');if(dd)dd.style.display='none';
-  var inp=document.getElementById('bom-parent-input');if(inp)inp.value=pn;
-  var hidden=document.getElementById('bom-parent');if(hidden)hidden.value=pn;
+  // Sync both pickers — set S.selBOM so left panel shows this assembly's BOM
+  S.selBOM=pn;
+  render(); // re-renders with both panels pointing to the same assembly
 }
 
 // ============================================================
@@ -2794,10 +2678,7 @@ async function markDelivered(saleId){
 // Helper: update description cell when SKU input changes
 function eoUpdateDesc(el){
   var d=el.closest('tr')&&el.closest('tr').querySelector('[data-field="desc"]');
-  if(d){
-    var a=S.assemblies.find(function(x){return x.pn===el.value;})||S.parts.find(function(x){return x.pn===el.value;});
-    d.textContent=a&&a.description||'';
-  }
+  if(d){var a=S.assemblies.find(function(x){return x.pn===el.value;});d.textContent=a&&a.description||'';}
 }
 
 function openEditOrderModal(orderNumOrId){
@@ -2837,7 +2718,7 @@ function openEditOrderModal(orderNumOrId){
   overlay.id='edit-order-overlay';
   overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
 
-  const asmPNs=[...new Set([...S.assemblies.map(function(a){return a.pn;}),...S.parts.map(function(p){return p.pn;})])].sort();
+  const asmPNs=[...new Set([...S.assemblies.map(function(a){return a.pn;}),...S.parts.map(function(p){return p.pn;})])].sort().slice(0,600);
 
   overlay.innerHTML=''
     +'<div class="modal" style="width:900px;max-width:98vw;margin:auto">'
@@ -5737,7 +5618,7 @@ function openModal(type,data){
       <div id="m-bom-existing">${existingRows}</div>
       <div id="m-bom-pending"></div>
       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px;padding:8px 10px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)">
-        <input id="m-bom-pn" class="form-input" placeholder="Part # or SKU" style="flex:2;min-width:90px" list="m-bom-pn-list" autocomplete="off" onkeydown="if(event.key==='Enter'){event.preventDefault();modalAddBOMRow();}">
+        <input id="m-bom-pn" class="form-input" placeholder="Part # or SKU" style="flex:2;min-width:90px" list="m-bom-pn-list" autocomplete="off">
         <datalist id="m-bom-pn-list">${allPNs.map(function(pn){return'<option value="'+escHtml(pn)+'">';}).join('')}${discPNs.map(function(pn){return'<option value="'+escHtml(pn)+'" label="'+escHtml(pn)+' (discontinued)">';}).join('')}</datalist>
         <input id="m-bom-qty" type="number" min="0.001" step="0.001" value="1" class="form-input" style="width:65px">
         <select id="m-bom-type" class="form-input" style="width:110px">
@@ -6657,10 +6538,9 @@ function modalAddBOMRow(){
   if(!pn){toast('Enter a Part # or SKU');return;}
   var item=S.parts.find(function(p){return p.pn===pn;})||S.assemblies.find(function(a){return a.pn===pn;});
   var desc=item?item.description||'':'(not yet in catalog)';
-  var idx=Date.now();
+  var idx=S.pendingBOMLines.length;
   S.pendingBOMLines.push({pn:pn,qty:qty,type:type,idx:idx});
-  var container=document.getElementById('m-bom-pending');
-  if(!container){toast('BOM section not found — try reopening the modal');return;}
+  var container=document.getElementById('m-bom-pending');if(!container)return;
   var row=document.createElement('div');
   row.id='m-bom-prow-'+idx;
   row.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 8px;background:var(--bg2);border:1px solid var(--teal);border-radius:6px;margin-bottom:4px';
@@ -6670,12 +6550,9 @@ function modalAddBOMRow(){
     +'<span style="font-size:10px;background:var(--teal-dim);color:var(--teal);border-radius:4px;padding:1px 6px">'+type+'</span>'
     +'<button type="button" onclick="modalRemoveBOMRow('+idx+')" style="background:transparent;border:none;color:var(--text3);cursor:pointer;font-size:16px;line-height:1;padding:2px" title="Remove">×</button>';
   container.appendChild(row);
-  // Scroll the new row into view (modal has overflow-y:auto so pending section may be above scroll pos)
-  row.scrollIntoView({behavior:'smooth',block:'nearest'});
-  var pnIn=document.getElementById('m-bom-pn');
-  var qtyIn=document.getElementById('m-bom-qty');
-  if(pnIn){pnIn.value='';pnIn.focus();}
-  if(qtyIn)qtyIn.value='1';
+  document.getElementById('m-bom-pn').value='';
+  document.getElementById('m-bom-qty').value='1';
+  document.getElementById('m-bom-pn').focus();
 }
 function modalRemoveBOMRow(idx){
   S.pendingBOMLines=S.pendingBOMLines.filter(function(l){return l.idx!==idx;});
