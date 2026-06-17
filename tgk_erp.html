@@ -3733,18 +3733,22 @@ Deno.serve(async (req) => {
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
     const auth = ssAuth()
     const { orderNumber, customerName, customerEmail, pn, description, qty, shipTo, internalNotes, ssItems } = body
-    if (!orderNumber || !pn || !shipTo?.street1) return json({ error: 'orderNumber, pn and shipTo.street1 required' }, 400)
+    if (!orderNumber || !pn) return json({ error: 'orderNumber and pn are required' }, 400)
     const items = (Array.isArray(ssItems) && ssItems.length)
       ? ssItems.map((it: any, i: number) => ({ lineItemKey: String(i + 1), sku: it.sku || it.pn || pn, name: it.name || it.description || it.sku || pn, quantity: it.quantity || it.qty || 1, unitPrice: 0 }))
       : [{ lineItemKey: '1', sku: pn, name: description || pn, quantity: qty || 1, unitPrice: 0 }]
+    const safe = shipTo || {}
+    const addrName = safe.name || customerName || 'Customer'
+    const billToObj = { name: addrName, street1: safe.street1 || '', city: safe.city || '', state: safe.state || '', postalCode: safe.postal_code || '', country: safe.country || 'US' }
+    const shipToObj = { ...billToObj, ...(safe.street2 ? { street2: safe.street2 } : {}) }
     const ssPayload = {
       orderNumber,
       orderDate: new Date().toISOString(),
       orderStatus: 'awaiting_shipment',
       customerUsername: customerEmail || undefined,
       customerEmail: customerEmail || undefined,
-      billTo: { name: shipTo.name || customerName || 'Customer', street1: shipTo.street1, city: shipTo.city, state: shipTo.state, postalCode: shipTo.postal_code, country: shipTo.country || 'US' },
-      shipTo: { name: shipTo.name || customerName || 'Customer', street1: shipTo.street1, street2: shipTo.street2 || undefined, city: shipTo.city, state: shipTo.state, postalCode: shipTo.postal_code, country: shipTo.country || 'US' },
+      billTo: billToObj,
+      shipTo: shipToObj,
       items,
       internalNotes: internalNotes || ('TGK ERP order — ' + orderNumber),
       advancedOptions: { source: 'TGK ERP' }
@@ -5626,6 +5630,23 @@ function openModal(type,data){
       ${fi('ms-qty','Qty',1,'type="number" min="1"')}
       <div class="form-group"><label class="form-label">Source</label><select id="ms-source" class="form-input"><option>Manual</option><option>Phone</option><option>Email</option><option>Dealer</option><option>Shopify</option></select></div>
     </div>
+    <div style="border-top:1px solid var(--border);margin:10px 0 12px;padding-top:12px">
+      <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--text3);margin-bottom:8px">Customer &amp; ShipStation</div>
+      <div class="form-row cols-2">${fi('ms-cname','Customer Name','','placeholder="Jane Smith"')} ${fi('ms-email','Email (optional)','','type="email" placeholder="jane@example.com"')}</div>
+      <details style="margin-top:6px">
+        <summary style="font-size:11px;color:var(--text3);cursor:pointer;user-select:none">▸ Shipping address (optional — can be added later in ShipStation)</summary>
+        <div style="margin-top:8px">
+          <div class="form-row">${fi('ms-addr1','Street','','placeholder="123 Main St"')}</div>
+          <div class="form-row cols-3">${fi('ms-city','City','')} ${fi('ms-state','State','','placeholder="CA" maxlength=2')} ${fi('ms-zip','ZIP','','placeholder="90210"')}</div>
+        </div>
+      </details>
+      <div style="font-size:10px;color:var(--text3);margin-top:8px">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="ms-create-ss" ${S.settings?.shipstation?.key?'checked':''}>
+          Create order in ShipStation as <code style="background:var(--bg3);padding:1px 5px;border-radius:3px">Manual_<em>order#</em></code>
+        </label>
+      </div>
+    </div>
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitManualSale()">Create Order</button></div>`;
   }
   else if(type==='addPOLine'){
@@ -6203,11 +6224,53 @@ async function submitManualSale(){
   const orderNum=document.getElementById('ms-order').value.trim()||('MANUAL-'+Date.now().toString().slice(-6));
   const qty=parseInt(document.getElementById('ms-qty').value)||1;
   const source=document.getElementById('ms-source').value;
+  const customerName=(document.getElementById('ms-cname')?.value||'').trim();
+  const customerEmail=(document.getElementById('ms-email')?.value||'').trim();
+  const createSS=document.getElementById('ms-create-ss')?.checked;
   if(!pn){toast('Select a SKU');return;}
-  const{data,error}=await db.from('sales').insert({pn,order_number:orderNum,qty,source,status:'Open',fulfillment_status:'Open',sale_date:new Date().toISOString().slice(0,10)}).select().single();
+  const{data,error}=await db.from('sales').insert({
+    pn,order_number:orderNum,qty,source,status:'Open',fulfillment_status:'Open',
+    sale_date:new Date().toISOString().slice(0,10),
+    customer_name:customerName||null,customer_email:customerEmail||null
+  }).select().single();
   if(error){toast('Error: '+error.message);return;}
   S.sales=[data,...S.sales];
-  closeModal();toast('Order '+orderNum+' created');render();
+  closeModal();
+  toast('Order '+orderNum+' created'+(createSS?' — creating in ShipStation…':''));
+  render();
+  if(createSS){
+    const addr1=(document.getElementById('ms-addr1')?.value||'').trim();
+    const city=(document.getElementById('ms-city')?.value||'').trim();
+    const state=(document.getElementById('ms-state')?.value||'').trim();
+    const zip=(document.getElementById('ms-zip')?.value||'').trim();
+    const shipTo={name:customerName||'Customer',street1:addr1,city,state,postal_code:zip,country:'US'};
+    try{
+      const asm=S.assemblies.find(a=>a.pn===pn);
+      const resp=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+        body:JSON.stringify({
+          action:'create_order',
+          orderNumber:'Manual_'+orderNum,
+          customerName:customerName||'Customer',
+          customerEmail:customerEmail||undefined,
+          pn,
+          description:asm?.description||pn,
+          qty,
+          shipTo,
+          internalNotes:'Manual ERP order — '+orderNum+(customerName?' — '+customerName:'')
+        })
+      });
+      const json=await resp.json().catch(()=>({}));
+      if(resp.ok&&(json.orderId||json.orderNumber)){
+        toast('✓ ShipStation order created — Manual_'+orderNum,4000);
+      } else {
+        toast('⚠ ERP order saved, but ShipStation failed: '+(json.error||'Check SS credentials'),5000);
+      }
+    }catch(e){
+      toast('⚠ ERP order saved, SS unreachable: '+e.message,5000);
+    }
+  }
 }
 // Auto-fill warranty form from order number lookup (Fill button only)
 function wtyLookupOrder(orderNum){
@@ -10199,10 +10262,10 @@ async function deleteShipmentError(id){
 async function checkResolutionTracking(){
   const wtyOrders=(S.warrantyClaims||[])
     .filter(w=>w.ss_order_id&&!w.tracking_number&&w.status!=='Resolved')
-    .map(w=>({type:'warranty',id:w.id,orderNumber:'WARRANTY-'+w.id}));
+    .map(w=>({type:'warranty',id:w.id,orderNumber:'Warranty_'+(w.order_number||w.id)}));
   const seOrders=(S.shipmentErrors||[])
     .filter(e=>e.ss_order_id&&!e.tracking_number&&e.status!=='Resolved')
-    .map(e=>({type:'shiperror',id:e.id,orderNumber:'SHERROR-'+e.id}));
+    .map(e=>({type:'shiperror',id:e.id,orderNumber:'SHError_'+(e.order_number||e.id)}));
   const orders=[...wtyOrders,...seOrders];
   if(!orders.length){toast('No untracked orders to check');return;}
   toast('Checking '+orders.length+' order'+(orders.length!==1?'s':'')+' in ShipStation…',3000);
@@ -10288,7 +10351,7 @@ async function confirmShipShipmentError(id){
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
         action:'create_order',
-        orderNumber:'SHERROR-'+id,
+        orderNumber:'SHError_'+(e.order_number||id),
         customerName:e.customer_name||name,
         customerEmail:e.customer_email||'',
         pn:e.expected_pn,
@@ -10398,7 +10461,7 @@ async function confirmShipWarranty(claimId, pn){
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
         action:'create_order',
-        orderNumber:'WARRANTY-'+claimId,
+        orderNumber:'Warranty_'+(claim?.order_number||claimId),
         customerName:claim?.customer_name||name,
         customerEmail:claim?.customer_email||'',
         // pass first item for legacy compat, but edge function uses ssItems if present
