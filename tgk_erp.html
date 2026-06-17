@@ -1505,8 +1505,8 @@ function renderAssemblies(){
 // BOMs
 // ============================================================
 function renderBOMs(){
-  const keys=Object.keys(S.boms).sort(); // assemblies with existing BOMs
-  const sel=S.selBOM||keys[0]||''; // default to first BOM assembly if nothing selected
+  const keys=Object.keys(S.boms).sort();
+  const sel=S.selBOM||keys[0]||'';
   const items=sel?S.boms[sel]||[]:[];
   const totalCost=items.reduce((s,i)=>s+lineCost(i),0);
   const asm=S.assemblies.find(a=>a.pn===sel);
@@ -1613,12 +1613,12 @@ function renderBOMs(){
 // ── BOM SEARCHABLE COMBOBOX ──────────────────────────────────────────────────
 // Shared dropdown builder for both the "Select Assembly" and "Parent" pickers
 function _bomDdBuild(dd, q, currentVal, onSelect) {
-  const bomKeys=new Set(Object.keys(S.boms));
+  const keys=Object.keys(S.boms).sort();
   // For parent picker we want ALL assemblies, not just those with BOMs
   const active=S.assemblies.filter(function(a){return !a.discontinued;}).map(function(a){return a.pn;}).sort();
   const disc=S.assemblies.filter(function(a){return a.discontinued;}).map(function(a){return a.pn;}).sort();
   const all=[...active,...disc];
-  const pool=all; // both pickers show all assemblies (BOM badge distinguishes)
+  const pool=(dd.id==='bom-par-dd')?all:keys;
   const lq=(q||'').toLowerCase().trim();
   const filtered=lq?pool.filter(function(k){
     const a=S.assemblies.find(function(x){return x.pn===k;});
@@ -1629,12 +1629,13 @@ function _bomDdBuild(dd, q, currentVal, onSelect) {
     const a=S.assemblies.find(function(x){return x.pn===k;});
     const isSel=k===currentVal;
     const isDisc=a?.discontinued;
-    const hasBOM=bomKeys.has(k);
     return '<div class="_bom-opt" data-val="'+k+'" data-idx="'+i+'"'
       +' onclick="'+onSelect+'(\''+k+'\')"'
       +' style="padding:8px 12px;cursor:pointer;background:'+(isSel?'var(--bg4)':'transparent')+';border-bottom:1px solid var(--border);opacity:'+(isDisc?'.5':'1')+'"'
       +' onmouseenter="this.style.background=\'var(--bg3)\'" onmouseleave="this.style.background=\''+(isSel?'var(--bg4)':'transparent')+'\'">'
-      +'<div style="display:flex;align-items:center;gap:6px">'        +'<span style="font-family:var(--mono);font-size:12px;color:'+(isDisc?'var(--text3)':'var(--teal)')+'">'+k+(isDisc?' <span style="font-size:9px">🗄 disc.</span>':'')+'</span>'        +(hasBOM?'<span style="font-size:9px;font-weight:700;background:var(--teal-dim);color:var(--teal);border-radius:3px;padding:1px 5px">BOM ✓</span>':'<span style="font-size:9px;color:var(--text3);border-radius:3px;padding:1px 5px;border:1px solid var(--border)">no BOM yet</span>')      +'</div>'      +(a?.description?'<div style="font-size:10px;color:var(--text3);margin-top:1px">'+escHtml(a.description)+'</div>':'')    +'</div>';
+      +'<div style="font-family:var(--mono);font-size:12px;color:'+(isDisc?'var(--text3)':'var(--teal)')+'">'+k+(isDisc?' <span style="font-size:9px">🗄 disc.</span>':'')+'</div>'
+      +(a?.description?'<div style="font-size:10px;color:var(--text3);margin-top:1px">'+escHtml(a.description)+'</div>':'')
+    +'</div>';
   }).join('');
 }
 function _bomDdKey(e, ddId, inputId, onSelect){
@@ -1689,9 +1690,8 @@ function bomParFilter(q){var dd=document.getElementById('bom-par-dd');if(dd)_bom
 function bomParKey(e){_bomDdKey(e,'bom-par-dd','bom-parent-input','bomParPick');}
 function bomParPick(pn){
   var dd=document.getElementById('bom-par-dd');if(dd)dd.style.display='none';
-  // Sync both pickers — set S.selBOM so left panel shows this assembly's BOM
-  S.selBOM=pn;
-  render(); // re-renders with both panels pointing to the same assembly
+  var inp=document.getElementById('bom-parent-input');if(inp)inp.value=pn;
+  var hidden=document.getElementById('bom-parent');if(hidden)hidden.value=pn;
 }
 
 // ============================================================
@@ -2787,7 +2787,13 @@ async function submitEditOrder(originalOrderNumOrId){
   const tbody=document.getElementById('eo-lines-body');
   const rows=tbody?[...tbody.querySelectorAll('tr[data-line-id]')]:[];
 
+  // Snapshot original PN + status for every line BEFORE saving — needed for inventory reconciliation
+  const origData={};
+  lines.forEach(function(l){origData[l.id]={pn:l.pn,qty:l.qty||1,status:l.fulfillment_status||'Open'};});
+
   let errors=0,saved=0,deleted=0,added=0;
+  // Track PN changes that may require inventory adjustment
+  const invChanges=[];
 
   for(const row of rows){
     const lineId=row.dataset.lineId;
@@ -2813,6 +2819,16 @@ async function submitEditOrder(originalOrderNumOrId){
       if(error){errors++;console.error('Insert',error.message);}
       else{S.sales=[...S.sales,data];added++;}
     } else {
+      // Detect PN change before updating
+      const orig=origData[lineId];
+      if(orig&&orig.pn!==pn){
+        const wasERP=!!S.assemblies.find(function(a){return a.pn===orig.pn;});
+        const isERP=!!S.assemblies.find(function(a){return a.pn===pn;});
+        const isAlreadyShipped=['Shipped','Delivered','Packed'].includes(status)||['Shipped','Delivered','Packed'].includes(orig.status);
+        if(wasERP!==isERP&&isAlreadyShipped){
+          invChanges.push({type:wasERP?'restore':'deduct',oldPn:orig.pn,newPn:pn,qty,lineId,status});
+        }
+      }
       // Update existing line
       const payload=Object.assign({},basePayload,{pn,qty,fulfillment_status:status,tracking_number:tracking,carrier:carrier||null});
       const{error}=await db.from('sales').update(payload).eq('id',lineId);
@@ -2821,14 +2837,41 @@ async function submitEditOrder(originalOrderNumOrId){
     }
   }
 
+  // ── Inventory reconciliation for PN changes that crossed the ERP boundary ──────────
+  // non-ERP → ERP on a shipped line: deduct stock (it was drop-shipped, now has a real SKU)
+  // ERP → non-ERP on a shipped line: restore stock (was deducted in error, now a non-ERP item)
+  for(const chg of invChanges){
+    const targetPn=chg.type==='deduct'?chg.newPn:chg.oldPn;
+    const asm=S.assemblies.find(function(a){return a.pn===targetPn;});
+    if(!asm)continue;
+    const prev=asm.total_on_hand||0;
+    const delta=chg.type==='deduct'?-chg.qty:+chg.qty;
+    const newOh=prev+delta;
+    const reason=chg.type==='deduct'
+      ?'PN corrected: '+chg.oldPn+' → '+chg.newPn+' on '+newOrderNum+' (retroactive deduction)'
+      :'PN corrected: '+chg.oldPn+' → '+chg.newPn+' on '+newOrderNum+' (stock restored)';
+    const{error:invErr}=await db.from('assemblies').update({total_on_hand:newOh,updated_at:now}).eq('id',asm.id);
+    if(!invErr){
+      S.assemblies=S.assemblies.map(function(a){return a.id===asm.id?Object.assign({},a,{total_on_hand:newOh}):a;});
+      await db.from('inv_corrections').insert({pn:targetPn,previous_qty:prev,new_qty:newOh,adjustment:delta,reason,source:'order_edit'});
+    }
+  }
+
   document.getElementById('edit-order-overlay')?.remove();
-  if(errors)toast('Saved with '+errors+' error(s) — check console');
-  else{
+
+  // Build summary toast
+  if(errors){
+    toast('Saved with '+errors+' error(s) — check console');
+  } else {
     const parts=[];
     if(saved)parts.push(saved+' updated');
     if(added)parts.push(added+' added');
     if(deleted)parts.push(deleted+' removed');
-    toast('Order saved'+(parts.length?' — '+parts.join(', '):''));
+    const deductions=invChanges.filter(function(c){return c.type==='deduct';});
+    const restorations=invChanges.filter(function(c){return c.type==='restore';});
+    if(deductions.length)parts.push(deductions.map(function(c){return c.qty+'× '+c.newPn+' deducted from stock';}).join(', '));
+    if(restorations.length)parts.push(restorations.map(function(c){return c.qty+'× '+c.oldPn+' restored to stock';}).join(', '));
+    toast('Order saved'+(parts.length?' — '+parts.join(' · '):''), invChanges.length>0?5000:undefined);
   }
   render();
 }
