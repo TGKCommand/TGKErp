@@ -2531,74 +2531,161 @@ async function markDelivered(saleId){
   toast('Order marked Delivered ✓');render();
 }
 
+// Helper: update description cell when SKU input changes
+function eoUpdateDesc(el){
+  var d=el.closest('tr')&&el.closest('tr').querySelector('[data-field="desc"]');
+  if(d){var a=S.assemblies.find(function(x){return x.pn===el.value;});d.textContent=a&&a.description||'';}
+}
+
 function openEditOrderModal(orderNumOrId){
   const lines=S.sales.filter(function(s){return s.order_number===orderNumOrId||s.id===orderNumOrId;}).sort(function(a,b){return a.pn.localeCompare(b.pn);});
   if(!lines.length){toast('Order not found');return;}
   const first=lines[0];
+  const fstats=['Open','Pre-order','On Hold','Packed','Partial','Shipped','Delivered','Returned','Refunded','Cancelled'];
+  const carriers=['','UPS','USPS','FedEx','DHL','Other'];
+
+  function mkRow(l,isNew){
+    const la=S.assemblies.find(function(a){return a.pn===l.pn;});
+    const rid=isNew?('new-'+Date.now()+'-'+Math.floor(Math.random()*1e6)):(l.id||'');
+    const fs=l.fulfillment_status||'Open';
+    return '<tr data-line-id="'+escHtml(rid)+'" data-is-new="'+(isNew?'1':'0')+'">'
+      +'<td style="padding:3px 5px"><input list="eo-sku-list" value="'+escHtml(l.pn||'')+'" data-field="pn" oninput="eoUpdateDesc(this)"'
+        +' style="width:130px;padding:3px 6px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;color:var(--teal);font-size:11px;font-family:var(--mono)"></td>'
+      +'<td data-field="desc" style="font-size:10px;color:var(--text3);max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:3px 5px">'+escHtml(la&&la.description||'')+'</td>'
+      +'<td style="padding:3px 5px"><input type="number" min="1" step="1" value="'+(l.qty||1)+'" data-field="qty"'
+        +' style="width:52px;padding:3px 5px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;text-align:center"></td>'
+      +'<td style="padding:3px 5px"><select data-field="status" style="padding:3px 5px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:11px">'
+        +fstats.map(function(f){return '<option value="'+f+'"'+(fs===f?' selected':'')+'>'+f+'</option>';}).join('')
+      +'</select></td>'
+      +'<td style="padding:3px 5px"><input value="'+escHtml(l.tracking_number||'')+'" data-field="tracking" placeholder="Tracking #"'
+        +' style="width:140px;padding:3px 6px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:11px;font-family:var(--mono)"></td>'
+      +'<td style="padding:3px 5px"><select data-field="carrier" style="padding:3px 5px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:11px">'
+        +carriers.map(function(c){return '<option value="'+c+'"'+((l.carrier||'')===c?' selected':'')+'>'+(c||'— carrier —')+'</option>';}).join('')
+      +'</select></td>'
+      +'<td style="padding:3px 5px;text-align:center">'
+        +'<button onclick="var r=this.closest(\'tr\');r.style.opacity=\'.3\';r.style.pointerEvents=\'none\';r.dataset.deleted=\'1\'"'
+          +' style="background:transparent;border:none;color:var(--red);font-size:14px;cursor:pointer;padding:2px 5px" title="Remove line">✕</button>'
+      +'</td>'
+    +'</tr>';
+  }
+
+  document.getElementById('edit-order-overlay')?.remove();
   const overlay=document.createElement('div');
   overlay.id='edit-order-overlay';
-  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:center;justify-content:center;padding:20px';
+  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
 
-  const lineRows=lines.map(function(l){
-    const la=S.assemblies.find(function(a){return a.pn===l.pn;});
-    const fs=l.fulfillment_status||'Open';
-    const editable=(fs==='Open'||fs==='On Hold'||fs==='Pre-order');
-    return '<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:var(--bg3);border-radius:6px;margin-bottom:6px">'
-      +'<span style="font-family:var(--mono);font-size:12px;color:var(--teal);min-width:90px">'+escHtml(l.pn)+'</span>'
-      +'<span style="font-size:11px;color:var(--text3);flex:1">'+escHtml(la?.description||'')+'</span>'
-      +'<span style="font-size:10px;background:var(--bg4);border-radius:4px;padding:1px 7px;color:var(--text3);margin-right:4px">'+fs+'</span>'
-      +'<label style="font-size:11px;color:var(--text2);white-space:nowrap">Qty '
-        +(editable
-          ?'<input type="number" min="1" step="1" value="'+(l.qty||1)+'" id="eo-qty-'+l.id+'" style="width:60px;padding:3px 6px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px">'
-          :'<strong style="color:var(--text2)">'+(l.qty||1)+'</strong> <span style="color:var(--text3)">(locked)</span>')
-      +'</label>'
+  const asmPNs=[...new Set([...S.assemblies.map(function(a){return a.pn;}),...S.parts.map(function(p){return p.pn;})])].sort().slice(0,600);
+
+  overlay.innerHTML=''
+    +'<div class="modal" style="width:900px;max-width:98vw;margin:auto">'
+      +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">'
+        +'<div style="font-size:15px;font-weight:700;color:var(--text)">✏ Edit Order</div>'
+        +'<button onclick="document.getElementById(\'edit-order-overlay\').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">×</button>'
+      +'</div>'
+      // Order-level fields
+      +'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px">'
+        +'<div class="form-group"><label class="form-label">Order #</label>'
+          +'<input id="eo-ordernum" class="form-input" value="'+escHtml(first.order_number||'')+'" placeholder="Order number…"></div>'
+        +'<div class="form-group"><label class="form-label">Sale Date</label>'
+          +'<input id="eo-date" type="date" class="form-input" value="'+(first.sale_date?first.sale_date.slice(0,10):'')+'"></div>'
+        +'<div class="form-group"><label class="form-label">Source</label>'
+          +'<input id="eo-source" class="form-input" value="'+escHtml(first.source||'')+'" placeholder="shopify / manual…"></div>'
+      +'</div>'
+      +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px">'
+        +'<div class="form-group"><label class="form-label">Customer Name</label>'
+          +'<input id="eo-customer" class="form-input" value="'+escHtml(first.customer_name||'')+'" placeholder="Customer name…"></div>'
+        +'<div class="form-group"><label class="form-label">Customer Email</label>'
+          +'<input id="eo-email" type="email" class="form-input" value="'+escHtml(first.customer_email||'')+'" placeholder="customer@email.com"></div>'
+      +'</div>'
+      // Lines table
+      +'<div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Line Items</div>'
+      +'<datalist id="eo-sku-list">'+asmPNs.map(function(p){return '<option value="'+escHtml(p)+'">'; }).join('')+'</datalist>'
+      +'<div class="tbl-wrap" style="margin-bottom:10px">'
+        +'<table style="font-size:12px"><thead><tr>'
+          +'<th>SKU</th><th>Description</th><th style="text-align:center">Qty</th>'
+          +'<th>Status</th><th>Tracking #</th><th>Carrier</th><th></th>'
+        +'</tr></thead>'
+        +'<tbody id="eo-lines-body">'+lines.map(function(l){return mkRow(l,false);}).join('')+'</tbody>'
+        +'</table>'
+      +'</div>'
+      +'<button class="btn btn-sm" onclick="window._eoAddLine()" style="margin-bottom:18px">+ Add Line</button>'
+      +'<div style="display:flex;gap:8px;justify-content:flex-end;padding-top:14px;border-top:1px solid var(--border)">'
+        +'<button class="btn" onclick="document.getElementById(\'edit-order-overlay\').remove()">Cancel</button>'
+        +'<button class="btn btn-primary" onclick="submitEditOrder(\''+escHtml(orderNumOrId)+'\')">Save Changes</button>'
+      +'</div>'
     +'</div>';
-  }).join('');
 
-  overlay.innerHTML='<div class="modal" style="width:520px;max-width:95vw">'
-    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">'
-      +'<div style="font-size:15px;font-weight:700;color:var(--text)">Edit Order '+escHtml(orderNumOrId)+'</div>'
-      +'<button onclick="document.getElementById(\'edit-order-overlay\').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">×</button>'
-    +'</div>'
-    +'<div class="form-group" style="margin-bottom:12px"><label class="form-label">Customer Name</label>'
-      +'<input id="eo-customer" class="form-input" value="'+escHtml(first.customer_name||'')+'" placeholder="Customer name…"></div>'
-    +'<div style="display:flex;gap:10px;margin-bottom:12px">'
-      +'<div class="form-group" style="flex:1"><label class="form-label">Sale Date</label>'
-        +'<input id="eo-date" type="date" class="form-input" value="'+(first.sale_date?first.sale_date.slice(0,10):'')+'"></div>'
-      +'<div class="form-group" style="flex:1"><label class="form-label">Source</label>'
-        +'<input id="eo-source" class="form-input" value="'+escHtml(first.source||'')+'"></div>'
-    +'</div>'
-    +'<div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Line Items</div>'
-    +lineRows
-    +'<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">'
-      +'<button class="btn" onclick="document.getElementById(\'edit-order-overlay\').remove()">Cancel</button>'
-      +'<button class="btn btn-primary" onclick="submitEditOrder(\''+escHtml(orderNumOrId)+'\')">Save Changes</button>'
-    +'</div>'
-  +'</div>';
+  // Add-line handler available globally while modal is open
+  window._eoAddLine=function(){
+    var tbody=document.getElementById('eo-lines-body');
+    if(!tbody)return;
+    tbody.insertAdjacentHTML('beforeend',mkRow({pn:'',qty:1,fulfillment_status:'Open',tracking_number:'',carrier:''},true));
+    var last=tbody.lastElementChild;
+    if(last)last.querySelector('[data-field="pn"]')&&last.querySelector('[data-field="pn"]').focus();
+  };
+
   document.body.appendChild(overlay);
-  setTimeout(function(){document.getElementById('eo-customer')?.focus();},50);
+  setTimeout(function(){document.getElementById('eo-ordernum')&&document.getElementById('eo-ordernum').focus();},50);
 }
 
-async function submitEditOrder(orderNumOrId){
-  const lines=S.sales.filter(function(s){return s.order_number===orderNumOrId||s.id===orderNumOrId;});
+async function submitEditOrder(originalOrderNumOrId){
+  const lines=S.sales.filter(function(s){return s.order_number===originalOrderNumOrId||s.id===originalOrderNumOrId;});
   if(!lines.length){toast('Order not found');return;}
+
+  const newOrderNum=(document.getElementById('eo-ordernum')?.value||'').trim()||originalOrderNumOrId;
   const customer=(document.getElementById('eo-customer')?.value||'').trim();
+  const email=(document.getElementById('eo-email')?.value||'').trim();
   const date=document.getElementById('eo-date')?.value||'';
   const source=(document.getElementById('eo-source')?.value||'').trim();
-  const basePayload={customer_name:customer,sale_date:date||null,source:source,updated_at:new Date().toISOString()};
+  const now=new Date().toISOString();
+  const basePayload={order_number:newOrderNum,customer_name:customer,customer_email:email||null,sale_date:date||null,source,updated_at:now};
 
-  let errors=0;
-  for(const line of lines){
-    const qtyEl=document.getElementById('eo-qty-'+line.id);
-    const qty=qtyEl?parseInt(qtyEl.value)||line.qty||1:line.qty||1;
-    const payload=Object.assign({},basePayload,{qty:qty});
-    const{error}=await db.from('sales').update(payload).eq('id',line.id);
-    if(error){errors++;console.error(line.id,error.message);}
-    else{S.sales=S.sales.map(function(s){return s.id===line.id?Object.assign({},s,payload):s;});}
+  const tbody=document.getElementById('eo-lines-body');
+  const rows=tbody?[...tbody.querySelectorAll('tr[data-line-id]')]:[];
+
+  let errors=0,saved=0,deleted=0,added=0;
+
+  for(const row of rows){
+    const lineId=row.dataset.lineId;
+    const isNew=row.dataset.isNew==='1';
+    const isDeleted=row.dataset.deleted==='1';
+
+    const pn=(row.querySelector('[data-field="pn"]')?.value||'').trim();
+    const qty=parseInt(row.querySelector('[data-field="qty"]')?.value)||1;
+    const status=row.querySelector('[data-field="status"]')?.value||'Open';
+    const tracking=(row.querySelector('[data-field="tracking"]')?.value||'').trim()||null;
+    const carrier=row.querySelector('[data-field="carrier"]')?.value||null;
+
+    if(isDeleted&&isNew){continue;} // new line deleted before saving — skip
+
+    if(isDeleted&&!isNew){
+      // Delete existing line from DB
+      const{error}=await db.from('sales').delete().eq('id',lineId);
+      if(error){errors++;console.error('Delete',lineId,error.message);}
+      else{S.sales=S.sales.filter(function(s){return s.id!==lineId;});deleted++;}
+    } else if(isNew){
+      if(!pn)continue; // skip blank new lines
+      const{data,error}=await db.from('sales').insert(Object.assign({},basePayload,{pn,qty,fulfillment_status:status,tracking_number:tracking,carrier:carrier||null})).select().single();
+      if(error){errors++;console.error('Insert',error.message);}
+      else{S.sales=[...S.sales,data];added++;}
+    } else {
+      // Update existing line
+      const payload=Object.assign({},basePayload,{pn,qty,fulfillment_status:status,tracking_number:tracking,carrier:carrier||null});
+      const{error}=await db.from('sales').update(payload).eq('id',lineId);
+      if(error){errors++;console.error('Update',lineId,error.message);}
+      else{S.sales=S.sales.map(function(s){return s.id===lineId?Object.assign({},s,payload):s;});saved++;}
+    }
   }
+
   document.getElementById('edit-order-overlay')?.remove();
   if(errors)toast('Saved with '+errors+' error(s) — check console');
-  else toast('Order updated');
+  else{
+    const parts=[];
+    if(saved)parts.push(saved+' updated');
+    if(added)parts.push(added+' added');
+    if(deleted)parts.push(deleted+' removed');
+    toast('Order saved'+(parts.length?' — '+parts.join(', '):''));
+  }
   render();
 }
 
