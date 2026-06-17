@@ -2150,6 +2150,7 @@ function renderSales(){
     ${fstats.map(s=>`<button class="filter-chip ${chipActive(s)?'on-teal':''}" onclick="setFilter('sales','fstatus','${s}')">${s}</button>`).join('')}
     <button class="btn btn-sm" style="margin-left:auto" title="Remove duplicate order lines (same order # + SKU). Tracking numbers on surviving rows are always preserved — tracking is rescued from duplicates before they are deleted." onclick="dedupeOrders()">🧽 Dedupe & Recover Tracking</button>
     <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="syncOrdersNow()" title="Pull new orders from Shopify + check ShipStation for holds/splits">🔄 Sync Orders</button>
+    <button class="btn btn-sm" id="holds-btn" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="syncHoldsOnly()" title="Poll ShipStation right now for on-hold orders and update ERP status">⏸ Sync Holds</button>
     <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="ssOrderAudit()" title="Find ShipStation orders missing from ERP and import them">📦 SS Audit</button>
     <button class="btn btn-primary btn-sm" onclick='openModal("addSale",{})'>+ Manual Order</button>
     <span class="filter-count">${list.length} orders</span>
@@ -5269,23 +5270,27 @@ async function syncOrdersNow(){
   }
 
   // ── Step 3: Check ShipStation for held orders (via edge function — browser→SS is CORS-blocked) ──
-  const ssKey=(S.shipstation?.key||S.settings?.shipstation?.key||'').trim();
-  const ssSec=(S.shipstation?.secret||S.settings?.shipstation?.secret||'').trim();
-  if(ssKey&&ssSec){
-    try{
-      toast('🔄 Checking ShipStation for held orders…',1500);
-      const ssHoldRes=await fetch(edgeBase+'/shipstation-ship',{
-        method:'POST',
-        headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
-        body:JSON.stringify({action:'hold_sync'})
-      });
-      if(ssHoldRes.ok){
-        const holdData=await ssHoldRes.json().catch(()=>({}));
-        if((holdData.markedHold||0)+(holdData.markedOpen||0)>0)
-          updatedCount+=(holdData.markedHold||0)+(holdData.markedOpen||0);
+  // Always call the edge function — it uses Supabase Secrets (SS_KEY/SS_SECRET), not ERP-stored creds.
+  try{
+    toast('🔄 Checking ShipStation for held orders…',1500);
+    const ssHoldRes=await fetch(edgeBase+'/shipstation-ship',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+      body:JSON.stringify({action:'hold_sync'})
+    });
+    if(ssHoldRes.ok){
+      const holdData=await ssHoldRes.json().catch(()=>({}));
+      const h=holdData.markedHold||0,o=holdData.markedOpen||0;
+      if(h+o>0){
+        updatedCount+=h+o;
+        toast('⏸ Hold sync — '+h+' held, '+o+' released',3000);
       }
-    }catch(e){console.warn('ShipStation hold check skipped:',e.message);}
-  }
+    }else{
+      const errBody=await ssHoldRes.json().catch(()=>({}));
+      if(errBody.error&&errBody.error.includes('SS_KEY'))
+        toast('⚠ ShipStation hold sync skipped — SS_KEY not set in Supabase edge function secrets',5000);
+    }
+  }catch(e){console.warn('ShipStation hold check skipped:',e.message);}
 
   await refreshSales();render();
 
@@ -11674,6 +11679,29 @@ async function refreshAssemblies(){
   if(data)S.assemblies=data;
   computeDemand();
 }
+async function syncHoldsOnly(){
+  const edgeBase=SUPA_URL+'/functions/v1';
+  const btn=document.getElementById('holds-btn');
+  if(btn){btn.disabled=true;btn.textContent='⏸ Syncing…';}
+  try{
+    const res=await fetch(edgeBase+'/shipstation-ship',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+      body:JSON.stringify({action:'hold_sync'})
+    });
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok){
+      if(data.error&&data.error.includes('SS_KEY'))
+        toast('⚠ SS_KEY not set — add it in Supabase: Edge Functions → shipstation-ship → Secrets',6000);
+      else toast('Hold sync failed: '+(data.error||res.status));
+      return;
+    }
+    const h=data.markedHold||0,o=data.markedOpen||0;
+    await refreshSales();render();
+    toast('⏸ Hold sync done — '+h+' on hold, '+o+' released'+(h+o===0?' (no changes)':''),4000);
+  }catch(e){toast('Hold sync error: '+e.message);}
+  finally{if(btn){btn.disabled=false;btn.textContent='⏸ Sync Holds';}}
+}
 async function refreshAll(){
   const btn=document.getElementById('refresh-btn');
   if(btn){btn.disabled=true;btn.style.display='inline-flex';btn.style.animation='spin .7s linear infinite';}
@@ -11696,6 +11724,9 @@ async function refreshAll(){
     if(corrections.data)S.corrections=corrections.data;
     // Re-subscribe realtime in case connection dropped
     setupRealtime();
+    // Also sync ShipStation holds so ↺ catches holds without needing Sync Orders
+    fetch(SUPA_URL+'/functions/v1/shipstation-ship',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({action:'hold_sync'})})
+      .then(r=>r.ok?r.json():null).then(d=>{if(d&&(d.markedHold||d.markedOpen)){refreshSales().then(()=>render());if(d.markedHold||d.markedOpen)toast('⏸ '+d.markedHold+' held, '+d.markedOpen+' released',3000);}}).catch(()=>{});
     computeDemand();updateBadge();render();
     toast('↺ Data refreshed',2000);
   }catch(e){
