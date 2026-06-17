@@ -620,7 +620,7 @@ function statusPill(s){
   return `<span class="pill ${m[s]||'pill-muted'}">${l[s]||s}</span>`;
 }
 function poPill(s){
-  const m={'On Order':'pill-orange','In Transit':'pill-yellow','Received':'pill-teal','Cancelled':'pill-red','Partial':'pill-yellow','Backordered':'pill-orange'};
+  const m={'On Order':'pill-orange','In Transit':'pill-yellow','Received':'pill-teal','Cancelled':'pill-red'};
   return `<span class="pill ${m[s]||'pill-muted'}">${s}</span>`;
 }
 // Single source of truth for PO extended cost.
@@ -1037,6 +1037,15 @@ function openSubBuild(subPn, parentPn, parentQty){
   pushHist();render();
 }
 function lookupGo(type,pn){S.lookupSel={type,pn};S.lookupQ=pn;if(S.view!=='lookup')nav('lookup');else{pushHist();render();}}
+function lookupGoAuto(pn){
+  // Detect whether pn is an assembly (or new_sku alias) or a part, then navigate
+  const asm=S.assemblies.find(a=>a.pn===pn)||S.assemblies.find(a=>a.use_new_sku&&a.new_sku===pn);
+  if(asm){lookupGo('assembly',asm.pn);return;}
+  const part=S.parts.find(p=>p.pn===pn);
+  if(part){lookupGo('part',pn);return;}
+  // Not found — open lookup with query so user sees "No results"
+  S.lookupQ=pn;S.lookupSel=null;if(S.view!=='lookup')nav('lookup');else{pushHist();render();}
+}
 
 function trackingUrl(carrier, tracking){
   if(!tracking)return'';
@@ -1869,9 +1878,6 @@ function renderPurchases(){
     <div class="search-wrap"><span class="search-icon">⌕</span>
       <input placeholder="Vendor or part…" value="${sf.search||''}" oninput="setFilter('po','search',this.value)">
     </div>
-    <div class="search-wrap" style="min-width:170px"><span class="search-icon" style="color:var(--teal)">⌕</span>
-      <input placeholder="Search by part # across all POs…" value="${sf.partSearch||''}" oninput="setFilter('po','partSearch',this.value.toUpperCase())" style="font-family:var(--mono);font-size:12px">
-    </div>
     ${['','Draft','Ordered','On Order','In Transit','Partial','Received','Cancelled'].map(s=>`<button class="filter-chip ${sf.status===s&&s?'on-teal':sf.status===''&&s===''?'on-teal':''}" onclick="setFilter('po','status','${s}')">${s||'All'}</button>`).join('')}
     <button class="btn btn-sm" style="margin-left:auto" title="Remove duplicate POs (same vendor + date)" onclick="deduplicatePOs()">🧽 Dedupe</button>
     <button class="btn btn-primary btn-sm" onclick="nav('pobuilder')">+ New PO</button>
@@ -2217,7 +2223,7 @@ function renderSaleDetail(s){
     const lfs=line.fulfillment_status||'Open';
     const lcanFill=lstock!==null&&lstock>=(line.qty||1);
     return `<tr>
-      <td class="pn rowlink" style="color:var(--teal)" onclick="lookupGo('assembly','${line.pn}')">${line.pn} ↗</td>
+      <td class="pn rowlink" style="color:var(--teal)" onclick="lookupGoAuto('${line.pn}')">${line.pn} ↗</td>
       <td style="font-size:11px;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${la?.description||''}</td>
       <td class="money-neutral" style="font-weight:700">${line.qty||1}</td>
       <td class="money" style="color:${lstock===null?'var(--text3)':lcanFill?'var(--green)':'var(--red)'};font-weight:700">
@@ -7458,7 +7464,7 @@ function renderLookup(){
   let matches=[];
   if(q.length>=2){
     matches=[
-      ...S.assemblies.filter(a=>a.pn.toLowerCase().includes(q)||(a.description||'').toLowerCase().includes(q)).map(a=>({type:'assembly',item:a})),
+      ...S.assemblies.filter(a=>a.pn.toLowerCase().includes(q)||(a.new_sku&&a.new_sku.toLowerCase().includes(q))||(a.description||'').toLowerCase().includes(q)).map(a=>({type:'assembly',item:a})),
       ...S.parts.filter(p=>p.pn.toLowerCase().includes(q)||(p.description||'').toLowerCase().includes(q)).map(p=>({type:'part',item:p}))
     ].slice(0,30);
   }
@@ -7499,7 +7505,9 @@ function tierPrices(a){
 }
 
 function assemblyDossier(pn){
-  const a=S.assemblies.find(x=>x.pn===pn);
+  // Resolve new_sku aliases — if called with a new_sku, find the real pn
+  let a=S.assemblies.find(x=>x.pn===pn);
+  if(!a) a=S.assemblies.find(x=>x.use_new_sku&&x.new_sku===pn);
   if(!a)return'<div class="panel section-empty">Not found</div>';
   const b=buildability(pn);
   const demand=openOrderDemand(pn);
@@ -7510,11 +7518,14 @@ function assemblyDossier(pn){
   const corr=S.corrections.filter(c=>c.pn===pn).slice(0,6);
   const bomCost=bomCostOf(pn,0);
   const margin=a.msrp>0?((a.msrp-bomCost)/a.msrp*100):null;
+  const hasSubAsms=b.hasBOM&&b.checks.some(c=>c.isSub);
   return `
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
     <div style="flex:1"><div style="font-size:16px;font-weight:700;color:var(--teal)">${a.pn} ${a.is_subassembly?'<span class="pill pill-orange" style="font-size:9px;vertical-align:middle">SUBASSEMBLY</span>':''} ${a.discontinued?'<span class="pill pill-red" style="font-size:9px;vertical-align:middle">DISCONTINUED</span>':''}</div>
     <div style="font-size:12px;color:var(--text2)">${a.description||''}</div></div>
     ${a.drawing_url?`<a href="${a.drawing_url}" target="_blank" class="btn btn-sm">📐 Drawing</a>`:''}
+    ${b.hasBOM?`<button class="btn btn-sm" onclick="printBOM('${pn}')" title="Print this assembly's BOM only">🖨 BOM</button>`:''}
+    ${hasSubAsms?`<button class="btn btn-sm" onclick="printAllBOMs('${pn}')" title="Print all BOMs — this assembly plus every sub-assembly" style="color:var(--teal);border-color:rgba(13,148,136,.4)">🖨 All BOMs</button>`:''}
     <button class="btn btn-teal btn-sm" onclick="openBuild('${pn}')">Build Planner</button>
     <button class="btn btn-sm" onclick='openModal("editAsm",${JSON.stringify(a).replace(/'/g,"&#39;")})'>Edit</button>
   </div>
@@ -8000,6 +8011,119 @@ function lineCost(item){
   if(item.item_type==='assembly')return bomCostOf(item.child_pn,0)*(item.qty||1);
   const p=S.parts.find(x=>x.pn===item.child_pn);
   return (p?(p.unit_cost||0):0)*(item.qty||1);
+}
+
+function _buildBOMPageHTML(pn,headerLabel){
+  const a=S.assemblies.find(x=>x.pn===pn);
+  if(!a)return'';
+  const b=buildability(pn);
+  if(!b.hasBOM)return'';
+  const bomCost=bomCostOf(pn,0);
+  const rows=b.checks.map(c=>{
+    const unitCost=c.isSub?bomCostOf(c.pn,0):(S.parts.find(p=>p.pn===c.pn)?.unit_cost||0);
+    const ext=unitCost*(c.need||0);
+    const statusColor=c.ok?'#0d9488':'#dc2626';
+    return `<tr>
+      <td style="font-family:monospace;font-size:12px;color:#0d9488;white-space:nowrap">${c.pn}</td>
+      <td style="font-size:12px;color:#475569">${c.desc||''}</td>
+      <td style="text-align:center;font-weight:700">${c.need}</td>
+      <td style="text-align:right;font-family:monospace">${unitCost?'$'+unitCost.toFixed(4):'—'}</td>
+      <td style="text-align:right;font-family:monospace;font-weight:700">${ext?'$'+ext.toFixed(2):'—'}</td>
+      <td style="text-align:center;font-weight:700;color:${statusColor}">${c.avail}</td>
+      <td style="text-align:center;font-size:11px;color:#64748b">${c.loc||'—'}</td>
+    </tr>`;
+  }).join('');
+  return `<div style="page-break-after:always;padding-bottom:32px;margin-bottom:32px;border-bottom:2px solid #e2e8f0">
+    ${headerLabel?`<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#94a3b8;margin-bottom:8px">${headerLabel}</div>`:''}
+    <div style="font-size:18px;font-weight:700;color:#0d9488">${pn}</div>
+    <div style="font-size:13px;color:#475569;margin-top:3px">${a.description||''}</div>
+    ${a.category?`<div style="font-size:11px;color:#94a3b8;margin-top:2px">${a.category}</div>`:''}
+    <div style="display:flex;gap:24px;margin:12px 0 20px;flex-wrap:wrap">
+      <div><div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8">On Hand</div><div style="font-size:15px;font-weight:700;color:${(a.total_on_hand||0)>0?'#0d9488':'#dc2626'}">${a.total_on_hand||0}</div></div>
+      <div><div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8">BOM Cost</div><div style="font-size:15px;font-weight:700">$${bomCost.toFixed(2)}</div></div>
+      <div><div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8">MSRP</div><div style="font-size:15px;font-weight:700">${a.msrp?'$'+a.msrp.toFixed(2):'—'}</div></div>
+      <div><div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8">Components</div><div style="font-size:15px;font-weight:700">${b.checks.length}</div></div>
+    </div>
+    <table style="width:100%;border-collapse:collapse">
+      <thead><tr style="background:#f1f5f9">
+        <th style="padding:8px 10px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;border-bottom:1px solid #e2e8f0">Part #</th>
+        <th style="padding:8px 10px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;border-bottom:1px solid #e2e8f0">Description</th>
+        <th style="padding:8px 10px;text-align:center;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;border-bottom:1px solid #e2e8f0">Qty</th>
+        <th style="padding:8px 10px;text-align:right;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;border-bottom:1px solid #e2e8f0">Unit Cost</th>
+        <th style="padding:8px 10px;text-align:right;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;border-bottom:1px solid #e2e8f0">Extended</th>
+        <th style="padding:8px 10px;text-align:center;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;border-bottom:1px solid #e2e8f0">On Hand</th>
+        <th style="padding:8px 10px;text-align:center;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;border-bottom:1px solid #e2e8f0">Bin</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+      <tfoot><tr style="background:#f8fafc">
+        <td colspan="4" style="padding:10px;text-align:right;font-weight:700;border-top:2px solid #e2e8f0">Total BOM Cost</td>
+        <td style="padding:10px;text-align:right;font-family:monospace;font-weight:700;border-top:2px solid #e2e8f0">$${bomCost.toFixed(2)}</td>
+        <td colspan="2" style="border-top:2px solid #e2e8f0"></td>
+      </tfoot>
+    </table>
+  </div>`;
+}
+
+function printBOM(pn){
+  const a=S.assemblies.find(x=>x.pn===pn);
+  if(!a){toast('Assembly not found');return;}
+  const b=buildability(pn);
+  if(!b.hasBOM){toast('No BOM defined for '+pn);return;}
+  const today=new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'});
+  const html=`<!DOCTYPE html><html><head><title>BOM — ${pn}</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1e293b;padding:32px;font-size:13px}
+.hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:24px;padding-bottom:16px;border-bottom:2px solid #0d9488}
+.brand{font-size:18px;font-weight:800;color:#0d9488}.brand span{color:#f97316}
+@media print{body{padding:16px}}</style></head><body>
+<div class="hdr"><div><div class="brand">TGK<span>MOTORSPORT</span></div><div style="font-size:11px;color:#64748b;margin-top:2px">Bill of Materials</div></div>
+<div style="text-align:right;font-size:11px;color:#64748b">Printed: ${today}<br>TGKCommand ERP</div></div>
+${_buildBOMPageHTML(pn,'')}
+<div style="margin-top:16px;font-size:10px;color:#94a3b8;text-align:center;border-top:1px solid #e2e8f0;padding-top:10px">TGK Motorsport · ${pn} · ${today} · Quantities are per single assembled unit</div>
+<script>window.onload=function(){window.print();}<\/script>
+</body></html>`;
+  const w=window.open('','_blank','width=920,height=720');
+  if(w){w.document.write(html);w.document.close();}
+  else toast('Pop-up blocked — allow pop-ups and try again');
+}
+
+function printAllBOMs(pn){
+  const a=S.assemblies.find(x=>x.pn===pn);
+  if(!a){toast('Assembly not found');return;}
+  // Collect all unique sub-assembly PNs recursively
+  function collectSubAsms(p,visited=new Set()){
+    if(visited.has(p))return;
+    visited.add(p);
+    const items=S.boms[p]||[];
+    items.forEach(i=>{if(i.item_type==='assembly')collectSubAsms(i.child_pn,visited);});
+    return visited;
+  }
+  const allPNs=collectSubAsms(pn);
+  const today=new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'});
+  // Build pages: main assembly first, then each sub-assembly that has a BOM
+  let pages='';
+  // Main assembly
+  pages+=_buildBOMPageHTML(pn,'Finished Assembly');
+  // Sub-assemblies (excluding the top-level)
+  allPNs.forEach(p=>{
+    if(p===pn)return;
+    const pg=_buildBOMPageHTML(p,'Sub-Assembly');
+    if(pg)pages+=pg;
+  });
+  if(!pages){toast('No BOMs to print');return;}
+  const html=`<!DOCTYPE html><html><head><title>All BOMs — ${pn}</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1e293b;padding:32px;font-size:13px}
+.hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:24px;padding-bottom:16px;border-bottom:2px solid #0d9488}
+.brand{font-size:18px;font-weight:800;color:#0d9488}.brand span{color:#f97316}
+@media print{body{padding:16px}}</style></head><body>
+<div class="hdr"><div><div class="brand">TGK<span>MOTORSPORT</span></div><div style="font-size:11px;color:#64748b;margin-top:2px">Full Bill of Materials Package — ${pn}</div></div>
+<div style="text-align:right;font-size:11px;color:#64748b">Printed: ${today}<br>TGKCommand ERP · ${allPNs.size} BOM${allPNs.size!==1?'s':''}</div></div>
+${pages}
+<div style="margin-top:16px;font-size:10px;color:#94a3b8;text-align:center;border-top:1px solid #e2e8f0;padding-top:10px">TGK Motorsport · ${pn} · ${today} · Full BOM package including all sub-assemblies</div>
+<script>window.onload=function(){window.print();}<\/script>
+</body></html>`;
+  const w=window.open('','_blank','width=920,height=720');
+  if(w){w.document.write(html);w.document.close();}
+  else toast('Pop-up blocked — allow pop-ups and try again');
 }
 
 // Hardware Pack check: TGK-P + digits (TGK-P01…TGK-P100). TGK-PCV etc. are NOT packs.
@@ -8573,23 +8697,23 @@ function renderPODetail(po) {
       <span class="money-cost" style="font-size:10px">${fc(line.unit_cost||0)} ea</span>
       ${done
         ?`<span style="display:flex;align-items:center;gap:6px"><span class="pill pill-teal" style="font-size:10px">✓ Complete</span><button class="btn btn-sm" title="Reverse receipt" onclick="unreceiveLine('${line.id}','${po.id}')">↩ Undo</button><button class="action-btn del" onclick="deletePOLine('${line.id}','${po.id}')">×</button></span>`
-        :`<div style="display:flex;flex-direction:column;gap:5px;flex:1;min-width:220px">
-            ${line.status==='Partial'&&line.notes?`<div style="font-size:10px;background:rgba(234,88,12,.07);color:var(--orange);border-radius:4px;padding:3px 8px;border-left:2px solid var(--orange)">↻ ${escHtml(line.notes)}</div>`:''}
-            <span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-              ${line.status==='Partial'?`<span class="pill pill-yellow" style="font-size:9px">Partial — ${remaining} remaining</span>`:''}
-              <input class="qty-input" id="checkin-${line.id}" type="number" min="0" value="${remaining}" style="width:60px" placeholder="Qty">
-              <input id="checkin-note-${line.id}" class="inline-edit" placeholder="Note (optional)" style="flex:1;min-width:90px;max-width:160px;font-size:11px">
-              <button class="btn btn-teal btn-sm" onclick="checkInLine('${line.id}','${po.id}','${line.pn}',${line.qty_ordered},${line.qty_received||0})">✓ Receive</button>
-              <button class="action-btn del" onclick="deletePOLine('${line.id}','${po.id}')">×</button>
-            </span>
-          </div>`
+        :`<span style="display:flex;align-items:center;gap:6px">
+            <input class="qty-input" id="checkin-${line.id}" type="number" min="0" value="${remaining}" style="width:64px" placeholder="Qty">
+            <span style="font-size:10px;color:var(--text3)">(expecting ${remaining})</span>
+            <button class="btn btn-teal btn-sm" onclick="checkInLine('${line.id}','${po.id}','${line.pn}',${line.qty_ordered},${line.qty_received||0})">✓ Receive</button>
+            <button class="action-btn del" onclick="deletePOLine('${line.id}','${po.id}')">×</button>
+          </span>`
       }
     </div>`;
   }).join('')}`;
 }
 
-async function _doCheckIn(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived, qty, note) {
+async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
+  const inp = document.getElementById('checkin-'+lineId);
+  const noteInp = document.getElementById('checkin-note-'+lineId);
+  const qty = parseFloat(inp.value)||0;
   if(qty<=0){toast('Enter a quantity');return;}
+  const note = noteInp?noteInp.value.trim():'';
   const newReceived = qtyAlreadyReceived + qty;
   const remaining = Math.max(0, qtyOrdered - newReceived);
   const surplus = Math.max(0, newReceived - qtyOrdered);
@@ -8606,62 +8730,93 @@ async function _doCheckIn(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived, qty,
     S.parts = S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
     const po=S.purchases.find(p=>p.id===poId);
     const poRef=po?(' ['+po.vendor+(po.order_date?' '+po.order_date:'')+']'):'';
-    const reason='PO Receipt'+poRef+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' ('+remaining+' still expected)':'')+(note?' — '+note:'');
+    const reason='PO Receipt'+poRef+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' ('+remaining+' auto-backordered)':'')+(note?' — '+note:'');
     const {data:corrRow}=await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,source:'po_receipt'}).select().single();
     if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
-    S.corrections=[{pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,source:'po_receipt',created_at:new Date().toISOString()},...S.corrections];
+    S.corrections = [{pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,source:'po_receipt',created_at:new Date().toISOString()},...S.corrections];
   }
 
   if(remaining>0){
-    // PARTIAL: keep line open on this PO, mark Partial, record note
-    const d=new Date().toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
-    const autoNote=qty+' of '+qtyOrdered+' received on '+d;
-    const fullNote=note?autoNote+' — '+note:autoNote;
+    // SHORT: close this line and auto-create a backorder PO for the remainder
     if(lineBefore)undoOps.push({action:'update',table:'po_lines',data:{id:lineId},prev:{...stripMeta(lineBefore)}});
-    await db.from('po_lines').update({qty_received:newReceived,status:'Partial',notes:fullNote,updated_at:new Date().toISOString()}).eq('id',lineId);
-    toast('Received '+qty+'× '+pn+' — '+remaining+' still expected on this PO');
+    await db.from('po_lines').update({qty_received:newReceived,status:'Backordered',notes:remaining+' backordered',updated_at:new Date().toISOString()}).eq('id',lineId);
+    const po=S.purchases.find(p=>p.id===poId);
+    const line=(S.poLines[poId]||[]).find(l=>l.id===lineId);
+    const {data:newPO,error}=await db.from('purchases').insert({
+      vendor:po?.vendor||'TBD',pn,description:'BACKORDER — '+(line?.description||pn),
+      qty:remaining,unit_cost:line?.unit_cost||0,status:'Ordered',
+      order_date:new Date().toISOString().slice(0,10),updated_at:new Date().toISOString()
+    }).select().single();
+    if(!error&&newPO){
+      const {data:boLine}=await db.from('po_lines').insert({po_id:newPO.id,pn,description:'BACKORDER — '+(line?.description||''),qty_ordered:remaining,unit_cost:line?.unit_cost||0,qty_received:0,status:'Pending'}).select().single();
+      S.purchases=[newPO,...S.purchases];
+      if(boLine)undoOps.push({action:'insert',table:'po_lines',data:boLine});
+      undoOps.push({action:'insert',table:'purchases',data:newPO});
+    }
+    toast('Received '+qty+'× '+pn+' — short '+remaining+' → backorder PO created automatically');
   } else {
-    // COMPLETE or surplus
+    // EXACT or SURPLUS: line complete
     if(lineBefore)undoOps.push({action:'update',table:'po_lines',data:{id:lineId},prev:{...stripMeta(lineBefore)}});
-    await db.from('po_lines').update({qty_received:newReceived,status:'Complete',notes:surplus>0?surplus+' surplus received':null,updated_at:new Date().toISOString()}).eq('id',lineId);
+    await db.from('po_lines').update({qty_received:newReceived,status:'Complete',updated_at:new Date().toISOString()}).eq('id',lineId);
     toast('Received '+qty+'× '+pn+(surplus>0?' (+'+surplus+' surplus into stock)':'')+' ✓');
   }
 
-  // Refresh PO lines + update PO status
+  // Refresh + auto-close PO when every line is settled
   await loadPOLines(poId);
   const lines = S.poLines[poId]||[];
-  const allComplete = lines.every(l=>(l.qty_received||0)>=(l.qty_ordered||0));
-  const anyPartial = lines.some(l=>l.status==='Partial'||(l.qty_received>0&&(l.qty_received||0)<(l.qty_ordered||0)));
-
-  if(allComplete){
+  if(lines.every(l=>l.qty_received>=l.qty_ordered||l.status==='Backordered')){
     if(poBefore)undoOps.push({action:'update',table:'purchases',data:{id:poId},prev:{...stripMeta(poBefore)}});
     await db.from('purchases').update({status:'Received',updated_at:new Date().toISOString()}).eq('id',poId);
-    S.purchases=S.purchases.map(p=>p.id===poId?{...p,status:'Received'}:p);
-  } else if(anyPartial){
-    if(poBefore&&poBefore.status!=='Partial')undoOps.push({action:'update',table:'purchases',data:{id:poId},prev:{...stripMeta(poBefore)}});
-    await db.from('purchases').update({status:'Partial',updated_at:new Date().toISOString()}).eq('id',poId);
-    S.purchases=S.purchases.map(p=>p.id===poId?{...p,status:'Partial'}:p);
+    S.purchases = S.purchases.map(p=>p.id===poId?{...p,status:'Received'}:p);
   }
   pushUndoMulti('Receive '+qty+'× '+pn+' on PO',undoOps);
   updateBadge();
   render();
 }
 
-async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
+async function closeShortBackorder(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived){
   const inp=document.getElementById('checkin-'+lineId);
-  const noteInp=document.getElementById('checkin-note-'+lineId);
-  const qty=parseFloat(inp?.value)||0;
-  const note=noteInp?noteInp.value.trim():'';
-  await _doCheckIn(lineId,poId,pn,qtyOrdered,qtyAlreadyReceived,qty,note);
+  const recvNow=parseFloat(inp?.value)||0;
+  const totalReceived=qtyAlreadyReceived+recvNow;
+  const remaining=Math.max(0,qtyOrdered-totalReceived);
+  if(remaining<=0){toast('Nothing remaining — use Receive instead');return;}
+  if(!confirm('Receive '+recvNow+' now, close this line, and create a backorder PO for the remaining '+remaining+'?'))return;
+  // receive what arrived (if any)
+  if(recvNow>0){
+    const part=S.parts.find(p=>p.pn===pn);
+    if(part){
+      const newQty=(part.total_unpckgd||0)+recvNow;
+      await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
+      S.parts=S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
+      await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:recvNow,reason:'PO Receipt (closed short, '+remaining+' backordered)',source:'po_receipt'});
+    }
+  }
+  // close the line as backordered
+  await db.from('po_lines').update({qty_received:totalReceived,status:'Backordered',notes:remaining+' backordered',updated_at:new Date().toISOString()}).eq('id',lineId);
+  // create the backorder PO with the remainder
+  const po=S.purchases.find(p=>p.id===poId);
+  const line=(S.poLines[poId]||[]).find(l=>l.id===lineId);
+  const {data:newPO,error}=await db.from('purchases').insert({
+    vendor:po?.vendor||'TBD',pn,description:'BACKORDER — '+(line?.description||pn),
+    qty:remaining,unit_cost:line?.unit_cost||0,status:'Ordered',
+    order_date:new Date().toISOString().slice(0,10),updated_at:new Date().toISOString()
+  }).select().single();
+  if(!error&&newPO){
+    await db.from('po_lines').insert({po_id:newPO.id,pn,description:'BACKORDER — '+(line?.description||''),qty_ordered:remaining,unit_cost:line?.unit_cost||0,qty_received:0,status:'Pending'});
+    S.purchases=[newPO,...S.purchases];
+  }
+  // if all lines settled, mark original PO received
+  await loadPOLines(poId);
+  const lines=S.poLines[poId]||[];
+  if(lines.every(l=>l.qty_received>=l.qty_ordered||l.status==='Backordered')){
+    await db.from('purchases').update({status:'Received',updated_at:new Date().toISOString()}).eq('id',poId);
+    S.purchases=S.purchases.map(p=>p.id===poId?{...p,status:'Received'}:p);
+  }
+  updateBadge();
+  toast('Line closed — backorder PO created for '+remaining+'× '+pn);
+  render();
 }
 
-async function checkInLineSearch(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
-  const inp=document.getElementById('checkin-s-'+lineId);
-  const noteInp=document.getElementById('checkin-note-s-'+lineId);
-  const qty=parseFloat(inp?.value)||0;
-  const note=noteInp?noteInp.value.trim():'';
-  await _doCheckIn(lineId,poId,pn,qtyOrdered,qtyAlreadyReceived,qty,note);
-}
 async function receiveAllLines(poId) {
   const lines = S.poLines[poId]||[];
   const pending = lines.filter(l=>l.qty_received<l.qty_ordered);
@@ -8690,14 +8845,15 @@ async function unreceiveLine(lineId, poId){
   undoOps.push({action:'update',table:'po_lines',data:{id:lineId},prev:{...stripMeta(line)}});
   await db.from('po_lines').update({qty_received:0,status:'Pending',notes:null,updated_at:new Date().toISOString()}).eq('id',lineId);
   const po=S.purchases.find(p=>p.id===poId);
-  if(po&&(po.status==='Received'||po.status==='Partial')){
+  if(po&&po.status==='Received'){
     undoOps.push({action:'update',table:'purchases',data:{id:poId},prev:{...stripMeta(po)}});
     await db.from('purchases').update({status:'Ordered',updated_at:new Date().toISOString()}).eq('id',poId);
     S.purchases=S.purchases.map(p=>p.id===poId?{...p,status:'Ordered'}:p);
   }
   await loadPOLines(poId);
   pushUndoMulti('Un-receive '+line.qty_received+'× '+line.pn,undoOps);
-  toast('Receipt reversed — '+line.qty_received+'× '+line.pn+' removed from stock, line reset to Pending');
+  if(line.status==='Backordered')toast('Receipt reversed. Note: the auto-created backorder PO still exists — delete it if not needed.');
+  else toast('Receipt reversed — '+line.qty_received+'× '+line.pn+' removed from stock, line reset');
   updateBadge();render();
 }
 
@@ -8748,60 +8904,7 @@ function renderPurchasesEnhanced() {
     const po = S.purchases.find(p=>p.id===S.activePO);
     if(po) return renderPODetail(po);
   }
-  const partQ=(S.filters.po?.partSearch||'').trim().toUpperCase();
-  const baseView=_origRenderPurchases();
-  if(!partQ||partQ.length<2) return baseView;
-
-  // Part # search: collect all PO lines matching the query across all POs
-  const matches=[];
-  Object.entries(S.poLines).forEach(([poId,lines])=>{
-    const po=S.purchases.find(p=>p.id===poId);
-    if(!po)return;
-    lines.forEach(line=>{
-      if((line.pn||'').toUpperCase().includes(partQ)||(line.description||'').toUpperCase().includes(partQ)){
-        matches.push({line,po});
-      }
-    });
-  });
-  // Also check POs without loaded lines (header pn)
-  S.purchases.forEach(po=>{
-    if(S.poLines[po.id])return; // already checked
-    if((po.pn||'').toUpperCase().includes(partQ)||(po.description||'').toUpperCase().includes(partQ)){
-      matches.push({line:{id:'hdr-'+po.id,pn:po.pn,description:po.description,qty_ordered:po.qty,qty_received:0,status:'Pending',unit_cost:po.unit_cost},po});
-    }
-  });
-
-  const searchPanel=matches.length===0
-    ?`<div class="panel" style="padding:14px 18px;margin-bottom:14px;background:rgba(220,38,38,.05);border:1px solid rgba(220,38,38,.2);border-radius:8px;font-size:12px;color:var(--text3)">No PO lines found for <b style="color:var(--text)">${escHtml(partQ)}</b></div>`
-    :`<div class="panel" style="padding:0;margin-bottom:16px;border:1.5px solid var(--teal);border-radius:10px;overflow:hidden">
-      <div class="section-header" style="background:rgba(13,148,136,.07)">🔍 PO lines matching <b>${escHtml(partQ)}</b> — ${matches.length} result${matches.length!==1?'s':''}</div>
-      ${matches.map(({line,po})=>{
-        const recv=line.qty_received||0;
-        const remaining=Math.max(0,(line.qty_ordered||0)-recv);
-        const done=recv>=(line.qty_ordered||0);
-        const isHeader=line.id.startsWith('hdr-');
-        return `<div class="check-row" style="background:var(--bg2);border-bottom:1px solid var(--border);flex-wrap:wrap;gap:10px;cursor:pointer" onclick="if(!event.target.closest('input,button'))openPODetail('${po.id}')">
-          <div style="display:flex;flex-direction:column;min-width:110px">
-            <span class="pn" style="color:var(--teal)">${escHtml(line.pn||'')}</span>
-            <span style="font-size:10px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:140px">${escHtml(line.description||'')}</span>
-          </div>
-          <div style="display:flex;flex-direction:column;gap:2px;min-width:120px">
-            <span style="font-size:11px;color:var(--text2);font-weight:700">${escHtml(po.vendor)}</span>
-            <span style="font-size:10px;color:var(--text3)">${po.order_date||''} · ${poPill(line.status||po.status)}</span>
-          </div>
-          <div style="font-size:11px;color:var(--text2)">Ord: <b>${line.qty_ordered||0}</b> · Rcvd: <b style="color:${done?'var(--teal)':recv>0?'var(--orange)':'var(--text3)'}">${recv}</b>${remaining>0?` · <b style="color:var(--red)">${remaining} left</b>`:''}</div>
-          <span style="flex:1"></span>
-          ${done||isHeader?`<span class="pill pill-teal" style="font-size:9px">✓ Complete</span>`
-            :`<span style="display:flex;align-items:center;gap:5px;flex-wrap:wrap">
-                <input class="qty-input" id="checkin-s-${line.id}" type="number" min="0" value="${remaining}" style="width:56px" placeholder="Qty" onclick="event.stopPropagation()">
-                <input id="checkin-note-s-${line.id}" class="inline-edit" placeholder="Note (optional)" style="width:120px;font-size:10px" onclick="event.stopPropagation()">
-                <button class="btn btn-teal btn-sm" onclick="event.stopPropagation();checkInLineSearch('${line.id}','${po.id}','${escHtml(line.pn||'')}',${line.qty_ordered||0},${recv})">✓ Receive</button>
-                <button class="btn btn-sm" onclick="event.stopPropagation();openPODetail('${po.id}')">View PO →</button>
-              </span>`}
-        </div>`;
-      }).join('')}
-    </div>`;
-  return searchPanel + baseView;
+  return _origRenderPurchases();
 }
 
 // ============================================================
