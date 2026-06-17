@@ -756,11 +756,11 @@ async function loadAll(){
       const icon={po_receipt:'📦',pack:'🔧',unpack:'↩',cycle_count:'📋',shipment:'🚚',manual:'✎'}[c.source]||'✎';
       S.liveActivity.push({icon,type:'stock_movement',text:c.pn+' '+(c.adjustment>0?'+':'')+c.adjustment+' ('+fn(c.new_qty)+' on hand)',sub:c.reason||c.source,ts:c.created_at,cls:c.adjustment>0?'var(--green)':'var(--red)'});
     });
-    [...S.sales].sort((a,b)=>new Date(b.created_at||b.sale_date||0)-new Date(a.created_at||a.sale_date||0)).slice(0,15).forEach(s=>{
+    S.sales.slice(0,15).forEach(s=>{
       const fs=s.fulfillment_status||'Open';
       const icon={Shipped:'📦',Delivered:'✅',Cancelled:'🚫','On Hold':'⏸',Open:'🛒'}[fs]||'🛒';
       const cls={Shipped:'var(--teal)',Delivered:'var(--green)',Cancelled:'var(--red)','On Hold':'var(--yellow)',Open:'var(--teal)'}[fs]||'var(--teal)';
-      S.liveActivity.push({icon,type:'order',text:'#'+(s.order_number||'')+' '+fs,sub:s.pn+(s.qty>1?' ×'+s.qty:'')+(s.customer_name?' — '+s.customer_name:''),ts:s.created_at||s.sale_date,cls});
+      S.liveActivity.push({icon,type:'order',text:'#'+(s.order_number||'')+' '+fs,sub:s.pn+(s.qty>1?' ×'+s.qty:'')+(s.customer_name?' — '+s.customer_name:''),ts:s.sale_date,cls});
     });
     S.liveActivity.sort((a,b)=>new Date(b.ts||0)-new Date(a.ts||0));
     S.liveActivity=S.liveActivity.slice(0,100);
@@ -796,7 +796,7 @@ function setupRealtime(){
         if(!S.sales.find(s=>s.id===p.new.id)){
           S.sales=[p.new,...S.sales];
           showOrderAlert(p.new.order_number||'',p.new.pn||'');
-          pushActivity({icon:'🛒',type:'order',text:'New order #'+(p.new.order_number||''),sub:p.new.pn+(p.new.qty>1?' ×'+p.new.qty:'')+(p.new.customer_name?' — '+p.new.customer_name:''),ts:p.new.created_at||new Date().toISOString(),cls:'var(--teal)'});
+          pushActivity({icon:'🛒',type:'order',text:'New order #'+(p.new.order_number||''),sub:p.new.pn+(p.new.qty>1?' ×'+p.new.qty:'')+(p.new.customer_name?' — '+p.new.customer_name:''),ts:p.new.sale_date||new Date().toISOString(),cls:'var(--teal)'});
         }
       } else if(p.eventType==='UPDATE'){
         const prev=S.sales.find(s=>s.id===p.new.id);
@@ -3077,28 +3077,13 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({error:'Missing credentials'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
     }
     const since = body.since || new Date(Date.now() - 30*24*60*60*1000).toISOString()
-    const page_info = body.page_info || ''
-    // Shopify 2024-01 uses cursor-based pagination — page= is rejected with 400
-    // When using page_info cursor, only limit= is allowed (cursor encodes all filters)
-    const url = page_info
-      ? 'https://' + store + '/admin/api/2024-01/orders.json?limit=250&page_info=' + encodeURIComponent(page_info)
-      : 'https://' + store + '/admin/api/2024-01/orders.json?status=any&limit=250&updated_at_min=' + encodeURIComponent(since)
+    const page = body.page || 1
+    const url = 'https://' + store + '/admin/api/2024-01/orders.json?status=any&limit=250&updated_at_min=' + since + '&page=' + page
     const shopRes = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
     if (!shopRes.ok) {
-      const errText = await shopRes.text().catch(() => '')
-      return new Response(JSON.stringify({error:'Shopify ' + shopRes.status + ': ' + errText.slice(0, 300)}), {status:shopRes.status, headers:{...CORS,'Content-Type':'application/json'}})
+      return new Response(JSON.stringify({error:'Shopify ' + shopRes.status}), {status:shopRes.status, headers:{...CORS,'Content-Type':'application/json'}})
     }
-    // Parse cursor for next page from Link header
-    const link = shopRes.headers.get('link') || ''
-    let next_page_info = ''
-    for (const part of link.split(',')) {
-      if (part.includes('rel="next"')) {
-        const m = part.match(/page_info=([^&>"]+)/)
-        if (m) { next_page_info = m[1]; break }
-      }
-    }
-    const shopData = await shopRes.json()
-    return new Response(JSON.stringify({...shopData, next_page_info}), {headers:{...CORS,'Content-Type':'application/json'}})
+    return new Response(await shopRes.text(), {headers:{...CORS,'Content-Type':'application/json'}})
   }
 
   // Image sync (single page): frontend calls repeatedly with page_info until done
@@ -3457,7 +3442,11 @@ Deno.serve(async (req) => {
 
   const ssKey = Deno.env.get('SS_KEY')!, ssSec = Deno.env.get('SS_SECRET')!
   const auth = btoa(ssKey + ':' + ssSec)
-  const ssRes = await fetch(resource_url, { headers: { Authorization: 'Basic ' + auth } })
+  // ShipStation's resource_url doesn't include item-level data by default.
+  // Without items, rawSkus is empty → SKU matching fails → ALL open lines get marked Shipped.
+  // Appending includeShipmentItems=true ensures split-shipment detection works correctly.
+  const fetchUrl = resource_url.includes('includeShipmentItems') ? resource_url : resource_url + '&includeShipmentItems=true'
+  const ssRes = await fetch(fetchUrl, { headers: { Authorization: 'Basic ' + auth } })
   if (!ssRes.ok) return new Response('SS fetch failed: ' + ssRes.status, { status: 502, headers: CORS })
   const data = await ssRes.json()
 
@@ -3543,59 +3532,21 @@ Deno.serve(async (req) => {
     }
   }
 
-if (resource_type === 'ORDER_CANCELLED') {
+  if (resource_type === 'ORDER_CANCELLED') {
     const rawNum = data.orderNumber
     const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
     const rn = ex?.length ? rawNum : '#' + rawNum
     await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('order_number', rn)
   }
-
-  // ORDER_NOTIFY fires when an order is modified in ShipStation (status change, hold, etc.)
-  // ShipStation does NOT have ORDER_ON_HOLD or ORDER_HOLD_RELEASED webhook triggers —
-  // hold status is synced via the hold_sync action (called by Sync Orders button).
-  // We handle ORDER_NOTIFY defensively in case SS fires it for status changes.
-  if (resource_type === 'ORDER_NOTIFY') {
-    const order = data
-    const rawNum = order.orderNumber || ''
-    if (rawNum) {
-      const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
-      const rn = ex?.length ? rawNum : '#' + rawNum
-      const ss = (order.orderStatus || '').toLowerCase()
-      if (ss === 'on_hold') {
-        await db.from('sales').update({ fulfillment_status: 'On Hold' })
-          .eq('order_number', rn)
-          .in('fulfillment_status', ['Open', 'Packed', 'Partial'])
-        console.log('[SS] ORDER_NOTIFY on_hold', rn)
-      } else if (ss === 'awaiting_shipment') {
-        await db.from('sales').update({ fulfillment_status: 'Open' })
-          .eq('order_number', rn)
-          .eq('fulfillment_status', 'On Hold')
-        console.log('[SS] ORDER_NOTIFY awaiting_shipment (released hold)', rn)
-      } else if (ss === 'cancelled') {
-        await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('order_number', rn)
-        console.log('[SS] ORDER_NOTIFY cancelled', rn)
-      }
-    }
-  }
-
-  // Keep legacy handlers in case a future SS plan exposes these events
   if (resource_type === 'ORDER_ON_HOLD') {
     const rawNum = data.orderNumber
     const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
-    const resolvedHold = ex?.length ? rawNum : '#' + rawNum
-    await db.from('sales').update({ fulfillment_status: 'On Hold' })
-      .eq('order_number', resolvedHold)
-      .in('fulfillment_status', ['Open', 'Packed', 'Partial'])
-    console.log('[SS] ORDER_ON_HOLD', resolvedHold)
+    await db.from('sales').update({ fulfillment_status: 'On Hold' }).eq('order_number', ex?.length ? rawNum : '#' + rawNum)
   }
   if (resource_type === 'ORDER_HOLD_RELEASED') {
     const rawNum = data.orderNumber
     const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
-    const resolvedRel = ex?.length ? rawNum : '#' + rawNum
-    await db.from('sales').update({ fulfillment_status: 'Open' })
-      .eq('order_number', resolvedRel)
-      .eq('fulfillment_status', 'On Hold')
-    console.log('[SS] ORDER_HOLD_RELEASED', resolvedRel)
+    await db.from('sales').update({ fulfillment_status: 'Open' }).eq('order_number', ex?.length ? rawNum : '#' + rawNum)
   }
 
   return ok('ok')
@@ -3616,12 +3567,14 @@ supabase functions deploy shipstation-ship --no-verify-jwt</pre>
       &nbsp;· <b>orders/create</b> → <span class="pn" style="color:var(--teal)">${edgeUrl}/shopify-orders</span><br>
       &nbsp;· <b>orders/cancelled</b> → same URL<br>
       &nbsp;· <b>orders/updated</b> → same URL (catches refunds)<br><br>
-      <b>ShipStation</b> → Account Settings → Webhooks → Add Webhook — create one webhook per event:<br>
-      &nbsp;· Event: <b>SHIP_NOTIFY</b> (items shipped / partial shipment) → <span class="pn" style="color:var(--teal)">${edgeUrl}/shipstation-ship</span><br>
-      &nbsp;· Event: <b>ORDER_NOTIFY</b> → same URL (catches hold/release status changes)<br>
-      &nbsp;· Event: <b>NEW_ORDER</b> → same URL (manually-created SS orders)<br>
-      &nbsp;· Event: <b>ORDER_CANCELLED</b> → same URL<br>
-      <span style="color:var(--text3);font-size:10px">ShipStation does not have dedicated hold/release webhook events — hold status is synced automatically when you click 🔄 Sync Orders, or via the Hold Sync button in Integrations.</span>
+      <b>ShipStation</b> → Account Settings → Webhooks → Add Webhook:<br>
+      &nbsp;· <b>On Items Shipped</b> → <span class="pn" style="color:var(--teal)">${edgeUrl}/shipstation-ship</span><br>
+      &nbsp;· <b>On New Orders</b> → same URL (catches manually-created SS orders)<br>
+      &nbsp;· <b>Order_Cancelled</b> → same URL<br>
+      &nbsp;· Event: <b>SHIP_NOTIFY</b> (fires when label created = split-aware)<br>
+      &nbsp;· Event: <b>ORDER_CANCELLED</b><br>
+      &nbsp;· Event: <b>ORDER_ON_HOLD</b> and <b>ORDER_HOLD_RELEASED</b><br>
+      &nbsp;· URL for all: <span class="pn" style="color:var(--teal)">${edgeUrl}/shipstation-ship</span>
     </div>
   </div>`:''}`;
 }
@@ -4294,19 +4247,26 @@ async function syncOrdersNow(){
 
   const edgeBase=SUPA_URL+'/functions/v1';
 
-  // ── Step 1: Query FULL DB for existing (order_number, pn) keys ──
+  // ── Step 1: Query FULL DB for existing (order_number, pn) → status map ──
+  // Uses fetchAll() to paginate past Supabase's server-side max_rows cap.
+  // Stores fulfillment_status so the update path can compare without touching S.sales.
+  // Keys are # -normalized so webhook rows (#1001) and manual rows (1001) don't ghost each other.
   toast('🔄 Checking existing orders…');
-  let existingKeys=new Set();
+  const normOrderNum=n=>(n||'').replace(/^#/,'');
+  const existMapKey=(on,pn)=>normOrderNum(on)+'||'+(pn||'');
+  let existingMap={};   // normalizedKey → fulfillment_status
   try{
-    const{data:existingRows,error}=await db.from('sales').select('order_number,pn').limit(500000);
-    if(!error&&existingRows)existingKeys=new Set(existingRows.map(s=>(s.order_number||'')+'||'+(s.pn||'')));
-    else existingKeys=new Set(S.sales.map(s=>(s.order_number||'')+'||'+(s.pn||'')));
-  }catch(e){existingKeys=new Set(S.sales.map(s=>(s.order_number||'')+'||'+(s.pn||'')));}
+    const existingRows=await fetchAll((f,t)=>db.from('sales').select('order_number,pn,fulfillment_status').range(f,t));
+    for(const r of existingRows) existingMap[existMapKey(r.order_number,r.pn)]=r.fulfillment_status||'Open';
+  }catch(e){
+    toast('⚠ Could not paginate full DB for dedup check — using in-memory fallback (may miss older records)',5000);
+    for(const r of S.sales) existingMap[existMapKey(r.order_number,r.pn)]=r.fulfillment_status||'Open';
+  }
 
   // ── Step 2: Fetch orders via edge function (avoids browser CORS block on Shopify API) ──
   toast('🔄 Fetching from Shopify via edge function…');
   const cutoff=new Date(Date.now()-30*24*60*60*1000).toISOString();
-  let newCount=0,updatedCount=0,pageInfo='',keepGoing=true;
+  let newCount=0,updatedCount=0,page=1,keepGoing=true;
 
   while(keepGoing){
     let resp,orders=[];
@@ -4314,7 +4274,7 @@ async function syncOrdersNow(){
       resp=await fetch(edgeBase+'/shopify-orders',{
         method:'POST',
         headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
-        body:JSON.stringify({action:'sync',store,key,since:cutoff,...(pageInfo?{page_info:pageInfo}:{})})
+        body:JSON.stringify({action:'sync',store,key,since:cutoff,page})
       });
       if(!resp.ok){
         const txt=await resp.text().catch(()=>'');
@@ -4322,7 +4282,7 @@ async function syncOrdersNow(){
           toast('⚠ Shopify rejected the API key — go to Integrations → Shopify, re-enter your Admin API token (starts with shpat_) and save',7000);
           return;
         }
-        if(resp.status===404){
+        if((resp.status===400&&txt.includes('Missing action'))||resp.status===404){
           toast('⚠ Edge function needs updating — copy the new shopify-orders code from Integrations → Setup Guide and redeploy',6000);
           return;
         }
@@ -4338,7 +4298,6 @@ async function syncOrdersNow(){
         toast('Shopify error: '+json.error);break;
       }
       orders=json.orders||[];
-      pageInfo=json.next_page_info||'';
     }catch(e){toast('Network error calling edge function: '+e.message);break;}
 
     if(!orders.length){keepGoing=false;break;}
@@ -4348,12 +4307,13 @@ async function syncOrdersNow(){
       for(const li of (order.line_items||[])){
         const pn=li.sku||li.title;
         if(!pn)continue;
-        const k=(orderNum||'')+'||'+(pn||'');
+        const k=existMapKey(orderNum,pn);
         const fs=order.financial_status==='refunded'?'Cancelled':
           order.fulfillment_status==='fulfilled'?'Delivered':
           order.fulfillment_status==='partial'?'Partial':'Open';
 
-        if(!existingKeys.has(k)){
+        if(!Object.prototype.hasOwnProperty.call(existingMap,k)){
+          // New row — insert it
           const custName=((order.shipping_address?.name||order.billing_address?.name||(order.customer?(order.customer.first_name||'')+' '+(order.customer.last_name||''):''))||'').trim()||null;
           const custEmail=(order.email||order.customer?.email||'')||null;
           const{data}=await db.from('sales').insert({
@@ -4363,35 +4323,42 @@ async function syncOrdersNow(){
             customer_name:custName,
             customer_email:custEmail,
           }).select().single();
-          if(data){existingKeys.add(k);S.sales=[data,...S.sales];newCount++;if(S.view!=='sales')showOrderAlert(orderNum,pn);pushActivity({icon:'🛒',type:'order',text:'New order #'+(orderNum||''),sub:pn+(data.qty>1?' ×'+data.qty:'')+(custName?' — '+custName:''),ts:data.created_at||new Date().toISOString(),cls:'var(--teal)'});}
+          if(data){existingMap[k]=fs;S.sales=[data,...S.sales];newCount++;if(S.view!=='sales')showOrderAlert(orderNum,pn);}
         } else {
-          const mem=S.sales.find(s=>s.order_number===orderNum&&s.pn===pn);
-          if(mem&&mem.fulfillment_status!==fs&&['Open','Partial'].includes(mem.fulfillment_status)){
-            await db.from('sales').update({fulfillment_status:fs}).eq('id',mem.id);
-            S.sales=S.sales.map(s=>s.id===mem.id?{...s,fulfillment_status:fs}:s);
-            updatedCount++;
+          // Row exists — update status if Shopify reports a more terminal state
+          // Use existingMap (full DB) not S.sales (capped at 5000) for comparison
+          const currentFs=existingMap[k]||'Open';
+          if(currentFs!==fs&&['Open','Partial'].includes(currentFs)){
+            const{error:upErr}=await db.from('sales').update({fulfillment_status:fs})
+              .eq('order_number',orderNum).eq('pn',pn)
+              .in('fulfillment_status',['Open','Partial']);
+            if(!upErr){existingMap[k]=fs;updatedCount++;}
           }
         }
       }
     }
-    if(!pageInfo)keepGoing=false; // no next_page_info = last page
+    page++;
+    if(orders.length<250)keepGoing=false;
     if(newCount+updatedCount>0)toast(`🔄 ${newCount} new, ${updatedCount} updated so far…`,1500);
   }
 
-  // ── Step 3: Check ShipStation for held/released orders via edge function ──
-  const ssKeyCheck=(S.shipstation?.key||S.settings?.shipstation?.key||'').trim();
-  if(ssKeyCheck){
+  // ── Step 3: Check ShipStation for held orders (via edge function — browser→SS is CORS-blocked) ──
+  const ssKey=(S.shipstation?.key||S.settings?.shipstation?.key||'').trim();
+  const ssSec=(S.shipstation?.secret||S.settings?.shipstation?.secret||'').trim();
+  if(ssKey&&ssSec){
     try{
-      const holdRes=await fetch(edgeBase+'/shipstation-ship',{
+      toast('🔄 Checking ShipStation for held orders…',1500);
+      const ssHoldRes=await fetch(edgeBase+'/shipstation-ship',{
         method:'POST',
         headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
         body:JSON.stringify({action:'hold_sync'})
       });
-      if(holdRes.ok){
-        const hd=await holdRes.json();
-        updatedCount+=(hd.markedHold||0)+(hd.markedOpen||0);
+      if(ssHoldRes.ok){
+        const holdData=await ssHoldRes.json().catch(()=>({}));
+        if((holdData.markedHold||0)+(holdData.markedOpen||0)>0)
+          updatedCount+=(holdData.markedHold||0)+(holdData.markedOpen||0);
       }
-    }catch(e){console.warn('ShipStation hold sync skipped:',e.message);}
+    }catch(e){console.warn('ShipStation hold check skipped:',e.message);}
   }
 
   await refreshSales();render();
@@ -4401,23 +4368,17 @@ async function syncOrdersNow(){
 async function importOrdersFromShopify(){
   const token=prompt('Paste your Shopify Admin API token (Settings → Apps → Private apps or API credentials):\nNeeded one-time to pull historical orders.');
   if(!token)return;
-  const store=(S.shopify?.store||prompt('Your store URL (e.g. mystore.myshopify.com):')||'').trim();
+  const store=S.shopify?.store||prompt('Your store URL (e.g. mystore.myshopify.com):');
   if(!store)return;
   toast('Fetching orders from Shopify… this may take a moment');
-  let imported=0,skipped=0,importPageInfo='',keepGoing=true;
+  let imported=0,skipped=0,page=1,keepGoing=true;
   while(keepGoing){
     try{
-      // Route through edge function — direct browser calls are CORS-blocked by Shopify
-      const res=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{
-        method:'POST',
-        headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
-        body:JSON.stringify({action:'sync',store,key:token,...(importPageInfo?{page_info:importPageInfo}:{since:'2000-01-01T00:00:00Z'})})
+      const res=await fetch(`https://${store.replace(/^https?:\/\//,'')}/admin/api/2024-01/orders.json?status=any&limit=250&page=${page}`,{
+        headers:{'X-Shopify-Access-Token':token,'Content-Type':'application/json'}
       });
       if(!res.ok){toast('Shopify error '+res.status+' — check token and store URL');break;}
-      const json=await res.json().catch(()=>({}));
-      if(json.error){toast('Shopify error: '+json.error);break;}
-      const orders=json.orders||[];
-      importPageInfo=json.next_page_info||'';
+      const {orders=[]}=await res.json();
       if(!orders.length){keepGoing=false;break;}
       for(const order of orders){
         const orderNum=order.name;
@@ -4438,8 +4399,9 @@ async function importOrdersFromShopify(){
           if(data){S.sales=[data,...S.sales];imported++;}
         }
       }
-      if(!importPageInfo)keepGoing=false;
-      toast(`Importing… ${imported} orders pulled so far…`);
+      page++;
+      if(orders.length<250)keepGoing=false;
+      toast(`Importing… ${imported} orders pulled so far (page ${page-1})`);
     }catch(e){toast('Error: '+e.message);keepGoing=false;}
   }
   await loadAll();render();
@@ -6744,7 +6706,7 @@ function buildActivityFeed(limit){
   });
 
   // 3. Recent sales orders (new orders + shipped)
-  const recentSales=[...S.sales].sort((a,b)=>new Date(b.created_at||b.sale_date||0)-new Date(a.created_at||a.sale_date||0)).slice(0,20);
+  const recentSales=[...S.sales].sort((a,b)=>new Date(b.sale_date||0)-new Date(a.sale_date||0)).slice(0,20);
   recentSales.forEach(s=>{
     const fs=s.fulfillment_status||'Open';
     if(fs==='Shipped'||fs==='Delivered'){
