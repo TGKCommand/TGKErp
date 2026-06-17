@@ -718,7 +718,7 @@ async function loadAll(){
     const[parts,assemblies,sales,purchases,dealers,vendors,settings,bomItems,warrantyClaims,shipmentErrors,corrections,cycleCounts,poLinesAll,poTrackingAll]=await Promise.all([
       db.from('parts').select('*').order('pn'),
       db.from('assemblies').select('*').order('pn'),
-      db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000),
+      db.from('sales').select('*').order('created_at',{ascending:false}).limit(5000),
       db.from('purchases').select('*').order('order_date',{ascending:false}),
       db.from('dealers').select('*').order('name'),
       db.from('vendors').select('*').order('name'),
@@ -1876,7 +1876,6 @@ function renderSales(){
   // Group multi-line orders → one row per order number
   // Internal orders (WARRANTY- / SHERROR-) are handled in their own modules — exclude from Sales view
   function isInternal(on){return(on||'').startsWith('WARRANTY-')||(on||'').startsWith('SHERROR-');}
-  function orderNumVal(on){return parseInt((on||'').replace(/^#/,''))||0;}
   function groupSales(rows){
     const groups={},noNum=[];
     rows.forEach(s=>{
@@ -1894,17 +1893,16 @@ function renderSales(){
         const shippedLines=lines.filter(l=>l.fulfillment_status==='Shipped'||l.fulfillment_status==='Delivered');
         const pendingLines=lines.filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
         const isPartial=shippedLines.length>0&&pendingLines.length>0;
+        // Use earliest created_at across all lines as the order timestamp
+        const orderTs=lines.reduce((earliest,s)=>s.created_at&&(!earliest||s.created_at<earliest)?s.created_at:earliest,'');
         return{...lead,_grouped:true,_lineCount:lines.length,_allLines:lines,qty:totalQty,pn:'Multiple',
           fulfillment_status:isPartial?'Partial':lead.fulfillment_status,
-          _isPartialShip:isPartial,_shippedCount:shippedLines.length,_pendingCount:pendingLines.length};
+          _isPartialShip:isPartial,_shippedCount:shippedLines.length,_pendingCount:pendingLines.length,
+          created_at:orderTs||lead.created_at};
       }),
       ...noNum
-      // Sort by order number numerically descending — higher number = newer order
-    ].sort((a,b)=>{
-      const na=orderNumVal(a.order_number),nb=orderNumVal(b.order_number);
-      if(nb!==na)return nb-na;
-      return new Date(b.sale_date||0)-new Date(a.sale_date||0);
-    });
+      // Sort by created_at (full ISO timestamp — date + time) descending: most recent first
+    ].sort((a,b)=>new Date(b.created_at||b.sale_date||0)-new Date(a.created_at||a.sale_date||0));
   }
 
   let list=groupSales(S.sales);
@@ -1984,7 +1982,7 @@ function renderSales(){
     const multiTrack=s._grouped&&allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length>1;
     const custName=s.customer_name||(s._grouped?S.sales.find(x=>x.order_number===s.order_number&&x.customer_name)?.customer_name:'');
     return `<tr class="rowlink" data-order="${escHtml(s.order_number||s.id)}" onclick="rowClick(event,function(){S.activeSale='${s.id}';pushHist();render()})">
-    <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${s.sale_date?s.sale_date.slice(0,10):''}</td>
+    <td style="font-size:10px;color:var(--text3);font-family:var(--mono);white-space:nowrap">${(()=>{const ts=s.created_at||s.sale_date;if(!ts)return'—';const d=new Date(ts);const dt=d.toLocaleDateString('en-US',{month:'2-digit',day:'2-digit',year:'2-digit'});const tm=s.created_at?d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}):'';return dt+(tm?`<div style="font-size:9px;opacity:.65">${tm}</div>`:'');})()}</td>
     <td class="pn">${s.order_number||''}${s._grouped?` <span style="font-size:9px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 5px;border-radius:8px;font-family:var(--mono);font-weight:600">${s._lineCount} items</span>`:''}</td>
     <td style="font-size:11px;color:var(--text2);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(custName||'—')}</td>
     <td class="pn" style="color:${s._grouped?'var(--text3)':'var(--teal)'}">${s._grouped?'Multiple SKUs':s.pn}</td>
@@ -10601,7 +10599,7 @@ function render(){
 
 // ── TARGETED TABLE REFRESH (avoids full loadAll on minor changes) ──
 async function refreshSales(){
-  const{data}=await db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000);
+  const{data}=await db.from('sales').select('*').order('created_at',{ascending:false}).limit(5000);
   if(data)S.sales=data;
   computeDemand();updateBadge();
 }
