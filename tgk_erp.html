@@ -1874,9 +1874,13 @@ function renderSales(){
   if(S.activeSale){const s=S.sales.find(x=>x.id===S.activeSale);if(s)return renderSaleDetail(s);}
 
   // Group multi-line orders → one row per order number
+  // Internal orders (WARRANTY- / SHERROR-) are handled in their own modules — exclude from Sales view
+  function isInternal(on){return(on||'').startsWith('WARRANTY-')||(on||'').startsWith('SHERROR-');}
+  function orderNumVal(on){return parseInt((on||'').replace(/^#/,''))||0;}
   function groupSales(rows){
     const groups={},noNum=[];
     rows.forEach(s=>{
+      if(isInternal(s.order_number))return; // skip warranty & shipment-error orders
       if(!s.order_number){noNum.push(s);return;}
       (groups[s.order_number]=groups[s.order_number]||[]).push(s);
     });
@@ -1895,7 +1899,12 @@ function renderSales(){
           _isPartialShip:isPartial,_shippedCount:shippedLines.length,_pendingCount:pendingLines.length};
       }),
       ...noNum
-    ].sort((a,b)=>new Date(b.sale_date||0)-new Date(a.sale_date||0));
+      // Sort by order number numerically descending — higher number = newer order
+    ].sort((a,b)=>{
+      const na=orderNumVal(a.order_number),nb=orderNumVal(b.order_number);
+      if(nb!==na)return nb-na;
+      return new Date(b.sale_date||0)-new Date(a.sale_date||0);
+    });
   }
 
   let list=groupSales(S.sales);
@@ -1903,13 +1912,14 @@ function renderSales(){
   const q=(sf.search||S.searchQ||'').toLowerCase();
   if(q)list=list.filter(s=>s.pn.toLowerCase().includes(q)||(s.order_number||'').toLowerCase().includes(q)||(s.source||'').toLowerCase().includes(q)||(s.customer_name||'').toLowerCase().includes(q));
   if(sf.fstatus)list=list.filter(s=>(s.fulfillment_status||'Open')===sf.fstatus);
-  const open=S.sales.filter(s=>!s.fulfillment_status||s.fulfillment_status==='Open');
-  const onHold=S.sales.filter(s=>s.fulfillment_status==='On Hold');
+  const realSales=S.sales.filter(s=>!isInternal(s.order_number));
+  const open=realSales.filter(s=>!s.fulfillment_status||s.fulfillment_status==='Open');
+  const onHold=realSales.filter(s=>s.fulfillment_status==='On Hold');
   const freshOpen=open.filter(s=>!s.sale_date||s.sale_date>=daysAgo(60));
   const staleOpen=open.filter(s=>s.sale_date&&s.sale_date<daysAgo(60));
-  const packed=S.sales.filter(s=>s.fulfillment_status==='Packed');
-  const shipped7=S.sales.filter(s=>s.fulfillment_status==='Shipped'&&s.shipped_at&&s.shipped_at.slice(0,10)>=daysAgo(7));
-  const rev7=S.sales.filter(s=>s.sale_date>=daysAgo(7)).reduce((t,s)=>{const a=S.assemblies.find(x=>x.pn===s.pn);return t+((a?.msrp||0)*(s.qty||1));},0);
+  const packed=realSales.filter(s=>s.fulfillment_status==='Packed');
+  const shipped7=realSales.filter(s=>s.fulfillment_status==='Shipped'&&s.shipped_at&&s.shipped_at.slice(0,10)>=daysAgo(7));
+  const rev7=realSales.filter(s=>s.sale_date>=daysAgo(7)).reduce((t,s)=>{const a=S.assemblies.find(x=>x.pn===s.pn);return t+((a?.msrp||0)*(s.qty||1));},0);
   const fstats=['Open','Pre-order','On Hold','Packed','Partial','Shipped','Delivered','Returned','Refunded','Cancelled'];
 
   // Detect split-shipped orders: any grouped order that has lines in different shipment states
@@ -3478,6 +3488,8 @@ Deno.serve(async (req) => {
         date: (o.orderDate || '').slice(0, 10),
         customer: o.shipTo?.name || '',
         status: o.orderStatus,
+        tracking: o.trackingNumber || '',
+        carrier: (o.carrierCode || '').toUpperCase(),
         items: (o.items || []).map((i: any) => ({ sku: i.sku || i.name, qty: i.quantity || 1 }))
       }))
     })
@@ -3503,6 +3515,8 @@ Deno.serve(async (req) => {
           source: 'ShipStation Import',
           sale_date: order.date || new Date().toISOString().slice(0, 10),
           customer_name: order.customer || null,
+          tracking_number: order.tracking || null,
+          carrier: order.carrier || null,
         })
         imported++
       }
