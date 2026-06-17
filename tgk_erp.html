@@ -657,6 +657,40 @@ const FS_MAP={
 function fsPill(fs){
   return `<span class="pill ${FS_MAP[fs]||'pill-muted'}">${fs||'Open'}</span>`;
 }
+// Internal orders live in their own modules — exclude from Sales view and counts
+function isInternal(on){return(on||'').startsWith('WARRANTY-')||(on||'').startsWith('SHERROR-');}
+// Count unique pending orders (grouped by order_number) — Open + Partial
+// Used by updateBadge and renderDashboard so numbers match what renderSales shows
+function countPendingOrders(){
+  const openNums=new Set();
+  S.sales.forEach(s=>{
+    if(isInternal(s.order_number))return;
+    const fs=s.fulfillment_status||'Open';
+    if(fs==='Open'||fs==='Partial')openNums.add(s.order_number||('__noid__'+s.id));
+  });
+  return openNums.size;
+}
+function countGroupedStatus(status){
+  // Count unique order numbers (or individual rows if no order#) with a given status
+  // For multi-line orders the effective status is determined the same way groupSales does it:
+  // highest-ranked line wins. This fast path just checks if ANY line matches for single-status needs.
+  const rank={'Shipped':5,'Delivered':4,'Packed':3,'On Hold':2,'Partial':2,'Open':1,'Cancelled':0,'Refunded':0};
+  const byOrder={};
+  S.sales.forEach(s=>{
+    if(isInternal(s.order_number))return;
+    const key=s.order_number||('__noid__'+s.id);
+    if(!byOrder[key])byOrder[key]=[];
+    byOrder[key].push(s);
+  });
+  return Object.values(byOrder).filter(lines=>{
+    if(lines.length===1)return(lines[0].fulfillment_status||'Open')===status;
+    const shippedLines=lines.filter(l=>l.fulfillment_status==='Shipped'||l.fulfillment_status==='Delivered');
+    const pendingLines=lines.filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
+    const effectiveStatus=shippedLines.length>0&&pendingLines.length>0?'Partial':
+      lines.reduce((best,x)=>(rank[x.fulfillment_status||'Open']||0)>(rank[best]||0)?x.fulfillment_status:best,lines[0].fulfillment_status||'Open');
+    return effectiveStatus===status;
+  }).length;
+}
 
 function toast(msg){
   const el=$('toast');el.textContent=msg;el.classList.add('show');
@@ -677,8 +711,8 @@ function updateBadge(){
   if(wb){wb.textContent=totalOpen;wb.style.display=totalOpen?'inline':'none';}
   const wEl=$('nav-warranty');
   if(wEl){wEl.classList.toggle('alert-nav',totalOpen>0);}
-  // Sales badge — open orders
-  const openSales=S.sales.filter(s=>!s.fulfillment_status||s.fulfillment_status==='Open').length;
+  // Sales badge — pending orders (grouped, matches what renderSales shows)
+  const openSales=countPendingOrders();
   const sb=$('sales-badge');
   if(sb){sb.textContent=openSales;sb.style.display=openSales>0?'inline':'none';}
 }
@@ -1232,13 +1266,19 @@ function renderDashboard(){
   const critical=S.assemblies.filter(a=>!a.discontinued&&liveStatus(a)==='critical').length;
   const needsReorder=S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||calcForecast(p.pn)>0)&&(p.total_unpckgd||0)<=calcReorderPoint(p)).length;
   const invVal=S.parts.reduce((s,p)=>s+Math.max(0,p.total_unpckgd||0)*(p.unit_cost||0),0);
-  // Separate Open (needs action) from On Hold (intentionally waiting)
-  const openOrders=S.sales.filter(s=>!s.fulfillment_status||s.fulfillment_status==='Open');
-  const onHoldOrders=S.sales.filter(s=>s.fulfillment_status==='On Hold');
-  const packedOrders=S.sales.filter(s=>s.fulfillment_status==='Packed');
-  // Stale open orders: Open but sale_date older than 60 days — likely historical/pre-system
-  const staleOpen=openOrders.filter(s=>s.sale_date&&s.sale_date<daysAgo(60));
-  const freshOpen=openOrders.filter(s=>!s.sale_date||s.sale_date>=daysAgo(60));
+  // Use grouped counts so numbers match exactly what the Sales page shows
+  const openOrders  =countGroupedStatus('Open');
+  const onHoldCount =countGroupedStatus('On Hold');
+  const packedCount =countGroupedStatus('Packed');
+  const partialCount=countGroupedStatus('Partial');
+  // Stale: grouped open orders where the lead line's sale_date is older than 60 days
+  // (approximation: count raw Open lines with stale dates, then deduplicate by order#)
+  const staleOpenNums=new Set(S.sales.filter(s=>!isInternal(s.order_number)&&(!s.fulfillment_status||s.fulfillment_status==='Open')&&s.sale_date&&s.sale_date<daysAgo(60)).map(s=>s.order_number||('__noid__'+s.id)));
+  const staleOpen=staleOpenNums.size;
+  const freshOpen=Math.max(0,openOrders-staleOpen);
+  // Fulfillment queue widget still uses raw lines (needs individual IDs for Pack/Ship buttons)
+  const freshOpenLines=S.sales.filter(s=>!isInternal(s.order_number)&&(!s.fulfillment_status||s.fulfillment_status==='Open')&&(!s.sale_date||s.sale_date>=daysAgo(60)));
+  const packedLines   =S.sales.filter(s=>!isInternal(s.order_number)&&s.fulfillment_status==='Packed');
   const openWarranty=S.warrantyClaims.filter(w=>w.status==='Open').length;
   const openCounts=S.cycleCounts.filter(c=>c.status==='Open').length;
   const weekOrds=S.sales.filter(s=>s.sale_date>=daysAgo(7)).length;
@@ -1247,17 +1287,17 @@ function renderDashboard(){
   const feed=buildActivityFeed(12);
   return `
   <div class="kpi-grid kpi-grid-4">
-    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','Open');nav('sales')">
+    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','Open|Partial');nav('sales')" title="Open + Partial orders">
       <div class="kpi-label">Orders to Fulfill</div>
-      <div class="kpi-value">${freshOpen.length}</div>
-      <div class="kpi-sub">${packedOrders.length} packed · ${onHoldOrders.length} on hold</div>
+      <div class="kpi-value">${freshOpen+partialCount}</div>
+      <div class="kpi-sub">${packedCount} packed · ${onHoldCount} on hold</div>
     </div>
     <div class="kpi kpi-orange" style="cursor:pointer" onclick="nav('planning')"><div class="kpi-label">Parts Need Reorder</div><div class="kpi-value">${needsReorder}</div><div class="kpi-sub">Below reorder point</div></div>
     <div class="kpi kpi-yellow" style="cursor:pointer" onclick="nav('assemblies')"><div class="kpi-label">Critical Assemblies</div><div class="kpi-value">${critical}</div></div>
     <div class="kpi kpi-teal"><div class="kpi-label">Parts Inventory Value</div><div class="kpi-value" style="font-size:17px">${fc(invVal)}</div><div class="kpi-sub">${weekOrds} orders this week</div></div>
   </div>
-  ${staleOpen.length>20?`<div class="panel" style="padding:10px 18px;display:flex;gap:12px;align-items:center;border-left:3px solid var(--red);flex-wrap:wrap">
-    <span style="font-size:12px;color:var(--red);font-weight:700">⚠ ${staleOpen.length} stale Open orders</span>
+  ${staleOpen>20?`<div class="panel" style="padding:10px 18px;display:flex;gap:12px;align-items:center;border-left:3px solid var(--red);flex-wrap:wrap">
+    <span style="font-size:12px;color:var(--red);font-weight:700">⚠ ${staleOpen} stale Open orders</span>
     <span style="font-size:11px;color:var(--text2);flex:1">Orders older than 60 days still showing as Open — likely fulfilled before the ERP existed.</span>
     <button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="closeHistoricalOrders()">🧹 Close old orders</button>
   </div>`:''}
@@ -1270,8 +1310,8 @@ function renderDashboard(){
   <div>
     <div class="panel">
       <div class="panel-title"><span class="panel-title-left">🚚 Fulfillment Queue</span><button class="btn btn-sm" onclick="nav('sales')">All Orders →</button></div>
-      ${freshOpen.length===0&&packedOrders.length===0?'<div class="section-empty">All orders fulfilled ✓</div>':
-      [...freshOpen.slice(0,4),...packedOrders.slice(0,3)].map(s=>{
+      ${freshOpenLines.length===0&&packedLines.length===0?'<div class="section-empty">All orders fulfilled ✓</div>':
+      [...freshOpenLines.slice(0,4),...packedLines.slice(0,3)].map(s=>{
         const asm=S.assemblies.find(a=>a.pn===s.pn);
         const stock=asm?(asm.total_on_hand||0):null;
         const canFill=stock!==null&&stock>=(s.qty||1);
@@ -1874,8 +1914,7 @@ function renderSales(){
   if(S.activeSale){const s=S.sales.find(x=>x.id===S.activeSale);if(s)return renderSaleDetail(s);}
 
   // Group multi-line orders → one row per order number
-  // Internal orders (WARRANTY- / SHERROR-) are handled in their own modules — exclude from Sales view
-  function isInternal(on){return(on||'').startsWith('WARRANTY-')||(on||'').startsWith('SHERROR-');}
+  // isInternal() is a global helper — WARRANTY-/SHERROR- orders live in their own modules
   function groupSales(rows){
     const groups={},noNum=[];
     rows.forEach(s=>{
@@ -1894,30 +1933,50 @@ function renderSales(){
         const pendingLines=lines.filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
         const isPartial=shippedLines.length>0&&pendingLines.length>0;
         // Use earliest created_at across all lines as the order timestamp
-        const orderTs=lines.reduce((earliest,s)=>s.created_at&&(!earliest||s.created_at<earliest)?s.created_at:earliest,'');
+        // Use earliest sale_date (actual order date) across lines; fall back to created_at (DB insert time)
+        const orderTs=lines.reduce((earliest,s)=>{const ts=s.sale_date||s.created_at;return ts&&(!earliest||ts<earliest)?ts:earliest;},'');
         return{...lead,_grouped:true,_lineCount:lines.length,_allLines:lines,qty:totalQty,pn:'Multiple',
           fulfillment_status:isPartial?'Partial':lead.fulfillment_status,
           _isPartialShip:isPartial,_shippedCount:shippedLines.length,_pendingCount:pendingLines.length,
           created_at:orderTs||lead.created_at};
       }),
       ...noNum
-      // Sort by created_at (full ISO timestamp — date + time) descending: most recent first
-    ].sort((a,b)=>new Date(b.created_at||b.sale_date||0)-new Date(a.created_at||a.sale_date||0));
+      // Sort by sale_date (actual order date) descending — fall back to created_at only for orders with no sale_date
+    ].sort((a,b)=>new Date(b.sale_date||b.created_at||0)-new Date(a.sale_date||a.created_at||0));
   }
 
-  let list=groupSales(S.sales);
+  // ── SINGLE SOURCE OF TRUTH: group once, derive everything from it ──────────
+  // KPIs and the list BOTH come from allGrouped so the numbers always match.
+  const allGrouped=groupSales(S.sales);
+
   const sf=S.filters.sales||{};
   const q=(sf.search||S.searchQ||'').toLowerCase();
+
+  // Build filtered list — supports pipe-separated multi-status e.g. 'Open|Partial'
+  let list=allGrouped;
   if(q)list=list.filter(s=>s.pn.toLowerCase().includes(q)||(s.order_number||'').toLowerCase().includes(q)||(s.source||'').toLowerCase().includes(q)||(s.customer_name||'').toLowerCase().includes(q));
-  if(sf.fstatus)list=list.filter(s=>(s.fulfillment_status||'Open')===sf.fstatus);
-  const realSales=S.sales.filter(s=>!isInternal(s.order_number));
-  const open=realSales.filter(s=>!s.fulfillment_status||s.fulfillment_status==='Open');
-  const onHold=realSales.filter(s=>s.fulfillment_status==='On Hold');
-  const freshOpen=open.filter(s=>!s.sale_date||s.sale_date>=daysAgo(60));
-  const staleOpen=open.filter(s=>s.sale_date&&s.sale_date<daysAgo(60));
-  const packed=realSales.filter(s=>s.fulfillment_status==='Packed');
-  const shipped7=realSales.filter(s=>s.fulfillment_status==='Shipped'&&s.shipped_at&&s.shipped_at.slice(0,10)>=daysAgo(7));
-  const rev7=realSales.filter(s=>s.sale_date>=daysAgo(7)).reduce((t,s)=>{const a=S.assemblies.find(x=>x.pn===s.pn);return t+((a?.msrp||0)*(s.qty||1));},0);
+  if(sf.fstatus){
+    const allowed=new Set(sf.fstatus.split('|'));
+    list=list.filter(s=>allowed.has(s.fulfillment_status||'Open'));
+  }
+
+  // KPIs — all derived from allGrouped (same as the list, just unfiltered)
+  const openOrders   =allGrouped.filter(s=>(s.fulfillment_status||'Open')==='Open');
+  const partialOrders=allGrouped.filter(s=>s.fulfillment_status==='Partial');
+  const onHoldOrders =allGrouped.filter(s=>s.fulfillment_status==='On Hold');
+  const packedOrders =allGrouped.filter(s=>s.fulfillment_status==='Packed');
+  const preOrders    =allGrouped.filter(s=>s.fulfillment_status==='Pre-order');
+  const freshOpen    =openOrders.filter(s=>!s.sale_date||s.sale_date>=daysAgo(60));
+  const staleOpen    =openOrders.filter(s=>s.sale_date&&s.sale_date<daysAgo(60));
+  const shipped7     =allGrouped.filter(s=>s.fulfillment_status==='Shipped'&&s.shipped_at&&s.shipped_at.slice(0,10)>=daysAgo(7));
+  const delivered7   =allGrouped.filter(s=>s.fulfillment_status==='Delivered'&&s.shipped_at&&s.shipped_at.slice(0,10)>=daysAgo(7));
+  // Revenue uses raw lines — each SKU line contributes its own value
+  const rev7=S.sales.filter(s=>!isInternal(s.order_number)&&(s.sale_date||'')>=daysAgo(7))
+    .reduce((t,s)=>{const a=S.assemblies.find(x=>x.pn===s.pn);return t+((a?.msrp||0)*(s.qty||1));},0);
+
+  // "Needs action" = Open + Partial orders (has unfulfilled items)
+  const needsActionStatuses='Open|Partial';
+
   const fstats=['Open','Pre-order','On Hold','Packed','Partial','Shipped','Delivered','Returned','Refunded','Cancelled'];
 
   // Detect split-shipped orders: any grouped order that has lines in different shipment states
@@ -1930,19 +1989,33 @@ function renderSales(){
     return shipped&&open;
   }
 
+  const awaitingSub=(()=>{
+    const parts=[];
+    if(staleOpen.length)parts.push(`<span style="color:var(--text3)">${staleOpen.length} stale</span>`);
+    if(partialOrders.length)parts.push(`${partialOrders.length} partial`);
+    if(packedOrders.length)parts.push(`${packedOrders.length} packed`);
+    return parts.length?parts.join(' · '):'Ready to pack';
+  })();
+
+  // Filter chip active-state helper (handles single or multi-status filter values)
+  function chipActive(status){
+    if(!sf.fstatus)return false;
+    return sf.fstatus.split('|').includes(status);
+  }
+
   return `
   <div class="kpi-grid kpi-grid-4">
-    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','Open')">
+    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','${needsActionStatuses}')" title="Show Open + Partial orders">
       <div class="kpi-label">Awaiting Fulfillment</div>
-      <div class="kpi-value">${freshOpen.length}</div>
-      <div class="kpi-sub">${staleOpen.length>0?`<span style="color:var(--text3)">${staleOpen.length} stale (60+ days)</span>`:'Ready to pack'}</div>
+      <div class="kpi-value">${freshOpen.length+partialOrders.length}</div>
+      <div class="kpi-sub">${awaitingSub}</div>
     </div>
     <div class="kpi kpi-orange" style="cursor:pointer" onclick="setFilter('sales','fstatus','On Hold')">
       <div class="kpi-label">On Hold</div>
-      <div class="kpi-value">${onHold.length}</div>
-      <div class="kpi-sub">${packed.length} packed ready to ship</div>
+      <div class="kpi-value">${onHoldOrders.length}</div>
+      <div class="kpi-sub">${preOrders.length?preOrders.length+' pre-order':'Awaiting release'}</div>
     </div>
-    <div class="kpi kpi-teal"><div class="kpi-label">Shipped — 7 Days</div><div class="kpi-value">${shipped7.length}</div><div class="kpi-sub">${S.sales.filter(s=>s.fulfillment_status==='Delivered'&&s.delivered_at&&s.delivered_at.slice(0,10)>=daysAgo(7)).length} delivered</div></div>
+    <div class="kpi kpi-teal"><div class="kpi-label">Shipped — 7 Days</div><div class="kpi-value">${shipped7.length}</div><div class="kpi-sub">${delivered7.length} delivered</div></div>
     <div class="kpi kpi-green"><div class="kpi-label">Est. Revenue — 7 Days</div><div class="kpi-value" style="font-size:17px">${fc(rev7)}</div></div>
   </div>
   ${staleOpen.length>10?`<div class="panel" style="padding:10px 18px;display:flex;gap:12px;align-items:center;border-left:3px solid var(--orange);flex-wrap:wrap">
@@ -1961,7 +2034,7 @@ function renderSales(){
       <input placeholder="Order #, SKU or customer name…" value="${sf.search||''}" oninput="setFilter('sales','search',this.value)">
     </div>
     <button class="filter-chip ${!sf.fstatus?'on-teal':''}" onclick="setFilter('sales','fstatus','')">All</button>
-    ${fstats.map(s=>`<button class="filter-chip ${sf.fstatus===s?'on-teal':''}" onclick="setFilter('sales','fstatus','${s}')">${s}</button>`).join('')}
+    ${fstats.map(s=>`<button class="filter-chip ${chipActive(s)?'on-teal':''}" onclick="setFilter('sales','fstatus','${s}')">${s}</button>`).join('')}
     <button class="btn btn-sm" style="margin-left:auto" title="Remove duplicate order lines (same order # + SKU). Tracking numbers on surviving rows are always preserved — tracking is rescued from duplicates before they are deleted." onclick="dedupeOrders()">🧽 Dedupe & Recover Tracking</button>
     <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="syncOrdersNow()" title="Pull new orders from Shopify + check ShipStation for holds/splits">🔄 Sync Orders</button>
     <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="ssOrderAudit()" title="Find ShipStation orders missing from ERP and import them">📦 SS Audit</button>
@@ -1982,7 +2055,7 @@ function renderSales(){
     const multiTrack=s._grouped&&allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length>1;
     const custName=s.customer_name||(s._grouped?S.sales.find(x=>x.order_number===s.order_number&&x.customer_name)?.customer_name:'');
     return `<tr class="rowlink" data-order="${escHtml(s.order_number||s.id)}" onclick="rowClick(event,function(){S.activeSale='${s.id}';pushHist();render()})">
-    <td style="font-size:10px;color:var(--text3);font-family:var(--mono);white-space:nowrap">${(()=>{const ts=s.created_at||s.sale_date;if(!ts)return'—';const d=new Date(ts);const dt=d.toLocaleDateString('en-US',{month:'2-digit',day:'2-digit',year:'2-digit'});const tm=s.created_at?d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}):'';return dt+(tm?`<div style="font-size:9px;opacity:.65">${tm}</div>`:'');})()}</td>
+    <td style="font-size:10px;color:var(--text3);font-family:var(--mono);white-space:nowrap">${(()=>{const ts=s.sale_date||s.created_at;if(!ts)return'—';const d=new Date(ts);const dt=d.toLocaleDateString('en-US',{month:'2-digit',day:'2-digit',year:'2-digit'});const tm=(!s.sale_date&&s.created_at)?d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}):'';return dt+(tm?`<div style="font-size:9px;opacity:.65">${tm}</div>`:'');})()}</td>
     <td class="pn">${s.order_number||''}${s._grouped?` <span style="font-size:9px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 5px;border-radius:8px;font-family:var(--mono);font-weight:600">${s._lineCount} items</span>`:''}</td>
     <td style="font-size:11px;color:var(--text2);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(custName||'—')}</td>
     <td class="pn" style="color:${s._grouped?'var(--text3)':'var(--teal)'}">${s._grouped?'Multiple SKUs':s.pn}</td>
