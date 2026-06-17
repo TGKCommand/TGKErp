@@ -3070,6 +3070,7 @@ Deno.serve(async (req) => {
   }
 
   // Sync proxy: browser calls this to pull orders from Shopify (avoids CORS)
+  // Uses cursor-based page_info pagination — the deprecated page= param fails on Shopify 2024-01
   if (body.action === 'sync') {
     const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
     const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
@@ -3077,13 +3078,26 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({error:'Missing credentials'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
     }
     const since = body.since || new Date(Date.now() - 30*24*60*60*1000).toISOString()
-    const page = body.page || 1
-    const url = 'https://' + store + '/admin/api/2024-01/orders.json?status=any&limit=250&updated_at_min=' + since + '&page=' + page
+    const page_info = body.page_info || ''
+    // First call: filter by date. Subsequent calls: use cursor (cannot mix page_info with other params)
+    const url = page_info
+      ? 'https://' + store + '/admin/api/2024-01/orders.json?limit=250&page_info=' + page_info
+      : 'https://' + store + '/admin/api/2024-01/orders.json?status=any&limit=250&updated_at_min=' + encodeURIComponent(since)
     const shopRes = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
     if (!shopRes.ok) {
       return new Response(JSON.stringify({error:'Shopify ' + shopRes.status}), {status:shopRes.status, headers:{...CORS,'Content-Type':'application/json'}})
     }
-    return new Response(await shopRes.text(), {headers:{...CORS,'Content-Type':'application/json'}})
+    // Parse next cursor from Link header so the client can fetch the next page
+    const link = shopRes.headers.get('link') || ''
+    let next_page_info = ''
+    for (const part of link.split(',')) {
+      if (part.includes('rel="next"')) {
+        const m = part.match(/page_info=([^&>"]+)/)
+        if (m) { next_page_info = m[1]; break }
+      }
+    }
+    const payload = await shopRes.json()
+    return new Response(JSON.stringify({...payload, next_page_info}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
 
   // Image sync (single page): frontend calls repeatedly with page_info until done
@@ -3147,9 +3161,14 @@ Deno.serve(async (req) => {
       const custName = (order.shipping_address?.name || order.billing_address?.name || (order.customer ? (order.customer.first_name||'')+' '+(order.customer.last_name||'') : '')).trim()
       const custEmail = order.email || order.customer?.email || ''
       for (const li of (order.line_items || [])) {
+        const pn = li.sku || li.title
+        if (!pn) continue
+        // Dedup: skip if this (order_number, pn) already exists — prevents double-inserts on Shopify retries
+        const { data: existing } = await db.from('sales').select('id').eq('order_number', order.name).eq('pn', pn).limit(1)
+        if (existing?.length) { console.log('[shopify-orders] skipping duplicate', order.name, pn); continue }
         await db.from('sales').insert({
           order_number: order.name,
-          pn: li.sku || li.title,
+          pn,
           qty: li.quantity || 1,
           source: 'Shopify',
           fulfillment_status: 'Open',
@@ -4264,18 +4283,19 @@ async function syncOrdersNow(){
   }
 
   // ── Step 2: Fetch orders via edge function (avoids browser CORS block on Shopify API) ──
+  // Uses cursor-based page_info — the deprecated page= param fails on Shopify 2024-01 for page 2+
   toast('🔄 Fetching from Shopify via edge function…');
   const cutoff=new Date(Date.now()-90*24*60*60*1000).toISOString(); // 90-day window
-  let newCount=0,updatedCount=0,page=1,keepGoing=true;
+  let newCount=0,updatedCount=0,page_info='',keepGoing=true;
   const addedOrders=[]; // collect details for the results modal
 
   while(keepGoing){
-    let resp,orders=[];
+    let resp,orders=[],json={};
     try{
       resp=await fetch(edgeBase+'/shopify-orders',{
         method:'POST',
         headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
-        body:JSON.stringify({action:'sync',store,key,since:cutoff,page})
+        body:JSON.stringify({action:'sync',store,key,since:cutoff,page_info})
       });
       if(!resp.ok){
         const txt=await resp.text().catch(()=>'');
@@ -4290,7 +4310,7 @@ async function syncOrdersNow(){
         toast('Sync error '+resp.status+': '+txt.slice(0,200));
         break;
       }
-      const json=await resp.json().catch(()=>({}));
+      json=await resp.json().catch(()=>({}));
       if(json.error){
         if(json.error.includes('401')||json.error.includes('Unauthorized')){
           toast('⚠ Shopify rejected the API key — check your Admin API token in Integrations → Shopify',7000);
@@ -4344,8 +4364,9 @@ async function syncOrdersNow(){
         }
       }
     }
-    page++;
-    if(orders.length<250)keepGoing=false;
+    // Advance to next page using cursor returned by edge function
+    page_info=json.next_page_info||'';
+    if(!page_info||!orders.length)keepGoing=false;
     if(newCount+updatedCount>0)toast(`🔄 ${newCount} new, ${updatedCount} updated so far…`,1500);
   }
 
