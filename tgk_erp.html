@@ -507,6 +507,7 @@ const S = {
   selectedParts:new Set(), selectedAsms:new Set(), bulkEditMode:null,
   workOrderMode:false, workOrderBuilds:{},
   pendingBOMLines:[],
+  syncLocked:new Set(), // order numbers locked from Shopify sync overwrite
   pendingPriceBreaks:[],
   // Cycle counts
   cycleCounts:[], activeCount:null, countLines:[],
@@ -779,6 +780,8 @@ async function loadAll(){
     if(S.settings.shipstation)Object.assign(S.shipstation,S.settings.shipstation);
     if(S.settings.custom_cats){try{Object.assign(S.customCats,S.settings.custom_cats);}catch(e){}}
     if(S.settings.custom_vendors){try{S.customVendors=S.settings.custom_vendors||[];}catch(e){}}
+    // Sync lock: orders edited in ERP that should never be overwritten by Shopify sync
+    if(S.settings.sync_locked){try{S.syncLocked=new Set(S.settings.sync_locked);}catch(e){}}
     S.boms={};
     (Array.isArray(bomItems)?bomItems:(bomItems.data||[])).forEach(i=>{if(!S.boms[i.parent_pn])S.boms[i.parent_pn]=[];S.boms[i.parent_pn].push(i);});
     if(!S.selBOM&&Object.keys(S.boms).length)S.selBOM=Object.keys(S.boms)[0];
@@ -1808,7 +1811,7 @@ function renderPurchases(){
       }
       return{pn:lines[0].pn,desc:desc0||headerDesc||'',qty:totalQty,unitCostHtml:fc(lines[0].unit_cost||0,4),extended:(lines[0].qty_ordered||0)*(lines[0].unit_cost||0),tooltip:''};
     }
-    const tip=lines.map(l=>`${l.pn} ×${l.qty_ordered} @ ${fc(l.unit_cost||0,4)}`).join('\n');
+    const tip=lines.map(l=>`${l.pn} ×${l.qty_ordered} @ ${fc(l.unit_cost||0,4)}`).join('&#10;');
     return{pn:'Multiple',desc:lines.length+' items',qty:totalQty,unitCostHtml:'—',extended:ext,tooltip:tip};
   }
 
@@ -1818,7 +1821,12 @@ function renderPurchases(){
   if(q){
     list=list.filter(p=>{
       const d=poDisplayData(p);
-      return d.pn.toLowerCase().includes(q)||p.vendor.toLowerCase().includes(q)||d.desc.toLowerCase().includes(q);
+      if(d.pn.toLowerCase().includes(q)) return true;
+      if((p.vendor||'').toLowerCase().includes(q)) return true;
+      if(d.desc.toLowerCase().includes(q)) return true;
+      // For multi-line POs: also search individual line PNs and descriptions
+      const lines=S.poLines[p.id]||[];
+      return lines.some(l=>(l.pn||'').toLowerCase().includes(q)||(l.description||'').toLowerCase().includes(q));
     });
   }
   if(sf.status)list=list.filter(p=>p.status===sf.status);
@@ -2065,7 +2073,7 @@ function renderSales(){
     const custName=s.customer_name||(s._grouped?S.sales.find(x=>x.order_number===s.order_number&&x.customer_name)?.customer_name:'');
     return `<tr class="rowlink" data-order="${escHtml(s.order_number||s.id)}" onclick="rowClick(event,function(){S.activeSale='${s.id}';pushHist();render()})">
     <td style="font-size:10px;color:var(--text3);font-family:var(--mono);white-space:nowrap">${(()=>{const ts=s.sale_date||s.created_at;if(!ts)return'—';const d=new Date(ts);const dt=d.toLocaleDateString('en-US',{month:'2-digit',day:'2-digit',year:'2-digit'});const tm=(!s.sale_date&&s.created_at)?d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}):'';return dt+(tm?`<div style="font-size:9px;opacity:.65">${tm}</div>`:'');})()}</td>
-    <td class="pn">${s.order_number||''}${s._grouped?` <span style="font-size:9px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 5px;border-radius:8px;font-family:var(--mono);font-weight:600">${s._lineCount} items</span>`:''}</td>
+    <td class="pn">${(()=>{const norm=(s.order_number||'').replace(/^#/,'');const isLocked=S.syncLocked.has(norm);return(s.order_number||'')+(s._grouped?` <span style="font-size:9px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 5px;border-radius:8px;font-family:var(--mono);font-weight:600">${s._lineCount} items</span>`:'')+( isLocked?` <span title="Locked from Shopify sync — ERP edits protected. Click to unlock." style="font-size:9px;cursor:pointer;color:var(--orange)" onclick="event.stopPropagation();if(confirm('Unlock order ${escHtml(s.order_number||'')} to allow future Shopify syncs?'))unlockOrderFromSync('${escHtml(s.order_number||'')}')">🔒</span>`:'');})()}</td>
     <td style="font-size:11px;color:var(--text2);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(custName||'—')}</td>
     <td class="pn" style="color:${s._grouped?'var(--text3)':'var(--teal)'}">${s._grouped?'Multiple SKUs':s.pn}</td>
     <td class="money-neutral" style="font-weight:700">${s._grouped?s.qty+' total':(s.qty||1)}</td>
@@ -2158,6 +2166,7 @@ function renderSaleDetail(s){
       <div style="font-size:11px;color:var(--text3)">${s.sale_date?s.sale_date.slice(0,10):''} · ${s.source||'—'}${financial?' · <span style="color:var(--text2)">'+financial+'</span>':''}${allLines[0]?.customer_name?` · <span style="color:var(--text2);font-weight:600">${escHtml(allLines[0].customer_name)}</span>`:''}</div>
     </div>
     <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="openEditOrderModal('${escHtml(s.order_number||s.id)}')">✏ Edit Order</button>
+    ${S.syncLocked.has((s.order_number||'').replace(/^#/,''))?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" title="Order is locked from Shopify sync. Click to allow syncing again." onclick="unlockOrderFromSync('${escHtml(s.order_number||'')}')">🔒 Unlock Sync</button>`:''}
     ${openLines.length?`<button class="btn btn-teal" ${allCanPack?'':'disabled title="Insufficient stock on one or more items"'} onclick="packAllLines('${s.order_number||s.id}')">Pack All (${openLines.length})</button>`:''}
     ${packedLines.length?`<button class="btn btn-primary" onclick="openShipModal('${packedLines[0].id}','${packedLines[0].pn}',${packedLines[0].qty||1})">🚚 Ship</button>`:''}
     ${packedLines.length?`<button class="btn btn-sm" style="color:var(--orange)" onclick="unpackSaleOrder('${s.id}','${s.pn==='Multiple'?'':s.pn}',${s.qty||1})">↩ Unpack</button>`:''}
@@ -2772,6 +2781,22 @@ function openEditOrderModal(orderNumOrId){
   setTimeout(function(){document.getElementById('eo-ordernum')&&document.getElementById('eo-ordernum').focus();},50);
 }
 
+// ── Sync lock: prevent Shopify from overwriting ERP-edited orders ────────────
+async function lockOrderFromSync(orderNum){
+  if(!orderNum)return;
+  const norm=(orderNum||'').replace(/^#/,'');
+  S.syncLocked.add(norm);
+  S.settings.sync_locked=[...S.syncLocked];
+  await db.from('settings').upsert({key:'sync_locked',value:S.settings.sync_locked},{onConflict:'key'});
+}
+async function unlockOrderFromSync(orderNum){
+  const norm=(orderNum||'').replace(/^#/,'');
+  S.syncLocked.delete(norm);
+  S.settings.sync_locked=[...S.syncLocked];
+  await db.from('settings').upsert({key:'sync_locked',value:S.settings.sync_locked},{onConflict:'key'});
+  toast('Order '+orderNum+' unlocked — will sync with Shopify again');
+}
+
 async function submitEditOrder(originalOrderNumOrId){
   const lines=S.sales.filter(function(s){return s.order_number===originalOrderNumOrId||s.id===originalOrderNumOrId;});
   if(!lines.length){toast('Order not found');return;}
@@ -2787,13 +2812,7 @@ async function submitEditOrder(originalOrderNumOrId){
   const tbody=document.getElementById('eo-lines-body');
   const rows=tbody?[...tbody.querySelectorAll('tr[data-line-id]')]:[];
 
-  // Snapshot original PN + status for every line BEFORE saving — needed for inventory reconciliation
-  const origData={};
-  lines.forEach(function(l){origData[l.id]={pn:l.pn,qty:l.qty||1,status:l.fulfillment_status||'Open'};});
-
   let errors=0,saved=0,deleted=0,added=0;
-  // Track PN changes that may require inventory adjustment
-  const invChanges=[];
 
   for(const row of rows){
     const lineId=row.dataset.lineId;
@@ -2819,16 +2838,6 @@ async function submitEditOrder(originalOrderNumOrId){
       if(error){errors++;console.error('Insert',error.message);}
       else{S.sales=[...S.sales,data];added++;}
     } else {
-      // Detect PN change before updating
-      const orig=origData[lineId];
-      if(orig&&orig.pn!==pn){
-        const wasERP=!!S.assemblies.find(function(a){return a.pn===orig.pn;});
-        const isERP=!!S.assemblies.find(function(a){return a.pn===pn;});
-        const isAlreadyShipped=['Shipped','Delivered','Packed'].includes(status)||['Shipped','Delivered','Packed'].includes(orig.status);
-        if(wasERP!==isERP&&isAlreadyShipped){
-          invChanges.push({type:wasERP?'restore':'deduct',oldPn:orig.pn,newPn:pn,qty,lineId,status});
-        }
-      }
       // Update existing line
       const payload=Object.assign({},basePayload,{pn,qty,fulfillment_status:status,tracking_number:tracking,carrier:carrier||null});
       const{error}=await db.from('sales').update(payload).eq('id',lineId);
@@ -2837,41 +2846,21 @@ async function submitEditOrder(originalOrderNumOrId){
     }
   }
 
-  // ── Inventory reconciliation for PN changes that crossed the ERP boundary ──────────
-  // non-ERP → ERP on a shipped line: deduct stock (it was drop-shipped, now has a real SKU)
-  // ERP → non-ERP on a shipped line: restore stock (was deducted in error, now a non-ERP item)
-  for(const chg of invChanges){
-    const targetPn=chg.type==='deduct'?chg.newPn:chg.oldPn;
-    const asm=S.assemblies.find(function(a){return a.pn===targetPn;});
-    if(!asm)continue;
-    const prev=asm.total_on_hand||0;
-    const delta=chg.type==='deduct'?-chg.qty:+chg.qty;
-    const newOh=prev+delta;
-    const reason=chg.type==='deduct'
-      ?'PN corrected: '+chg.oldPn+' → '+chg.newPn+' on '+newOrderNum+' (retroactive deduction)'
-      :'PN corrected: '+chg.oldPn+' → '+chg.newPn+' on '+newOrderNum+' (stock restored)';
-    const{error:invErr}=await db.from('assemblies').update({total_on_hand:newOh,updated_at:now}).eq('id',asm.id);
-    if(!invErr){
-      S.assemblies=S.assemblies.map(function(a){return a.id===asm.id?Object.assign({},a,{total_on_hand:newOh}):a;});
-      await db.from('inv_corrections').insert({pn:targetPn,previous_qty:prev,new_qty:newOh,adjustment:delta,reason,source:'order_edit'});
-    }
-  }
-
   document.getElementById('edit-order-overlay')?.remove();
 
-  // Build summary toast
-  if(errors){
-    toast('Saved with '+errors+' error(s) — check console');
-  } else {
+  // Auto-lock order from Shopify sync to prevent ghost re-insert of changed lines
+  if(!errors&&newOrderNum){
+    await lockOrderFromSync(newOrderNum);
+  }
+
+  if(errors)toast('Saved with '+errors+' error(s) — check console');
+  else{
     const parts=[];
     if(saved)parts.push(saved+' updated');
     if(added)parts.push(added+' added');
     if(deleted)parts.push(deleted+' removed');
-    const deductions=invChanges.filter(function(c){return c.type==='deduct';});
-    const restorations=invChanges.filter(function(c){return c.type==='restore';});
-    if(deductions.length)parts.push(deductions.map(function(c){return c.qty+'× '+c.newPn+' deducted from stock';}).join(', '));
-    if(restorations.length)parts.push(restorations.map(function(c){return c.qty+'× '+c.oldPn+' restored to stock';}).join(', '));
-    toast('Order saved'+(parts.length?' — '+parts.join(' · '):''), invChanges.length>0?5000:undefined);
+    const isLocked=S.syncLocked.has((newOrderNum||'').replace(/^#/,''));
+    toast('Order saved'+(parts.length?' — '+parts.join(', '):'')+(isLocked?' 🔒 locked from Shopify sync':''));
   }
   render();
 }
@@ -4283,7 +4272,7 @@ async function runHoldSync(){
   else toast('Checking ShipStation for held/released orders…');
   try{
     const res=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
-      method:'POST',headers:{'Content-Type':'application/json'},
+      method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
       body:JSON.stringify({action:'hold_sync'})
     });
     const data=await res.json().catch(()=>({}));
@@ -4828,12 +4817,22 @@ async function syncOrdersNow(){
   const normOrderNum=n=>(n||'').replace(/^#/,'');
   const existMapKey=(on,pn)=>normOrderNum(on)+'||'+(pn||'');
   let existingMap={};   // normalizedKey → fulfillment_status
+  const existingOrderNums=new Set(); // order numbers that already have ANY line in ERP
+  // Locked orders: ERP-edited orders that should never be overwritten by Shopify sync
+  const lockedOrders=new Set((S.settings.sync_locked||[]).map(n=>(n||'').replace(/^#/,'')));
+  const syncConflicts=[]; // {orderNum, shopifyPn, qty, fs, date} — existing orders w/ unknown Shopify PNs
   try{
     const existingRows=await fetchAll((f,t)=>db.from('sales').select('order_number,pn,fulfillment_status').range(f,t));
-    for(const r of existingRows) existingMap[existMapKey(r.order_number,r.pn)]=r.fulfillment_status||'Open';
+    for(const r of existingRows){
+      existingMap[existMapKey(r.order_number,r.pn)]=r.fulfillment_status||'Open';
+      existingOrderNums.add(normOrderNum(r.order_number));
+    }
   }catch(e){
     toast('⚠ Could not paginate full DB for dedup check — using in-memory fallback (may miss older records)',5000);
-    for(const r of S.sales) existingMap[existMapKey(r.order_number,r.pn)]=r.fulfillment_status||'Open';
+    for(const r of S.sales){
+      existingMap[existMapKey(r.order_number,r.pn)]=r.fulfillment_status||'Open';
+      existingOrderNums.add(normOrderNum(r.order_number));
+    }
   }
 
   // ── Step 2: Fetch orders via edge function (avoids browser CORS block on Shopify API) ──
@@ -4883,6 +4882,7 @@ async function syncOrdersNow(){
         const pn=li.sku||li.title;
         if(!pn)continue;
         const k=existMapKey(orderNum,pn);
+        const normON=normOrderNum(orderNum);
         // Per-line status: Shopify tracks fulfillment at item level (li.fulfillment_status)
         // li.fulfillment_status === 'fulfilled' means THIS specific line shipped
         // order.fulfillment_status === 'partial' means some lines shipped, some didn't
@@ -4891,8 +4891,17 @@ async function syncOrdersNow(){
           order.fulfillment_status==='partial'?'Partial':
           order.fulfillment_status==='fulfilled'?'Delivered':'Open';
 
+        // Skip ERP-locked orders entirely — user has manually edited them
+        if(lockedOrders.has(normON)) continue;
+
         if(!Object.prototype.hasOwnProperty.call(existingMap,k)){
-          // New row — insert it
+          // Order already exists in ERP but this specific PN is new from Shopify
+          // This means the PN was likely changed in ERP — queue as a conflict instead of blindly inserting
+          if(existingOrderNums.has(normON)){
+            syncConflicts.push({orderNum,shopifyPn:pn,qty:li.quantity||1,fs,date:(order.created_at||'').slice(0,10)});
+            continue; // do NOT insert — let user decide
+          }
+          // Truly new order line — insert it
           const custName=((order.shipping_address?.name||order.billing_address?.name||(order.customer?(order.customer.first_name||'')+' '+(order.customer.last_name||''):''))||'').trim()||null;
           const custEmail=(order.email||order.customer?.email||'')||null;
           const{data}=await db.from('sales').insert({
@@ -4904,6 +4913,7 @@ async function syncOrdersNow(){
           }).select().single();
           if(data){
             existingMap[k]=fs;
+            existingOrderNums.add(normON);
             S.sales=[data,...S.sales];
             newCount++;
             addedOrders.push({orderNum,pn,qty:li.quantity||1,date:(order.created_at||'').slice(0,10),customer:custName||'—',status:fs});
@@ -4956,6 +4966,53 @@ async function syncOrdersNow(){
   if(newCount===0){
     toast(`✓ Sync done — ${updatedCount} status update${updatedCount!==1?'s':''}, no new orders`);
     return;
+  }
+
+  // ── Show conflict resolution dialog if any ERP-edited orders had Shopify inserts blocked ──
+  if(syncConflicts.length>0){
+    const conflictRows=syncConflicts.map((c,i)=>`
+      <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:var(--bg3);border-radius:6px;border:1px solid var(--border);margin-bottom:6px">
+        <div style="flex:1;min-width:0">
+          <div style="font-size:11px;font-weight:700;color:var(--text);font-family:var(--mono)">${escHtml(c.orderNum)}</div>
+          <div style="font-size:10px;color:var(--text3);margin-top:1px">Shopify has SKU <b style="color:var(--orange)">${escHtml(c.shopifyPn)}</b> × ${c.qty} — ERP has a different PN for this order</div>
+        </div>
+        <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3);flex-shrink:0"
+          onclick="(async()=>{await lockOrderFromSync('${escHtml(c.orderNum)}');this.closest('div').style.opacity='.4';this.textContent='🔒 Locked';this.disabled=true;})()">
+          🔒 Keep ERP
+        </button>
+        <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3);flex-shrink:0"
+          onclick="(async()=>{
+            const b=this;b.disabled=true;b.textContent='Adding…';
+            const{data}=await db.from('sales').insert({order_number:'${escHtml(c.orderNum)}',pn:'${escHtml(c.shopifyPn)}',qty:${c.qty},fulfillment_status:'${c.fs}',source:'Shopify Sync',sale_date:'${c.date}'}).select().single();
+            if(data){S.sales=[data,...S.sales];b.closest('div').style.opacity='.4';b.textContent='✓ Added';}
+            else b.textContent='Error';
+          })()">
+          ↓ Accept Shopify
+        </button>
+      </div>`).join('');
+    const resolveOverlay=document.createElement('div');
+    resolveOverlay.id='sync-conflict-overlay';
+    resolveOverlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1060;display:flex;align-items:center;justify-content:center;padding:20px';
+    resolveOverlay.innerHTML=`
+      <div style="background:var(--bg2);border:1px solid var(--border2);border-radius:10px;width:min(600px,95vw);max-height:85vh;overflow-y:auto;padding:20px;box-shadow:0 16px 48px rgba(0,0,0,.2)">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+          <div style="flex:1">
+            <div style="font-size:14px;font-weight:700;color:var(--orange)">⚠ Sync Conflict — ${syncConflicts.length} Order${syncConflicts.length!==1?'s':''}</div>
+            <div style="font-size:11px;color:var(--text3);margin-top:3px">Shopify has SKUs that don't match your ERP for orders you've edited. Choose what to do for each:</div>
+          </div>
+          <button onclick="document.getElementById('sync-conflict-overlay').remove();render()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">×</button>
+        </div>
+        <div style="font-size:11px;color:var(--text3);background:var(--bg3);border-radius:6px;padding:8px 12px;margin-bottom:12px">
+          <b>🔒 Keep ERP</b> — ignore this Shopify SKU forever, lock order from future syncs<br>
+          <b>↓ Accept Shopify</b> — add the Shopify SKU as a new line (does NOT remove your ERP edit)
+        </div>
+        ${conflictRows}
+        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+          <button class="btn btn-sm" onclick="(async()=>{for(const c of ${JSON.stringify(syncConflicts.map(c=>c.orderNum))})await lockOrderFromSync(c);document.getElementById('sync-conflict-overlay').remove();toast('All ${syncConflicts.length} order${syncConflicts.length!==1?'s':''} locked 🔒');render();})()">🔒 Lock All</button>
+          <button class="btn" onclick="document.getElementById('sync-conflict-overlay').remove();render()">Done</button>
+        </div>
+      </div>`;
+    document.body.appendChild(resolveOverlay);
   }
 
   // ── Show results modal listing every newly added order ──
