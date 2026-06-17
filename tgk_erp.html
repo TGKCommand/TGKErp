@@ -1037,15 +1037,6 @@ function openSubBuild(subPn, parentPn, parentQty){
   pushHist();render();
 }
 function lookupGo(type,pn){S.lookupSel={type,pn};S.lookupQ=pn;if(S.view!=='lookup')nav('lookup');else{pushHist();render();}}
-function lookupGoAuto(pn){
-  // Detect whether pn is an assembly (or new_sku alias) or a part, then navigate
-  const asm=S.assemblies.find(a=>a.pn===pn)||S.assemblies.find(a=>a.use_new_sku&&a.new_sku===pn);
-  if(asm){lookupGo('assembly',asm.pn);return;}
-  const part=S.parts.find(p=>p.pn===pn);
-  if(part){lookupGo('part',pn);return;}
-  // Not found — open lookup with query so user sees "No results"
-  S.lookupQ=pn;S.lookupSel=null;if(S.view!=='lookup')nav('lookup');else{pushHist();render();}
-}
 
 function trackingUrl(carrier, tracking){
   if(!tracking)return'';
@@ -1275,6 +1266,7 @@ function addAction(){const m={parts:'addPart',assemblies:'addAsm',purchases:'add
 // ============================================================
 function renderDashboard(){
   const critical=S.assemblies.filter(a=>!a.discontinued&&liveStatus(a)==='critical').length;
+  const lowStock=S.assemblies.filter(a=>!a.discontinued&&liveStatus(a)==='low').length;
   const needsReorder=S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||calcForecast(p.pn)>0)&&(p.total_unpckgd||0)<=calcReorderPoint(p)).length;
   const invVal=S.parts.reduce((s,p)=>s+Math.max(0,p.total_unpckgd||0)*(p.unit_cost||0),0);
   // Use grouped counts so numbers match exactly what the Sales page shows
@@ -1282,8 +1274,8 @@ function renderDashboard(){
   const onHoldCount =countGroupedStatus('On Hold');
   const packedCount =countGroupedStatus('Packed');
   const partialCount=countGroupedStatus('Partial');
+  const preorderCount=countGroupedStatus('Pre-order');
   // Stale: grouped open orders where the lead line's sale_date is older than 60 days
-  // (approximation: count raw Open lines with stale dates, then deduplicate by order#)
   const staleOpenNums=new Set(S.sales.filter(s=>!isInternal(s.order_number)&&(!s.fulfillment_status||s.fulfillment_status==='Open')&&s.sale_date&&s.sale_date<daysAgo(60)).map(s=>s.order_number||('__noid__'+s.id)));
   const staleOpen=staleOpenNums.size;
   const freshOpen=Math.max(0,openOrders-staleOpen);
@@ -1292,20 +1284,55 @@ function renderDashboard(){
   const packedLines   =S.sales.filter(s=>!isInternal(s.order_number)&&s.fulfillment_status==='Packed');
   const openWarranty=S.warrantyClaims.filter(w=>w.status==='Open').length;
   const openCounts=S.cycleCounts.filter(c=>c.status==='Open').length;
-  const weekOrds=S.sales.filter(s=>s.sale_date>=daysAgo(7)).length;
   const openPOs=S.purchases.filter(p=>p.status!=='Received');
   const openPOAmt=openPOs.reduce((s,p)=>s+poExtended(p),0);
   const feed=buildActivityFeed(12);
+  // Revenue — MSRP * qty for non-internal orders
+  function calcRev(arr){return arr.reduce(function(s,x){var a=S.assemblies.find(function(z){return z.pn===x.pn;});return s+(x.qty||1)*(a?a.msrp||0:0);},0);}
+  const now=new Date();
+  const monthStart=new Date(now.getFullYear(),now.getMonth(),1).toISOString().slice(0,10);
+  const lastMonthStart=new Date(now.getFullYear(),now.getMonth()-1,1).toISOString().slice(0,10);
+  const thisMonthSales=S.sales.filter(s=>!isInternal(s.order_number)&&(s.sale_date||'')>=monthStart);
+  const lastMonthSales=S.sales.filter(s=>!isInternal(s.order_number)&&(s.sale_date||'')>=lastMonthStart&&(s.sale_date||'')<monthStart);
+  const revThisMonth=calcRev(thisMonthSales);
+  const revLastMonth=calcRev(lastMonthSales);
+  const revChange=revLastMonth>0?((revThisMonth-revLastMonth)/revLastMonth*100):null;
+  const revChangeTxt=revChange!==null
+    ?'<span style="color:'+(revChange>=0?'var(--green)':'var(--red)')+'\">'+(revChange>=0?'&#9650;':'&#9660;')+Math.abs(revChange).toFixed(0)+'%</span> vs last month'
+    :'first month of data';
+  const thisMonthOrderCount=new Set(thisMonthSales.map(s=>s.order_number||s.id)).size;
   return `
-  <div class="kpi-grid kpi-grid-4">
-    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','Open|Partial');nav('sales')" title="Open + Partial orders">
+  <div class="kpi-grid kpi-grid-3">
+    <div class="kpi kpi-green" style="cursor:pointer" onclick="nav('sales')" title="MSRP \xd7 qty for all orders this calendar month">
+      <div class="kpi-label">Revenue This Month</div>
+      <div class="kpi-value" style="font-size:${revThisMonth>=100000?'16px':revThisMonth>=10000?'18px':'22px'}">${fc(revThisMonth)}</div>
+      <div class="kpi-sub">${revChangeTxt} &middot; ${thisMonthOrderCount} order${thisMonthOrderCount!==1?'s':''}</div>
+    </div>
+    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','Open|Partial');nav('sales')" title="Open + Partial orders needing to be packed">
       <div class="kpi-label">Orders to Fulfill</div>
       <div class="kpi-value">${freshOpen+partialCount}</div>
-      <div class="kpi-sub">${packedCount} packed · ${onHoldCount} on hold</div>
+      <div class="kpi-sub">${freshOpen} open &middot; ${partialCount} partial${onHoldCount>0?' &middot; '+onHoldCount+' on hold':''}</div>
     </div>
-    <div class="kpi kpi-orange" style="cursor:pointer" onclick="nav('planning')"><div class="kpi-label">Parts Need Reorder</div><div class="kpi-value">${needsReorder}</div><div class="kpi-sub">Below reorder point</div></div>
-    <div class="kpi kpi-yellow" style="cursor:pointer" onclick="nav('assemblies')"><div class="kpi-label">Critical Assemblies</div><div class="kpi-value">${critical}</div></div>
-    <div class="kpi kpi-teal"><div class="kpi-label">Parts Inventory Value</div><div class="kpi-value" style="font-size:17px">${fc(invVal)}</div><div class="kpi-sub">${weekOrds} orders this week</div></div>
+    <div class="kpi kpi-teal" style="cursor:pointer" onclick="setFilter('sales','fstatus','Packed');nav('sales')" title="Packed orders ready to ship now">
+      <div class="kpi-label">Packed \u2014 Ready to Ship</div>
+      <div class="kpi-value">${packedCount}</div>
+      <div class="kpi-sub">${preorderCount>0?preorderCount+' pre-order &middot; ':''}${staleOpen>0?staleOpen+' stale open':'all orders current'}</div>
+    </div>
+    <div class="kpi kpi-yellow" style="cursor:pointer" onclick="nav('assemblies')" title="Assemblies at critical or low stock levels">
+      <div class="kpi-label">Assembly Stock Alerts</div>
+      <div class="kpi-value">${critical+lowStock}</div>
+      <div class="kpi-sub">${critical} critical &middot; ${lowStock} low</div>
+    </div>
+    <div class="kpi kpi-orange" style="cursor:pointer" onclick="nav('planning')" title="Parts below their reorder point">
+      <div class="kpi-label">Parts to Reorder</div>
+      <div class="kpi-value">${needsReorder}</div>
+      <div class="kpi-sub">Below reorder point &middot; ${fc(invVal,0)} value</div>
+    </div>
+    <div class="kpi" style="cursor:pointer" onclick="nav('purchases')" title="Total value of all open purchase orders">
+      <div class="kpi-label">Open PO Spend</div>
+      <div class="kpi-value" style="font-size:${openPOAmt>=100000?'16px':openPOAmt>=10000?'18px':'22px'};color:var(--text)">${fc(openPOAmt)}</div>
+      <div class="kpi-sub">${openPOs.length} open PO${openPOs.length!==1?'s':''}</div>
+    </div>
   </div>
   ${staleOpen>20?`<div class="panel" style="padding:10px 18px;display:flex;gap:12px;align-items:center;border-left:3px solid var(--red);flex-wrap:wrap">
     <span style="font-size:12px;color:var(--red);font-weight:700">⚠ ${staleOpen} stale Open orders</span>
@@ -2223,7 +2250,7 @@ function renderSaleDetail(s){
     const lfs=line.fulfillment_status||'Open';
     const lcanFill=lstock!==null&&lstock>=(line.qty||1);
     return `<tr>
-      <td class="pn rowlink" style="color:var(--teal)" onclick="lookupGoAuto('${line.pn}')">${line.pn} ↗</td>
+      <td class="pn rowlink" style="color:var(--teal)" onclick="lookupGo('assembly','${line.pn}')">${line.pn} ↗</td>
       <td style="font-size:11px;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${la?.description||''}</td>
       <td class="money-neutral" style="font-weight:700">${line.qty||1}</td>
       <td class="money" style="color:${lstock===null?'var(--text3)':lcanFill?'var(--green)':'var(--red)'};font-weight:700">
@@ -2687,7 +2714,10 @@ async function markDelivered(saleId){
 // Helper: update description cell when SKU input changes
 function eoUpdateDesc(el){
   var d=el.closest('tr')&&el.closest('tr').querySelector('[data-field="desc"]');
-  if(d){var a=S.assemblies.find(function(x){return x.pn===el.value;});d.textContent=a&&a.description||'';}
+  if(d){
+    var a=S.assemblies.find(function(x){return x.pn===el.value;})||S.parts.find(function(x){return x.pn===el.value;});
+    d.textContent=a&&a.description||'';
+  }
 }
 
 function openEditOrderModal(orderNumOrId){
@@ -2727,7 +2757,7 @@ function openEditOrderModal(orderNumOrId){
   overlay.id='edit-order-overlay';
   overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
 
-  const asmPNs=[...new Set([...S.assemblies.map(function(a){return a.pn;}),...S.parts.map(function(p){return p.pn;})])].sort().slice(0,600);
+  const asmPNs=[...new Set([...S.assemblies.map(function(a){return a.pn;}),...S.parts.map(function(p){return p.pn;})])].sort();
 
   overlay.innerHTML=''
     +'<div class="modal" style="width:900px;max-width:98vw;margin:auto">'
@@ -6541,6 +6571,7 @@ function removePriceBreak(idx){
 }
 
 function modalAddBOMRow(){
+  var pn=(document.getElementById('m-bom-pn')?.value||'').trim();
   var qty=parseFloat(document.getElementById('m-bom-qty')?.value)||1;
   var type=document.getElementById('m-bom-type')?.value||'part';
   if(!pn){toast('Enter a Part # or SKU');return;}
@@ -7464,7 +7495,7 @@ function renderLookup(){
   let matches=[];
   if(q.length>=2){
     matches=[
-      ...S.assemblies.filter(a=>a.pn.toLowerCase().includes(q)||(a.new_sku&&a.new_sku.toLowerCase().includes(q))||(a.description||'').toLowerCase().includes(q)).map(a=>({type:'assembly',item:a})),
+      ...S.assemblies.filter(a=>a.pn.toLowerCase().includes(q)||(a.description||'').toLowerCase().includes(q)).map(a=>({type:'assembly',item:a})),
       ...S.parts.filter(p=>p.pn.toLowerCase().includes(q)||(p.description||'').toLowerCase().includes(q)).map(p=>({type:'part',item:p}))
     ].slice(0,30);
   }
@@ -7505,9 +7536,7 @@ function tierPrices(a){
 }
 
 function assemblyDossier(pn){
-  // Resolve new_sku aliases — if called with a new_sku, find the real pn
-  let a=S.assemblies.find(x=>x.pn===pn);
-  if(!a) a=S.assemblies.find(x=>x.use_new_sku&&x.new_sku===pn);
+  const a=S.assemblies.find(x=>x.pn===pn);
   if(!a)return'<div class="panel section-empty">Not found</div>';
   const b=buildability(pn);
   const demand=openOrderDemand(pn);
@@ -7518,14 +7547,11 @@ function assemblyDossier(pn){
   const corr=S.corrections.filter(c=>c.pn===pn).slice(0,6);
   const bomCost=bomCostOf(pn,0);
   const margin=a.msrp>0?((a.msrp-bomCost)/a.msrp*100):null;
-  const hasSubAsms=b.hasBOM&&b.checks.some(c=>c.isSub);
   return `
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
     <div style="flex:1"><div style="font-size:16px;font-weight:700;color:var(--teal)">${a.pn} ${a.is_subassembly?'<span class="pill pill-orange" style="font-size:9px;vertical-align:middle">SUBASSEMBLY</span>':''} ${a.discontinued?'<span class="pill pill-red" style="font-size:9px;vertical-align:middle">DISCONTINUED</span>':''}</div>
     <div style="font-size:12px;color:var(--text2)">${a.description||''}</div></div>
     ${a.drawing_url?`<a href="${a.drawing_url}" target="_blank" class="btn btn-sm">📐 Drawing</a>`:''}
-    ${b.hasBOM?`<button class="btn btn-sm" onclick="printBOM('${pn}')" title="Print this assembly's BOM only">🖨 BOM</button>`:''}
-    ${hasSubAsms?`<button class="btn btn-sm" onclick="printAllBOMs('${pn}')" title="Print all BOMs — this assembly plus every sub-assembly" style="color:var(--teal);border-color:rgba(13,148,136,.4)">🖨 All BOMs</button>`:''}
     <button class="btn btn-teal btn-sm" onclick="openBuild('${pn}')">Build Planner</button>
     <button class="btn btn-sm" onclick='openModal("editAsm",${JSON.stringify(a).replace(/'/g,"&#39;")})'>Edit</button>
   </div>
@@ -8011,119 +8037,6 @@ function lineCost(item){
   if(item.item_type==='assembly')return bomCostOf(item.child_pn,0)*(item.qty||1);
   const p=S.parts.find(x=>x.pn===item.child_pn);
   return (p?(p.unit_cost||0):0)*(item.qty||1);
-}
-
-function _buildBOMPageHTML(pn,headerLabel){
-  const a=S.assemblies.find(x=>x.pn===pn);
-  if(!a)return'';
-  const b=buildability(pn);
-  if(!b.hasBOM)return'';
-  const bomCost=bomCostOf(pn,0);
-  const rows=b.checks.map(c=>{
-    const unitCost=c.isSub?bomCostOf(c.pn,0):(S.parts.find(p=>p.pn===c.pn)?.unit_cost||0);
-    const ext=unitCost*(c.need||0);
-    const statusColor=c.ok?'#0d9488':'#dc2626';
-    return `<tr>
-      <td style="font-family:monospace;font-size:12px;color:#0d9488;white-space:nowrap">${c.pn}</td>
-      <td style="font-size:12px;color:#475569">${c.desc||''}</td>
-      <td style="text-align:center;font-weight:700">${c.need}</td>
-      <td style="text-align:right;font-family:monospace">${unitCost?'$'+unitCost.toFixed(4):'—'}</td>
-      <td style="text-align:right;font-family:monospace;font-weight:700">${ext?'$'+ext.toFixed(2):'—'}</td>
-      <td style="text-align:center;font-weight:700;color:${statusColor}">${c.avail}</td>
-      <td style="text-align:center;font-size:11px;color:#64748b">${c.loc||'—'}</td>
-    </tr>`;
-  }).join('');
-  return `<div style="page-break-after:always;padding-bottom:32px;margin-bottom:32px;border-bottom:2px solid #e2e8f0">
-    ${headerLabel?`<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#94a3b8;margin-bottom:8px">${headerLabel}</div>`:''}
-    <div style="font-size:18px;font-weight:700;color:#0d9488">${pn}</div>
-    <div style="font-size:13px;color:#475569;margin-top:3px">${a.description||''}</div>
-    ${a.category?`<div style="font-size:11px;color:#94a3b8;margin-top:2px">${a.category}</div>`:''}
-    <div style="display:flex;gap:24px;margin:12px 0 20px;flex-wrap:wrap">
-      <div><div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8">On Hand</div><div style="font-size:15px;font-weight:700;color:${(a.total_on_hand||0)>0?'#0d9488':'#dc2626'}">${a.total_on_hand||0}</div></div>
-      <div><div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8">BOM Cost</div><div style="font-size:15px;font-weight:700">$${bomCost.toFixed(2)}</div></div>
-      <div><div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8">MSRP</div><div style="font-size:15px;font-weight:700">${a.msrp?'$'+a.msrp.toFixed(2):'—'}</div></div>
-      <div><div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8">Components</div><div style="font-size:15px;font-weight:700">${b.checks.length}</div></div>
-    </div>
-    <table style="width:100%;border-collapse:collapse">
-      <thead><tr style="background:#f1f5f9">
-        <th style="padding:8px 10px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;border-bottom:1px solid #e2e8f0">Part #</th>
-        <th style="padding:8px 10px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;border-bottom:1px solid #e2e8f0">Description</th>
-        <th style="padding:8px 10px;text-align:center;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;border-bottom:1px solid #e2e8f0">Qty</th>
-        <th style="padding:8px 10px;text-align:right;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;border-bottom:1px solid #e2e8f0">Unit Cost</th>
-        <th style="padding:8px 10px;text-align:right;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;border-bottom:1px solid #e2e8f0">Extended</th>
-        <th style="padding:8px 10px;text-align:center;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;border-bottom:1px solid #e2e8f0">On Hand</th>
-        <th style="padding:8px 10px;text-align:center;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;border-bottom:1px solid #e2e8f0">Bin</th>
-      </tr></thead>
-      <tbody>${rows}</tbody>
-      <tfoot><tr style="background:#f8fafc">
-        <td colspan="4" style="padding:10px;text-align:right;font-weight:700;border-top:2px solid #e2e8f0">Total BOM Cost</td>
-        <td style="padding:10px;text-align:right;font-family:monospace;font-weight:700;border-top:2px solid #e2e8f0">$${bomCost.toFixed(2)}</td>
-        <td colspan="2" style="border-top:2px solid #e2e8f0"></td>
-      </tfoot>
-    </table>
-  </div>`;
-}
-
-function printBOM(pn){
-  const a=S.assemblies.find(x=>x.pn===pn);
-  if(!a){toast('Assembly not found');return;}
-  const b=buildability(pn);
-  if(!b.hasBOM){toast('No BOM defined for '+pn);return;}
-  const today=new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'});
-  const html=`<!DOCTYPE html><html><head><title>BOM — ${pn}</title>
-<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1e293b;padding:32px;font-size:13px}
-.hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:24px;padding-bottom:16px;border-bottom:2px solid #0d9488}
-.brand{font-size:18px;font-weight:800;color:#0d9488}.brand span{color:#f97316}
-@media print{body{padding:16px}}</style></head><body>
-<div class="hdr"><div><div class="brand">TGK<span>MOTORSPORT</span></div><div style="font-size:11px;color:#64748b;margin-top:2px">Bill of Materials</div></div>
-<div style="text-align:right;font-size:11px;color:#64748b">Printed: ${today}<br>TGKCommand ERP</div></div>
-${_buildBOMPageHTML(pn,'')}
-<div style="margin-top:16px;font-size:10px;color:#94a3b8;text-align:center;border-top:1px solid #e2e8f0;padding-top:10px">TGK Motorsport · ${pn} · ${today} · Quantities are per single assembled unit</div>
-<script>window.onload=function(){window.print();}<\/script>
-</body></html>`;
-  const w=window.open('','_blank','width=920,height=720');
-  if(w){w.document.write(html);w.document.close();}
-  else toast('Pop-up blocked — allow pop-ups and try again');
-}
-
-function printAllBOMs(pn){
-  const a=S.assemblies.find(x=>x.pn===pn);
-  if(!a){toast('Assembly not found');return;}
-  // Collect all unique sub-assembly PNs recursively
-  function collectSubAsms(p,visited=new Set()){
-    if(visited.has(p))return;
-    visited.add(p);
-    const items=S.boms[p]||[];
-    items.forEach(i=>{if(i.item_type==='assembly')collectSubAsms(i.child_pn,visited);});
-    return visited;
-  }
-  const allPNs=collectSubAsms(pn);
-  const today=new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'});
-  // Build pages: main assembly first, then each sub-assembly that has a BOM
-  let pages='';
-  // Main assembly
-  pages+=_buildBOMPageHTML(pn,'Finished Assembly');
-  // Sub-assemblies (excluding the top-level)
-  allPNs.forEach(p=>{
-    if(p===pn)return;
-    const pg=_buildBOMPageHTML(p,'Sub-Assembly');
-    if(pg)pages+=pg;
-  });
-  if(!pages){toast('No BOMs to print');return;}
-  const html=`<!DOCTYPE html><html><head><title>All BOMs — ${pn}</title>
-<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1e293b;padding:32px;font-size:13px}
-.hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:24px;padding-bottom:16px;border-bottom:2px solid #0d9488}
-.brand{font-size:18px;font-weight:800;color:#0d9488}.brand span{color:#f97316}
-@media print{body{padding:16px}}</style></head><body>
-<div class="hdr"><div><div class="brand">TGK<span>MOTORSPORT</span></div><div style="font-size:11px;color:#64748b;margin-top:2px">Full Bill of Materials Package — ${pn}</div></div>
-<div style="text-align:right;font-size:11px;color:#64748b">Printed: ${today}<br>TGKCommand ERP · ${allPNs.size} BOM${allPNs.size!==1?'s':''}</div></div>
-${pages}
-<div style="margin-top:16px;font-size:10px;color:#94a3b8;text-align:center;border-top:1px solid #e2e8f0;padding-top:10px">TGK Motorsport · ${pn} · ${today} · Full BOM package including all sub-assemblies</div>
-<script>window.onload=function(){window.print();}<\/script>
-</body></html>`;
-  const w=window.open('','_blank','width=920,height=720');
-  if(w){w.document.write(html);w.document.close();}
-  else toast('Pop-up blocked — allow pop-ups and try again');
 }
 
 // Hardware Pack check: TGK-P + digits (TGK-P01…TGK-P100). TGK-PCV etc. are NOT packs.
