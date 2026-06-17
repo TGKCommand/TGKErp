@@ -2150,7 +2150,9 @@ function renderSales(){
     ${fstats.map(s=>`<button class="filter-chip ${chipActive(s)?'on-teal':''}" onclick="setFilter('sales','fstatus','${s}')">${s}</button>`).join('')}
     <button class="btn btn-sm" style="margin-left:auto" title="Remove duplicate order lines (same order # + SKU). Tracking numbers on surviving rows are always preserved — tracking is rescued from duplicates before they are deleted." onclick="dedupeOrders()">🧽 Dedupe & Recover Tracking</button>
     <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="syncOrdersNow()" title="Pull new orders from Shopify + check ShipStation for holds/splits">🔄 Sync Orders</button>
-    <button class="btn btn-sm" id="holds-btn" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="syncHoldsOnly()" title="Poll ShipStation right now for on-hold orders and update ERP status">⏸ Sync Holds</button>
+    <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="syncHoldsOnly()" title="Poll ShipStation right now for on-hold orders and update ERP status">⏸ Sync Holds</button>
+    <button class="btn btn-sm" id="cancel-sync-btn" style="color:var(--red);border-color:rgba(239,68,68,.3)" onclick="syncCancellationsOnly()" title="Poll ShipStation for recently cancelled orders (last 30 days)">✕ Sync Cancels</button>
+    <button class="btn btn-sm" style="color:var(--text3);border-color:var(--border2)" onclick="diagHolds()" title="Diagnose why hold sync returns 0 — shows raw SS order numbers vs ERP">🔍 Diagnose Holds</button>
     <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="ssOrderAudit()" title="Find ShipStation orders missing from ERP and import them">📦 SS Audit</button>
     <button class="btn btn-primary btn-sm" onclick='openModal("addSale",{})'>+ Manual Order</button>
     <span class="filter-count">${list.length} orders</span>
@@ -3943,7 +3945,76 @@ Deno.serve(async (req) => {
     return json({ markedHold, markedOpen, message: markedHold + ' marked On Hold, ' + markedOpen + ' released to Open' })
   }
 
-  // --- DELIVERY SYNC: check ShipStation for delivered shipments ---
+  // --- CANCEL SYNC: poll ShipStation for recently cancelled orders and update ERP ---
+  if (body.action === 'cancel_sync') {
+    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
+    const auth = ssAuth()
+    const days = body.days || 30
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    let page = 1, totalPages = 1, markedCancelled = 0
+
+    while (page <= totalPages) {
+      const res = await fetch('https://ssapi.shipstation.com/orders?orderStatus=cancelled&pageSize=500&page=' + page + '&modifyDateStart=' + since, { headers: { Authorization: 'Basic ' + auth } })
+      if (!res.ok) return json({ error: 'ShipStation error ' + res.status }, 502)
+      const data = await res.json()
+      totalPages = data.pages || 1
+
+      for (const order of (data.orders || [])) {
+        const rawNum = stripHash(order.orderNumber || '')
+        if (!rawNum) continue
+        // Check ERP with both # and non-# formats
+        const { data: ex1 } = await db.from('sales').select('id,fulfillment_status').eq('order_number', '#' + rawNum).in('fulfillment_status', ['Open','Packed','Partial','On Hold']).limit(1)
+        const { data: ex2 } = await db.from('sales').select('id,fulfillment_status').eq('order_number', rawNum).in('fulfillment_status', ['Open','Packed','Partial','On Hold']).limit(1)
+        const resolvedNum = ex1?.length ? '#' + rawNum : rawNum
+        const found = (ex1?.length || 0) + (ex2?.length || 0)
+        if (found) {
+          await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('order_number', resolvedNum).in('fulfillment_status', ['Open','Packed','Partial','On Hold'])
+          markedCancelled += found
+        }
+      }
+      page++
+    }
+    return json({ markedCancelled, message: markedCancelled + ' orders marked Cancelled' })
+  } diagnose why holds aren't matching ---
+  if (body.action === 'hold_sync_debug') {
+    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
+    const auth = ssAuth()
+    // Fetch first page of on-hold orders from SS
+    const ssRes = await fetch('https://ssapi.shipstation.com/orders?orderStatus=on_hold&pageSize=50&page=1', { headers: { Authorization: 'Basic ' + auth } })
+    if (!ssRes.ok) return json({ error: 'ShipStation error ' + ssRes.status }, 502)
+    const ssData = await ssRes.json()
+    const ssOrders = (ssData.orders || []).map((o: any) => ({
+      raw: o.orderNumber,
+      stripped: stripHash(o.orderNumber || ''),
+      status: o.orderStatus,
+      customer: o.shipTo?.name || '',
+    }))
+    // Sample of ERP open orders
+    const { data: erpSample } = await db.from('sales')
+      .select('order_number,fulfillment_status')
+      .in('fulfillment_status', ['Open','Packed','Partial','On Hold'])
+      .limit(20)
+    const erpSample2 = (erpSample || []).map((r: any) => ({
+      raw: r.order_number,
+      stripped: stripHash(r.order_number || ''),
+      status: r.fulfillment_status
+    }))
+    // Check for matches
+    const erpKeys = new Set((erpSample || []).map((r: any) => stripHash(r.order_number || '')))
+    const matches = ssOrders.filter((o: any) => erpKeys.has(o.stripped))
+    return json({
+      ss_on_hold_count: ssData.total || ssOrders.length,
+      ss_on_hold_sample: ssOrders.slice(0, 10),
+      erp_open_sample: erpSample2.slice(0, 10),
+      matches_found: matches.length,
+      matched_orders: matches,
+      diagnosis: ssOrders.length === 0
+        ? 'ShipStation returned 0 on-hold orders — nothing to sync'
+        : matches.length === 0
+          ? 'SS has on-hold orders but NONE match ERP order numbers — likely a format mismatch. Compare ss_on_hold_sample vs erp_open_sample.'
+          : matches.length + ' orders matched — hold_sync should work. Run normal hold_sync to apply.'
+    })
+  }
   if (body.action === 'delivery_sync') {
     const auth = ssAuth()
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
@@ -4309,14 +4380,48 @@ Deno.serve(async (req) => {
     }
   }
 
+  // ORDER_NOTIFY fires on any order status change (cancel, hold, etc.)
+  // It's a real SS webhook event — register it in ShipStation → Webhooks → ORDER_NOTIFY
+  if (resource_type === 'ORDER_NOTIFY') {
+    const orders = Array.isArray(data?.orders) ? data.orders : (data?.orderNumber ? [data] : [])
+    for (const order of orders) {
+      if (!order.orderNumber) continue
+      const rawNum = stripHash(order.orderNumber)
+      // Try both #NUM and NUM formats
+      const { data: ex1 } = await db.from('sales').select('id,fulfillment_status').eq('order_number', '#' + rawNum).limit(1)
+      const { data: ex2 } = await db.from('sales').select('id,fulfillment_status').eq('order_number', rawNum).limit(1)
+      const erpLines = [...(ex1 || []), ...(ex2 || [])]
+      if (!erpLines.length) continue
+      const resolvedNum = ex1?.length ? '#' + rawNum : rawNum
+
+      if (order.orderStatus === 'cancelled') {
+        await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('order_number', resolvedNum)
+        console.log('[SS] ORDER_NOTIFY → Cancelled:', resolvedNum)
+      } else if (order.orderStatus === 'on_hold') {
+        const ids = erpLines.filter((l: any) => ['Open','Packed','Partial'].includes(l.fulfillment_status)).map((l: any) => l.id)
+        if (ids.length) await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', ids)
+        console.log('[SS] ORDER_NOTIFY → On Hold:', resolvedNum)
+      } else if (order.orderStatus === 'awaiting_shipment') {
+        // Released from hold → restore to Open
+        const ids = erpLines.filter((l: any) => l.fulfillment_status === 'On Hold').map((l: any) => l.id)
+        if (ids.length) await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', ids)
+        console.log('[SS] ORDER_NOTIFY → Released hold:', resolvedNum)
+      }
+    }
+  }
+
+  // ORDER_CANCELLED: kept for safety in case some SS integrations still send it,
+  // but ORDER_NOTIFY above is the real event
   if (resource_type === 'ORDER_CANCELLED') {
-    const rawNum = data.orderNumber
-    const { data: ex } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
-    const rn = ex?.length ? rawNum : '#' + rawNum
-    await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('order_number', rn)
+    const rawNum = stripHash(data?.orderNumber || '')
+    if (rawNum) {
+      const { data: ex1 } = await db.from('sales').select('id').eq('order_number', '#' + rawNum).limit(1)
+      const resolvedNum = ex1?.length ? '#' + rawNum : rawNum
+      await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('order_number', resolvedNum)
+    }
   }
   // Note: ORDER_ON_HOLD and ORDER_HOLD_RELEASED are not real ShipStation webhook events.
-  // Use the hold_sync action (polling) instead to sync hold status.
+  // ORDER_NOTIFY handles holds. Use the hold_sync action for manual polling.
 
   return ok('ok')
 })
@@ -4339,10 +4444,10 @@ supabase functions deploy shipstation-ship --no-verify-jwt</pre>
       <b>ShipStation</b> → Account Settings → Webhooks → Add Webhook:<br>
       &nbsp;· <b>On Items Shipped</b> → <span class="pn" style="color:var(--teal)">${edgeUrl}/shipstation-ship</span><br>
       &nbsp;· <b>On New Orders</b> → same URL (catches manually-created SS orders)<br>
-      &nbsp;· <b>Order_Cancelled</b> → same URL<br>
+      &nbsp;· <b>On Order Notify</b> → same URL <span style="color:var(--orange);font-weight:600">(handles cancellations + holds — required)</span><br>
       &nbsp;· Event: <b>SHIP_NOTIFY</b> (fires when label created = split-aware)<br>
-      &nbsp;· Event: <b>ORDER_CANCELLED</b><br>
-      &nbsp;· <i>Note: ShipStation does not fire ORDER_ON_HOLD or ORDER_HOLD_RELEASED events. Use the Hold Sync button instead to poll for hold changes.</i><br>
+      &nbsp;· Event: <b>ORDER_NOTIFY</b> <span style="color:var(--orange)">← this is the real cancel/hold event — register this, not ORDER_CANCELLED</span><br>
+      &nbsp;· <i>Note: ORDER_CANCELLED and ORDER_ON_HOLD are not real SS events. ORDER_NOTIFY handles both. Use Sync Holds / Sync Cancellations buttons to poll manually.</i><br>
       &nbsp;· URL for all: <span class="pn" style="color:var(--teal)">${edgeUrl}/shipstation-ship</span>
     </div>
   </div>`:''}`;
@@ -5291,6 +5396,20 @@ async function syncOrdersNow(){
         toast('⚠ ShipStation hold sync skipped — SS_KEY not set in Supabase edge function secrets',5000);
     }
   }catch(e){console.warn('ShipStation hold check skipped:',e.message);}
+
+  // ── Step 4: Check ShipStation for recently cancelled orders ──
+  try{
+    const ssCancelRes=await fetch(edgeBase+'/shipstation-ship',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+      body:JSON.stringify({action:'cancel_sync',days:30})
+    });
+    if(ssCancelRes.ok){
+      const cancelData=await ssCancelRes.json().catch(()=>({}));
+      const c=cancelData.markedCancelled||0;
+      if(c>0){updatedCount+=c;toast('✕ '+c+' order'+(c!==1?'s':'')+' marked Cancelled',3000);}
+    }
+  }catch(e){console.warn('ShipStation cancel check skipped:',e.message);}
 
   await refreshSales();render();
 
@@ -11679,9 +11798,64 @@ async function refreshAssemblies(){
   if(data)S.assemblies=data;
   computeDemand();
 }
-async function syncHoldsOnly(){
+async function syncCancellationsOnly(){
   const edgeBase=SUPA_URL+'/functions/v1';
-  const btn=document.getElementById('holds-btn');
+  const btn=document.getElementById('cancel-sync-btn');
+  if(btn){btn.disabled=true;btn.textContent='Syncing…';}
+  try{
+    const res=await fetch(edgeBase+'/shipstation-ship',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+      body:JSON.stringify({action:'cancel_sync',days:30})
+    });
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok){toast('Cancel sync failed: '+(data.error||res.status));return;}
+    await refreshSales();render();
+    const c=data.markedCancelled||0;
+    toast('Cancel sync done — '+c+' order'+(c!==1?'s':'')+' marked Cancelled'+(c===0?' (none found in last 30 days)':''),4000);
+  }catch(e){toast('Cancel sync error: '+e.message);}
+  finally{if(btn){btn.disabled=false;btn.textContent='✕ Sync Cancels';}}
+}
+async function diagHolds(){
+  const edgeBase=SUPA_URL+'/functions/v1';
+  toast('🔍 Diagnosing hold sync…',2000);
+  try{
+    const res=await fetch(edgeBase+'/shipstation-ship',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+      body:JSON.stringify({action:'hold_sync_debug'})
+    });
+    const d=await res.json().catch(()=>({}));
+    if(!res.ok){toast('Error: '+(d.error||res.status));return;}
+
+    const ssOrders=d.ss_on_hold_sample||[];
+    const erpOrders=d.erp_open_sample||[];
+
+    const html=`
+      <div style="font-size:13px;font-weight:700;margin-bottom:12px">🔍 Hold Sync Diagnosis</div>
+      <div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:10px">
+        <div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Result</div>
+        <div style="font-size:12px;color:${d.matches_found>0?'var(--green)':d.ss_on_hold_count===0?'var(--yellow)':'var(--red)'};font-weight:600">${escHtml(d.diagnosis||'')}</div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+        <div>
+          <div style="font-size:10px;font-weight:700;color:var(--orange);text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px">ShipStation on-hold (${d.ss_on_hold_count||0} total)</div>
+          ${ssOrders.length===0?'<div style="font-size:11px;color:var(--text3)">None found</div>':ssOrders.map((o)=>`<div style="font-size:11px;font-family:var(--mono);padding:2px 0;border-bottom:1px solid var(--border)">${escHtml(o.raw)} <span style="color:var(--text3);font-size:9px">→ stripped: ${escHtml(o.stripped)}</span></div>`).join('')}
+        </div>
+        <div>
+          <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px">ERP open orders (sample)</div>
+          ${erpOrders.length===0?'<div style="font-size:11px;color:var(--text3)">None found</div>':erpOrders.map((o)=>`<div style="font-size:11px;font-family:var(--mono);padding:2px 0;border-bottom:1px solid var(--border)">${escHtml(o.raw)} <span style="color:var(--text3);font-size:9px">[${escHtml(o.status)}]</span></div>`).join('')}
+        </div>
+      </div>
+      ${d.matches_found>0?`<div style="background:var(--teal-dim);border:1px solid rgba(13,148,136,.3);border-radius:6px;padding:8px 12px;font-size:11px;color:var(--teal)">✓ ${d.matches_found} match${d.matches_found!==1?'es':''} found — click ⏸ Sync Holds to apply</div>`:''}
+      <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);font-size:10px;color:var(--text3)">
+        If SS order numbers have a different prefix/suffix than ERP, the hold_sync can't match them. Compare the two columns above.
+      </div>`;
+
+    openModal('custom',{title:'Hold Sync Diagnosis',html:html+'<div class="modal-footer"><button class="btn btn-primary" onclick="closeModal()">Close</button></div>'});
+  }catch(e){toast('Diagnose error: '+e.message);}
+}
+async function syncHoldsOnly(){
   if(btn){btn.disabled=true;btn.textContent='⏸ Syncing…';}
   try{
     const res=await fetch(edgeBase+'/shipstation-ship',{
@@ -11724,9 +11898,11 @@ async function refreshAll(){
     if(corrections.data)S.corrections=corrections.data;
     // Re-subscribe realtime in case connection dropped
     setupRealtime();
-    // Also sync ShipStation holds so ↺ catches holds without needing Sync Orders
+    // Also sync ShipStation holds and cancellations so ↺ catches them without needing Sync Orders
     fetch(SUPA_URL+'/functions/v1/shipstation-ship',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({action:'hold_sync'})})
       .then(r=>r.ok?r.json():null).then(d=>{if(d&&(d.markedHold||d.markedOpen)){refreshSales().then(()=>render());if(d.markedHold||d.markedOpen)toast('⏸ '+d.markedHold+' held, '+d.markedOpen+' released',3000);}}).catch(()=>{});
+    fetch(SUPA_URL+'/functions/v1/shipstation-ship',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({action:'cancel_sync',days:30})})
+      .then(r=>r.ok?r.json():null).then(d=>{if(d&&d.markedCancelled>0){refreshSales().then(()=>render());toast('✕ '+d.markedCancelled+' order(s) marked Cancelled',3000);}}).catch(()=>{});
     computeDemand();updateBadge();render();
     toast('↺ Data refreshed',2000);
   }catch(e){
