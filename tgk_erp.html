@@ -129,6 +129,7 @@
     </div>
     <div class="topbar-actions">
       <button id="cc-back-btn" onclick="goToCommandCenter()" style="display:flex;align-items:center;gap:6px;padding:5px 12px;background:var(--teal-dim);border:1px solid rgba(13,148,136,.25);border-radius:6px;color:var(--teal);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;flex-shrink:0"><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>Command Center</button>
+      <button id="cart-btn" onclick="openCart()" title="PO Cart">&#128722; PO Cart<span id="cart-badge"></span></button>
       <div class="search-wrap" style="max-width:220px">
         <span class="search-icon">⌕</span>
         <input type="text" placeholder="Search anything — parts, finished goods…" id="gsearch" oninput="onSearch(this.value)">
@@ -6266,16 +6267,16 @@ function renderPlanning() { const weeks = S.forecastWeeks; const sf = S.filters.
   const inBOMSet=new Set();
   Object.values(S.boms).forEach(items=>items.forEach(i=>{if(i.item_type==='part')inBOMSet.add(i.child_pn);}));
   function makePOBtn(p,oq,moq){
-  var qty=oq>0?oq:(moq||1);
-  var lbl=oq>0?('Order '+oq):'+ PO';
-  var cls=oq>0?'btn btn-primary btn-sm':'btn btn-sm';
-  return '<button class="'+cls+'" onclick="createPOFromSuggestion('
-   +JSON.stringify(p.pn)+','
-   +JSON.stringify(p.vendor||'')+','
-   +qty+','
-   +costForQty(p,qty)+','
-   +JSON.stringify(p.description||'')
-   +')">'+lbl+'</button>';
+    var qty=oq>0?oq:(moq||1);
+    var inCart=S.poCart&&S.poCart.some(function(c){return c.pn===p.pn;});
+    var lbl=inCart?'In Cart':'Order '+(oq>0?oq:'');
+    var cls=inCart?'btn btn-teal btn-sm':'btn btn-primary btn-sm';
+    if(!oq&&!moq){lbl='+ PO';cls='btn btn-sm';}
+    return '<button class="'+cls+'" onclick="addToCart('
+      +JSON.stringify(p.pn)+','
+      +qty
+      +');renderCartPanel()" title="Add to PO Cart">'
+      +lbl+'</button>';
   }
   return parts.map(p=>{
   const rp=calcReorderPoint(p);
@@ -7553,8 +7554,9 @@ function renderPriceList(){
     var pref=sp!=null?'SALE $'+sp.toFixed(2):(msrp>0?'$'+(msrp*0.80).toFixed(2):'--');
     var stdStyle=sp!=null?'color:var(--red);font-weight:700':'color:var(--teal);font-weight:600';
     var prefStyle=sp!=null?'color:var(--red);font-weight:700':'color:var(--orange);font-weight:600';
-    tbody+='<tr style="'+(!(msrp>0)?'background:rgba(217,119,6,.04)':'')+'">'
-      +'<td class="pn" style="font-family:var(--mono);font-size:11px">'+escHtml(a.pn)+'</td>'
+    var isLive=a.pl_active!==false;
+    tbody+='<tr style="'+(!(msrp>0)?'background:rgba(217,119,6,.04)':'')+(!isLive?'opacity:.5;background:rgba(107,114,128,.06)':'')+'">'
+      +'<td style="text-align:center">'+'<input type="checkbox" '+(isLive?'checked':'')+' title="Live on vendor price list"'+' onchange="savePriceField(\''+a.id+'\',\'pl_active\',this.checked)" onclick="event.stopPropagation()">'+'</td>'+'<td class="pn" style="font-family:var(--mono);font-size:11px">'+escHtml(a.pn)+'</td>'
       +'<td style="font-size:11px;color:var(--text2)">'+escHtml(a.category||'')+'</td>'
       +'<td style="font-size:11px;max-width:220px">'+escHtml(a.description||'')+'</td>'
       +'<td class="money-retail" style="font-weight:700">'+(!(msrp>0)?'<span style="color:var(--yellow);font-size:10px">Set in Assemblies</span>':'$'+msrp.toFixed(2))+'</td>'
@@ -7591,7 +7593,7 @@ function renderPriceList(){
     +'<div style="overflow:auto;flex:1">'
     +'<table class="data-table" style="min-width:900px">'
     +'<thead><tr style="position:sticky;top:0;z-index:2;background:var(--bg3)">'
-    +'<th class="pn">SKU</th><th>Category</th><th>Description</th>'
+    +'<th style="text-align:center" title="Live on vendor price list">Live</th><th class="pn">SKU</th><th>Category</th><th>Description</th>'
     +'<th class="money-retail">MSRP</th>'
     +'<th class="money-retail" style="color:var(--teal)">Std 10%</th>'
     +'<th class="money-retail" style="color:var(--orange)">Pref 20%</th>'
@@ -7603,8 +7605,9 @@ function renderPriceList(){
 
 async function savePriceField(asmId,field,value){
   var update={updated_at:new Date().toISOString()};
-  update[field]=(field==='sales_price'&&(value===''||value==='blank'))?null:(parseFloat(value)||null);
-  if(field!=='sales_price')update[field]=value;
+  if(field==='sales_price'){update[field]=(value===''||value==='blank')?null:(parseFloat(value)||null);}
+  else if(field==='pl_active'){update[field]=value===true||value==='true';}
+  else{update[field]=value;}
   var r=await db.from('assemblies').update(update).eq('id',asmId);
   if(r.error){toast('Error: '+r.error.message);return;}
   S.assemblies=S.assemblies.map(function(a){return a.id===asmId?Object.assign({},a,update):a;});
@@ -7701,6 +7704,7 @@ function render(){
     if(el){el.focus();try{el.setSelectionRange(selS,selE);}catch(e){}}
   }
   updateBadge();
+  if(typeof updateCartBadge==='function')updateCartBadge();
 }
 
 // ── TARGETED TABLE REFRESH (avoids full loadAll on minor changes) ──
@@ -7858,6 +7862,43 @@ function _showCCInbox(){if(!_ccProduct)return;var p=_ccProduct.data||{};var ex=d
 function ccImportAsPart(){if(!_ccProduct)return;var p=_ccProduct.data||{},s=_ccProduct.seo||{};if(typeof S!=='undefined'){S.view='parts';if(typeof scheduleRender==='function')scheduleRender();}var prefill={pn:p.sku||'',description:p.name||s.meta_title||'',category:_mapCCCat(p.cat||''),vendor:'TGK Motorsport',unit_cost:0,lead_time_weeks:1,avg_sales_wk:0,total_unpckgd:0,min_qty:0,moq:1,location:'',drawing_url:'',discontinued:false,price_breaks:[]};var ex=document.getElementById('cc-inbox-banner');if(ex)ex.remove();if(typeof openModal==='function'){openModal('addPart',prefill);setTimeout(function(){var c=document.getElementById('m-cost');if(c){c.focus();c.select();}},150);}if(typeof logAction==='function')logAction('Imported from Command Center: '+(p.name||'Product'),'parts',p.sku||'',null,prefill).catch(function(){});_pingCC('PRODUCT_IMPORTED',{name:p.name||''});}
 function _mapCCCat(cat){var m={'Suspension / mounts':'Suspension','Engine / drivetrain':'Engine','Exhaust / intake':'Exhaust','Interior / exterior':'Interior','Brakes / wheels':'Brakes','Lifestyle / apparel':'Apparel'};return m[cat]||cat||'';}
 
+
+function openCart(){renderCartPanel();document.getElementById('cart-overlay').classList.add('open');document.getElementById('cart-panel').classList.add('open');}
+function closeCart(){document.getElementById('cart-overlay').classList.remove('open');document.getElementById('cart-panel').classList.remove('open');}
+function updateCartBadge(){var b=document.getElementById('cart-badge');if(!b)return;var n=(S.poCart||[]).length;b.textContent=n||'';b.classList.toggle('show',n>0);}
+function renderCartPanel(){
+  var body=document.getElementById('cart-body');
+  var foot=document.getElementById('cart-foot');
+  var vc=document.getElementById('cart-vendor-count');
+  if(!body)return;
+  if(!(S.poCart&&S.poCart.length)){
+    body.innerHTML='<div class="cart-empty">Your cart is empty.<br>Click Order or + PO buttons in Purchasing.</div>';
+    if(foot)foot.style.display='none';
+    if(vc)vc.textContent='';
+    updateCartBadge();return;
+  }
+  var pm={};S.parts.forEach(function(p){pm[p.pn]=p;});
+  var groups={};
+  S.poCart.forEach(function(c){var p=pm[c.pn];var v=(p&&p.vendor)||'Unknown Vendor';if(!groups[v])groups[v]=[];groups[v].push(c);});
+  var vendors=Object.keys(groups).sort();
+  var grandTotal=0;var html='';
+  vendors.forEach(function(v){
+    var items=groups[v];
+    var vTotal=items.reduce(function(t,c){var p=pm[c.pn];return t+c.qty*(p?costForQty(p,c.qty):0);},0);
+    grandTotal+=vTotal;
+    html+='<div class="cart-vendor-hdr">'+escHtml(v)+'<span style="margin-left:auto;font-size:10px;color:var(--text3);font-weight:400">'+items.length+' line'+(items.length>1?'s':'')+'</span><span style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--orange);margin-left:8px">$'+vTotal.toFixed(2)+'</span></div>';
+    items.forEach(function(c){
+      var p=pm[c.pn];var cost=p?costForQty(p,c.qty):0;var total=c.qty*cost;
+      html+='<div class="cart-item"><span class="cart-item-pn">'+escHtml(c.pn)+'</span><span class="cart-item-desc">'+(p?escHtml(p.description||''):'')+'</span><input class="cart-qty-input" type="number" min="1" value="'+c.qty+'" onchange="setCartQty(\''+escHtml(c.pn)+'\',this.value)"><span class="cart-item-total">$'+total.toFixed(2)+'</span><button class="cart-remove" onclick="setCartQty(\''+escHtml(c.pn)+'\',0)" title="Remove">&#x2715;</button></div>';
+    });
+  });
+  body.innerHTML=html;
+  if(foot)foot.style.display='';
+  var totalEl=document.getElementById('cart-total');
+  if(totalEl)totalEl.textContent='$'+grandTotal.toFixed(2);
+  if(vc)vc.textContent=vendors.length+' vendor'+(vendors.length>1?'s':'');
+  updateCartBadge();
+}
 (function startTGK(){
   const msg=document.getElementById('tgk-msg');
   const retry=document.getElementById('tgk-retry');
@@ -7957,5 +7998,28 @@ function _mapCCCat(cat){var m={'Suspension / mounts':'Suspension','Engine / driv
   else{waitForSupabase();}
 })();
 </script>
+
+<div id="cart-overlay" onclick="closeCart()"></div>
+<div id="cart-panel">
+  <div class="cart-head">
+    <span class="cart-head-title">&#128722; PO Cart</span>
+    <span id="cart-vendor-count" style="font-size:11px;color:var(--text3)"></span>
+    <button class="cart-close" onclick="closeCart()">&#x2715;</button>
+  </div>
+  <div class="cart-body" id="cart-body"><div class="cart-empty">Your cart is empty.<br>Click + PO or Order buttons in Purchasing.</div></div>
+  <div class="cart-foot" id="cart-foot" style="display:none">
+    <div class="cart-total-row">
+      <span class="cart-total-lbl">Est. Total</span>
+      <span class="cart-total-val" id="cart-total">$0.00</span>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-sm" onclick="S.poCart=[];renderCartPanel();render()">Clear All</button>
+      <button class="btn btn-primary" style="flex:1;justify-content:center" onclick="closeCart();submitPOCart()">
+        &#10003; Create Draft POs by Vendor
+      </button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>
