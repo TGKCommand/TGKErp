@@ -417,7 +417,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
     <button class="nav-item" id="nav-planning" onclick="nav('planning')"><span class="nav-dot"></span>Inv. Planning</button>
     <button class="nav-item" id="nav-packqueue" onclick="nav('packqueue')"><span class="nav-dot"></span>Production</button>
     <button class="nav-item" id="nav-cyclecounts" onclick="nav('cyclecounts')"><span class="nav-dot"></span>Cycle Counts</button>
-    <button class="nav-item" id="nav-corrections" onclick="nav('corrections')"><span class="nav-dot"></span>Corrections Log</button>
+    <button class="nav-item" id="nav-corrections" onclick="nav('corrections')"><span class="nav-dot"></span>Activity Log</button>
 
     <div class="sidebar-section">Purchasing</div>
     <button class="nav-item" id="nav-purchases" onclick="nav('purchases')"><span class="nav-dot"></span>Purchase Orders</button>
@@ -534,7 +534,7 @@ const S = {
   shipstation:{connected:false,key:'',secret:''},
   aiHistory:[{role:'assistant',text:'Hi — I\'m your TGK ERP assistant. Ask me about inventory levels, what needs reordering, BOM analysis, or pack planning.'}],
   aiLoading:false,
-  undoStack:[], backups:[], lastBackup:null, autoBackupTimer:null,
+  undoStack:[], backups:[], lastBackup:null, autoBackupTimer:null, autoRefreshTimer:null, lastActivity:Date.now(),
   backupTableOk:null, // null=unknown, true=exists, false=missing
   backupError:null,   // last error string if backup failed
   // Planning
@@ -549,8 +549,8 @@ const S = {
   pendingPriceBreaks:[],
   // Cycle counts
   cycleCounts:[], activeCount:null, countLines:[],
-  // Corrections
-  corrections:[],
+  // Corrections / Activity
+  corrections:[], auditLog:[], _auditLogLoaded:false, _auditLogLoading:false,
   // Warranty
   warrantyClaims:[],
   // Shipment Errors
@@ -983,7 +983,7 @@ function setupRealtime(){
 // ============================================================
 // NAV
 // ============================================================
-const PAGE_TITLES={dashboard:'Dashboard',users:'Users & Permissions',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',planning:'Inventory Planning',purchases:'Purchase Orders',vendors:'Vendors',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Corrections Log',warranty:'Customer Resolution',import:'Import Data',pobuilder:'PO Builder',reports:'Reports & Export'};
+const PAGE_TITLES={dashboard:'Dashboard',users:'Users & Permissions',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',inventory:'Inventory',planning:'Inventory Planning',purchases:'Purchase Orders',vendors:'Vendors',sales:'Sales Orders',dealers:'Dealers',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Activity Log',warranty:'Customer Resolution',import:'Import Data',pobuilder:'PO Builder',reports:'Reports & Export'};
 
 function nav(v){
   if(v!==S.view){
@@ -991,6 +991,7 @@ function nav(v){
     S.navHistory=[...(S.navHistory||[]).slice(-29),{view:S.view,activePO:S.activePO,activeSale:S.activeSale,activeBuild:S.activeBuild,buildStack:[...(S.buildStack||[])],activeCount:S.activeCount,lookupSel:S.lookupSel,lookupQ:S.lookupQ}];
     S.activePO=null;S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.buildStack=[];S.activeCount=null;
     if(v==='users'){S._profilesLoaded=false;S._profilesLoading=false;S._profilesError=null;}
+    if(v==='corrections'){S._auditLogLoaded=false;S._auditLogLoading=false;}
     if(v!=='packqueue'){S.workOrderMode=false;S.customPackMode=false;}
     S.searchQ='';if(S.view==='reports')S.rptState={...S.rptState,preview:null};
   }
@@ -1003,11 +1004,12 @@ function nav(v){
   // Update sub-nav active items
   $('subnav-claims')?.classList.toggle('active',v==='warranty'&&(S.wtyTab||'claims')==='claims');
   $('subnav-errors')?.classList.toggle('active',v==='warranty'&&S.wtyTab==='errors');
-  // Clear new-order badge when visiting Sales Orders
+  // Clear new-order badge and refresh data when visiting Sales Orders
   if(v==='sales'){
     const b=$('sales-badge');
     if(b){b.textContent='0';b.style.display='none';}
     $('nav-sales')?.classList.remove('alert-nav');
+    refreshSales().then(()=>{if(S.view==='sales')render();});
   }
   // Clear warranty badge when visiting Warranty
   if(v==='warranty'){
@@ -7719,6 +7721,42 @@ async function startAutoBackup() {
   if(el) el.textContent = ok ? 'Auto-backup ready' : '⚠ Backups not set up';
 }
 
+
+// ── Background auto-refresh — silently reloads all key tables after 5 min inactivity ──
+function startAutoRefresh(){
+  if(S.autoRefreshTimer)clearInterval(S.autoRefreshTimer);
+  // Track user activity — any interaction resets the idle clock
+  const resetIdle=()=>S.lastActivity=Date.now();
+  ['mousedown','keydown','touchstart','scroll'].forEach(e=>document.addEventListener(e,resetIdle,{passive:true}));
+  const IDLE_MS=5*60*1000; // 5 minutes
+  S.autoRefreshTimer=setInterval(async()=>{
+    if(Date.now()-S.lastActivity<IDLE_MS)return; // user active — skip
+    if(!S.currentUserId)return; // not logged in
+    try{
+      // Refresh all key tables silently
+      const[salesData,partsData,purchData,corr]=await Promise.all([
+        fetchAll((f,t)=>db.from('sales').select('*').order('created_at',{ascending:false}).range(f,t)),
+        db.from('parts').select('*').order('pn'),
+        db.from('purchases').select('*').order('order_date',{ascending:false}),
+        db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
+      ]);
+      S.sales=salesData||[];
+      if(partsData.data)S.parts=partsData.data;
+      if(purchData.data)S.purchases=purchData.data;
+      if(corr.data)S.corrections=corr.data;
+      computeDemand();updateBadge();
+      // Only re-render if on a page that shows this data — don't interrupt modal workflows
+      // Only re-render if: on an affected page AND no modal open AND no input focused
+      const modalOpen=document.getElementById('modal-overlay')?.style.display!=='none';
+      const inputFocused=document.activeElement&&['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName);
+      if(['dashboard','sales','inventory','planning','purchases','corrections'].includes(S.view)&&!modalOpen&&!inputFocused){
+        render();
+      }
+      console.log('[TGK] Auto-refresh complete at',new Date().toLocaleTimeString());
+    }catch(e){console.warn('[TGK] Auto-refresh failed:',e.message);}
+  }, 60*1000); // check every 60s, only refresh if idle ≥ 5 min
+}
+
 // ============================================================
 // REPORTS & EXPORT
 // ============================================================
@@ -11302,7 +11340,88 @@ async function applyCountCorrections(countId) {
 // ============================================================
 // CORRECTIONS LOG
 // ============================================================
+async function loadAuditLog(){
+  if(S._auditLogLoading)return;
+  S._auditLogLoading=true;
+  const{data,error}=await db.from('audit_log').select('*').order('created_at',{ascending:false}).limit(1000);
+  S._auditLogLoading=false;
+  S._auditLogLoaded=true;
+  S.auditLog=data||[];
+  render();
+}
+
+function renderAuditLog(){
+  if(!S._auditLogLoaded&&!S._auditLogLoading){loadAuditLog();return'<div class="section-empty" style="padding:40px 0">Loading activity log\u2026</div>';}
+  if(S._auditLogLoading)return'<div class="section-empty" style="padding:40px 0">Loading\u2026</div>';
+  const sf=S.filters.auditlog||{};
+  const users=[...new Set(S.auditLog.map(a=>a.user_email).filter(Boolean))].sort();
+  let list=[...S.auditLog];
+  const q=(sf.search||'').toLowerCase();
+  if(q)list=list.filter(a=>(a.summary||'').toLowerCase().includes(q)||(a.entity_pn||'').toLowerCase().includes(q)||(a.user_email||'').toLowerCase().includes(q)||(a.entity_type||'').toLowerCase().includes(q));
+  if(sf.user)list=list.filter(a=>a.user_email===sf.user);
+  if(sf.from)list=list.filter(a=>a.created_at>=sf.from);
+  if(sf.to)list=list.filter(a=>a.created_at<=sf.to+'T23:59:59');
+  if(sf.role)list=list.filter(a=>a.user_role===sf.role);
+  const sortField=sf.sort||'date';
+  const sortDir=sf.dir||'desc';
+  list.sort((a,b)=>{
+    let cmp=0;
+    if(sortField==='user')cmp=(a.user_email||'').localeCompare(b.user_email||'');
+    else if(sortField==='entity')cmp=(a.entity_pn||'').localeCompare(b.entity_pn||'');
+    else if(sortField==='action')cmp=(a.summary||'').localeCompare(b.summary||'');
+    else if(sortField==='role')cmp=(a.user_role||'').localeCompare(b.user_role||'');
+    else cmp=new Date(a.created_at)-new Date(b.created_at);
+    return sortDir==='desc'?-cmp:cmp;
+  });
+
+  const sSort=(val,label)=>{const arr=sortField===val?(sortDir==='desc'?'↓':'↑'):'';return`<button class="filter-chip ${sortField===val?'on-teal':''}" onclick="(()=>{const d=S.filters.auditlog?.sort==='${val}'&&(S.filters.auditlog?.dir||'desc')==='desc'?'asc':'desc';setFilter('auditlog','sort','${val}');setFilter('auditlog','dir',d)})()">${label}${arr?' '+arr:''}</button>`;};
+
+  const rows=list.map(a=>{
+    const roleColor=a.user_role==='admin'?'var(--teal)':'var(--orange)';
+    const dt=a.created_at?new Date(a.created_at):null;
+    return `<tr>
+      <td style="font-size:10px;color:var(--text3);font-family:var(--mono);white-space:nowrap;min-width:100px">${dt?timeAgo(a.created_at):'—'}<br><span style="font-size:8px">${dt?dt.toLocaleString():''}</span></td>
+      <td><div style="font-size:12px;color:var(--text);font-weight:500">${escHtml(a.user_email||'—')}</div><span style="font-size:9px;color:${roleColor};background:${a.user_role==='admin'?'rgba(13,148,136,.12)':'rgba(234,88,12,.1)'};border-radius:3px;padding:1px 5px">${a.user_role||''}</span></td>
+      <td style="font-size:12px;color:var(--text2);max-width:300px">${escHtml(a.summary||'')}</td>
+      <td style="font-size:11px;font-family:var(--mono);color:var(--teal)">${a.entity_pn?escHtml(a.entity_pn):'—'}</td>
+      <td style="font-size:10px;color:var(--text3)">${escHtml(a.entity_type||'—')}</td>
+    </tr>`;
+  }).join('');
+
+  return `<div class="filter-bar" style="flex-wrap:wrap;gap:8px">
+    <div class="search-wrap"><span class="search-icon">⌕</span><input placeholder="Search user, action, part\u2026" value="${sf.search||''}" oninput="setFilter('auditlog','search',this.value)"></div>
+    <select class="form-input" style="width:auto;padding:6px 10px;font-size:11px" onchange="setFilter('auditlog','user',this.value)">
+      <option value="">All Users</option>
+      ${users.map(u=>`<option value="${escHtml(u)}" ${sf.user===u?'selected':''}>${escHtml(u)}</option>`).join('')}
+    </select>
+    <select class="form-input" style="width:auto;padding:6px 10px;font-size:11px" onchange="setFilter('auditlog','role',this.value)">
+      <option value="">All Roles</option>
+      <option value="admin" ${sf.role==='admin'?'selected':''}>Admin</option>
+      <option value="super_user" ${sf.role==='super_user'?'selected':''}>Super User</option>
+    </select>
+    <input type="date" class="form-input" style="width:auto;padding:6px 10px;font-size:11px" value="${sf.from||''}" title="From date" onchange="setFilter('auditlog','from',this.value)">
+    <input type="date" class="form-input" style="width:auto;padding:6px 10px;font-size:11px" value="${sf.to||''}" title="To date" onchange="setFilter('auditlog','to',this.value)">
+    ${sf.from||sf.to||sf.user||sf.role||sf.search?`<button class="filter-chip" onclick="S.filters.auditlog={};render()">✕ Clear</button>`:''}
+    <div style="margin-left:auto;display:flex;align-items:center;gap:6px">
+      <span style="font-size:11px;color:var(--text3)">Sort:</span>
+      ${sSort('date','Date')}${sSort('user','User')}${sSort('action','Action')}${sSort('entity','Part')}
+    </div>
+    <button class="btn btn-sm" onclick="S._auditLogLoaded=false;loadAuditLog()">\u21ba Refresh</button>
+    <span class="filter-count">${list.length} of ${S.auditLog.length} records</span>
+  </div>
+  ${!S.auditLog.length?'<div class="section-empty">No audit log entries yet. Actions will appear here as users make changes.</div>':
+  `<div class="tbl-wrap"><table><thead><tr>
+    <th>When</th><th>User</th><th>Action</th><th>Part / Entity</th><th>Type</th>
+  </tr></thead><tbody>${rows}</tbody></table></div>`}`;
+}
+
 function renderCorrections() {
+  const actTab=S.filters.corrections?._tab||'stock';
+  const tabBar=`<div class="tabs-row" style="margin-bottom:0">
+    <div class="tab ${actTab==='stock'?'active':''}" onclick="setFilter('corrections','_tab','stock')">📦 Stock Movements</div>
+    <div class="tab ${actTab==='actions'?'active':''}" onclick="setFilter('corrections','_tab','actions')">👤 User Actions</div>
+  </div>`;
+  if(actTab==='actions')return tabBar+renderAuditLog();
   const sf=S.filters.corrections||{};
   let list=S.corrections;
   const q=(sf.search||'').toLowerCase();
@@ -11321,7 +11440,7 @@ function renderCorrections() {
   // Also pick up any sources in the data not covered by fixedSources
   const dataSources=[...new Set(S.corrections.map(c=>c.source||'manual'))];
   const extraSources=dataSources.filter(s=>!fixedSources.find(f=>f.key===s));
-  return `
+  return tabBar+`
   <div class="filter-bar">
     <div class="search-wrap"><span class="search-icon">⌕</span><input placeholder="Part # or reason…" value="${sf.search||''}" oninput="setFilter('corrections','search',this.value)"></div>
     <button class="filter-chip ${!sf.source?'on-teal':''}" onclick="setFilter('corrections','source','')">All (${S.corrections.length})</button>
@@ -12458,13 +12577,9 @@ async function refreshAll(){
         try{setupRealtime();}catch(e){console.error('setupRealtime:',e);}
         try{loadBackups();}catch(e){console.error('loadBackups:',e);}
         try{startAutoBackup();}catch(e){console.error('startAutoBackup:',e);}
+        try{startAutoRefresh();}catch(e){console.error('startAutoRefresh:',e);}
         try{history.replaceState(snapState(),'','#dashboard');}catch(e){}
         if(window.location.search.includes('code=')&&window.location.search.includes('shop='))handleShopifyOAuthCallback();
-        // Diagnostic: log data counts so we can spot RLS-empty-result issues
-        console.log('[TGK] Load complete — parts:'+S.parts.length+' sales:'+S.sales.length+' purchases:'+S.purchases.length+' assemblies:'+S.assemblies.length);
-        if(S.parts.length===0&&S.sales.length===0){
-          setTimeout(()=>toast('⚠ No data loaded — possible RLS issue. Check browser console or see Backups page.',6000),500);
-        }
         render();
       })
       .catch(err=>{
