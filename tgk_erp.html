@@ -8053,7 +8053,7 @@ function showAuthGate(){
   const a=document.getElementById('tgk-app');if(a)a.style.display='none';
   const l=document.getElementById('tgk-loader');if(l)l.style.display='none';
 }
-function hideAuthGate(){const g=document.getElementById('auth-gate');if(g)g.style.display='none';}
+function hideAuthGate(){const g=document.getElementById('auth-gate');if(g)g.style.display='none';_pingCC('ERP_READY',{});}
 
 function showSetPasswordGate(isInvite){
   const g=document.getElementById('auth-gate');
@@ -13511,6 +13511,166 @@ async function refreshAll(){
   }
 }
 
+// ════════════════════════════════════════════════════════
+// TGK COMMAND CENTER BRIDGE
+// Receives auth tokens + product data from the CC iframe
+// ════════════════════════════════════════════════════════
+var _ccToken   = null;   // {access_token, refresh_token, email}
+var _ccProduct = null;   // latest product pushed from CC
+
+window.addEventListener('message', function(e) {
+  if (!e.data || e.data.source !== 'TGK_CC') return;
+
+  if (e.data.type === 'AUTH_TOKEN') {
+    _ccToken = e.data;
+    // If Supabase is already loaded, apply session now
+    if (typeof db !== 'undefined' && db && db.auth) {
+      _applyCCToken();
+    }
+    // Otherwise startTGK will pick it up in checkAuthAndConnect
+  }
+
+  if (e.data.type === 'PRODUCT_DATA') {
+    _ccProduct = { data: e.data.data, seo: e.data.seo || {}, copy: e.data.copy || {} };
+    _showCCInbox();
+  }
+
+  if (e.data.type === 'REQUEST_PRODUCT') {
+    // CC is asking for confirmation
+    _pingCC('ERP_READY', {});
+  }
+});
+
+function _pingCC(type, payload) {
+  try {
+    var msg = Object.assign({ source: 'TGK_ERP', type: type }, payload || {});
+    window.parent.postMessage(msg, 'https://TGKMotorsport.github.io');
+  } catch(e) {}
+}
+
+async function _applyCCToken() {
+  if (!_ccToken || !_ccToken.access_token) return false;
+  try {
+    var result = await db.auth.setSession({
+      access_token:  _ccToken.access_token,
+      refresh_token: _ccToken.refresh_token || ''
+    });
+    if (!result.error && result.data && result.data.session) {
+      try { await loadUserProfile(result.data.session.user); } catch(pe) {}
+      hideAuthGate();
+      if (typeof window._appRestart === 'function') window._appRestart(1);
+      _pingCC('ERP_READY', {});
+      return true;
+    }
+  } catch(e) {}
+  return false;
+}
+
+// CC Inbox — show when a product arrives from Command Center
+function _showCCInbox() {
+  if (!_ccProduct) return;
+  var p = _ccProduct.data || {};
+  var existing = document.getElementById('cc-inbox-banner');
+  if (existing) existing.remove();
+
+  var banner = document.createElement('div');
+  banner.id = 'cc-inbox-banner';
+  banner.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:9000;width:340px;background:#fff;border:1px solid #E4E7EC;border-radius:12px;padding:16px;box-shadow:0 4px 24px rgba(0,0,0,.12);animation:cc-slide-in .3s ease';
+  banner.innerHTML = ''
+    + '<style>@keyframes cc-slide-in{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}</style>'
+    + '<div style="display:flex;align-items:flex-start;gap:10px">'
+    +   '<div style="width:36px;height:36px;border-radius:8px;background:rgba(13,148,136,.1);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">&#128640;</div>'
+    +   '<div style="flex:1;min-width:0">'
+    +     '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--teal);margin-bottom:3px">From Command Center</div>'
+    +     '<div style="font-size:13px;font-weight:700;color:var(--text);margin-bottom:2px">' + escHtml(p.name || 'New Product') + '</div>'
+    +     '<div style="font-size:11px;color:var(--text3)">'
+    +       (p.sku ? 'SKU: ' + escHtml(p.sku) + ' &nbsp;' : '')
+    +       (p.cat ? escHtml(p.cat) : '')
+    +     '</div>'
+    +   '</div>'
+    +   '<button onclick="document.getElementById(\'cc-inbox-banner\').remove()" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:16px;padding:2px;line-height:1">&#x2715;</button>'
+    + '</div>'
+    + '<div style="display:flex;gap:8px;margin-top:12px">'
+    +   '<button class="btn btn-teal" style="flex:1;justify-content:center" onclick="ccImportAsPart()">&#43; Import as Part</button>'
+    +   '<button class="btn" style="flex:1;justify-content:center" onclick="document.getElementById(\'cc-inbox-banner\').remove()">Dismiss</button>'
+    + '</div>';
+
+  document.body.appendChild(banner);
+
+  // Also navigate to parts view and show badge
+  var partsBadge = document.querySelector('.nav-item[data-view="parts"] .nav-badge, .nav-item[onclick*="parts"] .nav-badge');
+  if (partsBadge) { partsBadge.style.color = 'var(--orange)'; }
+}
+
+function ccImportAsPart() {
+  if (!_ccProduct) return;
+  var p  = _ccProduct.data || {};
+  var s  = _ccProduct.seo  || {};
+
+  // Navigate to parts view
+  if (typeof S !== 'undefined') { S.view = 'parts'; scheduleRender && scheduleRender(); }
+
+  // Build the pre-fill object
+  var prefill = {
+    pn:               p.sku         || '',
+    description:      p.name        || s.meta_title || '',
+    category:         _mapCCCat(p.cat || ''),
+    vendor:           'TGK Motorsport',
+    unit_cost:        0,
+    lead_time_weeks:  1,
+    avg_sales_wk:     0,
+    total_unpckgd:    0,
+    min_qty:          0,
+    moq:              1,
+    location:         '',
+    drawing_url:      '',
+    discontinued:     false,
+    price_breaks:     [],
+    // Store CC metadata for reference
+    _cc_notes: [
+      p.make && p.model ? 'Fitment: ' + p.make + ' ' + p.model + (p.years ? ' ' + p.years : '') : '',
+      p.material ? 'Material: ' + p.material : '',
+      s.url_handle ? 'URL: /' + s.url_handle : ''
+    ].filter(Boolean).join(' | ')
+  };
+
+  // Remove the banner
+  var b = document.getElementById('cc-inbox-banner');
+  if (b) b.remove();
+
+  // Open the part modal pre-filled
+  if (typeof openModal === 'function') {
+    openModal('addPart', prefill);
+    // After modal opens, fill the notes field if it exists
+    setTimeout(function() {
+      var notesEl = document.getElementById('m-notes') || document.getElementById('m-loc');
+      if (notesEl && prefill._cc_notes && !notesEl.value) {
+        notesEl.value = prefill._cc_notes;
+      }
+      // Put cursor in cost field since that's what user needs to fill
+      var costEl = document.getElementById('m-cost');
+      if (costEl) { costEl.focus(); costEl.select(); }
+    }, 150);
+  }
+
+  // Notify CC that product was received
+  _pingCC('PRODUCT_IMPORTED', { name: p.name || '' });
+}
+
+function _mapCCCat(cat) {
+  var m = {
+    'Suspension / mounts': 'Suspension',
+    'Engine / drivetrain':  'Engine',
+    'Exhaust / intake':     'Exhaust',
+    'Interior / exterior':  'Interior',
+    'Brakes / wheels':      'Brakes',
+    'Lifestyle / apparel':  'Apparel'
+  };
+  return m[cat] || cat || '';
+}
+
+// ── END CC BRIDGE ────────────────────────────────────────────────────
+
 // ── INIT ─────────────────────────────────────────────────────
 (function startTGK(){
   const msg=document.getElementById('tgk-msg');
@@ -13596,6 +13756,8 @@ async function refreshAll(){
     }
 
     try{
+      // Check for CC token first (auto-login from Command Center)
+      if(_ccToken&&_ccToken.access_token){const ok=await _applyCCToken();if(ok)return;}
       const{data:{session}}=await db.auth.getSession();
       if(!session){
         showAuthGate();
