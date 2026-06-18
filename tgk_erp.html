@@ -8048,6 +8048,61 @@ function showAuthGate(){
 }
 function hideAuthGate(){const g=document.getElementById('auth-gate');if(g)g.style.display='none';}
 
+function showSetPasswordGate(isInvite){
+  const g=document.getElementById('auth-gate');
+  if(g){
+    g.style.display='flex';
+    g.innerHTML='<div style="width:100%;max-width:380px;padding:16px">'
+      +'<div class="panel" style="padding:36px 32px">'
+        +'<div style="text-align:center;margin-bottom:28px">'
+          +'<div style="font-size:11px;font-weight:800;color:var(--teal);letter-spacing:.18em;text-transform:uppercase;margin-bottom:6px">TGK MOTORSPORT</div>'
+          +'<div style="font-size:22px;font-weight:700;color:var(--text)">Command</div>'
+          +'<div style="font-size:12px;color:var(--text3);margin-top:4px">'+(isInvite?'Set your password to activate your account':'Set a new password')+'</div>'
+        +'</div>'
+        +'<div class="form-group">'
+          +'<label class="form-label">New Password</label>'
+          +'<input type="password" id="set-pw-1" class="form-input" placeholder="At least 8 characters" style="font-size:14px" onkeydown="if(event.key===\'Enter\')document.getElementById(\'set-pw-2\').focus()">'
+        +'</div>'
+        +'<div class="form-group">'
+          +'<label class="form-label">Confirm Password</label>'
+          +'<input type="password" id="set-pw-2" class="form-input" placeholder="Repeat password" style="font-size:14px" onkeydown="if(event.key===\'Enter\')submitNewPassword()">'
+        +'</div>'
+        +'<div id="set-pw-error" style="color:var(--red);font-size:12px;min-height:18px;margin-bottom:10px"></div>'
+        +'<button id="set-pw-btn" class="btn btn-primary" style="width:100%;padding:10px;font-size:14px" onclick="submitNewPassword()">'+(isInvite?'Activate Account':'Set Password')+'</button>'
+      +'</div>'
+      +'<div style="text-align:center;margin-top:10px;font-size:10px;color:var(--text3)">TGK Command · Access restricted</div>'
+    +'</div>';
+  }
+  const a=document.getElementById('tgk-app');if(a)a.style.display='none';
+  const l=document.getElementById('tgk-loader');if(l)l.style.display='none';
+  setTimeout(function(){document.getElementById('set-pw-1')?.focus();},100);
+}
+
+async function submitNewPassword(){
+  const p1=(document.getElementById('set-pw-1')?.value||'').trim();
+  const p2=(document.getElementById('set-pw-2')?.value||'').trim();
+  const errEl=document.getElementById('set-pw-error');
+  const btn=document.getElementById('set-pw-btn');
+  if(errEl)errEl.textContent='';
+  if(!p1||p1.length<8){if(errEl)errEl.textContent='Password must be at least 8 characters.';return;}
+  if(p1!==p2){if(errEl)errEl.textContent='Passwords do not match.';return;}
+  if(btn){btn.disabled=true;btn.textContent='Saving…';}
+  const{error}=await db.auth.updateUser({password:p1});
+  if(error){
+    if(errEl)errEl.textContent='Error: '+error.message;
+    if(btn){btn.disabled=false;btn.textContent='Set Password';}
+    return;
+  }
+  // Password saved — clear the invite/recovery hash and load the ERP
+  try{history.replaceState(null,'',window.location.pathname);}catch(_){}
+  const{data:{session}}=await db.auth.getSession();
+  if(session){
+    try{await loadUserProfile(session.user);}catch(pe){console.warn('Profile load:',pe);}
+    const g=document.getElementById('auth-gate');if(g)g.style.display='none';
+    window._appRestart(1);
+  }
+}
+
 async function loadUserProfile(user){
   S.currentUserId=user.id;S.currentUser=user.email;
   // Default — overridden below if profiles table exists
@@ -9478,8 +9533,10 @@ async function aiSuggestMinMax(singlePn){
     const importedAvg=p.avg_sales_wk||0;
     // If both live and imported are 0, still include for AI with context
     const effectiveAvg=st.avg>0?st.avg:importedAvg;
+    const _effOH=Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn));
+    const _onOrd=openOrderedQty(p.pn);
     return{pn:p.pn,desc:p.description||'',curMin:p.min_qty||0,curMax:p.max_qty||0,curSafety:p.safety_stock||0,
-      lead:p.lead_time_weeks||2,onHand:p.total_unpckgd||0,moq:p.moq||0,importedAvg,...st,
+      lead:p.lead_time_weeks||2,onHand:_effOH,onOrder:_onOrd,moq:p.moq||0,importedAvg,...st,
       avg:effectiveAvg>0?+effectiveAvg.toFixed(3):st.avg,
       note:st.avg>0?('Live: '+st.avg+'/wk avg, σ'+st.sd+', '+(p.lead_time_weeks||2)+'w lead'):importedAvg>0?('Spreadsheet avg: '+importedAvg+'/wk'):'No sales data'};
   });
@@ -9498,8 +9555,8 @@ async function aiSuggestMinMax(singlePn){
   try{
     for(let i=0;i<base.length;i+=chunkSize){
       const chunk=base.slice(i,i+chunkSize);
-      const lines=chunk.map(b=>b.pn+(b.desc?' ('+b.desc.slice(0,30)+')':'')+' | avg/wk:'+b.avg+' | stdev:'+b.sd+' | lead:'+b.lead+'w | moq:'+b.moq+' | onhand:'+b.onHand+' | curMin:'+b.curMin+' | curMax:'+b.curMax+' | statMin:'+b.min+' | statMax:'+b.max).join('\n');
-      const prompt='You are an inventory planning expert for a motorsport parts manufacturer. For each part below, recommend min_qty (reorder point) and max_qty (order-up-to level) and safety_stock. The statistical baseline (95% service) is given as statMin/statMax; adjust with judgment: round to sensible order quantities (respect MOQ), raise mins for volatile items (high stdev vs avg), keep slow movers lean, raise if curMin/curMax was already higher (may reflect business rules). Respond with ONLY a JSON array, no markdown: [{"pn":"...","min":N,"max":N,"safety":N,"note":"max 8 words"}]\n\nPARTS:\n'+lines;
+      const lines=chunk.map(b=>b.pn+(b.desc?' ('+b.desc.slice(0,30)+')':'')+' | avg/wk:'+b.avg+' | stdev:'+b.sd+' | lead:'+b.lead+'w | moq:'+b.moq+' | onhand:'+b.onHand+' | onOrder:'+b.onOrder+' | curMin:'+b.curMin+' | curMax:'+b.curMax+' | statMin:'+b.min+' | statMax:'+b.max).join('\n');
+      const prompt='You are an inventory planning expert for a motorsport parts manufacturer. For each part below, recommend min_qty (reorder point) and max_qty (order-up-to level) and safety_stock. Fields: onhand=effective available stock (already minus backorder reservations), onOrder=qty already on open POs (already inbound, counts toward coverage). The statistical baseline (95% service) is given as statMin/statMax; adjust with judgment: round to sensible order quantities (always ensure max is a multiple of MOQ when moq>0), raise mins for volatile items (high stdev vs avg), keep slow movers lean, raise if curMin/curMax was already higher (may reflect business rules). Respond with ONLY a JSON array, no markdown: [{"pn":"...","min":N,"max":N,"safety":N,"note":"max 8 words"}]\n\nPARTS:\n'+lines;
       let data=null;
       for(let attempt=0;attempt<3;attempt++){
         const res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:4000,messages:[{role:'user',content:prompt}]})});
@@ -9514,7 +9571,14 @@ async function aiSuggestMinMax(singlePn){
           const arr=JSON.parse(clean);
           arr.forEach(a=>{
             const b=chunk.find(x=>x.pn===a.pn);
-            if(b)results.push({...b,min:Math.max(0,Math.round(a.min)),max:Math.max(0,Math.round(a.max)),safety:Math.max(0,Math.round(a.safety||b.safety)),note:a.note||b.note,ai:true});
+            if(!b)return;
+            const rawMin=Math.max(0,Math.round(a.min));
+            const rawMax=Math.max(0,Math.round(a.max));
+            const rawSafety=Math.max(0,Math.round(a.safety||b.safety));
+            // Enforce MOQ: order-up-to level must be a whole multiple of MOQ
+            const moq=b.moq||0;
+            const enforcedMax=moq>0?Math.ceil(rawMax/moq)*moq:rawMax;
+            results.push({...b,min:rawMin,max:enforcedMax,safety:rawSafety,note:a.note||b.note,ai:true});
           });
         }catch(e){chunk.forEach(b=>results.push(b));}
       }else{
@@ -9611,7 +9675,7 @@ function addAllReorder(vendorFilter){
     if(p.discontinued)return;
     if(vendorFilter&&(p.vendor||'')!==vendorFilter)return;
     const rp=calcReorderPoint(p);
-    if((p.total_unpckgd||0)>rp)return;
+    if(Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn))>rp)return;
     const sq=calcSuggestedQty(p);const moq=p.moq||0;
     if(moq>0&&sq<moq)return;
     const oq=Math.max(sq,moq);
@@ -9715,9 +9779,10 @@ function renderPOBuilder(){
     <table><thead class="sticky-header"><tr><th>Part #</th><th>Description</th><th>Vendor</th><th>On Hand</th><th>Sugg.</th><th>$/ea @ sugg</th><th>Qty</th><th></th></tr></thead><tbody>
     ${list.map(p=>{
       const rp=calcReorderPoint(p);const oh=p.total_unpckgd||0;
+      const effectivePobOh=Math.max(0,oh-boReserved(p.pn));
       const sq=Math.max(calcSuggestedQty(p),p.moq||0)||1;
       const inCart=S.poCart.find(c=>c.pn===p.pn);
-      return `<tr style="${oh<=rp?'background:rgba(224,123,40,.05)':''}">
+      return `<tr style="${effectivePobOh<=rp?'background:rgba(224,123,40,.05)':''}">
         <td class="pn" style="color:var(--text)">${p.pn}${inCart?' <span style="color:var(--teal)">✓</span>':''}</td>
         <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${p.description||''}</td>
         <td style="font-size:10.5px;color:var(--text3)">${p.vendor||'—'}</td>
@@ -9850,9 +9915,12 @@ function calcSuggestedQty(p) {
   const curr = p.total_unpckgd || 0;
   const reserved = boReserved(p.pn);
   const available = Math.max(0, curr - reserved);
-  if(max > 0) return Math.max(0, Math.ceil(max - available)); // fill up to max from effective stock
+  const onOrder = openOrderedQty(p.pn);
+  // Subtract on-order so we only suggest the NET gap still needed
+  if(max > 0) return Math.max(0, Math.ceil(max - available - onOrder));
   const wkDemand = avgWk(p) || calcForecast(p.pn);
-  return Math.ceil(wkDemand * S.forecastWeeks + reserved); // cover forecast + committed backorder parts
+  const needed = Math.ceil(wkDemand * S.forecastWeeks + reserved);
+  return Math.max(0, needed - onOrder); // don't order what's already inbound
 }
 
 // ── Planning status helper — used for both filtering and sorting ──
@@ -10031,8 +10099,9 @@ function renderPlanning() {
     const status=getPlanningStatus(p);
     const statusCls={Critical:'pill-red',Reorder:'pill-orange','On Order':'pill-teal','Below MOQ':'pill-muted',Overstock:'pill-yellow',OK:'pill-teal'}[status]||'pill-muted';
 
-    const alreadyCovered=onOrder>0&&effectiveStock>rp;
-    const needsOrder=oh<=rp&&orderQty>0&&!(moq>0&&sq<moq)&&!alreadyCovered;
+    // sq is now net of onOrder — if sq<=0 the in-flight PO already covers all needs
+    const alreadyCovered=sq<=0&&onOrder>0;
+    const needsOrder=effectiveOh<=rp&&sq>0&&orderQty>0&&!(moq>0&&sq<moq);
     const wksColor=wksStock!==null?(parseFloat(wksStock)<(p.lead_time_weeks||1)*1.2?'var(--red)':parseFloat(wksStock)<(p.lead_time_weeks||1)*2.5?'var(--orange)':'var(--text2)'):'var(--text3)';
 
     return `<tr class="rowlink" onclick="rowClick(event,function(){lookupGo('part','${p.pn}')})">
@@ -10061,7 +10130,7 @@ function renderPlanning() {
       <td><span class="pill ${statusCls}" title="Reorder point: ${rp}${onOrder>0?' · '+onOrder+' on open PO':''}">${status}</span></td>
       <td style="display:flex;gap:4px;align-items:center">
         ${needsOrder?`<button class="btn btn-primary btn-sm" onclick='createPOFromSuggestion("${p.pn}","${p.vendor||''}",${orderQty},${costForQty(p,orderQty)},"${p.description||''}")'>Order ${orderQty}</button>`:''}
-        ${alreadyCovered?`<span style="font-size:10px;color:var(--teal)" title="${onOrder} on open PO — no action needed">✓ Ordered</span>`:''}
+        ${alreadyCovered?`<span style="font-size:10px;color:var(--teal)" title="${onOrder} on open PO covers all current needs">✓ Covered</span>`:''}
         <button class="action-btn" title="AI suggest min/max" onclick="aiSuggestMinMax('${p.pn}')">✨</button>
       </td>
     </tr>`;
@@ -13470,12 +13539,24 @@ async function refreshAll(){
 
   async function checkAuthAndConnect(){
     setMsg('Checking authentication…');
+
+    // Detect invite or password-recovery link — Supabase puts type=invite/recovery in the URL hash.
+    // The JS client processes the token automatically, but we must prompt the user to set a
+    // permanent password before letting them into the ERP.
+    const _hp=new URLSearchParams((window.location.hash||'').slice(1));
+    const _authType=_hp.get('type');
+    if(_authType==='invite'||_authType==='recovery'){
+      showSetPasswordGate(_authType==='invite');
+      return;
+    }
+
     try{
       const{data:{session}}=await db.auth.getSession();
       if(!session){
         showAuthGate();
         db.auth.onAuthStateChange(async(event,sess)=>{
           if(event==='SIGNED_OUT')showAuthGate();
+          if(event==='PASSWORD_RECOVERY')showSetPasswordGate(false);
         });
         return;
       }
