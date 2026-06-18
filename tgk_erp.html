@@ -1151,6 +1151,13 @@ function trackingUrl(carrier, tracking){
   if(c.includes('LSO'))return'https://www.lso.com/go/track?tracking_id='+tracking;
   return'https://www.google.com/search?q='+encodeURIComponent(tracking+' '+carrier+' tracking');
 }
+// dispOH: display on-hand stock — floors at 0, shows backorder badge if negative
+function dispOH(val){
+  const v=Math.round(val||0);
+  if(v>=0)return String(v);
+  return '0 <span class="pill pill-red" style="font-size:9px;padding:1px 5px;vertical-align:middle">'+Math.abs(v)+' BO</span>';
+}
+
 function carrierLabel(code){
   if(!code)return'';
   const c=code.toUpperCase();
@@ -1630,7 +1637,7 @@ function renderAssemblies(){
     <td><span class="pill pill-muted">${a.category||''}</span></td>
     <td class="money-retail">${fc(a.msrp||0)}</td>
     <td class="money-vendor">${fc((a.msrp||0)*(1-(a.discount_t1||0.1)))}</td>
-    <td class="money" style="color:${(a.total_on_hand||0)<=0?'var(--red)':(a.total_on_hand||0)<3?'var(--yellow)':'var(--text)'};font-weight:700">${a.total_on_hand||0}</td>
+    <td class="money" style="color:${(a.total_on_hand||0)<=0?'var(--red)':(a.total_on_hand||0)<3?'var(--yellow)':'var(--text)'};font-weight:700">${dispOH(a.total_on_hand)}</td>
     <td class="money-neutral" title="auto from sales">${asmAvgWk(a)>0?asmAvgWk(a).toFixed(2)+'/wk':'-'}</td>
     <td>${statusPill(liveStatus(a))}</td>
     <td style="display:flex;gap:4px">
@@ -2900,18 +2907,18 @@ async function closeHistoricalOrders(){
 async function markPacked(saleId,pn,qty){
   const asm=S.assemblies.find(a=>a.pn===pn);
   if(!asm){toast('Assembly '+pn+' not found');return;}
-  if((asm.total_on_hand||0)<qty){toast('Insufficient stock — have '+(asm.total_on_hand||0)+', need '+qty);return;}
+  const oh=asm.total_on_hand||0;
+  // Stock is NOT deducted at Pack — deduction happens when the order ships
+  // (either via ERP Ship button or ShipStation SHIP_NOTIFY webhook).
+  // This means you can Pack a backorder even if stock is 0.
+  if(oh<qty){
+    if(!confirm('⚠ Low stock: have '+oh+', need '+qty+'.\nPack anyway as backorder? Stock will deduct when shipped.'))return;
+  }
   const sale=S.sales.find(s=>s.id===saleId);
-  const newOh=(asm.total_on_hand||0)-qty;
-  const{error:ae}=await db.from('assemblies').update({total_on_hand:newOh}).eq('id',asm.id);
-  if(ae){toast('Stock update failed: '+ae.message);return;}
-  S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
-  await db.from('inv_corrections').insert({pn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Packed — order '+(sale?.order_number||saleId),user_email:S.currentUser||null,source:'pack'});
   const{error:se}=await db.from('sales').update({fulfillment_status:'Packed'}).eq('id',saleId);
   if(se){toast('Sale update failed: '+se.message);return;}
   S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Packed'}:s);
   pushUndoMulti('Pack order '+(sale?.order_number||''),[
-    {action:'update',table:'assemblies',data:{...asm,total_on_hand:newOh},prev:{...asm}},
     {action:'update',table:'sales',data:{id:saleId,fulfillment_status:'Packed'},prev:{id:saleId,fulfillment_status:sale?.fulfillment_status||'Open'}}
   ]);
   toast('Packed '+qty+'× '+pn);render();
@@ -2923,11 +2930,15 @@ async function submitShipment(saleId,pn,qty){
   const tracking=document.getElementById('ship-tracking').value.trim();
   const carrier=document.getElementById('ship-carrier').value;
   const asm=S.assemblies.find(a=>a.pn===pn);
-  // Stock already deducted at markPacked — do NOT deduct again here.
+  // Deduct stock at Ship (not at Pack) — works for both ERP-packed and SS-direct flows
+  const asmPrev=asm?{...asm}:null;
   if(asm){
-    const oh=asm.total_on_hand||0;
-    await db.from('inv_corrections').insert({pn,previous_qty:oh,new_qty:oh,adjustment:0,reason:'Shipped order'+(tracking?' — '+tracking:''),user_email:S.currentUser||null,source:'shipment'});
-    S.corrections=[{pn,previous_qty:oh,new_qty:oh,adjustment:0,reason:'Shipped order',source:'shipment',created_at:new Date().toISOString()},...S.corrections];
+    const prev=asm.total_on_hand||0;
+    const newOh=prev-qty; // may go negative = backorder
+    await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
+    S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
+    await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newOh,adjustment:-qty,reason:'Shipped order'+(tracking?' — '+tracking:''),user_email:S.currentUser||null,source:'shipment'});
+    S.corrections=[{pn,previous_qty:prev,new_qty:newOh,adjustment:-qty,reason:'Shipped order',source:'shipment',created_at:new Date().toISOString()},...S.corrections];
   }
   // Update sale
   const preSale=S.sales.find(s=>s.id===saleId);
@@ -2935,9 +2946,9 @@ async function submitShipment(saleId,pn,qty){
   S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Shipped',tracking_number:tracking,carrier,shipped_at:new Date().toISOString()}:s);
   pushActivity({icon:'📦',type:'order_status',text:'#'+(preSale?.order_number||'')+' → Shipped',sub:pn+(tracking?' · '+tracking:'')+(preSale?.customer_name?' — '+preSale.customer_name:''),ts:new Date().toISOString(),cls:'var(--teal)'});
   const saleRow=S.sales.find(s=>s.id===saleId);
-  pushUndoMulti('Ship '+qty+'×'+pn,[
-    {action:'update',table:'sales',data:{id:saleId},prev:{...stripMeta(saleRow||{}),id:saleId,fulfillment_status:saleRow?.fulfillment_status||'Packed',tracking_number:saleRow?.tracking_number||'',carrier:saleRow?.carrier||'',shipped_at:null}}
-  ]);
+  const undoOps=[{action:'update',table:'sales',data:{id:saleId},prev:{...stripMeta(preSale||{}),id:saleId,fulfillment_status:preSale?.fulfillment_status||'Packed',tracking_number:preSale?.tracking_number||null,carrier:preSale?.carrier||null,shipped_at:null}}];
+  if(asmPrev)undoOps.push({action:'update',table:'assemblies',data:{id:asmPrev.id,total_on_hand:(asmPrev.total_on_hand||0)-qty},prev:{...asmPrev}});
+  pushUndoMulti('Ship '+qty+'×'+pn,undoOps);
   updateBadge();closeModal();
   toast('Shipped '+qty+'× '+pn+(tracking?' · '+tracking:''));
   render();
@@ -4552,8 +4563,8 @@ Deno.serve(async (req) => {
         continue
       }
 
-      const { data: orderLines } = await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', orderNum)
-      const erpLines = orderLines?.length ? orderLines : (await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', '#' + orderNum)).data ?? []
+      const { data: orderLines } = await db.from('sales').select('id,pn,fulfillment_status,qty').eq('order_number', orderNum)
+      const erpLines = orderLines?.length ? orderLines : (await db.from('sales').select('id,pn,fulfillment_status,qty').eq('order_number', '#' + orderNum)).data ?? []
       const resolvedOrderNum = erpLines.length && !orderLines?.length ? '#' + orderNum : orderNum
       const allErpPns = erpLines.map((l: any) => l.pn as string)
       const norm = (s: string) => s.trim().toUpperCase()
@@ -4577,6 +4588,24 @@ Deno.serve(async (req) => {
       } else {
         console.warn('[SS] WARNING: no SKU match for order', resolvedOrderNum, '- updating all Open/Packed lines')
         await db.from('sales').update({ fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt }).eq('order_number', resolvedOrderNum).in('fulfillment_status', ['Open', 'Packed', 'Partial'])
+      }
+
+      // Deduct inventory for lines that were Open or Packed (not already Shipped via ERP Ship button)
+      // If ERP Ship button was used, fulfillment_status was already 'Shipped' when we fetched erpLines above,
+      // so those lines are skipped and no double-deduction occurs.
+      const pnsToDeduct = (matchedPns.length > 0 ? matchedPns : allErpPns)
+      for (const pn of pnsToDeduct) {
+        const line = erpLines.find((l: any) => l.pn === pn)
+        if (!line || !['Open', 'Packed', 'Partial'].includes(line.fulfillment_status)) continue
+        const lineQty = (line as any).qty || 1
+        const { data: asms } = await db.from('assemblies').select('id,total_on_hand').eq('pn', pn).limit(1)
+        const asm = asms?.[0]
+        if (!asm) continue
+        const prev = asm.total_on_hand || 0
+        const newOh = prev - lineQty
+        await db.from('assemblies').update({ total_on_hand: newOh, updated_at: new Date().toISOString() }).eq('id', asm.id)
+        await db.from('inv_corrections').insert({ pn, previous_qty: prev, new_qty: newOh, adjustment: -lineQty, reason: 'Shipped via ShipStation ' + resolvedOrderNum + ' ' + tracking, source: 'shipment' })
+        console.log('[SS] Deducted', lineQty, 'of', pn, 'on', resolvedOrderNum, '| on_hand:', prev, '->', newOh)
       }
     }
   }
@@ -9213,7 +9242,7 @@ function assemblyDossier(pn){
     <button class="btn btn-sm" onclick="printAssemblyBOMs('${a.pn}')" title="Print this assembly's BOM + all sub-assembly BOMs nested inside it">🖨 Print w/ Sub-BOMs</button>
   </div>
   <div class="kpi-grid kpi-grid-4">
-    <div class="kpi ${(a.total_on_hand||0)<=0?'kpi-red':'kpi-teal'}"><div class="kpi-label">On Hand</div><div class="kpi-value">${a.total_on_hand||0}</div>${demand>0?`<div class="kpi-sub">${demand} on open orders</div>`:''}</div>
+    <div class="kpi ${(a.total_on_hand||0)<=0?'kpi-red':'kpi-teal'}"><div class="kpi-label">On Hand</div><div class="kpi-value">${Math.max(0,a.total_on_hand||0)}</div>${(a.total_on_hand||0)<0?`<div class="kpi-sub" style="color:var(--red)">${Math.abs(a.total_on_hand)} backordered</div>`:demand>0?`<div class="kpi-sub">${demand} on open orders</div>`:''}</div>
     <div class="kpi kpi-green"><div class="kpi-label">Max Buildable</div><div class="kpi-value">${b.hasBOM?b.maxBuild:'—'}</div><div class="kpi-sub">from component stock</div></div>
     <div class="kpi"><div class="kpi-label">Sold 30 / 90d</div><div class="kpi-value">${sold30}<span style="font-size:13px;color:var(--text3)"> / ${sold90}</span></div></div>
     <div class="kpi kpi-orange"><div class="kpi-label">BOM Cost / Margin</div><div class="kpi-value" style="font-size:15px">${fc(bomCost)}<span style="font-size:11px;color:${margin>40?'var(--green)':margin>25?'var(--yellow)':'var(--red)'}"> ${margin!==null?margin.toFixed(0)+'%':''}</span></div><div class="kpi-sub">Sug. MSRP ${fc(bomCost*1.6)} @ 60% above cost</div></div>
@@ -10761,7 +10790,7 @@ function renderPackQueue(){
     return `<tr class="rowlink" onclick="rowClick(event,function(){openBuild('${r.pn}')})">
       <td class="pn" style="color:var(--teal)">${r.pn}${!sf.type?typeBadge(r.type):''}</td>
       <td style="max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${r.description||''}${r.b.hasBOM?'':' <span style="font-size:8px;color:var(--text3)">(no BOM)</span>'}</td>
-      <td class="money" style="color:${(r.total_on_hand||0)<=0?'var(--red)':'var(--text)'};font-weight:700">${r.total_on_hand||0}</td>
+      <td class="money" style="color:${(r.total_on_hand||0)<=0?'var(--red)':'var(--text)'};font-weight:700">${dispOH(r.total_on_hand)}</td>
       <td class="money-neutral">${r.demand||'—'}</td>
       <td class="money-neutral">${r.fcDemand||'—'}</td>
       <td class="money" style="color:${r.suggested>0?'var(--orange)':'var(--text3)'};font-weight:700">${r.suggested||'—'}</td>
@@ -11209,7 +11238,7 @@ function renderBuildPlanner(asm){
       <div style="font-size:14px;font-weight:700;color:var(--text)">${asm.pn} — Build Planner${(S.buildStack||[]).length>0?` <span style="font-size:11px;font-weight:400;color:var(--orange)">(sub-assembly for ${S.buildStack[S.buildStack.length-1].pn})</span>`:''}</div>
       <div style="font-size:11px;color:var(--text3)">${asm.description||''}</div>
     </div>
-    <span class="pill ${(asm.total_on_hand||0)>0?'pill-teal':'pill-red'}">On hand: ${asm.total_on_hand||0}</span>
+    <span class="pill ${(asm.total_on_hand||0)>0?'pill-teal':'pill-red'}">On hand: ${dispOH(asm.total_on_hand)}</span>
     ${demand>0?`<span class="pill pill-orange">Open orders: ${demand}</span>`:''}
   </div>
   <div class="grid-2">
@@ -12683,10 +12712,29 @@ async function confirmShipShipmentError(id){
       return;
     }
     const ssOrderId=json.orderId||json.orderNumber||'(created)';
+
+    // Deduct inventory for the correction item being sent
+    const corrPn=e.expected_pn;
+    const corrQty=e.expected_qty||1;
+    const corrAsm=S.assemblies.find(function(x){return x.pn===corrPn;});
+    const corrPrt=corrAsm?null:S.parts.find(function(x){return x.pn===corrPn;});
+    if(corrAsm){
+      const newOh=(corrAsm.total_on_hand||0)-corrQty;
+      await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',corrAsm.id);
+      S.assemblies=S.assemblies.map(function(x){return x.pn===corrPn?{...x,total_on_hand:newOh}:x;});
+      await db.from('inv_corrections').insert({pn:corrPn,previous_qty:corrAsm.total_on_hand||0,new_qty:newOh,adjustment:-corrQty,reason:'Shipment error correction shipped (SS#'+ssOrderId+') — order '+(e.order_number||id),user_email:S.currentUser||null,source:'shipment'});
+    } else if(corrPrt){
+      const newQty=(corrPrt.total_unpckgd||0)-corrQty;
+      await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',corrPrt.id);
+      S.parts=S.parts.map(function(x){return x.pn===corrPn?{...x,total_unpckgd:newQty}:x;});
+      await db.from('inv_corrections').insert({pn:corrPn,previous_qty:corrPrt.total_unpckgd||0,new_qty:newQty,adjustment:-corrQty,reason:'Shipment error correction shipped (SS#'+ssOrderId+') — order '+(e.order_number||id),user_email:S.currentUser||null,source:'shipment'});
+    }
+
     const{error:dbErr}=await db.from('shipment_errors').update({ss_order_id:String(ssOrderId),status:'Reshipping'}).eq('id',id);
     if(!dbErr)S.shipmentErrors=(S.shipmentErrors||[]).map(function(x){return x.id===id?{...x,ss_order_id:String(ssOrderId),status:'Reshipping'}:x;});
     document.getElementById('se-ship-overlay')?.remove();
-    toast('ShipStation correction order created — SS#'+ssOrderId+'. Tracking will appear automatically when shipped.',6000);
+    const deducted=corrAsm||corrPrt;
+    toast('ShipStation correction order created — SS#'+ssOrderId+(deducted?' · inventory updated for '+corrPn:'')+'. Tracking auto-syncs when shipped.',6000);
     updateBadge();render();
   }catch(err){
     if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='Network error: '+err.message;}
@@ -12808,7 +12856,7 @@ async function confirmShipWarranty(claimId, pn){
       if(item.type==='assembly'){
         const a=S.assemblies.find(function(x){return x.pn===item.pn;});
         if(a){
-          const newOh=Math.max(0,(a.total_on_hand||0)-qty);
+          const newOh=(a.total_on_hand||0)-qty; // allow negative = backorder
           await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',a.id);
           S.assemblies=S.assemblies.map(function(x){return x.pn===item.pn?{...x,total_on_hand:newOh}:x;});
           await db.from('inv_corrections').insert({pn:item.pn,previous_qty:a.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Warranty replacement shipped (SS#'+ssOrderId+')',user_email:S.currentUser||null,source:'warranty'});
@@ -12816,7 +12864,7 @@ async function confirmShipWarranty(claimId, pn){
       } else {
         const p=S.parts.find(function(x){return x.pn===item.pn;});
         if(p){
-          const newQty=Math.max(0,(p.total_unpckgd||0)-qty);
+          const newQty=(p.total_unpckgd||0)-qty; // allow negative = backorder
           await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
           S.parts=S.parts.map(function(x){return x.pn===item.pn?{...x,total_unpckgd:newQty}:x;});
           await db.from('inv_corrections').insert({pn:item.pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:-qty,reason:'Warranty part shipped (SS#'+ssOrderId+')',user_email:S.currentUser||null,source:'warranty'});
