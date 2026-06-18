@@ -3494,7 +3494,11 @@ ALTER TABLE dealer_visits DISABLE ROW LEVEL SECURITY;
 ALTER PUBLICATION supabase_realtime ADD TABLE dealer_visits;</pre>
         <button class="btn btn-sm" style="margin-top:8px" onclick="S._visitLogMissing=false;S.dealerVisitsLoaded=false;loadDealerVisitCounts()">↻ Retry</button>
       </div>`:''}
-      ${!S._visitLogMissing&&S.dealerVisitsLoaded?'':`<button class="btn btn-sm" style="margin-top:8px" onclick="testDealerVisitLog()">🔍 Test Visit Log Setup</button>`}
+      <div style="margin-top:10px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <button class="btn btn-sm" onclick="testDealerVisitLog()">🔍 Test Visit Log</button>
+        ${S.dealerVisitsLoaded&&!S._visitLogMissing&&totalVisits===0?'<span style="font-size:10px;color:var(--text3)">Table found but no visits yet</span>':''}
+        ${S.dealerVisitsLoaded&&!S._visitLogMissing&&totalVisits>0?'<span style="font-size:10px;color:var(--teal)">✓ Working</span>':''}
+      </div>
       <div style="margin-top:12px;padding:10px 12px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)">
         <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text3);margin-bottom:6px">Store Website URL <span style="font-weight:400;text-transform:none;color:var(--text3)">(makes SKUs clickable)</span></div>
         <div style="display:flex;gap:6px">
@@ -6298,11 +6302,13 @@ td.dp-save{color:#D97706}
 @keyframes dpfadein{from{opacity:0;transform:scale(.95)}to{opacity:1;transform:scale(1)}}
 @media(max-width:640px){.dp-msrp,.dp-save{display:none}#dp-topbar{flex-direction:column;align-items:flex-start;gap:8px}}
 @media print{
+  /* Override fixed/overflow container so ALL content prints, not just viewport */
+  #dealer-portal{position:static!important;overflow:visible!important;height:auto!important;background:#fff!important}
+  body,html{overflow:visible!important;height:auto!important}
   #dp-topbar,#dp-search-row,#dp-lightbox,#dp-empty,.dp-thumb,.dp-thumb-empty,#dp-screen-hdr{display:none!important}
   #dp-print-header{display:flex!important}
   #dp-footer{display:block!important}
   @page{margin:18mm 14mm}
-  #dealer-portal{background:#fff!important}
   .dp-section{margin-bottom:18px}
   .dp-cat-hdr{page-break-after:avoid}
   tr[data-dpn]{page-break-inside:avoid}
@@ -6411,13 +6417,19 @@ function attachDealerPortalSearch(){
 
 // ── Dealer visit log helpers ──────────────────────────────────────────
 async function logDealerVisit(dealer){
-  await db.from('dealer_visits').insert({
+  const{error}=await db.from('dealer_visits').insert({
     dealer_id:dealer.id,
     dealer_name:dealer.name,
     visited_at:new Date().toISOString(),
     user_agent:navigator.userAgent||null,
     referrer:document.referrer||null,
   });
+  if(error){
+    // Show visible error on price list page so admin can see if RLS is blocking
+    const ts=document.getElementById('dp-ts');
+    if(ts)ts.innerHTML+=' <span style="color:#ef4444;font-size:10px" title="'+error.message+'">⚠ visit log error</span>';
+    console.warn('[TGK] dealer visit insert failed:',error.code,error.message);
+  }
 }
 
 function parseUA(ua){
@@ -6462,22 +6474,32 @@ async function loadDealerVisitCounts(){
 }
 
 async function testDealerVisitLog(){
-  toast('Testing visit log table…');
-  try{
-    const{error}=await db.from('dealer_visits').select('id').limit(1);
-    if(error){
-      const missing=error.code==='42P01'||error.message?.includes('does not exist');
-      S._visitLogMissing=missing;
-      toast('❌ Error: '+error.message);
-    } else {
-      S._visitLogMissing=false;
-      S.dealerVisitsLoaded=false;
-      toast('✓ Table exists! Loading counts…');
-      loadDealerVisitCounts();
-    }
-  }catch(e){
-    toast('❌ '+e.message);
+  toast('Testing visit log…');
+  // Test SELECT
+  const{error:selErr}=await db.from('dealer_visits').select('id').limit(1);
+  if(selErr){
+    const missing=selErr.code==='42P01'||selErr.message?.includes('does not exist');
+    S._visitLogMissing=missing;
+    toast('❌ Read error: '+selErr.message,6000);
+    render();return;
   }
+  // Test INSERT with a dummy record then immediately delete it
+  const testId='00000000-0000-0000-0000-000000000001';
+  const{error:insErr}=await db.from('dealer_visits').upsert({
+    id:testId,dealer_id:'00000000-0000-0000-0000-000000000000',
+    dealer_name:'__test__',visited_at:new Date().toISOString(),
+    user_agent:'test',referrer:'test'
+  },{onConflict:'id'});
+  if(insErr){
+    toast('❌ INSERT blocked: '+insErr.message+'\n\nRun: ALTER TABLE dealer_visits DISABLE ROW LEVEL SECURITY',8000);
+    render();return;
+  }
+  // Clean up test record
+  await db.from('dealer_visits').delete().eq('id',testId);
+  S._visitLogMissing=false;
+  S.dealerVisitsLoaded=false;
+  toast('✓ Visit log is fully working — reads and writes both OK');
+  loadDealerVisitCounts();
   render();
 }
 
