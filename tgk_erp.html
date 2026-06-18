@@ -7295,9 +7295,11 @@ async function fixAssemblyClassification(){
 // ============================================================
 
 async function logAction(summary,entityType,entityPn,oldData,newData){
-  if(!S.currentUserId||!summary)return;
-  try{await db.from('audit_log').insert({user_id:S.currentUserId,user_email:S.currentUser,user_role:S.currentRole,summary,entity_type:entityType||null,entity_pn:entityPn||null,old_data:oldData||null,new_data:newData||null});}
-  catch(e){console.warn('Audit:',e?.message);}
+  if(!S.currentUserId||!summary||S._profilesTableMissing)return;
+  try{
+    const{error}=await db.from('audit_log').insert({user_id:S.currentUserId,user_email:S.currentUser,user_role:S.currentRole,summary,entity_type:entityType||null,entity_pn:entityPn||null,old_data:oldData||null,new_data:newData||null});
+    if(error&&(error.code==='42P01'||error.message?.includes('schema cache')))S._profilesTableMissing=true;
+  }catch(e){/* silent */}
 }
 
 function showAuthGate(){
@@ -7309,15 +7311,33 @@ function hideAuthGate(){const g=document.getElementById('auth-gate');if(g)g.styl
 
 async function loadUserProfile(user){
   S.currentUserId=user.id;S.currentUser=user.email;
-  let{data:profile}=await db.from('profiles').select('*').eq('id',user.id).single();
-  if(!profile){
-    const{data:any}=await db.from('profiles').select('id').limit(1);
-    const role=(!any||!any.length)?'admin':'super_user';
-    const{data:np}=await db.from('profiles').insert({id:user.id,email:user.email,full_name:user.email.split('@')[0],role}).select().single();
-    profile=np||{role,email:user.email,full_name:user.email.split('@')[0]};
+  // Default — overridden below if profiles table exists
+  S.currentRole='admin';
+  S.currentFullName=user.email;
+  try{
+    let{data:profile,error:perr}=await db.from('profiles').select('*').eq('id',user.id).single();
+    if(perr&&(perr.code==='42P01'||perr.message?.includes('schema cache')||perr.message?.includes('not found'))){
+      // Table doesn't exist yet — run setup SQL. Grant admin so they can access the Users page.
+      S._profilesTableMissing=true;
+      console.warn('profiles table not set up yet — granting temporary admin');
+    } else if(!profile){
+      // Logged-in user has no profile row — create one
+      const{data:any}=await db.from('profiles').select('id').limit(1).maybeSingle();
+      const role=!any?'admin':'super_user';
+      const{data:np}=await db.from('profiles').insert({id:user.id,email:user.email,full_name:user.email.split('@')[0],role}).select().single();
+      profile=np||{role,email:user.email,full_name:user.email.split('@')[0]};
+      S.currentRole=profile.role||'admin';
+      S.currentFullName=profile.full_name||user.email;
+      S._profilesTableMissing=false;
+    } else {
+      S.currentRole=profile.role||'admin';
+      S.currentFullName=profile.full_name||user.email;
+      S._profilesTableMissing=false;
+    }
+  }catch(e){
+    console.warn('loadUserProfile error:',e?.message);
+    // Fall through with admin so the user can access Users page and run setup SQL
   }
-  S.currentRole=profile.role||'super_user';
-  S.currentFullName=profile.full_name||user.email;
   _updateAuthUI();
 }
 
@@ -7392,8 +7412,51 @@ async function loadProfiles(){
   render();
 }
 
+function renderUsersSQLSetup(msg){
+  const sql='-- Run in Supabase SQL Editor\n\n'
+    +'-- 1. Profiles table\n'
+    +'CREATE TABLE IF NOT EXISTS profiles (\n'
+    +'  id UUID REFERENCES auth.users(id) ON DELETE CASCADE PRIMARY KEY,\n'
+    +'  email TEXT NOT NULL,\n'
+    +"  full_name TEXT DEFAULT '',\n"
+    +"  role TEXT NOT NULL DEFAULT 'super_user'\n"
+    +"    CHECK (role IN ('admin','super_user')),\n"
+    +'  created_at TIMESTAMPTZ DEFAULT NOW(),\n'
+    +'  updated_at TIMESTAMPTZ DEFAULT NOW()\n'
+    +');\n'
+    +'ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;\n'
+    +'CREATE POLICY \"own_profile\" ON profiles FOR SELECT USING (auth.uid()=id);\n'
+    +'CREATE POLICY \"admin_all\"   ON profiles FOR ALL USING (\n'
+    +'  EXISTS (SELECT 1 FROM profiles WHERE id=auth.uid() AND role=\'admin\')\n'
+    +');\n\n'
+    +'-- 2. Audit log\n'
+    +'CREATE TABLE IF NOT EXISTS audit_log (\n'
+    +'  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,\n'
+    +'  user_id UUID, user_email TEXT, user_role TEXT,\n'
+    +'  action TEXT, entity_type TEXT, entity_pn TEXT,\n'
+    +'  summary TEXT NOT NULL, old_data JSONB, new_data JSONB,\n'
+    +'  created_at TIMESTAMPTZ DEFAULT NOW()\n'
+    +');\n'
+    +'ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;\n'
+    +'CREATE POLICY \"auth_insert\" ON audit_log FOR INSERT WITH CHECK (auth.uid() IS NOT NULL);\n'
+    +'CREATE POLICY \"auth_select\" ON audit_log FOR SELECT   USING (auth.uid() IS NOT NULL);\n\n'
+    +'-- After running, sign out and back in.';
+  const escaped=sql.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+  return '<div class="panel" style="padding:20px 24px;max-width:640px;margin:20px auto">'
+    +'<div style="font-size:15px;font-weight:700;margin-bottom:6px;color:var(--orange)">&#9888; Setup Required</div>'
+    +'<div style="font-size:13px;color:var(--text2);margin-bottom:14px">'+(msg||'Run the SQL below in Supabase to enable user management.')+'</div>'
+    +'<pre id="users-setup-sql" style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto;white-space:pre-wrap;max-height:320px">'+escaped+'</pre>'
+    +'<div style="display:flex;gap:8px;margin-top:10px">'
+    +'<button class="btn btn-teal btn-sm" onclick="navigator.clipboard.writeText(document.getElementById(\'users-setup-sql\').textContent).then(()=>toast(\'SQL copied\'))">Copy SQL</button>'
+    +'<a href="https://supabase.com/dashboard/project/piamamighqiielfztgic/sql" target="_blank" class="btn btn-sm">Open SQL Editor &#8599;</a>'
+    +'<button class="btn btn-sm" onclick="doLogout()" style="margin-left:auto">Sign Out &amp; Back In</button>'
+    +'</div></div>';
+}
+
 function renderUsers(){
   if(S.currentRole!=='admin')return'<div class="section-empty" style="margin-top:60px">\u2691 Administrator access required.</div>';
+  // Table not set up yet — show setup panel immediately without attempting a load
+  if(S._profilesTableMissing){return renderUsersSQLSetup('Run the SQL below to create the required tables, then sign out and back in.');}
   if(!S._profilesLoaded&&!S._profilesLoading){loadProfiles();return'<div class="section-empty">Loading users\u2026</div>';}
   if(S._profilesLoading)return'<div class="section-empty">Loading users\u2026</div>';
   if(S._profilesError||!S.profiles.length){return`<div class="panel" style="padding:20px 24px;max-width:600px;margin:20px auto">
