@@ -1181,6 +1181,19 @@ function trackingUrl(carrier, tracking){
   return'https://www.google.com/search?q='+encodeURIComponent(tracking+' '+carrier+' tracking');
 }
 // dispOH: display on-hand stock — floors at 0, shows backorder badge if negative
+// Fire-and-forget: switch Shopify product template when stock crosses zero
+function syncShopifyTemplate(pn,newOh){
+  if(!pn||!S.shopify||!S.shopify.store||!S.shopify.key)return;
+  const template=newOh<=0?(S.settings.shopify_backorder_template||'backorder'):'';
+  fetch(SUPA_URL+'/functions/v1/shopify-orders',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:'update_template',store:S.shopify.store,key:S.shopify.key,pn,template})
+  }).then(function(r){
+    if(!r.ok)r.json().then(function(e){console.warn('[Shopify template]',pn,e.error||r.status);});
+  }).catch(function(){});
+}
+
 function dispOH(val){
   const v=Math.round(val||0);
   if(v>=0)return String(v);
@@ -1521,7 +1534,8 @@ function renderDashboard(){
           <span style="flex-shrink:0;font-size:15px;line-height:1.2">${e.icon}</span>
           <div style="min-width:0;flex:1">
             <div style="font-size:11px;font-weight:600;color:${e.cls||'var(--text2)'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${e.text}</div>
-            ${e.sub?`<div style="font-size:10px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${e.sub}</div>`:''}
+            ${e.sub?`<div style="font-size:10px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(e.sub)}</div>`:''}
+            ${e.tracking?`<div style="font-size:10px;margin-top:1px"><a href="${trackingUrl(e.carrier||'',e.tracking)}" target="_blank" style="color:var(--teal);text-decoration:none;font-family:var(--mono)">${e.carrier?escHtml(e.carrier)+' ':''}<b>${escHtml(e.tracking)}</b> ↗</a></div>`:''}
           </div>
         </div>
         <span style="font-size:9px;color:var(--text3);font-family:var(--mono);flex-shrink:0;white-space:nowrap">${timeAgo(e.ts)}</span>
@@ -2121,7 +2135,7 @@ function renderPurchases(){
     const tracking=S.poTracking[p.id]||[];
     const isPending=p.status!=='Received'&&p.status!=='Cancelled';
     const isDraft=p.status==='Draft';
-    const trackChips=tracking.slice(0,2).map(t=>`<span style="font-size:9px;background:var(--bg4);border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--text3);cursor:help;white-space:nowrap" title="${t.tracking_number}">${t.carrier} ···${t.tracking_number.slice(-6)}</span>`).join(' ');
+    const trackChips=tracking.slice(0,2).map(t=>`<a href="${trackingUrl(t.carrier||'',t.tracking_number)}" target="_blank" onclick="event.stopPropagation()" style="font-size:9px;background:var(--bg4);border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--teal);text-decoration:none;cursor:pointer;white-space:nowrap" title="Track ${t.tracking_number}${t.estimated_delivery?' — ETA: '+t.estimated_delivery:t.carrier_status?' — '+t.carrier_status:''}">${t.carrier} ···${t.tracking_number.slice(-6)}${t.estimated_delivery?' (ETA '+t.estimated_delivery.slice(5)+')':''} ↗</a>`).join(' ');
     const moreTrack=tracking.length>2?`<span style="font-size:9px;color:var(--text3)">+${tracking.length-2}</span>`:'';
     return `<tr class="rowlink${isDraft?' rt-flash':''}" onclick="rowClick(event,function(){openPODetail('${p.id}')})" style="${isDraft?'border-left:3px solid var(--orange)':''}">
     <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${p.order_date||''}</td>
@@ -2793,6 +2807,7 @@ async function unshipLine(saleId, pn, qty){
       user_email:S.currentUser||null,source:'unship'
     }).select().single();
     if(corr){S.corrections=[corr,...S.corrections];undoOps.push({action:'insert',table:'inv_corrections',data:corr});}
+    syncShopifyTemplate(pn,newOh);
   }
 
   // Reset the sale line: clear tracking + revert status
@@ -2943,6 +2958,35 @@ async function markPacked(saleId,pn,qty){
   toast('Packed '+qty+'× '+pn);render();
 }
 
+async function checkPOTracking(poTrackingId, poId, carrier, tracking){
+  const btn=document.getElementById('chk-eta-'+poTrackingId);
+  if(btn){btn.disabled=true;btn.textContent='Checking…';}
+  try{
+    const res=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'track_po',carrier,tracking,po_tracking_id:poTrackingId})
+    });
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok){toast('Tracking error: '+(data.error||res.status),4000);return;}
+    // Update in-memory po_tracking record
+    if(S.poTracking[poId]){
+      S.poTracking[poId]=S.poTracking[poId].map(function(t){
+        if(t.id!==poTrackingId)return t;
+        return Object.assign({},t,{
+          estimated_delivery:data.estimatedDelivery||t.estimated_delivery,
+          carrier_status:data.statusDesc||t.carrier_status
+        });
+      });
+    }
+    const eta=data.estimatedDelivery?'ETA: '+data.estimatedDelivery:'';
+    const st=data.statusDesc||'';
+    if(eta||st)toast((eta?eta+' — ':'')+st,5000);
+    else toast('No ETA data returned — carrier may not support API tracking');
+    render();
+  }catch(e){toast('Network error: '+e.message);}
+  finally{if(btn){btn.disabled=false;btn.textContent='Check ETA';}}
+}
+
 function openShipModal(saleId,pn,qty){openModal('shipOrder',{saleId,pn,qty});}
 
 async function submitShipment(saleId,pn,qty){
@@ -2958,12 +3002,13 @@ async function submitShipment(saleId,pn,qty){
     S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
     await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newOh,adjustment:-qty,reason:'Shipped order'+(tracking?' — '+tracking:''),user_email:S.currentUser||null,source:'shipment'});
     S.corrections=[{pn,previous_qty:prev,new_qty:newOh,adjustment:-qty,reason:'Shipped order',source:'shipment',created_at:new Date().toISOString()},...S.corrections];
+    syncShopifyTemplate(pn,newOh);
   }
   // Update sale
   const preSale=S.sales.find(s=>s.id===saleId);
   await db.from('sales').update({fulfillment_status:'Shipped',tracking_number:tracking,carrier,shipped_at:new Date().toISOString()}).eq('id',saleId);
   S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Shipped',tracking_number:tracking,carrier,shipped_at:new Date().toISOString()}:s);
-  pushActivity({icon:'📦',type:'order_status',text:'#'+(preSale?.order_number||'')+' → Shipped',sub:pn+(tracking?' · '+tracking:'')+(preSale?.customer_name?' — '+preSale.customer_name:''),ts:new Date().toISOString(),cls:'var(--teal)'});
+  pushActivity({icon:'📦',type:'order_status',text:'#'+(preSale?.order_number||'')+' → Shipped',sub:pn+(preSale?.customer_name?' — '+preSale.customer_name:''),tracking:tracking||'',carrier:carrier||'',ts:new Date().toISOString(),cls:'var(--teal)'});
   const saleRow=S.sales.find(s=>s.id===saleId);
   const undoOps=[{action:'update',table:'sales',data:{id:saleId},prev:{...stripMeta(preSale||{}),id:saleId,fulfillment_status:preSale?.fulfillment_status||'Packed',tracking_number:preSale?.tracking_number||null,carrier:preSale?.carrier||null,shipped_at:null}}];
   if(asmPrev)undoOps.push({action:'update',table:'assemblies',data:{id:asmPrev.id,total_on_hand:(asmPrev.total_on_hand||0)-qty},prev:{...asmPrev}});
@@ -3003,7 +3048,7 @@ async function submitDropShipAll(orderNum){
   closeModal();
   if(errors)toast('↓ Shipped '+shipped+' lines, '+errors+' errors');
   else toast('↓ Drop-shipped all '+shipped+' line'+(shipped!==1?'s':'')+' on '+orderNum+(tracking?' · '+tracking:''));
-  if(shipped)pushActivity({icon:'↓📦',type:'order_status',text:'#'+orderNum+' → Shipped (drop-ship all)',sub:shipped+' line'+(shipped!==1?'s':'')+(tracking?' · '+tracking:''),ts:new Date().toISOString(),cls:'var(--teal)'});
+  if(shipped)pushActivity({icon:'↓📦',type:'order_status',text:'#'+orderNum+' → Shipped (drop-ship all)',sub:shipped+' line'+(shipped!==1?'s':''),tracking:tracking||'',carrier:carrier||'',ts:new Date().toISOString(),cls:'var(--teal)'});
   render();
 }
 
@@ -3024,7 +3069,7 @@ async function submitDropShipment(saleId,pn,qty){
     user_email:S.currentUser||null,source:'dropship'
   });
   S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Shipped',tracking_number:tracking||null,carrier:carrier||null,shipped_at:now}:s);
-  pushActivity({icon:'↓📦',type:'order_status',text:'#'+(sale?.order_number||'')+' → Shipped (drop-ship)',sub:pn+(tracking?' · '+tracking:'')+(sale?.customer_name?' — '+sale.customer_name:''),ts:now,cls:'var(--teal)'});
+  pushActivity({icon:'↓📦',type:'order_status',text:'#'+(sale?.order_number||'')+' → Shipped (drop-ship)',sub:pn+(sale?.customer_name?' — '+sale.customer_name:''),tracking:tracking||'',carrier:carrier||'',ts:now,cls:'var(--teal)'});
   pushUndoMulti('Drop-ship '+qty+'×'+pn,[
     {action:'update',table:'sales',data:{id:saleId,fulfillment_status:'Shipped'},prev:{id:saleId,fulfillment_status:sale?.fulfillment_status||'Open',tracking_number:sale?.tracking_number||null,carrier:sale?.carrier||null,shipped_at:null}}
   ]);
@@ -3683,6 +3728,11 @@ function renderIntegrations(){
       <div class="form-group"><label class="form-label">Admin API Token <span style="font-size:9px;color:var(--text3)">(auto-filled after OAuth, or paste manually)</span></label><input id="sh-key" class="form-input" type="password" value="${S.shopify.key||''}" placeholder="shpat_••••••••"></div>
       <div class="form-group"><label class="form-label">Webhook Signing Secret</label><input id="sh-wh" class="form-input" type="password" value="${S.shopify.webhook||''}" placeholder="From Shopify webhook settings"></div>
     </div>
+    <div class="form-group" style="margin-top:4px">
+      <label class="form-label">Backorder Template Suffix</label>
+      <input id="sh-backorder-template" class="form-input" value="${S.settings.shopify_backorder_template||'backorder'}" placeholder="backorder" style="max-width:200px">
+      <div style="font-size:10px;color:var(--text3);margin-top:3px">When a finished good hits 0 stock, ERP switches its Shopify page to <code>product.{suffix}.liquid</code> and reverts when stock returns. Requires <b>write_products</b> scope.</div>
+    </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <button class="btn btn-primary" onclick="saveShopify()">Save Credentials</button>
       <button class="btn btn-teal" onclick="startShopifyOAuth()" title="Opens Shopify OAuth to automatically get your access token">🔗 Connect via OAuth</button>
@@ -3892,6 +3942,27 @@ Deno.serve(async (req) => {
     }
     const payload = await shopRes.json()
     return new Response(JSON.stringify({...payload, next_page_info}), {headers:{...CORS,'Content-Type':'application/json'}})
+  }
+
+  // Template sync: switch product template based on stock level
+  if (body.action === 'update_template') {
+    const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
+    const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
+    const sku = (body.pn || '').trim()
+    const templateSuffix = body.template || ''
+    if (!store || !key || !sku) return new Response(JSON.stringify({error:'Missing store, key or pn'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
+    const varRes = await fetch('https://' + store + '/admin/api/2024-01/variants.json?sku=' + encodeURIComponent(sku) + '&fields=product_id', {headers:{'X-Shopify-Access-Token': key}})
+    if (!varRes.ok) return new Response(JSON.stringify({error:'Variant lookup failed: ' + varRes.status}), {status:varRes.status, headers:{...CORS,'Content-Type':'application/json'}})
+    const varData = await varRes.json()
+    const productId = varData.variants?.[0]?.product_id
+    if (!productId) return new Response(JSON.stringify({error:'No Shopify product found for SKU: ' + sku}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
+    const putRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + productId + '.json', {
+      method: 'PUT',
+      headers: {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'},
+      body: JSON.stringify({product: {id: productId, template_suffix: templateSuffix}})
+    })
+    if (!putRes.ok) return new Response(JSON.stringify({error:'Product update failed: ' + putRes.status}), {status:putRes.status, headers:{...CORS,'Content-Type':'application/json'}})
+    return new Response(JSON.stringify({success: true, productId, template_suffix: templateSuffix}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
 
   // Image sync (single page): frontend calls repeatedly with page_info until done
@@ -4309,6 +4380,39 @@ Deno.serve(async (req) => {
       delivered += Math.min(200, toDeliver.length - i)
     }
     return json({ delivered, checked: shipped?.length || 0, message: delivered + ' orders marked Delivered' })
+  }
+
+  // --- TRACK PO: look up inbound tracking via ShipStation carrier tracking API ---
+  if (body.action === 'track_po') {
+    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
+    const auth = ssAuth()
+    const rawCarrier = (body.carrier || '').trim()
+    const trackingNum = (body.tracking || '').trim()
+    const poTrackingId = body.po_tracking_id || null
+    if (!trackingNum) return json({ error: 'tracking number required' }, 400)
+    // Map our carrier labels to ShipStation carrier codes
+    const cu = rawCarrier.toUpperCase()
+    const ssCarrier = cu.includes('FEDEX') || cu.includes('FED') ? 'fedex'
+      : cu.includes('UPS') ? 'ups'
+      : cu.includes('USPS') || cu.includes('STAMPS') || cu.includes('ENDICIA') ? 'stamps_com'
+      : cu.includes('DHL') ? 'dhl_express_worldwide'
+      : cu.includes('ONTRAC') ? 'ontrac'
+      : cu.toLowerCase()
+    const res = await fetch('https://ssapi.shipstation.com/carriers/track?carrierCode=' + encodeURIComponent(ssCarrier) + '&trackingNumber=' + encodeURIComponent(trackingNum), {
+      headers: { Authorization: 'Basic ' + auth }
+    })
+    if (!res.ok) return json({ error: 'ShipStation tracking error ' + res.status + ' — carrier may not support API tracking' }, res.status)
+    const data = await res.json()
+    const estimatedDelivery = data.estimatedDeliveryDate ? data.estimatedDeliveryDate.slice(0, 10) : null
+    const statusDesc = data.statusDescription || data.status || null
+    // Save back to po_tracking row if id provided
+    if (poTrackingId && (estimatedDelivery || statusDesc)) {
+      const patch: any = { updated_at: new Date().toISOString() }
+      if (estimatedDelivery) patch.estimated_delivery = estimatedDelivery
+      if (statusDesc) patch.carrier_status = statusDesc
+      await db.from('po_tracking').update(patch).eq('id', poTrackingId)
+    }
+    return json({ estimatedDelivery, statusDesc, events: (data.trackingEvents || []).slice(0, 5) })
   }
 
   // --- SS ORDER AUDIT: find SS orders missing from ERP, optionally import them ---
@@ -5972,7 +6076,7 @@ async function ssManualSync(orderNum,tracking,carrier){
     }
   }
   if(!rows.length){toast('No lines updated — check order number');return;}
-  pushActivity({icon:'📦',type:'order_status',text:'#'+orderNum+' → Shipped (manual sync)',sub:(tracking?tracking+' ':'')+carrier,ts:new Date().toISOString(),cls:'var(--teal)'});
+  pushActivity({icon:'📦',type:'order_status',text:'#'+orderNum+' → Shipped (manual sync)',sub:'',tracking:tracking||'',carrier:carrier||'',ts:new Date().toISOString(),cls:'var(--teal)'});
   await refreshSales();
   pushUndoMulti('Manual ship order '+orderNum,undoOps);
   toast('✓ Order '+orderNum+' marked Shipped · tracking: '+tracking);
@@ -6819,6 +6923,9 @@ async function saveShopify(){
   if(!store){toast('Enter your store URL');return;}
   Object.assign(S.shopify,{store,key,webhook,clientId,connected:!!(store&&key)});
   await db.from('settings').upsert({key:'shopify',value:S.shopify},{onConflict:'key'});
+  const bkTpl=(document.getElementById('sh-backorder-template')?.value||'backorder').trim();
+  S.settings.shopify_backorder_template=bkTpl||'backorder';
+  await db.from('settings').upsert({key:'shopify_backorder_template',value:bkTpl||'backorder'},{onConflict:'key'});
   toast('Shopify credentials saved');render();
 }
 
@@ -7322,7 +7429,7 @@ async function submitPart(eid){
 
 async function deletePart(pn, id){
   // Check if part is used in any BOM
-  const inBOMs=Object.entries(S.boms).filter(([,lines])=>lines.some(l=>l.child_pn===pn)).map(([k])=>k);
+  const inBOMs=Object.entries(S.boms).filter(([k,lines])=>lines.some(l=>l.child_pn===pn)&&!S.assemblies.find(a=>a.pn===k)?.discontinued).map(([k])=>k);
   const hasStock=(S.parts.find(p=>p.id===id)?.total_unpckgd||0)>0;
   let msg=`Delete part ${pn}?`;
   if(inBOMs.length)msg+=`\n\n⚠ This part is used in ${inBOMs.length} BOM(s): ${inBOMs.slice(0,3).join(', ')}${inBOMs.length>3?' …':''}. BOM references will remain but the part will be gone.`;
@@ -7640,7 +7747,7 @@ async function deleteCategory(table,name){
 }
 
 async function deleteAsm(pn, id){
-  const inBOMs=Object.entries(S.boms).filter(([,lines])=>lines.some(l=>l.child_pn===pn)).map(([k])=>k);
+  const inBOMs=Object.entries(S.boms).filter(([k,lines])=>lines.some(l=>l.child_pn===pn)&&!S.assemblies.find(a=>a.pn===k)?.discontinued).map(([k])=>k);
   const openOrders=S.sales.filter(s=>s.pn===pn&&!['Delivered','Cancelled','Refunded','Returned'].includes(s.fulfillment_status||'Open'));
   let msg=`Delete assembly ${pn}?`;
   if(openOrders.length)msg+=`\n\n⚠ There are ${openOrders.length} open/in-progress orders for this assembly.`;
@@ -8053,7 +8160,7 @@ function showAuthGate(){
   const a=document.getElementById('tgk-app');if(a)a.style.display='none';
   const l=document.getElementById('tgk-loader');if(l)l.style.display='none';
 }
-function hideAuthGate(){const g=document.getElementById('auth-gate');if(g)g.style.display='none';_pingCC('ERP_READY',{});}
+function hideAuthGate(){const g=document.getElementById('auth-gate');if(g)g.style.display='none';}
 
 function showSetPasswordGate(isInvite){
   const g=document.getElementById('auth-gate');
@@ -8623,6 +8730,13 @@ function startAutoRefresh(){
       const inputFocused=document.activeElement&&['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName);
       if(['dashboard','sales','inventory','planning','purchases','corrections'].includes(S.view)&&!modalOpen&&!inputFocused){
         render();
+      }
+      // Delivery sync — throttled to once per hour to avoid hammering ShipStation
+      const hourMs=60*60*1000;
+      if(!S._lastDeliverySync||Date.now()-S._lastDeliverySync>hourMs){
+        S._lastDeliverySync=Date.now();
+        fetch(SUPA_URL+'/functions/v1/shipstation-ship',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'delivery_sync'})})
+          .then(r=>r.ok?r.json():null).then(d=>{if(d&&d.delivered>0){refreshSales().then(()=>render());toast('✅ '+d.delivered+' order'+(d.delivered!==1?'s':'')+' marked Delivered',3000);}}).catch(()=>{});
       }
       console.log('[TGK] Auto-refresh complete at',new Date().toLocaleTimeString());
     }catch(e){console.warn('[TGK] Auto-refresh failed:',e.message);}
@@ -9418,7 +9532,7 @@ function assemblyDossier(pn){
 function partDossier(pn){
   const p=S.parts.find(x=>x.pn===pn);
   if(!p)return'<div class="panel section-empty">Not found</div>';
-  const whereUsed=Object.entries(S.boms).filter(([parent,items])=>items.some(i=>i.child_pn===pn)).map(([parent,items])=>({parent,qty:items.find(i=>i.child_pn===pn)?.qty||0}));
+  const whereUsed=Object.entries(S.boms).filter(([parent,items])=>items.some(i=>i.child_pn===pn)&&!S.assemblies.find(a=>a.pn===parent)?.discontinued).map(([parent,items])=>({parent,qty:items.find(i=>i.child_pn===pn)?.qty||0}));
   const rp=calcReorderPoint(p);
   const corr=S.corrections.filter(c=>c.pn===pn).slice(0,8);
   const openLines=[];Object.values(S.poLines).forEach(ls=>ls.forEach(l=>{if(l.pn===pn&&l.qty_received<l.qty_ordered)openLines.push(l);}));
@@ -10409,9 +10523,10 @@ async function loadPOTracking(poId){
 async function addPOTracking(poId){
   const carrier=document.getElementById('pot-carrier').value;
   const tracking=document.getElementById('pot-num').value.trim();
+  const eta=(document.getElementById('pot-eta')?.value||'').trim()||null;
   const note=document.getElementById('pot-note').value.trim();
   if(!tracking){toast('Enter a tracking number');return;}
-  const{data,error}=await db.from('po_tracking').insert({po_id:poId,carrier,tracking_number:tracking,notes:note}).select().single();
+  const{data,error}=await db.from('po_tracking').insert({po_id:poId,carrier,tracking_number:tracking,notes:note,estimated_delivery:eta||null}).select().single();
   if(error){toast('Error: '+error.message+' — run the po_tracking SQL first');return;}
   if(!S.poTracking[poId])S.poTracking[poId]=[];
   S.poTracking[poId].push(data);
@@ -10510,7 +10625,7 @@ function quickAddTracking(poId,vendorName){
   const modal=document.createElement('div');modal.id='quick-track-modal';
   modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
   const existing2=S.poTracking[poId]||[];
-  const existingHtml=existing2.length?'<div style="margin-bottom:12px">'+existing2.map(t=>`<div style="display:flex;align-items:center;gap:8px;font-size:11px;margin-bottom:4px"><span class="pill pill-muted" style="min-width:44px;justify-content:center">${t.carrier}</span><span style="font-family:var(--mono);color:var(--teal);user-select:all">${t.tracking_number}</span><button onclick="deletePOTrackingQ('${t.id}','${poId}')" style="background:transparent;border:none;color:var(--text3);cursor:pointer;font-size:14px;line-height:1">×</button></div>`).join('')+'</div>':'';
+  const existingHtml=existing2.length?'<div style="margin-bottom:12px">'+existing2.map(t=>`<div style="display:flex;align-items:center;gap:8px;font-size:11px;margin-bottom:4px"><span class="pill pill-muted" style="min-width:44px;justify-content:center">${t.carrier}</span><a href="${trackingUrl(t.carrier||'',t.tracking_number)}" target="_blank" style="font-family:var(--mono);color:var(--teal);text-decoration:none">${t.tracking_number} ↗</a><button onclick="deletePOTrackingQ('${t.id}','${poId}')" style="background:transparent;border:none;color:var(--text3);cursor:pointer;font-size:14px;line-height:1">×</button></div>`).join('')+'</div>':'';
   modal.innerHTML=`
     <div style="background:var(--bg2);border:1px solid var(--border2);border-radius:10px;padding:20px 22px;max-width:420px;width:92%;box-shadow:0 16px 48px rgba(0,0,0,.18)">
       <div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:4px">🔗 Add Tracking — ${vendorName}</div>
@@ -10519,6 +10634,10 @@ function quickAddTracking(poId,vendorName){
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
         <select id="qt-carrier" class="form-input" style="width:90px;padding:6px 8px;font-size:11px"><option>UPS</option><option>FedEx</option><option>USPS</option><option>DHL</option><option>Freight</option><option>Other</option></select>
         <input id="qt-num" class="form-input" placeholder="Tracking number…" style="flex:1;padding:6px 10px;font-size:12px;font-family:var(--mono)" autofocus>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+        <label style="font-size:11px;color:var(--text3);white-space:nowrap">ETA (optional)</label>
+        <input id="qt-eta" type="date" class="form-input" style="flex:1;padding:6px 10px;font-size:11px" title="Expected delivery date">
       </div>
       <input id="qt-note" class="form-input" placeholder="Note (e.g. box 1 of 2)" style="width:100%;margin-bottom:14px;padding:6px 10px;font-size:11px">
       <div style="display:flex;justify-content:flex-end;gap:8px">
@@ -10533,9 +10652,10 @@ function quickAddTracking(poId,vendorName){
 async function submitQuickTracking(poId){
   const carrier=document.getElementById('qt-carrier').value;
   const tracking=(document.getElementById('qt-num').value||'').trim();
+  const eta=(document.getElementById('qt-eta')?.value||'').trim()||null;
   const note=(document.getElementById('qt-note').value||'').trim();
   if(!tracking){toast('Enter a tracking number');return;}
-  const{data,error}=await db.from('po_tracking').insert({po_id:poId,carrier,tracking_number:tracking,notes:note||null}).select().single();
+  const{data,error}=await db.from('po_tracking').insert({po_id:poId,carrier,tracking_number:tracking,notes:note||null,estimated_delivery:eta||null}).select().single();
   if(error){toast('Error: '+error.message+(error.message.includes('po_tracking')?' — run po_tracking SQL first':''));return;}
   if(!S.poTracking[poId])S.poTracking[poId]=[];
   S.poTracking[poId].push(data);
@@ -10594,18 +10714,22 @@ function renderPODetail(po) {
   </div>
   <div class="panel" style="padding:0;margin-bottom:14px">
     <div class="section-header">📦 Shipment Tracking ${(S.poTracking[po.id]||[]).length?'('+(S.poTracking[po.id]||[]).length+(((S.poTracking[po.id]||[]).length)>1?' shipments — split shipped':' shipment')+')':''}</div>
-    ${(S.poTracking[po.id]||[]).map(t=>`<div class="check-row">
+    ${(S.poTracking[po.id]||[]).map(t=>{const daysToEta=t.estimated_delivery?Math.ceil((new Date(t.estimated_delivery)-new Date())/(86400000)):null;const etaLabel=t.estimated_delivery?(daysToEta<0?'Overdue by '+Math.abs(daysToEta)+'d':daysToEta===0?'Due today':daysToEta+'d out'):null;const etaColor=daysToEta!==null?(daysToEta<0?'var(--red)':daysToEta<=2?'var(--orange)':'var(--teal)'):null;return`<div class="check-row">
       <span class="pill pill-muted" style="min-width:52px;justify-content:center">${t.carrier}</span>
-      <span class="pn" style="color:var(--teal);user-select:all">${t.tracking_number}</span>
+      <a href="${trackingUrl(t.carrier||'',t.tracking_number)}" target="_blank" style="font-family:var(--mono);color:var(--teal);font-size:12px;text-decoration:none;font-weight:600">${t.tracking_number} ↗</a>
+      ${t.carrier_status?`<span style="font-size:10px;color:var(--text3);background:var(--bg3);border-radius:4px;padding:1px 6px">${t.carrier_status}</span>`:''}
+      ${etaLabel?`<span style="font-size:10px;font-weight:600;color:${etaColor}">📅 ${etaLabel}</span>`:''}
       ${t.notes?`<span style="font-size:10px;color:var(--text3)">${t.notes}</span>`:''}
       <span style="flex:1"></span>
+      <button id="chk-eta-${t.id}" class="btn btn-sm" style="font-size:9px;padding:2px 7px" onclick="checkPOTracking('${t.id}','${po.id}','${t.carrier}','${t.tracking_number}')">Check ETA</button>
       <span style="font-size:9px;color:var(--text3);font-family:var(--mono)">${new Date(t.created_at).toLocaleDateString()}</span>
       <button class="action-btn del" onclick="deletePOTracking('${t.id}','${po.id}')">×</button>
-    </div>`).join('')}
+    </div>`}).join('')}
     <div class="check-row" style="background:var(--bg3)">
       <select id="pot-carrier" class="form-input" style="width:90px;padding:5px 8px;font-size:11px"><option>UPS</option><option>FedEx</option><option>USPS</option><option>DHL</option><option>Freight</option><option>Other</option></select>
-      <input id="pot-num" class="inline-edit" placeholder="Tracking number…" style="flex:1;max-width:240px">
-      <input id="pot-note" class="inline-edit" placeholder="Note (e.g. partial — 2 of 3 boxes)" style="flex:1">
+      <input id="pot-num" class="inline-edit" placeholder="Tracking number…" style="flex:1;max-width:220px">
+      <input id="pot-eta" type="date" class="inline-edit" style="width:130px" title="Estimated delivery date (optional)">
+      <input id="pot-note" class="inline-edit" placeholder="Note (e.g. partial shipment)" style="flex:1">
       <button class="btn btn-teal btn-sm" onclick="addPOTracking('${po.id}')">+ Add Tracking</button>
     </div>
   </div>
@@ -13455,6 +13579,8 @@ async function diagHolds(){
   }catch(e){toast('Diagnose error: '+e.message);}
 }
 async function syncHoldsOnly(){
+  const edgeBase=SUPA_URL+'/functions/v1';
+  const btn=document.querySelector('[onclick="syncHoldsOnly()"]');
   if(btn){btn.disabled=true;btn.textContent='⏸ Syncing…';}
   try{
     const res=await fetch(edgeBase+'/shipstation-ship',{
@@ -13502,6 +13628,9 @@ async function refreshAll(){
       .then(r=>r.ok?r.json():null).then(d=>{if(d&&(d.markedHold||d.markedOpen)){refreshSales().then(()=>render());if(d.markedHold||d.markedOpen)toast('⏸ '+d.markedHold+' held, '+d.markedOpen+' released',3000);}}).catch(()=>{});
     fetch(SUPA_URL+'/functions/v1/shipstation-ship',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({action:'cancel_sync',days:30})})
       .then(r=>r.ok?r.json():null).then(d=>{if(d&&d.markedCancelled>0){refreshSales().then(()=>render());toast('✕ '+d.markedCancelled+' order(s) marked Cancelled',3000);}}).catch(()=>{});
+    // Auto delivery sync — mark Shipped orders Delivered when carrier confirms delivery
+    fetch(SUPA_URL+'/functions/v1/shipstation-ship',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'delivery_sync'})})
+      .then(r=>r.ok?r.json():null).then(d=>{if(d&&d.delivered>0){refreshSales().then(()=>render());toast('✅ '+d.delivered+' order'+(d.delivered!==1?'s':'')+' marked Delivered',3000);}}).catch(()=>{});
     computeDemand();updateBadge();render();
     toast('↺ Data refreshed',2000);
   }catch(e){
@@ -13510,166 +13639,6 @@ async function refreshAll(){
     if(btn){btn.textContent='↺';btn.disabled=false;btn.style.animation='';}
   }
 }
-
-// ════════════════════════════════════════════════════════
-// TGK COMMAND CENTER BRIDGE
-// Receives auth tokens + product data from the CC iframe
-// ════════════════════════════════════════════════════════
-var _ccToken   = null;   // {access_token, refresh_token, email}
-var _ccProduct = null;   // latest product pushed from CC
-
-window.addEventListener('message', function(e) {
-  if (!e.data || e.data.source !== 'TGK_CC') return;
-
-  if (e.data.type === 'AUTH_TOKEN') {
-    _ccToken = e.data;
-    // If Supabase is already loaded, apply session now
-    if (typeof db !== 'undefined' && db && db.auth) {
-      _applyCCToken();
-    }
-    // Otherwise startTGK will pick it up in checkAuthAndConnect
-  }
-
-  if (e.data.type === 'PRODUCT_DATA') {
-    _ccProduct = { data: e.data.data, seo: e.data.seo || {}, copy: e.data.copy || {} };
-    _showCCInbox();
-  }
-
-  if (e.data.type === 'REQUEST_PRODUCT') {
-    // CC is asking for confirmation
-    _pingCC('ERP_READY', {});
-  }
-});
-
-function _pingCC(type, payload) {
-  try {
-    var msg = Object.assign({ source: 'TGK_ERP', type: type }, payload || {});
-    window.parent.postMessage(msg, 'https://TGKMotorsport.github.io');
-  } catch(e) {}
-}
-
-async function _applyCCToken() {
-  if (!_ccToken || !_ccToken.access_token) return false;
-  try {
-    var result = await db.auth.setSession({
-      access_token:  _ccToken.access_token,
-      refresh_token: _ccToken.refresh_token || ''
-    });
-    if (!result.error && result.data && result.data.session) {
-      try { await loadUserProfile(result.data.session.user); } catch(pe) {}
-      hideAuthGate();
-      if (typeof window._appRestart === 'function') window._appRestart(1);
-      _pingCC('ERP_READY', {});
-      return true;
-    }
-  } catch(e) {}
-  return false;
-}
-
-// CC Inbox — show when a product arrives from Command Center
-function _showCCInbox() {
-  if (!_ccProduct) return;
-  var p = _ccProduct.data || {};
-  var existing = document.getElementById('cc-inbox-banner');
-  if (existing) existing.remove();
-
-  var banner = document.createElement('div');
-  banner.id = 'cc-inbox-banner';
-  banner.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:9000;width:340px;background:#fff;border:1px solid #E4E7EC;border-radius:12px;padding:16px;box-shadow:0 4px 24px rgba(0,0,0,.12);animation:cc-slide-in .3s ease';
-  banner.innerHTML = ''
-    + '<style>@keyframes cc-slide-in{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}</style>'
-    + '<div style="display:flex;align-items:flex-start;gap:10px">'
-    +   '<div style="width:36px;height:36px;border-radius:8px;background:rgba(13,148,136,.1);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">&#128640;</div>'
-    +   '<div style="flex:1;min-width:0">'
-    +     '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--teal);margin-bottom:3px">From Command Center</div>'
-    +     '<div style="font-size:13px;font-weight:700;color:var(--text);margin-bottom:2px">' + escHtml(p.name || 'New Product') + '</div>'
-    +     '<div style="font-size:11px;color:var(--text3)">'
-    +       (p.sku ? 'SKU: ' + escHtml(p.sku) + ' &nbsp;' : '')
-    +       (p.cat ? escHtml(p.cat) : '')
-    +     '</div>'
-    +   '</div>'
-    +   '<button onclick="document.getElementById(\'cc-inbox-banner\').remove()" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:16px;padding:2px;line-height:1">&#x2715;</button>'
-    + '</div>'
-    + '<div style="display:flex;gap:8px;margin-top:12px">'
-    +   '<button class="btn btn-teal" style="flex:1;justify-content:center" onclick="ccImportAsPart()">&#43; Import as Part</button>'
-    +   '<button class="btn" style="flex:1;justify-content:center" onclick="document.getElementById(\'cc-inbox-banner\').remove()">Dismiss</button>'
-    + '</div>';
-
-  document.body.appendChild(banner);
-
-  // Also navigate to parts view and show badge
-  var partsBadge = document.querySelector('.nav-item[data-view="parts"] .nav-badge, .nav-item[onclick*="parts"] .nav-badge');
-  if (partsBadge) { partsBadge.style.color = 'var(--orange)'; }
-}
-
-function ccImportAsPart() {
-  if (!_ccProduct) return;
-  var p  = _ccProduct.data || {};
-  var s  = _ccProduct.seo  || {};
-
-  // Navigate to parts view
-  if (typeof S !== 'undefined') { S.view = 'parts'; scheduleRender && scheduleRender(); }
-
-  // Build the pre-fill object
-  var prefill = {
-    pn:               p.sku         || '',
-    description:      p.name        || s.meta_title || '',
-    category:         _mapCCCat(p.cat || ''),
-    vendor:           'TGK Motorsport',
-    unit_cost:        0,
-    lead_time_weeks:  1,
-    avg_sales_wk:     0,
-    total_unpckgd:    0,
-    min_qty:          0,
-    moq:              1,
-    location:         '',
-    drawing_url:      '',
-    discontinued:     false,
-    price_breaks:     [],
-    // Store CC metadata for reference
-    _cc_notes: [
-      p.make && p.model ? 'Fitment: ' + p.make + ' ' + p.model + (p.years ? ' ' + p.years : '') : '',
-      p.material ? 'Material: ' + p.material : '',
-      s.url_handle ? 'URL: /' + s.url_handle : ''
-    ].filter(Boolean).join(' | ')
-  };
-
-  // Remove the banner
-  var b = document.getElementById('cc-inbox-banner');
-  if (b) b.remove();
-
-  // Open the part modal pre-filled
-  if (typeof openModal === 'function') {
-    openModal('addPart', prefill);
-    // After modal opens, fill the notes field if it exists
-    setTimeout(function() {
-      var notesEl = document.getElementById('m-notes') || document.getElementById('m-loc');
-      if (notesEl && prefill._cc_notes && !notesEl.value) {
-        notesEl.value = prefill._cc_notes;
-      }
-      // Put cursor in cost field since that's what user needs to fill
-      var costEl = document.getElementById('m-cost');
-      if (costEl) { costEl.focus(); costEl.select(); }
-    }, 150);
-  }
-
-  // Notify CC that product was received
-  _pingCC('PRODUCT_IMPORTED', { name: p.name || '' });
-}
-
-function _mapCCCat(cat) {
-  var m = {
-    'Suspension / mounts': 'Suspension',
-    'Engine / drivetrain':  'Engine',
-    'Exhaust / intake':     'Exhaust',
-    'Interior / exterior':  'Interior',
-    'Brakes / wheels':      'Brakes',
-    'Lifestyle / apparel':  'Apparel'
-  };
-  return m[cat] || cat || '';
-}
-
-// ── END CC BRIDGE ────────────────────────────────────────────────────
 
 // ── INIT ─────────────────────────────────────────────────────
 (function startTGK(){
@@ -13756,8 +13725,6 @@ function _mapCCCat(cat) {
     }
 
     try{
-      // Check for CC token first (auto-login from Command Center)
-      if(_ccToken&&_ccToken.access_token){const ok=await _applyCCToken();if(ok)return;}
       const{data:{session}}=await db.auth.getSession();
       if(!session){
         showAuthGate();
