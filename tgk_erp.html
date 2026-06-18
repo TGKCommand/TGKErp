@@ -556,6 +556,7 @@ const S = {
   // Shipment Errors
   shipmentErrors:[],
   // Customer Resolution tab: 'claims' | 'errors'
+  packagingRules:[],
   wtyTab:'claims',
   // Production
   activeBuild:null, buildQty:null, buildCoverage:4,
@@ -863,6 +864,7 @@ async function loadAll(){
     if(S.settings.custom_cats){try{Object.assign(S.customCats,S.settings.custom_cats);}catch(e){}}
     if(S.settings.custom_vendors){try{S.customVendors=S.settings.custom_vendors||[];}catch(e){}}
     if(S.settings.sync_locked){try{S.syncLocked=new Set(S.settings.sync_locked);}catch(e){}}
+    if(S.settings.packaging_rules){try{S.packagingRules=S.settings.packaging_rules||[];}catch(e){}}
     if(S.settings.pricing_tiers?.length){S.pricingTiers=S.settings.pricing_tiers;}else{S.pricingTiers=DEFAULT_PRICING_TIERS.map(t=>({...t}));}
     S.boms={};
     (Array.isArray(bomItems)?bomItems:(bomItems.data||[])).forEach(i=>{if(!S.boms[i.parent_pn])S.boms[i.parent_pn]=[];S.boms[i.parent_pn].push(i);});
@@ -3663,6 +3665,7 @@ function renderIntegrations(){
   <div class="tabs-row">
     <div class="tab ${t==='shopify'?'active':''}" onclick="S.intTab='shopify';render()">Shopify</div>
     <div class="tab ${t==='shipstation'?'active':''}" onclick="S.intTab='shipstation';render()">ShipStation</div>
+    <div class="tab ${t==='packaging'?'active':''}" onclick="S.intTab='packaging';render()">📦 Packaging Rules</div>
     <div class="tab ${t==='setup'?'active':''}" onclick="S.intTab='setup';render()">⚙ Setup Guide</div>
   </div>
   ${t==='shopify'?`<div class="int-card">
@@ -3737,6 +3740,32 @@ function renderIntegrations(){
         </div>
         <div id="ss-diag-result" style="display:none;font-size:10px;font-family:var(--mono);background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px;max-height:280px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;color:var(--text2)"></div>
       </div>
+    </div>
+  </div>`:''}
+  ${t==='packaging'?`<div class="int-card">
+    <div class="int-title" style="margin-bottom:4px">Packaging Rules</div>
+    <div class="int-sub" style="margin-bottom:14px">Define which box SKU to deduct from stock when ShipStation ships an order. Rules are evaluated in order — first match wins. Box SKU must be a Part in your inventory.</div>
+    <div class="alert-row alert-row-yellow" style="margin-bottom:14px">
+      <div style="flex:1;font-size:11px"><b>How it works:</b> When the ShipStation SHIP_NOTIFY webhook fires, the ERP checks how many unique product SKUs are in the shipment, matches the first applicable rule, and deducts 1 unit of that box SKU from parts inventory. Redeploy <b>shipstation-ship</b> after saving rules for the first time.</div>
+    </div>
+    <div class="tbl-wrap" style="margin-bottom:12px">
+    <table><thead><tr><th>Rule Name</th><th>Box SKU</th><th title="Minimum unique product SKUs in shipment">Min SKUs</th><th title="Maximum unique product SKUs (blank = no limit)">Max SKUs</th><th title="Optional: only apply if ALL these SKUs are in the order (comma-separated)">Contains SKUs</th><th></th></tr></thead><tbody>
+    ${(S.packagingRules||[]).length===0?'<tr><td colspan="6" class="section-empty">No rules yet — add one below</td></tr>':''}
+    ${(S.packagingRules||[]).map((r,i)=>`<tr>
+      <td><input class="inline-edit" style="width:120px" value="${escHtml(r.name||'')}" placeholder="e.g. Multi-item box" onchange="S.packagingRules[${i}].name=this.value"></td>
+      <td><input class="inline-edit" style="width:100px;font-family:var(--mono);color:var(--teal)" value="${escHtml(r.pn||'')}" list="pkg-pn-list" placeholder="Part #" onchange="S.packagingRules[${i}].pn=this.value"></td>
+      <td><input class="inline-edit" type="number" min="1" style="width:60px" value="${r.min_skus||1}" onchange="S.packagingRules[${i}].min_skus=+this.value||1"></td>
+      <td><input class="inline-edit" type="number" min="1" style="width:60px" value="${r.max_skus||''}" placeholder="any" onchange="S.packagingRules[${i}].max_skus=this.value?+this.value:null"></td>
+      <td><input class="inline-edit" style="width:160px" value="${escHtml((r.contains_skus||[]).join(', '))}" placeholder="SKU-A, SKU-B" onchange="S.packagingRules[${i}].contains_skus=this.value?this.value.split(',').map(s=>s.trim()).filter(Boolean):[]"></td>
+      <td><button class="action-btn del" onclick="deletePackagingRule(${i})">x</button></td>
+    </tr>`).join('')}
+    </tbody></table>
+    <datalist id="pkg-pn-list">${S.parts.filter(p=>!p.discontinued).map(p=>`<option value="${escHtml(p.pn)}">`)}</datalist>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="btn btn-sm" onclick="addPackagingRule()">+ Add Rule</button>
+      <button class="btn btn-primary btn-sm" onclick="savePackagingRules()">Save Rules</button>
+      <span style="font-size:10px;color:var(--text3)">Sorted by priority — top rule matched first</span>
     </div>
   </div>`:''}
   ${t==='setup'?`<div class="int-card">
@@ -4625,6 +4654,35 @@ Deno.serve(async (req) => {
         await db.from('assemblies').update({ total_on_hand: newOh, updated_at: new Date().toISOString() }).eq('id', asm.id)
         await db.from('inv_corrections').insert({ pn, previous_qty: prev, new_qty: newOh, adjustment: -lineQty, reason: 'Shipped via ShipStation ' + resolvedOrderNum + ' ' + tracking, source: 'shipment' })
         console.log('[SS] Deducted', lineQty, 'of', pn, 'on', resolvedOrderNum, '| on_hand:', prev, '->', newOh)
+      }
+
+      // Packaging rules — deduct box SKU based on how many unique product SKUs are in this shipment
+      try {
+        const { data: pkgSetting } = await db.from('settings').select('value').eq('key', 'packaging_rules').maybeSingle()
+        const pkgRules: any[] = pkgSetting?.value || []
+        if (pkgRules.length > 0) {
+          const skuCount = pnsToDeduct.length
+          const rule = pkgRules.find((r: any) => {
+            const minOk = !r.min_skus || skuCount >= Number(r.min_skus)
+            const maxOk = !r.max_skus || skuCount <= Number(r.max_skus)
+            const containsOk = !r.contains_skus || r.contains_skus.length === 0 ||
+              r.contains_skus.every((s: string) => pnsToDeduct.some((p: string) => p.toUpperCase() === s.trim().toUpperCase()))
+            return minOk && maxOk && containsOk
+          })
+          if (rule && rule.pn) {
+            const { data: pkgRows } = await db.from('parts').select('id,total_unpckgd').eq('pn', rule.pn).limit(1)
+            const pkgPart = pkgRows?.[0]
+            if (pkgPart) {
+              const pkgPrev = pkgPart.total_unpckgd || 0
+              const pkgNew = pkgPrev - 1
+              await db.from('parts').update({ total_unpckgd: pkgNew, updated_at: new Date().toISOString() }).eq('id', pkgPart.id)
+              await db.from('inv_corrections').insert({ pn: rule.pn, previous_qty: pkgPrev, new_qty: pkgNew, adjustment: -1, reason: 'Packaging rule "' + rule.name + '" -- ' + resolvedOrderNum + ' (' + skuCount + ' SKU' + (skuCount !== 1 ? 's' : '') + ')', source: 'shipment' })
+              console.log('[SS] Packaging deducted:', rule.pn, 'rule:', rule.name, 'for', resolvedOrderNum, '(' + skuCount + ' SKUs)')
+            }
+          }
+        }
+      } catch (pkgErr: any) {
+        console.warn('[SS] Packaging rules error:', pkgErr?.message)
       }
     }
   }
@@ -12733,6 +12791,27 @@ async function deleteShipmentError(id){
   S.shipmentErrors=(S.shipmentErrors||[]).filter(e=>e.id!==id);
   logAction('Deleted shipment error','shipment_errors',null,null,null).catch(()=>{});
   toast('Deleted');updateBadge();render();
+}
+
+function addPackagingRule(){
+  S.packagingRules=S.packagingRules||[];
+  S.packagingRules.push({name:'',pn:'',min_skus:2,max_skus:null,contains_skus:[]});
+  render();
+}
+
+function deletePackagingRule(idx){
+  S.packagingRules=(S.packagingRules||[]).filter((_,i)=>i!==idx);
+  render();
+}
+
+async function savePackagingRules(){
+  const rules=(S.packagingRules||[]).filter(r=>r.pn&&r.pn.trim());
+  const{error}=await db.from('settings').upsert({key:'packaging_rules',value:rules},{onConflict:'key'});
+  if(error){toast('Error saving rules: '+error.message);return;}
+  S.settings.packaging_rules=rules;
+  S.packagingRules=rules;
+  toast(rules.length+' packaging rule'+(rules.length!==1?'s':'')+' saved');
+  render();
 }
 
 async function checkResolutionTracking(){
