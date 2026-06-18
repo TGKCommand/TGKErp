@@ -693,7 +693,7 @@ function liveStatus(a){
   if(wk>0&&oh<wk*2)return 'low';
   return 'ok';
 }
-const wks = p => { const w=avgWk(p); return w>0 ? Math.round((p.total_unpckgd||0)/w) : null; };
+const wks = p => { const w=avgWk(p); return w>0 ? Math.round(Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn))/w) : null; };
 const wkColor = w => w===null?'var(--green)':w<2?'var(--red)':w<6?'var(--yellow)':'var(--green)';
 const wkPct  = w => w===null?100:Math.min(100,Math.round(w/12*100));
 
@@ -1405,7 +1405,7 @@ function addAction(){const m={parts:'addPart',assemblies:'addAsm',purchases:'add
 function renderDashboard(){
   const critical=S.assemblies.filter(a=>!a.discontinued&&liveStatus(a)==='critical').length;
   const lowStock=S.assemblies.filter(a=>!a.discontinued&&liveStatus(a)==='low').length;
-  const needsReorder=S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||calcForecast(p.pn)>0)&&(p.total_unpckgd||0)<=calcReorderPoint(p)).length;
+  const needsReorder=S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||calcForecast(p.pn)>0)&&Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn))<=calcReorderPoint(p)).length;
   const invVal=S.parts.reduce((s,p)=>s+Math.max(0,p.total_unpckgd||0)*(p.unit_cost||0),0);
   // Use grouped counts so numbers match exactly what the Sales page shows
   const openOrders  =countGroupedStatus('Open');
@@ -1503,7 +1503,7 @@ function renderDashboard(){
       <div class="panel-title"><span class="panel-title-left">⚠ Reorder Queue</span><button class="btn btn-sm" onclick="nav('planning')">Planning →</button></div>
       <div class="tbl-wrap">
       <table><thead><tr><th>Part #</th><th>On Hand</th><th>Reorder Pt</th><th></th></tr></thead><tbody>
-      ${S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0)&&(p.total_unpckgd||0)<=calcReorderPoint(p)).sort((a,b)=>(a.total_unpckgd||0)-(b.total_unpckgd||0)).slice(0,7).map(p=>{
+      ${S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0)&&Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn))<=calcReorderPoint(p)).sort((a,b)=>Math.max(0,(a.total_unpckgd||0)-boReserved(a.pn))-Math.max(0,(b.total_unpckgd||0)-boReserved(b.pn))).slice(0,7).map(p=>{
         const sq=calcSuggestedQty(p);
         return `<tr><td class="pn">${p.pn}</td>
         <td class="money" style="color:var(--red);font-weight:700">${p.total_unpckgd||0}</td>
@@ -2516,24 +2516,14 @@ async function unpackSaleOrder(saleId, pn, qty){
   if(!linesToUnpack.length){toast('No packed lines found to unpack');return;}
 
   const lineDesc=linesToUnpack.length>1?linesToUnpack.length+' lines':'1× '+pn;
-  if(!confirm('Unpack '+lineDesc+'?\nReturns finished goods to stock and resets order to Open.'))return;
+  if(!confirm('Unpack '+lineDesc+'?\nResets order to Open. (No stock change — stock deducts at ship, not at pack.)'))return;
 
+  // Pack no longer deducts stock (deduction happens at Ship), so Unpack
+  // just resets the sale status — no stock adjustment needed.
   const undoOps=[];
 
   for(const line of linesToUnpack){
-    const linePn=line.pn; const lineQty=line.qty||1;
-    // Return assembly stock
-    const asm=S.assemblies.find(a=>a.pn===linePn);
-    if(asm){
-      const newOh=(asm.total_on_hand||0)+lineQty;
-      undoOps.push({action:'update',table:'assemblies',data:{...asm,total_on_hand:newOh},prev:{...asm}});
-      const{error:aErr}=await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
-      if(aErr){toast('Error updating stock for '+linePn+': '+aErr.message);return;}
-      S.assemblies=S.assemblies.map(a=>a.pn===linePn?{...a,total_on_hand:newOh}:a);
-      const{data:corrRow}=await db.from('inv_corrections').insert({pn:linePn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:lineQty,reason:'Order unpacked — '+(line.order_number||saleId),user_email:S.currentUser||null,source:'unpack'}).select().single();
-      if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
-    }
-    // Reset sale line to Open
+    // Reset sale line to Open — no inventory change
     undoOps.push({action:'update',table:'sales',data:{...line,fulfillment_status:'Open'},prev:{...line}});
     const{error:sErr}=await db.from('sales').update({fulfillment_status:'Open'}).eq('id',line.id);
     if(sErr){toast('Error resetting order: '+sErr.message);return;}
@@ -2541,7 +2531,7 @@ async function unpackSaleOrder(saleId, pn, qty){
   }
 
   pushUndoMulti('Unpack order '+(sale?.order_number||''),undoOps);
-  toast('Unpacked '+lineDesc+' — stock returned, order Open');
+  toast('Unpacked '+lineDesc+' — order reset to Open');
   render();
 }
 
@@ -9674,7 +9664,7 @@ function renderPOBuilder(){
   let list=S.parts.filter(p=>!p.discontinued);
   if(q)list=list.filter(p=>p.pn.toLowerCase().includes(q)||(p.description||'').toLowerCase().includes(q));
   if(sf.vendor)list=list.filter(p=>(p.vendor||'')===sf.vendor);
-  if(sf.reorder)list=list.filter(p=>(p.total_unpckgd||0)<=calcReorderPoint(p));
+  if(sf.reorder)list=list.filter(p=>Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn))<=calcReorderPoint(p));
   list=list.slice(0,200);
   const pm={};S.parts.forEach(p=>pm[p.pn]=p);
   const cartTotal=S.poCart.reduce((t,c)=>t+c.qty*costForQty(pm[c.pn]||{},c.qty),0);
@@ -9915,7 +9905,7 @@ function renderPlanning() {
       case 'pn':    cmp=a.pn.localeCompare(b.pn);break;
       case 'oh':    cmp=(a.total_unpckgd||0)-(b.total_unpckgd||0);break;
       case 'demand':cmp=(avgWk(a)||calcForecast(a.pn))-(avgWk(b)||calcForecast(b.pn));break;
-      case 'weeks':{const wa=avgWk(a)>0?(a.total_unpckgd||0)/avgWk(a):9999,wb=avgWk(b)>0?(b.total_unpckgd||0)/avgWk(b):9999;cmp=wa-wb;break;}
+      case 'weeks':{const wa=avgWk(a)>0?Math.max(0,(a.total_unpckgd||0)-boReserved(a.pn))/avgWk(a):9999,wb=avgWk(b)>0?Math.max(0,(b.total_unpckgd||0)-boReserved(b.pn))/avgWk(b):9999;cmp=wa-wb;break;}
       case 'trend': cmp=trendRatio(a)-trendRatio(b);break;
       case 'status':cmp=(STATUS_PRI[getPlanningStatus(a)]||5)-(STATUS_PRI[getPlanningStatus(b)]||5);break;
       default:      cmp=((a.total_unpckgd||0)-calcReorderPoint(a))-((b.total_unpckgd||0)-calcReorderPoint(b));
@@ -10007,7 +9997,7 @@ function renderPlanning() {
     const effectiveStock=effectiveOh+onOrder;
     const wkd=(avgWk(p)||calcForecast(p.pn));
     const wk4d=avgWk4(p);
-    const wksStock=wkd>0?(oh/wkd).toFixed(1):null;
+    const wksStock=wkd>0?(effectiveOh/wkd).toFixed(1):null;
 
     // Trend
     let trend='',trendColor='var(--text3)',trendTitle='';
@@ -10027,10 +10017,10 @@ function renderPlanning() {
     const bomBadge=inBOM?'<span title="BOM demand included" style="font-size:8px;color:var(--purple);background:rgba(124,58,237,.12);border-radius:3px;padding:0 3px;margin-left:2px">BOM</span>':'';
 
     // Stock bar
-    const barMax=p.max_qty>0?p.max_qty:Math.max(rp*2,oh,1);
-    const barPct=Math.min(100,Math.round((oh/barMax)*100));
-    const barColor=oh<=0?'var(--red)':oh<=rp?'var(--orange)':p.max_qty>0&&oh>p.max_qty?'var(--yellow)':'var(--teal)';
-    const ohColor=oh<=rp&&onOrder===0?'var(--red)':oh<=rp?'var(--orange)':oh>=(p.max_qty||999999)?'var(--yellow)':'var(--text)';
+    const barMax=p.max_qty>0?p.max_qty:Math.max(rp*2,effectiveOh,1);
+    const barPct=Math.min(100,Math.round((effectiveOh/barMax)*100));
+    const barColor=effectiveOh<=0?'var(--red)':effectiveOh<=rp?'var(--orange)':p.max_qty>0&&oh>p.max_qty?'var(--yellow)':'var(--teal)';
+    const ohColor=effectiveOh<=rp&&onOrder===0?'var(--red)':effectiveOh<=rp?'var(--orange)':oh>=(p.max_qty||999999)?'var(--yellow)':'var(--text)';
 
     // Price break hint
     const pbHint=nextBreakHint(p,orderQty);
