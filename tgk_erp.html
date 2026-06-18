@@ -8672,6 +8672,21 @@ function costForQty(p, qty){
   return cost;
 }
 
+// Returns qty still outstanding (ordered - received) across all open POs for a given PN
+function openOrderedQty(pn) {
+  let qty = 0;
+  S.purchases.forEach(po => {
+    if(po.status === 'Received' || po.status === 'Cancelled') return;
+    const lines = S.poLines[po.id] || [];
+    if(lines.length) {
+      lines.forEach(l => { if(l.pn === pn) qty += Math.max(0, (l.qty_ordered||0) - (l.qty_received||0)); });
+    } else if(po.pn === pn) {
+      qty += po.qty || 0;
+    }
+  });
+  return qty;
+}
+
 function calcReorderPoint(p) {
   const wkDemand = avgWk(p) || calcForecast(p.pn);
   const lt = p.lead_time_weeks || 1;
@@ -8731,36 +8746,92 @@ function renderPlanning() {
   ${S.mmSuggest?renderMMReview():''}
   <div class="tbl-wrap">
   <table><thead class="sticky-header"><tr>
-    <th>Part #</th><th>Description</th><th>Vendor</th><th>On Hand</th><th>Min</th><th>Max</th><th>Safety</th><th>MOQ</th><th>Wk Demand</th><th>Suggested</th><th>Status</th><th>Action</th>
+    <th>Part #</th><th>Description</th><th>Vendor</th><th>Stock</th><th>Min</th><th>Max</th><th>Safety</th><th>MOQ</th><th>Demand</th><th>Suggested</th><th>Status</th><th>Action</th>
   </tr></thead><tbody>
-  ${parts.map(p=>{
+  ${(()=>{
+    // Pre-compute which parts appear in any BOM (for BOM demand badge)
+    const inBOMSet=new Set();
+    Object.values(S.boms).forEach(items=>items.forEach(i=>{if(i.item_type==='part')inBOMSet.add(i.child_pn);}));
+    return parts.map(p=>{
     const rp=calcReorderPoint(p);
     const oh=p.total_unpckgd||0;
     const sq=calcSuggestedQty(p);
     const moq=p.moq||0;
     const orderQty=Math.max(sq,moq);
+    const onOrder=openOrderedQty(p.pn);
+    const effectiveStock=oh+onOrder;
     const wkd=(avgWk(p)||calcForecast(p.pn));
+
+    // ── Trend: compare 4-wk vs 12-wk avg ──
+    const wk4d=avgWk4(p);
+    let trend='',trendColor='var(--text3)',trendTitle='';
+    if(wkd>0&&wk4d>0){
+      const ratio=wk4d/wkd;
+      if(ratio>1.25){trend='↑';trendColor='var(--red)';trendTitle='Rising — 4wk avg '+wk4d.toFixed(2)+' vs 12wk '+wkd.toFixed(2)+'/wk';}
+      else if(ratio<0.75){trend='↓';trendColor='var(--yellow)';trendTitle='Falling — 4wk avg '+wk4d.toFixed(2)+' vs 12wk '+wkd.toFixed(2)+'/wk';}
+      else{trend='→';trendColor='var(--text3)';trendTitle='Stable — 4wk avg '+wk4d.toFixed(2)+' vs 12wk '+wkd.toFixed(2)+'/wk';}
+    }
+
+    // ── Demand source badge ──
+    const calcD=S.calc&&S.calc.part&&S.calc.part[p.pn];
+    const hasLive=calcD&&(calcD.wk12>0||calcD.wk4>0);
+    const inBOM=inBOMSet.has(p.pn);
+    const demSrcTitle=(hasLive?(inBOM?'Live sales + BOM-exploded assembly demand':'Live from direct sales'):(p.avg_sales_wk>0?'Imported avg_sales_wk (no recent live sales)':''));
+    const demSrcIcon=hasLive?'<span title="'+demSrcTitle+'" style="font-size:9px;color:var(--teal);margin-left:2px">📊</span>':'<span title="'+demSrcTitle+'" style="font-size:9px;color:var(--text3);margin-left:2px">📋</span>';
+    const bomBadge=inBOM?'<span title="BOM demand included" style="font-size:8px;color:var(--purple);background:rgba(124,58,237,.12);border-radius:3px;padding:0 3px;margin-left:2px">BOM</span>':'';
+
+    // ── Stock bar ──
+    const barMax=p.max_qty>0?p.max_qty:Math.max(rp*2,oh,1);
+    const barPct=Math.min(100,Math.round((oh/barMax)*100));
+    const barColor=oh<=0?'var(--red)':oh<=rp?'var(--orange)':p.max_qty>0&&oh>p.max_qty?'var(--yellow)':'var(--teal)';
+    const ohColor=oh<=rp&&onOrder===0?'var(--red)':oh<=rp?'var(--orange)':oh>=(p.max_qty||999999)?'var(--yellow)':'var(--text)';
+
+    // ── Price break hint ──
+    const pbHint=nextBreakHint(p,orderQty);
+
+    // ── Status — account for open POs ──
     let status,statusCls;
-    if(oh<=0){status='Critical';statusCls='pill-red';}
+    if(oh<=0&&onOrder===0){status='Critical';statusCls='pill-red';}
+    else if(oh<=rp&&onOrder>0&&effectiveStock>rp){status='On Order';statusCls='pill-teal';}
     else if(oh<=rp&&moq>0&&sq<moq){status='OK · below MOQ';statusCls='pill-muted';}
     else if(oh<=rp){status='Reorder';statusCls='pill-orange';}
     else if(p.max_qty>0&&oh>p.max_qty){status='Overstock';statusCls='pill-yellow';}
     else{status='OK';statusCls='pill-teal';}
+
+    // ── Suppress order button when open PO already covers the need ──
+    const alreadyCovered=onOrder>0&&effectiveStock>rp;
+    const needsOrder=oh<=rp&&orderQty>0&&!(moq>0&&sq<moq)&&!alreadyCovered;
+
     return `<tr class="rowlink" onclick="rowClick(event,function(){lookupGo('part','${p.pn}')})">
       <td class="pn" style="color:var(--text)">${p.pn}</td>
       <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${p.description||''}</td>
       <td style="font-size:10px;color:var(--text3);max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.vendor||''}</td>
-      <td class="money" style="color:${oh<=rp?'var(--red)':oh>=(p.max_qty||999999)?'var(--yellow)':'var(--text)'};font-weight:700" title="Reorder point: ${rp}">${oh}</td>
+      <td title="Reorder point: ${rp}${onOrder>0?' · '+onOrder+' on open PO':''}">
+        <div style="font-weight:700;color:${ohColor}">${oh}</div>
+        <div style="width:52px;height:4px;background:var(--bg3);border-radius:2px;margin-top:3px;overflow:hidden"><div style="width:${barPct}%;height:100%;background:${barColor};border-radius:2px"></div></div>
+        ${onOrder>0?`<div style="font-size:9px;color:var(--teal);margin-top:2px;white-space:nowrap">+${onOrder} on order</div>`:''}
+      </td>
       <td><input class="inline-edit" style="width:55px" type="number" value="${p.min_qty||0}" onchange="savePlanField('${p.id}','min_qty',+this.value,'${p.pn}')"></td>
       <td><input class="inline-edit" style="width:55px" type="number" value="${p.max_qty||0}" onchange="savePlanField('${p.id}','max_qty',+this.value,'${p.pn}')"></td>
       <td><input class="inline-edit" style="width:55px" type="number" value="${p.safety_stock||0}" onchange="savePlanField('${p.id}','safety_stock',+this.value,'${p.pn}')"></td>
       <td><input class="inline-edit" style="width:55px" type="number" value="${moq}" title="Minimum order qty — won't flag unless suggested ≥ MOQ" onchange="savePlanField('${p.id}','moq',+this.value,'${p.pn}')"></td>
-      <td class="money-neutral" title="12-wk avg · 4-wk: ${avgWk4(p).toFixed(2)}/wk — auto from sales">${wkd.toFixed(2)}/wk</td>
-      <td class="money-cost" style="font-weight:700" title="Reorder point: ${rp} · Order ${orderQty} @ ${fc(costForQty(p,orderQty),4)}/ea">${sq}${moq>sq?'<span style="color:var(--text3);font-size:9px"> →'+moq+'</span>':''}</td>
-      <td><span class="pill ${statusCls}" title="Reorder point: ${rp}">${status}</span></td>
-      <td style="display:flex;gap:4px">${oh<=rp&&orderQty>0&&!(moq>0&&sq<moq)?`<button class="btn btn-primary btn-sm" onclick='createPOFromSuggestion("${p.pn}","${p.vendor||''}",${orderQty},${costForQty(p,orderQty)},"${p.description||''}")'>Order ${orderQty}</button>`:''}<button class="action-btn" title="AI suggest min/max" onclick="aiSuggestMinMax('${p.pn}')">✨</button></td>
+      <td class="money-neutral" style="white-space:nowrap" title="${trendTitle}">
+        ${wkd.toFixed(2)}/wk${trend?` <span style="color:${trendColor};font-weight:700">${trend}</span>`:''}
+        ${demSrcIcon}${bomBadge}
+      </td>
+      <td class="money-cost" style="font-weight:700" title="Reorder point: ${rp} · Order ${orderQty} @ ${fc(costForQty(p,orderQty),4)}/ea">
+        ${sq}${moq>sq?'<span style="color:var(--text3);font-size:9px"> →'+moq+'</span>':''}
+        ${pbHint?`<div style="font-size:9px;color:var(--yellow);white-space:nowrap">💡 ${pbHint}</div>`:''}
+      </td>
+      <td><span class="pill ${statusCls}" title="Reorder point: ${rp}${onOrder>0?' · '+onOrder+' on open PO':''}">${status}</span></td>
+      <td style="display:flex;gap:4px;align-items:center">
+        ${needsOrder?`<button class="btn btn-primary btn-sm" onclick='createPOFromSuggestion("${p.pn}","${p.vendor||''}",${orderQty},${costForQty(p,orderQty)},"${p.description||''}")'>Order ${orderQty}</button>`:''}
+        ${alreadyCovered?`<span style="font-size:10px;color:var(--teal)" title="${onOrder} on open PO — no action needed">✓ Ordered</span>`:''}
+        <button class="action-btn" title="AI suggest min/max" onclick="aiSuggestMinMax('${p.pn}')">✨</button>
+      </td>
     </tr>`;
-  }).join('')}
+  }).join('');
+  })()}
   </tbody></table></div>`;
 }
 
