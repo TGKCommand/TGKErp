@@ -437,6 +437,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 
     <div class="sidebar-section" id="admin-section" style="display:none">Admin</div>
     <button class="nav-item" id="nav-users" onclick="nav('users')" style="display:none"><span class="nav-dot"></span>Users &amp; Permissions</button>
+    <button class="nav-item" id="nav-audit" onclick="nav('audit')" style="display:none"><span class="nav-dot"></span>User Activity Log</button>
     <div class="sidebar-section">Tools</div>
     <button class="nav-item" id="nav-ai" onclick="nav('ai')"><span class="nav-dot"></span>AI Assistant</button>
     <button class="nav-item" id="nav-reports" onclick="nav('reports')"><span class="nav-dot"></span>Reports &amp; Export</button>
@@ -469,6 +470,12 @@ td[class*=money]{font-variant-numeric:tabular-nums}
       <div class="topbar-title" id="page-title">Dashboard</div>
     </div>
     <div class="topbar-actions">
+      <button id="cc-back-btn" onclick="goToCommandCenter()" title="Back to Command Center"
+        style="display:flex;align-items:center;gap:6px;padding:5px 12px;background:var(--teal-dim);border:1px solid rgba(13,148,136,.25);border-radius:6px;color:var(--teal);font-size:12px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap;flex-shrink:0"
+        onmouseover="this.style.background='rgba(13,148,136,.15)'" onmouseout="this.style.background='var(--teal-dim)'">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+        Command Center
+      </button>
       <div class="search-wrap" style="max-width:220px">
         <span class="search-icon">⌕</span>
         <input type="text" placeholder="Search anything — parts, finished goods…" id="gsearch" oninput="onSearch(this.value)">
@@ -8160,7 +8167,7 @@ function showAuthGate(){
   const a=document.getElementById('tgk-app');if(a)a.style.display='none';
   const l=document.getElementById('tgk-loader');if(l)l.style.display='none';
 }
-function hideAuthGate(){const g=document.getElementById('auth-gate');if(g)g.style.display='none';}
+function hideAuthGate(){const g=document.getElementById('auth-gate');if(g)g.style.display='none';_pingCC('ERP_READY',{});}
 
 function showSetPasswordGate(isInvite){
   const g=document.getElementById('auth-gate');
@@ -8209,7 +8216,9 @@ async function submitNewPassword(){
   }
   // Password saved — clear the invite/recovery hash and load the ERP
   try{history.replaceState(null,'',window.location.pathname);}catch(_){}
-  const{data:{session}}=await db.auth.getSession();
+  // Check for CC bridge token first (auto-login from Command Center)
+      if(_ccToken&&_ccToken.access_token){const ok=await _applyCCToken();if(ok)return;}
+      const{data:{session}}=await db.auth.getSession();
   if(session){
     try{await loadUserProfile(session.user);}catch(pe){console.warn('Profile load:',pe);}
     const g=document.getElementById('auth-gate');if(g)g.style.display='none';
@@ -8255,6 +8264,7 @@ function _updateAuthUI(){
   const em=document.getElementById('sidebar-email');if(em)em.textContent=S.currentUser||'';
   if(S.currentRole==='admin'){
     const un=document.getElementById('nav-users');if(un)un.style.display='';
+    var ua=document.getElementById('nav-audit');if(ua)ua.style.display='';
     const as=document.getElementById('admin-section');if(as)as.style.display='';
   }
 }
@@ -12399,6 +12409,7 @@ function renderAuditLog(){
 
   const rows=list.map(a=>{
     const roleColor=a.user_role==='admin'?'var(--teal)':'var(--orange)';
+    const isCC=(a.summary||'').startsWith('Imported from Command Center');
     const dt=a.created_at?new Date(a.created_at):null;
     return `<tr>
       <td style="font-size:10px;color:var(--text3);font-family:var(--mono);white-space:nowrap;min-width:100px">${dt?timeAgo(a.created_at):'—'}<br><span style="font-size:8px">${dt?dt.toLocaleString():''}</span></td>
@@ -13483,7 +13494,7 @@ function scheduleRender(){
 }
 function render(){
   // Hide loader on first render  if(_sh)_sh.style.display='flex';}
-  const views={dashboard:renderDashboard,users:renderUsers,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder,reports:renderReports};
+  const views={dashboard:renderDashboard,users:renderUsers,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder,reports:renderReports,audit:renderAuditLog};
   if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length)computeDemand();
   // Preserve focused input + caret across re-render
   const active=document.activeElement;
@@ -13639,6 +13650,146 @@ async function refreshAll(){
     if(btn){btn.textContent='↺';btn.disabled=false;btn.style.animation='';}
   }
 }
+
+// ════════════════════════════════════════════════════════
+// TGK COMMAND CENTER BRIDGE
+// Receives auth tokens + product data from the CC iframe
+// ════════════════════════════════════════════════════════
+var _ccToken   = null;   // {access_token, refresh_token, email}
+var _ccProduct = null;   // latest product pushed from CC
+
+window.addEventListener('message', function(e) {
+  if (!e.data || e.data.source !== 'TGK_CC') return;
+
+  if (e.data.type === 'AUTH_TOKEN') {
+    _ccToken = e.data;
+    if (typeof db !== 'undefined' && db && db.auth) {
+      _applyCCToken();
+    }
+  }
+
+  if (e.data.type === 'PRODUCT_DATA') {
+    _ccProduct = { data: e.data.data, seo: e.data.seo || {}, copy: e.data.copy || {} };
+    _showCCInbox();
+  }
+
+  if (e.data.type === 'REQUEST_PRODUCT') {
+    _pingCC('ERP_READY', {});
+  }
+});
+
+function goToCommandCenter() {
+  if (window.parent && window.parent !== window) {
+    _pingCC('CLOSE_ERP', {});
+  } else {
+    window.location.href = 'https://TGKMotorsport.github.io/TGK/';
+  }
+}
+
+function _pingCC(type, payload) {
+  try {
+    var msg = Object.assign({ source: 'TGK_ERP', type: type }, payload || {});
+    window.parent.postMessage(msg, 'https://TGKMotorsport.github.io');
+  } catch(e) {}
+}
+
+async function _applyCCToken() {
+  if (!_ccToken || !_ccToken.access_token) return false;
+  try {
+    var result = await db.auth.setSession({
+      access_token:  _ccToken.access_token,
+      refresh_token: _ccToken.refresh_token || ''
+    });
+    if (!result.error && result.data && result.data.session) {
+      try { await loadUserProfile(result.data.session.user); } catch(pe) {}
+      hideAuthGate();
+      if (typeof window._appRestart === 'function') window._appRestart(1);
+      _pingCC('ERP_READY', {});
+      return true;
+    }
+  } catch(e) {}
+  return false;
+}
+
+function _showCCInbox() {
+  if (!_ccProduct) return;
+  var p = _ccProduct.data || {};
+  var existing = document.getElementById('cc-inbox-banner');
+  if (existing) existing.remove();
+  var banner = document.createElement('div');
+  banner.id = 'cc-inbox-banner';
+  banner.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:9000;width:340px;background:#fff;border:1px solid #E4E7EC;border-radius:12px;padding:16px;box-shadow:0 4px 24px rgba(0,0,0,.12);animation:cc-slide-in .3s ease';
+  banner.innerHTML = '<style>@keyframes cc-slide-in{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}</style>'
+    + '<div style="display:flex;align-items:flex-start;gap:10px">'
+    +   '<div style="width:36px;height:36px;border-radius:8px;background:rgba(13,148,136,.1);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">&#128640;</div>'
+    +   '<div style="flex:1;min-width:0">'
+    +     '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--teal);margin-bottom:3px">From Command Center</div>'
+    +     '<div style="font-size:13px;font-weight:700;color:var(--text);margin-bottom:2px">' + (typeof escHtml==='function'?escHtml(p.name||'New Product'):(p.name||'New Product')) + '</div>'
+    +     '<div style="font-size:11px;color:var(--text3)">' + (p.sku?'SKU: '+p.sku+'  ':'') + (p.cat||'') + '</div>'
+    +   '</div>'
+    +   '<button onclick="document.getElementById(\'cc-inbox-banner\').remove()" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:16px;padding:2px;line-height:1">&#x2715;</button>'
+    + '</div>'
+    + '<div style="display:flex;gap:8px;margin-top:12px">'
+    +   '<button class="btn btn-teal" style="flex:1;justify-content:center" onclick="ccImportAsPart()">&#43; Import as Part</button>'
+    +   '<button class="btn" style="flex:1;justify-content:center" onclick="document.getElementById(\'cc-inbox-banner\').remove()">Dismiss</button>'
+    + '</div>';
+  document.body.appendChild(banner);
+}
+
+function ccImportAsPart() {
+  if (!_ccProduct) return;
+  var p  = _ccProduct.data || {};
+  var s  = _ccProduct.seo  || {};
+  if (typeof S !== 'undefined') { S.view = 'parts'; if(typeof scheduleRender==='function')scheduleRender(); }
+  var prefill = {
+    pn:              p.sku         || '',
+    description:     p.name        || s.meta_title || '',
+    category:        _mapCCCat(p.cat || ''),
+    vendor:          'TGK Motorsport',
+    unit_cost:       0,
+    lead_time_weeks: 1,
+    avg_sales_wk:    0,
+    total_unpckgd:   0,
+    min_qty:         0,
+    moq:             1,
+    location:        '',
+    drawing_url:     '',
+    discontinued:    false,
+    price_breaks:    []
+  };
+  var existing = document.getElementById('cc-inbox-banner');
+  if (existing) existing.remove();
+  if (typeof openModal === 'function') {
+    openModal('addPart', prefill);
+    setTimeout(function() {
+      var notesEl = document.getElementById('m-notes') || document.getElementById('m-loc');
+      if (notesEl && !notesEl.value) {
+        var notes = [
+          p.make && p.model ? 'Fitment: ' + p.make + ' ' + p.model + (p.years ? ' ' + p.years : '') : '',
+          p.material ? 'Material: ' + p.material : '',
+          s.url_handle ? 'URL: /' + s.url_handle : ''
+        ].filter(Boolean).join(' | ');
+        notesEl.value = notes;
+      }
+      var costEl = document.getElementById('m-cost');
+      if (costEl) { costEl.focus(); costEl.select(); }
+    }, 150);
+  }
+  if (typeof logAction === 'function') {
+    logAction('Imported from Command Center: ' + (p.name || 'Product'), 'parts', p.sku || '', null, prefill).catch(function(){});
+  }
+  _pingCC('PRODUCT_IMPORTED', { name: p.name || '' });
+}
+
+function _mapCCCat(cat) {
+  var m = {
+    'Suspension / mounts':'Suspension','Engine / drivetrain':'Engine',
+    'Exhaust / intake':'Exhaust','Interior / exterior':'Interior',
+    'Brakes / wheels':'Brakes','Lifestyle / apparel':'Apparel'
+  };
+  return m[cat] || cat || '';
+}
+// ── END CC BRIDGE ────────────────────────────────────────────────────
 
 // ── INIT ─────────────────────────────────────────────────────
 (function startTGK(){
