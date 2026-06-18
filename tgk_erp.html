@@ -4664,14 +4664,12 @@ Deno.serve(async (req) => {
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
     )
 
-    // Verify caller is authenticated
     const authHeader = req.headers.get('Authorization')
     if (!authHeader) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: CORS })
 
     const { data: { user }, error: authErr } = await adminDb.auth.getUser(authHeader.replace('Bearer ', ''))
     if (authErr || !user) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: CORS })
 
-    // Verify caller is an admin
     const { data: profile } = await adminDb.from('profiles').select('role').eq('id', user.id).single()
     if (profile?.role !== 'admin') return new Response(JSON.stringify({ error: 'Admin access required' }), { status: 403, headers: CORS })
 
@@ -4679,11 +4677,9 @@ Deno.serve(async (req) => {
     if (!email || !role) return new Response(JSON.stringify({ error: 'email and role are required' }), { status: 400, headers: CORS })
     if (!['admin', 'super_user'].includes(role)) return new Response(JSON.stringify({ error: 'Invalid role' }), { status: 400, headers: CORS })
 
-    // Send invite email via Supabase Auth Admin API
     const { data: inviteData, error: inviteErr } = await adminDb.auth.admin.inviteUserByEmail(email)
     if (inviteErr) return new Response(JSON.stringify({ error: inviteErr.message }), { status: 400, headers: CORS })
 
-    // Pre-create profile row with chosen role so it's ready on first login
     await adminDb.from('profiles').upsert({
       id: inviteData.user.id,
       email: email,
@@ -4698,14 +4694,14 @@ Deno.serve(async (req) => {
   }
 })</pre>
 
-    <div class="section-header" style="background:transparent;border:none;padding-left:0">5 — Set ShipStation env vars in Supabase</div>
+    <div class="section-header" style="background:transparent;border:none;padding-left:0">4 — Set ShipStation env vars in Supabase</div>
     <div style="font-size:11px;color:var(--text2);line-height:1.7;margin-bottom:8px">Dashboard → Edge Functions → <b>shipstation-ship</b> → Secrets → add:<br>
     <code>SS_KEY</code> = your ShipStation API Key &nbsp;·&nbsp; <code>SS_SECRET</code> = your ShipStation API Secret</div>
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">6 — Deploy functions</div>
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto">supabase functions deploy shopify-orders --no-verify-jwt
-supabase functions deploy shipstation-ship --no-verify-jwt
-supabase functions deploy invite-user --no-verify-jwt</pre>
+supabase functions deploy shipstation-ship --no-verify-jwt</pre>
+supabase functions deploy invite-user --no-verify-jwt
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">7 — Register webhooks</div>
     <div style="font-size:11px;color:var(--text2);line-height:1.9">
@@ -8069,6 +8065,62 @@ async function adminSetRole(userId,newRole,email){
   toast('Role updated for '+email);render();
 }
 
+function showInviteUserModal(){
+  const m=document.createElement('div');
+  m.id='invite-user-modal';
+  m.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;display:flex;align-items:center;justify-content:center';
+  m.innerHTML=`
+    <div style="background:var(--bg);border-radius:10px;padding:24px;width:360px;box-shadow:0 8px 32px rgba(0,0,0,.3)">
+      <div style="font-size:15px;font-weight:700;margin-bottom:16px">Invite Team Member</div>
+      <div class="form-group">
+        <label class="form-label">Email Address</label>
+        <input id="invite-email" class="form-input" type="email" placeholder="name@company.com" autofocus>
+      </div>
+      <div class="form-group" style="margin-top:10px">
+        <label class="form-label">Role</label>
+        <select id="invite-role" class="form-input">
+          <option value="super_user">Super User</option>
+          <option value="admin">Admin</option>
+        </select>
+      </div>
+      <div id="invite-error" style="color:var(--red);font-size:12px;margin-top:8px;display:none"></div>
+      <div style="display:flex;gap:8px;margin-top:18px;justify-content:flex-end">
+        <button class="btn btn-sm" onclick="document.getElementById('invite-user-modal').remove()">Cancel</button>
+        <button id="invite-submit-btn" class="btn btn-teal btn-sm" onclick="adminInviteUser()">Send Invite</button>
+      </div>
+    </div>`;
+  document.body.appendChild(m);
+  setTimeout(()=>document.getElementById('invite-email')?.focus(),50);
+}
+
+async function adminInviteUser(){
+  const email=(document.getElementById('invite-email')?.value||'').trim();
+  const role=document.getElementById('invite-role')?.value||'super_user';
+  const errEl=document.getElementById('invite-error');
+  if(errEl){errEl.style.display='none';}
+  if(!email){if(errEl){errEl.textContent='Email is required.';errEl.style.display='';}return;}
+  const btn=document.getElementById('invite-submit-btn');
+  if(btn){btn.disabled=true;btn.textContent='Sending…';}
+  try{
+    const{data:{session}}=await db.auth.getSession();
+    if(!session)throw new Error('Not authenticated');
+    const res=await fetch('https://piamamighqiielfztgic.supabase.co/functions/v1/invite-user',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+session.access_token},
+      body:JSON.stringify({email,role})
+    });
+    const json=await res.json();
+    if(!res.ok||json.error)throw new Error(json.error||'Invite failed');
+    document.getElementById('invite-user-modal')?.remove();
+    toast('Invite sent to '+email+' ✓');
+    await loadProfiles();
+    render();
+  }catch(e){
+    if(errEl){errEl.textContent=e.message;errEl.style.display='';}
+    if(btn){btn.disabled=false;btn.textContent='Send Invite';}
+  }
+}
+
 async function loadProfiles(){
   if(S.currentRole!=='admin'||S._profilesLoading)return;
   S._profilesLoading=true;
@@ -8195,7 +8247,7 @@ CREATE POLICY "auth_select" ON audit_log FOR SELECT   USING (auth.uid() IS NOT N
       <div style="font-size:13px;font-weight:600">Team Members</div>
       <div style="margin-left:auto;display:flex;gap:8px">
         <button class="btn btn-sm" onclick="loadProfiles().then(render)">\u21ba Refresh</button>
-        <button class="btn btn-teal btn-sm" onclick="alert('To add a user:\\n\\n1. Supabase Dashboard \u2192 Authentication \u2192 Users \u2192 Add User\\n2. Enter email + temp password\\n3. Share credentials securely\\n4. First login auto-assigns Super User\\n5. Promote to Admin here if needed.')">+ Invite User</button>
+        <button class="btn btn-teal btn-sm" onclick="showInviteUserModal()">+ Invite User</button>
       </div>
     </div>
   </div>
