@@ -852,11 +852,15 @@ async function loadAll(){
       const icon={po_receipt:'📦',pack:'🔧',unpack:'↩',cycle_count:'📋',shipment:'🚚',manual:'✎'}[c.source]||'✎';
       S.liveActivity.push({icon,type:'stock_movement',text:c.pn+' '+(c.adjustment>0?'+':'')+c.adjustment+' ('+fn(c.new_qty)+' on hand)',sub:c.reason||c.source,ts:c.created_at,cls:c.adjustment>0?'var(--green)':'var(--red)'});
     });
-    S.sales.slice(0,15).forEach(s=>{
+    // Seed recent Open/Packed + recent Shipped/Delivered separately so feed shows both
+    const seedOpen=S.sales.filter(s=>['Open','Packed','Partial','On Hold'].includes(s.fulfillment_status||'Open')).slice(0,10);
+    const seedShipped=S.sales.filter(s=>['Shipped','Delivered'].includes(s.fulfillment_status||'')).sort((a,b)=>new Date(b.shipped_at||b.sale_date||0)-new Date(a.shipped_at||a.sale_date||0)).slice(0,10);
+    [...seedOpen,...seedShipped].forEach(s=>{
       const fs=s.fulfillment_status||'Open';
       const icon={Shipped:'📦',Delivered:'✅',Cancelled:'🚫','On Hold':'⏸',Open:'🛒'}[fs]||'🛒';
       const cls={Shipped:'var(--teal)',Delivered:'var(--green)',Cancelled:'var(--red)','On Hold':'var(--yellow)',Open:'var(--teal)'}[fs]||'var(--teal)';
-      S.liveActivity.push({icon,type:'order',text:'#'+(s.order_number||'')+' '+fs,sub:s.pn+(s.qty>1?' ×'+s.qty:'')+(s.customer_name?' — '+s.customer_name:''),ts:s.sale_date,cls});
+      const seedTs=(['Shipped','Delivered'].includes(fs)&&s.shipped_at)?s.shipped_at:s.sale_date;
+      S.liveActivity.push({icon,type:'order',text:'#'+(s.order_number||'')+' '+fs,sub:s.pn+(s.qty>1?' ×'+s.qty:'')+(s.customer_name?' — '+s.customer_name:''),ts:seedTs,cls});
     });
     S.liveActivity.sort((a,b)=>new Date(b.ts||0)-new Date(a.ts||0));
     S.liveActivity=S.liveActivity.slice(0,100);
@@ -2926,8 +2930,10 @@ async function submitShipment(saleId,pn,qty){
     S.corrections=[{pn,previous_qty:oh,new_qty:oh,adjustment:0,reason:'Shipped order',source:'shipment',created_at:new Date().toISOString()},...S.corrections];
   }
   // Update sale
+  const preSale=S.sales.find(s=>s.id===saleId);
   await db.from('sales').update({fulfillment_status:'Shipped',tracking_number:tracking,carrier,shipped_at:new Date().toISOString()}).eq('id',saleId);
   S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Shipped',tracking_number:tracking,carrier,shipped_at:new Date().toISOString()}:s);
+  pushActivity({icon:'📦',type:'order_status',text:'#'+(preSale?.order_number||'')+' → Shipped',sub:pn+(tracking?' · '+tracking:'')+(preSale?.customer_name?' — '+preSale.customer_name:''),ts:new Date().toISOString(),cls:'var(--teal)'});
   const saleRow=S.sales.find(s=>s.id===saleId);
   pushUndoMulti('Ship '+qty+'×'+pn,[
     {action:'update',table:'sales',data:{id:saleId},prev:{...stripMeta(saleRow||{}),id:saleId,fulfillment_status:saleRow?.fulfillment_status||'Packed',tracking_number:saleRow?.tracking_number||'',carrier:saleRow?.carrier||'',shipped_at:null}}
@@ -2967,6 +2973,7 @@ async function submitDropShipAll(orderNum){
   closeModal();
   if(errors)toast('↓ Shipped '+shipped+' lines, '+errors+' errors');
   else toast('↓ Drop-shipped all '+shipped+' line'+(shipped!==1?'s':'')+' on '+orderNum+(tracking?' · '+tracking:''));
+  if(shipped)pushActivity({icon:'↓📦',type:'order_status',text:'#'+orderNum+' → Shipped (drop-ship all)',sub:shipped+' line'+(shipped!==1?'s':'')+(tracking?' · '+tracking:''),ts:new Date().toISOString(),cls:'var(--teal)'});
   render();
 }
 
@@ -2987,6 +2994,7 @@ async function submitDropShipment(saleId,pn,qty){
     user_email:S.currentUser||null,source:'dropship'
   });
   S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Shipped',tracking_number:tracking||null,carrier:carrier||null,shipped_at:now}:s);
+  pushActivity({icon:'↓📦',type:'order_status',text:'#'+(sale?.order_number||'')+' → Shipped (drop-ship)',sub:pn+(tracking?' · '+tracking:'')+(sale?.customer_name?' — '+sale.customer_name:''),ts:now,cls:'var(--teal)'});
   pushUndoMulti('Drop-ship '+qty+'×'+pn,[
     {action:'update',table:'sales',data:{id:saleId,fulfillment_status:'Shipped'},prev:{id:saleId,fulfillment_status:sale?.fulfillment_status||'Open',tracking_number:sale?.tracking_number||null,carrier:sale?.carrier||null,shipped_at:null}}
   ]);
@@ -3002,6 +3010,7 @@ async function markDelivered(saleId){
   if(error){toast('Error: '+error.message);return;}
   S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Delivered',delivered_at:now}:s);
   if(sale)pushUndoMulti('Delivered '+(sale.order_number||''),[{action:'update',table:'sales',data:{...sale,fulfillment_status:'Delivered'},prev:{...sale}}]);
+  pushActivity({icon:'✅',type:'order_status',text:'#'+(sale?.order_number||'')+' → Delivered',sub:(sale?.pn||'')+(sale?.customer_name?' — '+sale.customer_name:''),ts:now,cls:'var(--green)'});
   toast('Order marked Delivered ✓');render();
 }
 
@@ -5906,6 +5915,7 @@ async function ssManualSync(orderNum,tracking,carrier){
     }
   }
   if(!rows.length){toast('No lines updated — check order number');return;}
+  pushActivity({icon:'📦',type:'order_status',text:'#'+orderNum+' → Shipped (manual sync)',sub:(tracking?tracking+' ':'')+carrier,ts:new Date().toISOString(),cls:'var(--teal)'});
   await refreshSales();
   pushUndoMulti('Manual ship order '+orderNum,undoOps);
   toast('✓ Order '+orderNum+' marked Shipped · tracking: '+tracking);
