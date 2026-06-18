@@ -586,11 +586,18 @@ const S = {
   // Dealer visit log
   dealerVisitCounts:{},   // { dealer_id: count } — loaded on demand
   dealerVisitsLoaded:false,
+  pricingTiers:[],             // managed pricing tiers (loaded from settings)
 };
 
 // ============================================================
 // UTILS
 // ============================================================
+const DEFAULT_PRICING_TIERS=[
+  {id:'tier1',name:'Tier 1',pct:10,description:'Standard'},
+  {id:'tier2',name:'Tier 2',pct:20,description:'Most dealers'},
+  {id:'tier3',name:'Tier 3',pct:25,description:'High volume'},
+  {id:'wcavd',name:'WCAVD',pct:10,description:'Special rate'},
+];
 const $  = id => document.getElementById(id);
 const fc = (v,d=2) => '$'+Number(v||0).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const fn = v => Number(v||0).toLocaleString();
@@ -826,6 +833,7 @@ async function loadAll(){
     if(S.settings.custom_cats){try{Object.assign(S.customCats,S.settings.custom_cats);}catch(e){}}
     if(S.settings.custom_vendors){try{S.customVendors=S.settings.custom_vendors||[];}catch(e){}}
     if(S.settings.sync_locked){try{S.syncLocked=new Set(S.settings.sync_locked);}catch(e){}}
+    if(S.settings.pricing_tiers?.length){S.pricingTiers=S.settings.pricing_tiers;}else{S.pricingTiers=DEFAULT_PRICING_TIERS.map(t=>({...t}));}
     S.boms={};
     (Array.isArray(bomItems)?bomItems:(bomItems.data||[])).forEach(i=>{if(!S.boms[i.parent_pn])S.boms[i.parent_pn]=[];S.boms[i.parent_pn].push(i);});
     if(!S.selBOM&&Object.keys(S.boms).length)S.selBOM=Object.keys(S.boms)[0];
@@ -3490,10 +3498,67 @@ ALTER TABLE dealer_visits DISABLE ROW LEVEL SECURITY;</pre>
       </div>
     </div>
     <div class="panel">
-      <div class="panel-title"><span>Pricing Tiers</span></div>
-      ${[['Tier 1','10% off MSRP','Standard'],['Tier 2','20% off MSRP','Most dealers'],['Tier 3','25% off MSRP','High volume'],['WCAVD','10% off MSRP','Special rate']].map(([t,d,n])=>`<div class="margin-analysis-row"><div><span class="money-retail" style="font-weight:600;font-size:12px">${t}</span><span style="font-size:10px;color:var(--text3);margin-left:8px">${n}</span></div><span style="color:var(--text2);font-size:12px">${d}</span></div>`).join('')}
+      <div class="panel-title" style="display:flex;align-items:center;justify-content:space-between">
+        <span>Pricing Tiers</span>
+        <button class="btn btn-sm btn-teal" onclick="openTierModal()" style="font-size:10px">+ Add Tier</button>
+      </div>
+      ${S.pricingTiers.map(t=>`
+        <div class="margin-analysis-row" style="gap:6px">
+          <div style="flex:1;min-width:0">
+            <span class="money-retail" style="font-weight:600;font-size:12px">${escHtml(t.name)}</span>
+            ${t.description?`<span style="font-size:10px;color:var(--text3);margin-left:6px">${escHtml(t.description)}</span>`:''}
+          </div>
+          <span style="color:var(--text2);font-size:12px;white-space:nowrap">${t.pct}% off</span>
+          <button class="action-btn" style="padding:2px 6px;font-size:10px" onclick="openTierModal('${t.id}')">Edit</button>
+          <button class="action-btn del" style="padding:2px 6px;font-size:10px" onclick="deletePricingTier('${t.id}')">×</button>
+        </div>`).join('')}
+      ${!S.pricingTiers.length?'<div style="color:var(--text3);font-size:11px;padding:8px 0">No tiers defined — click + Add Tier</div>':''}
     </div>
   </div></div>`;
+}
+
+// ── Pricing Tier Management ───────────────────────────────────────────
+async function savePricingTiers(){
+  S.settings.pricing_tiers=S.pricingTiers;
+  await db.from('settings').upsert({key:'pricing_tiers',value:S.pricingTiers},{onConflict:'key'});
+}
+
+function openTierModal(tierId=null){
+  const tier=tierId?S.pricingTiers.find(t=>t.id===tierId):null;
+  const _ov=$('modal-overlay'),_bx=$('modal-box');
+  _bx.innerHTML=`<div class="modal-title">${tier?'Edit Tier':'Add Pricing Tier'}<button class="modal-close" onclick="closeModal()">✕</button></div>
+    <div class="form-group"><label class="form-label">Tier Name</label><input id="pt-name" class="form-input" value="${escHtml(tier?.name||'')}" placeholder="e.g. Preferred Dealer"></div>
+    <div class="form-row cols-2">
+      <div class="form-group"><label class="form-label">Discount %</label><input id="pt-pct" type="number" min="0" max="100" step="0.5" class="form-input" value="${tier?.pct??''}"></div>
+      <div class="form-group"><label class="form-label">Description <span style="color:var(--text3);font-weight:400">(optional)</span></label><input id="pt-desc" class="form-input" value="${escHtml(tier?.description||'')}" placeholder="e.g. High-volume partners"></div>
+    </div>
+    <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitTierEdit('${tierId||''}')">Save Tier</button></div>`;
+  _ov.classList.remove('hidden');
+}
+
+async function submitTierEdit(tierId){
+  const name=$('pt-name').value.trim();
+  if(!name){toast('Tier name required');return;}
+  const pct=parseFloat($('pt-pct').value);
+  if(isNaN(pct)||pct<0||pct>100){toast('Enter a valid discount % between 0 and 100');return;}
+  const description=$('pt-desc').value.trim();
+  if(tierId){
+    S.pricingTiers=S.pricingTiers.map(t=>t.id===tierId?{...t,name,pct,description}:t);
+    toast('Tier updated');
+  }else{
+    S.pricingTiers=[...S.pricingTiers,{id:'tier_'+Date.now(),name,pct,description}];
+    toast('Tier added');
+  }
+  await savePricingTiers();
+  closeModal();render();
+}
+
+async function deletePricingTier(id){
+  const tier=S.pricingTiers.find(t=>t.id===id);
+  if(!confirm(`Delete tier "${tier?.name}"?\n\nDealers currently using this tier will be unaffected — only the tier template is removed.`))return;
+  S.pricingTiers=S.pricingTiers.filter(t=>t.id!==id);
+  await savePricingTiers();
+  toast('Tier deleted');render();
 }
 
 function copyDealerLink(id){
@@ -6564,17 +6629,20 @@ function openModal(type,data){
   else if(type==='addDealer'||type==='editDealer'){
     title=type==='addDealer'?'Add Dealer':'Edit Dealer';
     const discPct=Math.round((data.discount_pct||0.2)*100);
+    const matchingTier=S.pricingTiers.find(t=>t.pct===discPct);
+    const isCustom=!matchingTier&&(data.discount_pct!==undefined);
+    const tierOpts=S.pricingTiers.map(t=>`<option value="${t.pct}" ${t.pct===discPct&&!isCustom?'selected':''}>${escHtml(t.name)} — ${t.pct}% off MSRP${t.description?` (${escHtml(t.description)})`:''}</option>`).join('')+`<option value="custom" ${isCustom?'selected':''}>Custom %…</option>`;
     body=`<div class="form-row cols-2">${fi('m-name','Dealer Name',data.name||'')} ${fi('m-contact','Contact Name',data.contact_name||'')}</div>
     <div class="form-row">${fi('m-email','Email',data.email||'','type="email"')}</div>
     <div class="form-row cols-2">
       <div class="form-group">
         <label class="form-label">Pricing Tier</label>
-        <select id="m-disc" class="form-input">
-          <option value="10" ${discPct===10?'selected':''}>Tier 1 — 10% off MSRP (Standard)</option>
-          <option value="20" ${discPct===20?'selected':''}>Tier 2 — 20% off MSRP (Most dealers)</option>
-          <option value="25" ${discPct===25?'selected':''}>Tier 3 — 25% off MSRP (High volume)</option>
-          <option value="10" ${discPct===10&&data.notes?.toLowerCase().includes('wcavd')?'selected':''}>WCAVD — 10% off MSRP (Special rate)</option>
+        <select id="m-disc" class="form-input" onchange="document.getElementById('m-disc-custom-wrap').style.display=this.value==='custom'?'block':'none'">
+          ${tierOpts}
         </select>
+        <div id="m-disc-custom-wrap" style="${isCustom?'':'display:none'}; margin-top:6px">
+          <input id="m-disc-custom" type="number" min="0" max="100" step="0.5" class="form-input" value="${isCustom?discPct:''}" placeholder="Enter % off MSRP">
+        </div>
       </div>
       ${fs('m-status','Status',[['Active','Active'],['Inactive','Inactive']],data.status||'Active')}
     </div>
@@ -6945,7 +7013,8 @@ async function submitSale(){
 }
 async function submitDealer(eid){
   const name=$('m-name').value.trim();if(!name){toast('Name required');return;}
-  const payload={name,contact_name:$('m-contact').value.trim(),email:$('m-email').value.trim(),discount_pct:parseFloat($('m-disc').value)/100||0.2,status:$('m-status').value,notes:$('m-notes').value};
+  const _tv=$('m-disc').value;const _rawPct=_tv==='custom'?parseFloat($('m-disc-custom')?.value||0)||0:parseFloat(_tv)||20;
+  const payload={name,contact_name:$('m-contact').value.trim(),email:$('m-email').value.trim(),discount_pct:_rawPct/100,status:$('m-status').value,notes:$('m-notes').value};
   let error,data;
   if(eid){({error}=await db.from('dealers').update(payload).eq('id',eid));}
   else{({data,error}=await db.from('dealers').insert(payload).select().single());}
