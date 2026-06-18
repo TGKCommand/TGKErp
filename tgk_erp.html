@@ -583,7 +583,9 @@ const S = {
   customCats:{parts:[],assemblies:[]},
   customVendors:[],
   vendors:[],
-
+  // Dealer visit log
+  dealerVisitCounts:{},   // { dealer_id: count } — loaded on demand
+  dealerVisitsLoaded:false,
 };
 
 // ============================================================
@@ -3428,21 +3430,31 @@ function renderDealers(){
   const portalBase=window.location.origin+window.location.pathname;
   const activeCount=S.dealers.filter(d=>d.status==='Active').length;
   const pricedAsms=S.assemblies.filter(a=>!a.is_subassembly&&!a.discontinued&&(a.msrp||0)>0).length;
+  const totalVisits=Object.values(S.dealerVisitCounts).reduce((a,b)=>a+b,0);
+  // Trigger count load if not done yet
+  if(!S.dealerVisitsLoaded)loadDealerVisitCounts();
   return `
   <div class="grid-2">
   <div class="panel" style="padding:0">
-    <div style="padding:14px 18px;border-bottom:1px solid var(--border)">
+    <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
       <div class="panel-title" style="margin:0;padding:0;border:none">Dealers <span style="color:var(--text);font-size:12px;font-weight:400;margin-left:6px;text-transform:none;letter-spacing:0">(${list.length})</span></div>
+      ${totalVisits>0?`<button class="btn btn-sm" onclick="showAllVisitLog()" title="View all dealer visits">📊 All Visits (${totalVisits})</button>`:''}
     </div>
-    <table><thead><tr><th>Dealer</th><th>Contact</th><th>Discount</th><th>Status</th><th>Price List</th><th></th></tr></thead><tbody>
+    <table><thead><tr><th>Dealer</th><th>Contact</th><th>Discount</th><th>Status</th><th>Visits</th><th>Price List</th><th></th></tr></thead><tbody>
     ${list.map(d=>{
       const url=portalBase+'?dealer='+d.id;
+      const visits=S.dealerVisitCounts[d.id]||0;
       return `<tr>
         <td class="main-col">${escHtml(d.name)}</td>
         <td style="font-size:11px;color:var(--text2)">${escHtml(d.contact_name||'')}${d.email?`<br><span style="font-size:10px;color:var(--text3);font-family:var(--mono)">${escHtml(d.email)}</span>`:''}
         </td>
         <td><span class="pill pill-orange">${typeof d.discount_pct==='number'?Math.round(d.discount_pct*100)+'%':'20%'} off</span></td>
         <td><span class="pill ${d.status==='Active'?'pill-teal':'pill-muted'}">${d.status}</span></td>
+        <td>
+          <button class="action-btn" style="font-size:10px;${visits>0?'color:var(--teal);font-weight:600':''}" onclick="showDealerLog('${d.id}','${escHtml(d.name)}')" title="View visit history">
+            📊 ${visits>0?visits:'—'}
+          </button>
+        </td>
         <td style="white-space:nowrap;display:flex;gap:4px;align-items:center">
           <a href="${url}" target="_blank" class="btn btn-sm btn-teal" style="text-decoration:none;font-size:10px" title="Open dealer price list">📄 View</a>
           <button class="action-btn" style="font-size:10px" onclick="copyDealerLink('${d.id}')" title="Copy link to clipboard">🔗 Copy</button>
@@ -3461,14 +3473,25 @@ function renderDealers(){
       <div style="font-size:11px;color:var(--text2);margin-bottom:12px">Each dealer gets a unique read-only URL showing their live prices — automatically calculated from assembly MSRP and their discount. Prices update in real time when you change an MSRP.</div>
       <div class="inline-stat"><span style="color:var(--text3)">Active Dealers</span><span class="money-retail">${activeCount}</span></div>
       <div class="inline-stat"><span style="color:var(--text3)">Priced Products</span><span class="money-retail">${pricedAsms}</span></div>
+      <div class="inline-stat"><span style="color:var(--text3)">Total Visits</span><span style="color:var(--teal);font-weight:700">${totalVisits}</span></div>
       <div style="margin-top:12px;padding:10px 12px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)">
         <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text3);margin-bottom:6px">URL Format</div>
-        <code style="font-size:10px;color:var(--teal);word-break:break-all">${escHtml(portalBase)}?dealer=<span style="color:var(--text3)">[dealer-id]</span></code>
-        <div style="font-size:10px;color:var(--text3);margin-top:6px">Click <b>📄 View</b> to open · <b>🔗 Copy</b> to copy link · Send URL to dealer</div>
+        <code style="font-size:10px;color:var(--teal);word-break:break-all">${escHtml(portalBase)}?dealer=<span style="color:var(--text3)">[id]</span></code>
+        <div style="font-size:10px;color:var(--text3);margin-top:6px">📄 View · 🔗 Copy · 📊 = visit count (click for log)</div>
       </div>
       <div style="margin-top:12px;font-size:10px;color:var(--text3)">
-        ⚠ Make sure the <code>dealers</code> table has RLS disabled so anon reads work:
-        <pre style="margin:4px 0;padding:6px 8px;background:var(--bg4);border-radius:4px;font-size:10px;color:var(--text2);overflow-x:auto">ALTER TABLE dealers DISABLE ROW LEVEL SECURITY;</pre>
+        One-time SQL setup:
+        <pre style="margin:4px 0;padding:6px 8px;background:var(--bg4);border-radius:4px;font-size:10px;color:var(--text2);overflow-x:auto">ALTER TABLE dealers DISABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS dealer_visits (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  dealer_id UUID,
+  dealer_name TEXT,
+  visited_at TIMESTAMPTZ DEFAULT NOW(),
+  user_agent TEXT,
+  referrer TEXT
+);
+ALTER TABLE dealer_visits DISABLE ROW LEVEL SECURITY;</pre>
       </div>
     </div>
     <div class="panel">
@@ -6100,6 +6123,9 @@ async function startDealerPortal(dealerId){
     wrap.innerHTML=buildDealerPortalHTML(dealer,products||[]);
     attachDealerPortalSearch();
 
+    // Log this visit (fire-and-forget, don't block render)
+    logDealerVisit(dealer).catch(()=>{});
+
     // Live updates — patch prices in place when MSRP changes in ERP
     db.channel('dealer-portal-prices')
       .on('postgres_changes',{event:'UPDATE',schema:'public',table:'assemblies'},payload=>{
@@ -6220,7 +6246,6 @@ function dealerPortalError(msg){
 }
 
 function attachDealerPortalSearch(){
-  // Defined inline in the portal HTML too; this is the JS-side version
   window.dealerPortalFilter=function(q){
     const lower=q.toLowerCase().trim();
     let anyVisible=false;
@@ -6236,6 +6261,147 @@ function attachDealerPortalSearch(){
     const empty=document.getElementById('dp-empty');
     if(empty)empty.style.display=anyVisible?'none':'block';
   };
+}
+
+// ── Dealer visit log helpers ──────────────────────────────────────────
+async function logDealerVisit(dealer){
+  await db.from('dealer_visits').insert({
+    dealer_id:dealer.id,
+    dealer_name:dealer.name,
+    visited_at:new Date().toISOString(),
+    user_agent:navigator.userAgent||null,
+    referrer:document.referrer||null,
+  });
+}
+
+function parseUA(ua){
+  if(!ua)return'Unknown';
+  const mob=/iPhone|iPad|Android/i.test(ua);
+  const os=/iPhone|iPad/i.test(ua)?'iOS':/Android/i.test(ua)?'Android':/Mac OS X/i.test(ua)?'macOS':/Windows/i.test(ua)?'Windows':/Linux/i.test(ua)?'Linux':'Unknown';
+  const br=/Edg\//i.test(ua)?'Edge':/OPR\/|Opera/i.test(ua)?'Opera':/Chrome\//i.test(ua)?'Chrome':/Firefox\//i.test(ua)?'Firefox':/Safari\//i.test(ua)?'Safari':'Browser';
+  return(mob?'📱':'💻')+' '+br+' · '+os;
+}
+
+function timeAgo(iso){
+  if(!iso)return'—';
+  const diff=Date.now()-new Date(iso).getTime();
+  const m=Math.floor(diff/60000);
+  if(m<1)return'just now';
+  if(m<60)return m+'m ago';
+  const h=Math.floor(m/60);
+  if(h<24)return h+'h ago';
+  const d=Math.floor(h/24);
+  if(d<7)return d+'d ago';
+  return new Date(iso).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
+}
+
+async function loadDealerVisitCounts(){
+  if(S.dealerVisitsLoaded)return;
+  try{
+    const{data}=await db.from('dealer_visits').select('dealer_id');
+    if(!data)return;
+    const counts={};
+    data.forEach(r=>{counts[r.dealer_id]=(counts[r.dealer_id]||0)+1;});
+    S.dealerVisitCounts=counts;
+    S.dealerVisitsLoaded=true;
+    render();
+  }catch(e){}
+}
+
+async function showDealerLog(dealerId,dealerName){
+  const _ov=$('modal-overlay'),_bx=$('modal-box');
+  _bx.innerHTML=`<div class="modal-title">Visit Log — ${escHtml(dealerName)}<button class="modal-close" onclick="closeModal()">✕</button></div>
+    <div id="dl-wrap" style="min-height:200px"><div style="text-align:center;padding:40px;color:var(--text3)">Loading…</div></div>
+    <div style="margin-top:4px;display:flex;justify-content:space-between;align-items:center;padding-top:10px;border-top:1px solid var(--border)">
+      <button class="btn btn-sm" style="color:var(--red)" onclick="clearDealerLog('${dealerId}','${escHtml(dealerName)}')">🗑 Clear Log</button>
+      <button class="btn" onclick="closeModal()">Close</button>
+    </div>`;
+  _ov.classList.remove('hidden');
+  // Fetch and render visits
+  const{data,error}=await db.from('dealer_visits')
+    .select('*')
+    .eq('dealer_id',dealerId)
+    .order('visited_at',{ascending:false})
+    .limit(200);
+  const wrap=document.getElementById('dl-wrap');
+  if(!wrap)return;
+  if(error||!data?.length){
+    wrap.innerHTML='<div style="text-align:center;padding:40px;color:var(--text3)">No visits recorded yet.</div>';
+    return;
+  }
+  // Build table
+  const rows=data.map(v=>`<tr>
+    <td style="white-space:nowrap">
+      <div style="font-size:12px;color:var(--text)">${new Date(v.visited_at).toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'})}</div>
+      <div style="font-size:10px;color:var(--text3)">${timeAgo(v.visited_at)}</div>
+    </td>
+    <td style="font-size:11px;color:var(--text2)">${parseUA(v.user_agent)}</td>
+    <td style="font-size:10px;color:var(--text3);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(v.referrer||'')}">${v.referrer?escHtml(v.referrer.replace(/^https?:\/\//,'').slice(0,50)):'Direct'}</td>
+  </tr>`).join('');
+  wrap.innerHTML=`
+    <div style="font-size:11px;color:var(--text3);margin-bottom:10px">${data.length} visit${data.length!==1?'s':''} recorded</div>
+    <div style="max-height:420px;overflow-y:auto">
+      <table style="width:100%">
+        <thead><tr>
+          <th style="font-size:10px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text3);white-space:nowrap">Date & Time</th>
+          <th style="font-size:10px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text3)">Device</th>
+          <th style="font-size:10px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text3)">Referred From</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}
+
+async function clearDealerLog(dealerId,dealerName){
+  if(!confirm(`Clear all visit history for ${dealerName}?`))return;
+  const{error}=await db.from('dealer_visits').delete().eq('dealer_id',dealerId);
+  if(error){toast('Error: '+error.message);return;}
+  S.dealerVisitCounts[dealerId]=0;
+  toast('Visit log cleared');
+  closeModal();
+  render();
+}
+
+async function showAllVisitLog(){
+  const _ov=$('modal-overlay'),_bx=$('modal-box');
+  _bx.innerHTML=`<div class="modal-title">All Dealer Visits<button class="modal-close" onclick="closeModal()">✕</button></div>
+    <div id="dl-wrap" style="min-height:200px"><div style="text-align:center;padding:40px;color:var(--text3)">Loading…</div></div>
+    <div style="margin-top:4px;text-align:right;padding-top:10px;border-top:1px solid var(--border)">
+      <button class="btn" onclick="closeModal()">Close</button>
+    </div>`;
+  _ov.classList.remove('hidden');
+  const{data,error}=await db.from('dealer_visits')
+    .select('*')
+    .order('visited_at',{ascending:false})
+    .limit(500);
+  const wrap=document.getElementById('dl-wrap');
+  if(!wrap)return;
+  if(error||!data?.length){
+    wrap.innerHTML='<div style="text-align:center;padding:40px;color:var(--text3)">No visits recorded yet.</div>';
+    return;
+  }
+  const rows=data.map(v=>`<tr>
+    <td style="white-space:nowrap">
+      <div style="font-size:12px;color:var(--text)">${new Date(v.visited_at).toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</div>
+      <div style="font-size:10px;color:var(--text3)">${timeAgo(v.visited_at)}</div>
+    </td>
+    <td style="font-size:12px;color:var(--teal);font-weight:600">${escHtml(v.dealer_name||'Unknown')}</td>
+    <td style="font-size:11px;color:var(--text2)">${parseUA(v.user_agent)}</td>
+    <td style="font-size:10px;color:var(--text3)">${v.referrer?escHtml(v.referrer.replace(/^https?:\/\//,'').slice(0,40)):'Direct'}</td>
+  </tr>`).join('');
+  wrap.innerHTML=`
+    <div style="font-size:11px;color:var(--text3);margin-bottom:10px">${data.length} total visit${data.length!==1?'s':''} across all dealers</div>
+    <div style="max-height:460px;overflow-y:auto">
+      <table style="width:100%">
+        <thead><tr>
+          <th style="font-size:10px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text3)">When</th>
+          <th style="font-size:10px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text3)">Dealer</th>
+          <th style="font-size:10px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text3)">Device</th>
+          <th style="font-size:10px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text3)">Source</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
 }
 
 async function deleteDealer(id){
