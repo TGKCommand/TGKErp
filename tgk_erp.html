@@ -583,6 +583,10 @@ const S = {
   customCats:{parts:[],assemblies:[]},
   customVendors:[],
   vendors:[],
+  // Price Sheet integration
+  priceSheetCache: null,      // { items:[], vendors:[], ts:... } from workspace table
+  priceSheetUrl: '',           // e.g. https://tgkcommand.github.io/TGKPriceSheet/TGK_Price_Sheet.html
+  _psLoading: false,
 };
 
 // ============================================================
@@ -1540,7 +1544,7 @@ function renderParts(){
       <td class="pn" style="color:var(--text)">${p.pn}</td>
       <td class="main-col" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.description||''}</td>
       <td style="font-size:11px;color:var(--text3)">${p.vendor||''}</td>
-      <td class="money-cost">${fc(p.unit_cost||0,4)}${Array.isArray(p.price_breaks)&&p.price_breaks.length?'<span title="'+p.price_breaks.length+' price tier'+(p.price_breaks.length!==1?'s':'')+': '+p.price_breaks.map(function(b){return'≥'+b.qty+'→$'+b.price.toFixed(4);}).join(', ')+'" style="cursor:help;font-size:9px;color:var(--teal);margin-left:4px;background:var(--teal-dim);border-radius:3px;padding:1px 4px">'+p.price_breaks.length+'T</span>':''}</td>
+      <td class="money-cost">${fc(p.unit_cost||0,4)}${Array.isArray(p.price_breaks)&&p.price_breaks.length?'<span title="'+p.price_breaks.length+' price tier'+(p.price_breaks.length!==1?'s':'')+': '+p.price_breaks.map(function(b){return'≥'+b.qty+'→$'+b.price.toFixed(2);}).join(', ')+'" style="cursor:help;font-size:9px;color:var(--teal);margin-left:4px;background:var(--teal-dim);border-radius:3px;padding:1px 4px">'+p.price_breaks.length+'T</span>':''}</td>
       <td class="money" style="color:${(p.total_unpckgd||0)<0?'var(--red)':'var(--text)'};font-weight:700">${fn(p.total_unpckgd||0)}</td>
       <td class="money-neutral" title="auto from sales">${avgWk(p)>0?avgWk(p).toFixed(1):'-'}</td>
       <td><div class="stock-bar-wrap"><div class="stock-bar"><div class="stock-fill" style="width:${pct}%;background:${col}"></div></div><span class="wk-label" style="color:${col}">${w!==null?w+'w':'N/A'}</span></div></td>
@@ -3424,27 +3428,64 @@ function renderDealers(){
   let list=S.dealers;
   const q=(S.searchQ||'').toLowerCase();
   if(q)list=list.filter(d=>d.name.toLowerCase().includes(q)||(d.contact_name||'').toLowerCase().includes(q));
+  const psVendors=S.priceSheetCache?.vendors||[];
+  const psLinkedCount=S.dealers.filter(d=>d.price_sheet_vendor_id).length;
   return `
   <div class="grid-2">
   <div class="panel" style="padding:0">
     <div style="padding:14px 18px;border-bottom:1px solid var(--border)">
       <div class="panel-title" style="margin:0;padding:0;border:none">Dealers <span style="color:var(--text);font-size:12px;font-weight:400;margin-left:6px;text-transform:none;letter-spacing:0">(${list.length})</span></div>
     </div>
-    <table><thead><tr><th>Dealer</th><th>Contact</th><th>Email</th><th>Discount</th><th>Status</th><th></th></tr></thead><tbody>
-    ${list.map(d=>`<tr>
-      <td class="main-col">${d.name}</td>
-      <td style="font-size:11px;color:var(--text2)">${d.contact_name||''}</td>
-      <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${d.email||''}</td>
-      <td><span class="pill pill-orange">${typeof d.discount_pct==='number'?Math.round(d.discount_pct*100)+'%':d.discount_flat||'20%'} off</span></td>
-      <td><span class="pill ${d.status==='Active'?'pill-teal':'pill-muted'}">${d.status}</span></td>
-      <td style="display:flex;gap:4px">
-        <button class="action-btn" onclick='openModal("editDealer",${JSON.stringify(d)})'>Edit</button>
-        <button class="action-btn del" onclick="deleteDealer('${d.id}')">×</button>
-      </td>
-    </tr>`).join('')}
+    <table><thead><tr><th>Dealer</th><th>Contact</th><th>Discount</th><th>Status</th><th>Price List</th><th></th></tr></thead><tbody>
+    ${list.map(d=>{
+      const link=getPriceSheetLink(d);
+      const psVendor=d.price_sheet_vendor_id?psVendors.find(v=>v.id===d.price_sheet_vendor_id):null;
+      return `<tr>
+        <td class="main-col">${d.name}</td>
+        <td style="font-size:11px;color:var(--text2)">${d.contact_name||''}${d.email?'<br><span style="font-size:10px;color:var(--text3);font-family:var(--mono)">'+escHtml(d.email)+'</span>':''}</td>
+        <td><span class="pill pill-orange">${typeof d.discount_pct==='number'?Math.round(d.discount_pct*100)+'%':d.discount_flat||'20%'} off</span>${psVendor?`<br><span style="font-size:9px;color:var(--text3)">PS: ${parseFloat(psVendor.discount||0).toFixed(0)}% off</span>`:''}</td>
+        <td><span class="pill ${d.status==='Active'?'pill-teal':'pill-muted'}">${d.status}</span></td>
+        <td style="white-space:nowrap">
+          ${link?`<a href="${link}" target="_blank" class="btn btn-sm btn-teal" style="text-decoration:none;font-size:10px" title="Open this dealer's live price list">📄 Price List ↗</a>`:''}
+          <button class="action-btn" style="font-size:10px;margin-top:2px" onclick="openLinkPriceSheet('${d.id}')" title="${d.price_sheet_vendor_id?'Change price sheet link':'Link to price sheet vendor'}">${d.price_sheet_vendor_id?'🔗 Linked':'🔗 Link'}</button>
+        </td>
+        <td style="display:flex;gap:4px">
+          <button class="action-btn" onclick='openModal("editDealer",${JSON.stringify(d)})'>Edit</button>
+          <button class="action-btn del" onclick="deleteDealer('${d.id}')">×</button>
+        </td>
+      </tr>`;
+    }).join('')}
     </tbody></table>
   </div>
   <div>
+    <div class="panel" style="border:1px solid rgba(42,191,170,.25);background:rgba(42,191,170,.04)">
+      <div class="panel-title" style="color:var(--teal)"><span>📄 Price Sheet Integration</span></div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:12px">The ERP is the <b style="color:var(--text)">source of truth</b> for pricing. Edit MSRP on any assembly and it auto-pushes to the price sheet instantly. Vendor price lists update live.</div>
+      <div style="margin-bottom:10px">
+        <label class="form-label">Price Sheet URL</label>
+        <div style="display:flex;gap:6px">
+          <input id="ps-url-input" class="form-input" style="font-size:11px" value="${escHtml(S.priceSheetUrl||'')}" placeholder="https://tgkcommand.github.io/TGKPriceSheet/TGK_Price_Sheet.html">
+          <button class="btn btn-sm" onclick="S.priceSheetUrl=document.getElementById('ps-url-input').value.trim();toast('URL saved');render()">Save</button>
+        </div>
+        <div style="font-size:10px;color:var(--text3);margin-top:4px">The hosted URL of TGK_Price_Sheet.html — dealer links append <code>?vendor=[id]</code></div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+        <button class="btn btn-sm btn-teal" onclick="loadAndShowPriceSheetPanel()">↻ Load Price Sheet Vendors${S._psLoading?' …':''}</button>
+        <button class="btn btn-sm" style="background:rgba(42,191,170,.12);color:var(--teal);border-color:rgba(42,191,170,.3)" onclick="pushAllPricesToSheet()" title="Push all ERP assembly MSRP values → price sheet vendor lists">📤 Push All ERP Prices → Sheet</button>
+        <button class="btn btn-sm" style="color:var(--text3)" onclick="syncPricesFromPriceSheet()" title="Pull prices FROM price sheet into ERP (override direction)">📥 Pull Sheet Prices → ERP</button>
+      </div>
+      ${psLinkedCount>0?`<div style="font-size:11px;color:var(--teal);margin-bottom:8px">✓ ${psLinkedCount} dealer${psLinkedCount!==1?'s':''} linked to price sheet</div>`:''}
+      ${psVendors.length?`<div style="font-size:10px;color:var(--text3);border-top:1px solid var(--border);padding-top:8px;margin-top:4px">
+        <div style="font-weight:700;color:var(--text2);margin-bottom:6px">Price Sheet Vendors (${psVendors.length})</div>
+        ${psVendors.map(v=>{
+          const linked=S.dealers.find(d=>d.price_sheet_vendor_id===v.id);
+          return `<div style="display:flex;align-items:center;gap:8px;padding:3px 0">
+            <div style="flex:1"><span style="color:var(--text)">${escHtml(v.name)}</span> <span style="color:var(--text3)">${parseFloat(v.discount||0).toFixed(0)}% off</span></div>
+            ${linked?`<span style="color:var(--teal);font-size:10px">→ ${escHtml(linked.name)}</span>`:'<span style="color:var(--text3);font-size:10px">unlinked</span>'}
+          </div>`;
+        }).join('')}
+      </div>`:'<div style="font-size:10px;color:var(--text3)">Click "Load Price Sheet Vendors" to see vendor list and link dealers.</div>'}
+    </div>
     <div class="panel">
       <div class="panel-title"><span>Pricing Tiers</span></div>
       ${[['Tier 1','10% off MSRP','Standard'],['Tier 2','20% off MSRP','Most dealers'],['Tier 3','25% off MSRP','High volume'],['WCAVD','10% off MSRP','Special rate']].map(([t,d,n])=>`<div class="margin-analysis-row"><div><span class="money-retail" style="font-weight:600;font-size:12px">${t}</span><span style="font-size:10px;color:var(--text3);margin-left:8px">${n}</span></div><span style="color:var(--text2);font-size:12px">${d}</span></div>`).join('')}
@@ -3452,10 +3493,11 @@ function renderDealers(){
     <div class="panel">
       <div class="panel-title"><span>Quick Stats</span></div>
       <div class="inline-stat"><span style="color:var(--text3)">Active Dealers</span><span class="money-retail">${S.dealers.filter(d=>d.status==='Active').length}</span></div>
-      <div class="inline-stat"><span style="color:var(--text3)">Countries</span><span style="color:var(--text2)">US, UK, CA, CZ</span></div>
+      <div class="inline-stat"><span style="color:var(--text3)">Linked to Price Sheet</span><span style="color:var(--teal)">${psLinkedCount} / ${S.dealers.length}</span></div>
     </div>
   </div></div>`;
 }
+
 
 // ============================================================
 // INTEGRATIONS
@@ -6028,6 +6070,161 @@ async function deleteSale(id){
   S.sales=S.sales.filter(s=>s.id!==id);
   toast('Sale deleted');render();
 }
+
+// ============================================================
+// PRICE SHEET INTEGRATION
+// ============================================================
+async function fetchPriceSheetData(force=false){
+  if(S.priceSheetCache&&!force)return S.priceSheetCache;
+  if(S._psLoading)return null;
+  S._psLoading=true;
+  try{
+    const{data,error}=await db.from('workspace').select('data').eq('id','tgk_pricesheet_v1').maybeSingle();
+    if(error||!data){toast('Could not read price sheet data: '+(error?.message||'not found'));S._psLoading=false;return null;}
+    S.priceSheetCache=data.data;
+    S._psLoading=false;
+    return data.data;
+  }catch(e){toast('Price sheet read error: '+e.message);S._psLoading=false;return null;}
+}
+async function openLinkPriceSheet(dealerId){
+  const ps=await fetchPriceSheetData(true);
+  if(!ps)return;
+  const dealer=S.dealers.find(d=>d.id===dealerId);
+  const currentLink=dealer?.price_sheet_vendor_id||'';
+  const rows=(ps.vendors||[]).map(v=>`
+    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+      <div style="flex:1">
+        <div style="font-weight:600;font-size:12px;color:var(--text)">${escHtml(v.name)}</div>
+        <div style="font-size:10px;color:var(--text3)">Universal ${parseFloat(v.discount||0).toFixed(0)}% off · ${Object.keys(v.overrides||{}).length} item overrides</div>
+      </div>
+      <button class="btn btn-sm ${currentLink===v.id?'btn-teal':''}" onclick="linkDealerToPriceSheet('${dealerId}','${v.id}')">
+        ${currentLink===v.id?'✓ Linked':'Link'}
+      </button>
+    </div>`).join('');
+  const unlinkRow=currentLink?`<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)"><button class="btn btn-sm" style="color:var(--red)" onclick="linkDealerToPriceSheet('${dealerId}','')">✕ Unlink</button></div>`:'';
+  const bodyHtml=`<div style="margin-bottom:12px;font-size:11px;color:var(--text3)">Select which price sheet vendor maps to <b style="color:var(--text)">${escHtml(dealer?.name||dealerId)}</b>:</div>
+    <div style="max-height:340px;overflow-y:auto">${rows||'<div style="color:var(--text3);padding:20px;text-align:center">No vendors found in price sheet</div>'}</div>
+    ${unlinkRow}
+    <div class="modal-footer"><button class="btn" onclick="closeModal()">Done</button></div>`;
+  // Inject directly into existing modal
+  const ov=document.getElementById('modal-overlay');
+  const mc=document.getElementById('modal-content');
+  if(ov&&mc){
+    mc.innerHTML=`<div class="modal-title"><span>Link to Price Sheet Vendor</span><button class="modal-close" onclick="closeModal()">✕</button></div>${bodyHtml}`;
+    ov.style.display='flex';
+  }
+}
+async function linkDealerToPriceSheet(dealerId,psVendorId){
+  const{error}=await db.from('dealers').update({price_sheet_vendor_id:psVendorId||null}).eq('id',dealerId);
+  if(error){toast('Error: '+error.message);return;}
+  S.dealers=S.dealers.map(d=>d.id===dealerId?{...d,price_sheet_vendor_id:psVendorId||null}:d);
+  if(psVendorId){const v=(S.priceSheetCache?.vendors||[]).find(v=>v.id===psVendorId);toast(`✓ Linked to "${v?.name||psVendorId}"`);}
+  else toast('Unlinked from price sheet');
+  closeModal();render();
+}
+function getPriceSheetLink(dealer){
+  if(!dealer.price_sheet_vendor_id)return null;
+  const base=(S.priceSheetUrl||'').replace(/\/$/,'').trim();
+  if(!base)return null;
+  return base+'?vendor='+dealer.price_sheet_vendor_id;
+}
+// ── Price Sheet push (ERP → Price Sheet) ─────────────────────────────
+// Standard TGK dealer tiers applied to MSRP
+function genPriceSheetNotes(retail){
+  if(!retail||retail<=0)return '';
+  const t1=(retail*0.90).toFixed(2);
+  const t2=(retail*0.80).toFixed(2);
+  const t3=(retail*0.75).toFixed(2);
+  return `T1 10%=$${t1} | T2 20%=$${t2} | T3 25%=$${t3}`;
+}
+
+async function pushAssemblyPriceToSheet(pn, msrp, silent=false){
+  if(!pn||!(msrp>0))return;
+  // Fetch fresh workspace data
+  let ps=S.priceSheetCache;
+  if(!ps){
+    const{data,error}=await db.from('workspace').select('data').eq('id','tgk_pricesheet_v1').maybeSingle();
+    if(error||!data){if(!silent)toast('⚠ Could not connect to price sheet');return;}
+    ps=data.data;
+    S.priceSheetCache=ps;
+  }
+  if(!ps?.items){if(!silent)toast('⚠ Price sheet has no items');return;}
+  // Match by SKU (case-insensitive)
+  const skuUp=pn.toUpperCase();
+  let matched=false;
+  const updatedItems=(ps.items||[]).map(item=>{
+    if((item.sku||'').toUpperCase()===skuUp){
+      matched=true;
+      return {...item,retail:msrp,notes:genPriceSheetNotes(msrp),updatedAt:new Date().toISOString()};
+    }
+    return item;
+  });
+  if(!matched){if(!silent)toast(`ℹ ${pn} not found in price sheet catalog — add it there first`);return;}
+  const updated={...ps,items:updatedItems,ts:Date.now()};
+  const{error}=await db.from('workspace').upsert({id:'tgk_pricesheet_v1',data:updated,updated_at:new Date().toISOString()},{onConflict:'id'});
+  if(error){if(!silent)toast('⚠ Price sheet write failed: '+error.message);return;}
+  S.priceSheetCache=updated;
+  if(!silent)toast(`✓ Price sheet updated — ${pn} → $${msrp.toFixed(2)}`);
+}
+
+async function pushAllPricesToSheet(){
+  const candidates=S.assemblies.filter(a=>a.msrp>0&&!a.discontinued);
+  if(!candidates.length){toast('No assemblies have an MSRP set');return;}
+  // Fetch workspace
+  let ps=S.priceSheetCache;
+  if(!ps){
+    const{data,error}=await db.from('workspace').select('data').eq('id','tgk_pricesheet_v1').maybeSingle();
+    if(error||!data){toast('Could not connect to price sheet');return;}
+    ps=data.data;
+    S.priceSheetCache=ps;
+  }
+  if(!ps?.items){toast('Price sheet has no items');return;}
+  // Build SKU→msrp map from ERP
+  const erpPrices={};
+  candidates.forEach(a=>{erpPrices[a.pn.toUpperCase()]=a.msrp;});
+  let updated=0;
+  const updatedItems=(ps.items||[]).map(item=>{
+    const price=erpPrices[(item.sku||'').toUpperCase()];
+    if(price!==undefined&&Math.abs((item.retail||0)-price)>0.001){
+      updated++;
+      return {...item,retail:price,notes:genPriceSheetNotes(price),updatedAt:new Date().toISOString()};
+    }
+    return item;
+  });
+  if(!updated){toast('All price sheet prices already match ERP — nothing to push');return;}
+  const confirmed=confirm(`Push ${updated} updated price${updated!==1?'s':''} from ERP → Price Sheet?\n\nThis will update the live vendor price lists.`);
+  if(!confirmed)return;
+  toast('Pushing prices to price sheet…');
+  const newPs={...ps,items:updatedItems,ts:Date.now()};
+  const{error}=await db.from('workspace').upsert({id:'tgk_pricesheet_v1',data:newPs,updated_at:new Date().toISOString()},{onConflict:'id'});
+  if(error){toast('Push failed: '+error.message);return;}
+  S.priceSheetCache=newPs;
+  toast(`✓ Pushed ${updated} price${updated!==1?'s':''} to price sheet — vendor lists updated`);
+}
+
+async function syncPricesFromPriceSheet(){
+  const ps=await fetchPriceSheetData();
+  if(!ps?.items?.length){toast('No price sheet data to sync');return;}
+  const priceMap={};
+  (ps.items||[]).forEach(item=>{if(item.sku&&item.retail>0)priceMap[item.sku.toUpperCase()]=item.retail;});
+  const updates=[];
+  S.assemblies.forEach(a=>{
+    const price=priceMap[a.pn?.toUpperCase()];
+    if(price!==undefined&&price>0&&price!==a.retail_price)updates.push({id:a.id,pn:a.pn,price});
+  });
+  if(!updates.length){toast('All prices already up to date (or no matching SKUs found)');return;}
+  const confirmed=confirm(`Sync ${updates.length} price${updates.length!==1?'s':''} from price sheet?\n\n${updates.slice(0,8).map(u=>`  ${u.pn} → $${u.price.toFixed(2)}`).join('\n')}${updates.length>8?`\n  …and ${updates.length-8} more`:''}\n\nThis updates the retail_price field on matching assembly SKUs.`);
+  if(!confirmed)return;
+  toast('Syncing prices…');
+  let updated=0,errs=0;
+  for(const u of updates){
+    const{error}=await db.from('assemblies').update({retail_price:u.price}).eq('id',u.id);
+    if(!error){S.assemblies=S.assemblies.map(a=>a.id===u.id?{...a,retail_price:u.price}:a);updated++;}
+    else errs++;
+  }
+  toast(`✓ Updated ${updated} retail price${updated!==1?'s':''}${errs?` (${errs} errors)`:''}`);
+  render();
+}
 async function deleteDealer(id){
   if(!confirm('Delete this dealer?'))return;
   const item=S.dealers.find(d=>d.id===id);
@@ -6201,7 +6398,7 @@ function openModal(type,data){
       return '<div id="m-pb-row-'+b.idx+'" style="display:flex;align-items:center;gap:8px;padding:5px 8px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;margin-bottom:4px">'
         +'<span style="font-size:11px;color:var(--text3);min-width:60px">≥ '+b.qty+'</span>'
         +'<span style="font-size:11px;color:var(--text3)">units →</span>'
-        +'<span style="font-size:12px;font-weight:700;color:var(--teal)">$'+b.price.toFixed(4)+'</span>'
+        +'<span style="font-size:12px;font-weight:700;color:var(--teal)">$'+b.price.toFixed(2)+'</span>'
         +'<span style="font-size:10px;color:var(--text3);flex:1">/ ea</span>'
         +'<button type="button" onclick="removePriceBreak('+b.idx+')" style="background:transparent;border:none;color:var(--text3);cursor:pointer;font-size:16px;line-height:1;padding:2px">×</button>'
       +'</div>';
@@ -6224,7 +6421,7 @@ function openModal(type,data){
         <span style="font-size:11px;color:var(--text3);white-space:nowrap">≥</span>
         <input id="m-pb-qty" type="number" min="1" step="1" class="form-input" placeholder="Min qty" style="width:80px">
         <span style="font-size:11px;color:var(--text3);white-space:nowrap">units → $</span>
-        <input id="m-pb-price" type="number" min="0" step="0.0001" class="form-input" placeholder="Price/ea" style="width:100px">
+        <input id="m-pb-price" type="number" min="0" step="0.01" class="form-input" placeholder="Price/ea" style="width:100px">
         <button type="button" class="btn btn-teal btn-sm" onclick="addPriceBreak()">+ Add Tier</button>
       </div>
     </div>
@@ -7163,7 +7360,7 @@ function addPriceBreak(){
     return '<div id="m-pb-row-'+b.idx+'" style="display:flex;align-items:center;gap:8px;padding:5px 8px;background:var(--bg2);border:1px solid var(--teal);border-radius:6px;margin-bottom:4px">'
       +'<span style="font-size:11px;color:var(--text3);min-width:60px">≥ '+b.qty+'</span>'
       +'<span style="font-size:11px;color:var(--text3)">units →</span>'
-      +'<span style="font-size:12px;font-weight:700;color:var(--teal)">$'+b.price.toFixed(4)+'</span>'
+      +'<span style="font-size:12px;font-weight:700;color:var(--teal)">$'+b.price.toFixed(2)+'</span>'
       +'<span style="font-size:10px;color:var(--text3);flex:1">/ ea</span>'
       +'<button type="button" onclick="removePriceBreak('+b.idx+')" style="background:transparent;border:none;color:var(--text3);cursor:pointer;font-size:16px;line-height:1;padding:2px">×</button>'
     +'</div>';
@@ -7271,6 +7468,10 @@ async function submitAsm(eid){
   }
   closeModal();
   toast(pending.length>0?'Assembly saved with '+pending.length+' BOM line'+(pending.length!==1?'s':''):'Assembly saved');
+  // Auto-push retail price to price sheet if MSRP is set
+  if(payload.msrp>0){
+    pushAssemblyPriceToSheet(pn, payload.msrp, false).catch(e=>console.warn('Price sheet push:',e));
+  }
   render();
 }
 
@@ -8173,7 +8374,7 @@ function buildReportRows(id, preset, customFrom, customTo){
       const rows=[];
       withBreaks.forEach(p=>{
         rows.push({'Part #':p.pn,'Description':p.description||'','Vendor':p.vendor||'','Break Level':'Base','Min Qty':1,'Unit Cost ($)':+(p.unit_cost||0).toFixed(4)});
-        (p.price_breaks||[]).forEach((b,i)=>rows.push({'Part #':p.pn,'Description':p.description||'','Vendor':p.vendor||'','Break Level':'Tier '+(i+1),'Min Qty':b.qty,'Unit Cost ($)':+(b.price||0).toFixed(4)}));
+        (p.price_breaks||[]).forEach((b,i)=>rows.push({'Part #':p.pn,'Description':p.description||'','Vendor':p.vendor||'','Break Level':'Tier '+(i+1),'Min Qty':b.qty,'Unit Cost ($)':+(b.price||0).toFixed(2)}));
       });
       return{cols:['Part #','Description','Vendor','Break Level','Min Qty','Unit Cost ($)'],data:rows};
     }
@@ -8576,13 +8777,13 @@ function partDossier(pn){
     br.forEach(function(b,i){
       const active=Math.abs(b.price-cur)<0.00005;
       const savePct=cur>b.price?Math.round((cur-b.price)/cur*100):0;
-      cards+='<div style="padding:10px 14px;border:2px solid '+(active?'var(--teal)':'var(--border2)')+';border-radius:8px;min-width:115px;text-align:center;background:'+(active?'rgba(13,148,136,.07)':'var(--bg3)')+';cursor:pointer" onclick="setPartTier(\''+pn+'\','+b.price+')" title="Click to set unit cost to '+b.price.toFixed(4)+'">' 
+      cards+='<div style="padding:10px 14px;border:2px solid '+(active?'var(--teal)':'var(--border2)')+';border-radius:8px;min-width:115px;text-align:center;background:'+(active?'rgba(13,148,136,.07)':'var(--bg3)')+';cursor:pointer" onclick="setPartTier(\''+pn+'\','+b.price+')" title="Click to set unit cost to '+b.price.toFixed(2)+'">' 
         +'<div style="font-size:9px;color:var(--text3);font-weight:700;letter-spacing:.07em;text-transform:uppercase;margin-bottom:4px">Tier '+(i+1)+(active?' <span style=\'background:var(--teal);color:#fff;border-radius:3px;padding:1px 5px;font-size:8px\'>ACTIVE</span>':'')+'</div>'
-        +'<div style="font-size:16px;font-weight:700;color:'+(active?'var(--teal)':'var(--text1)')+'">'+fc(b.price,4)+'</div>'
+        +'<div style="font-size:16px;font-weight:700;color:'+(active?'var(--teal)':'var(--text1)')+'">'+fc(b.price,2)+'</div>'
         +(savePct&&!active?'<div style="font-size:9px;color:var(--green);margin-top:2px">−'+savePct+'% vs current</div>':'')
         +'<div style="font-size:9px;color:var(--text3);margin-top:3px">≥ '+b.qty+' units</div></div>';
     });
-    const hdr=matchedTier?('Tier '+(br.indexOf(matchedTier)+1)+' active — '+fc(cur,4)+'/unit'):'Current cost '+fc(cur,4)+' (not a standard tier — click tier to apply or Edit to set manually)';
+    const hdr=matchedTier?('Tier '+(br.indexOf(matchedTier)+1)+' active — '+fc(cur,2)+'/unit'):'Current cost '+fc(cur,2)+' (not a standard tier — click tier to apply or Edit to set manually)';
     return '<div class="panel" style="padding:0"><div class="section-header" style="display:flex;align-items:center;gap:8px"><span>Pricing Tiers</span><span style="font-size:10px;font-weight:400;color:'+(matchedTier?'var(--teal)':'var(--text3)')+'">'+hdr+'</span></div><div style="display:flex;gap:8px;padding:12px 14px;flex-wrap:wrap">'+cards+'</div></div>';
   })()}
   <div class="grid-2">
