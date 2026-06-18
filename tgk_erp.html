@@ -583,10 +583,7 @@ const S = {
   customCats:{parts:[],assemblies:[]},
   customVendors:[],
   vendors:[],
-  // Price Sheet integration
-  priceSheetCache: null,      // { items:[], vendors:[], ts:... } from workspace table
-  priceSheetUrl: '',           // e.g. https://tgkcommand.github.io/TGKPriceSheet/TGK_Price_Sheet.html
-  _psLoading: false,
+
 };
 
 // ============================================================
@@ -2779,7 +2776,7 @@ async function unshipLine(saleId, pn, qty){
 
 async function dedupeOrders(){
   const el=document.getElementById('shopify-import-status');
-  function prog(t){toast(t,2000);console.log('[dedupe]',t);}
+  function prog(t){toast(t,2000);}
 
   // ── Step 1: Paginate through ALL sales rows (avoids Supabase 1000-row default cap) ──
   prog('🔍 Scanning full database for duplicates…');
@@ -3428,8 +3425,9 @@ function renderDealers(){
   let list=S.dealers;
   const q=(S.searchQ||'').toLowerCase();
   if(q)list=list.filter(d=>d.name.toLowerCase().includes(q)||(d.contact_name||'').toLowerCase().includes(q));
-  const psVendors=S.priceSheetCache?.vendors||[];
-  const psLinkedCount=S.dealers.filter(d=>d.price_sheet_vendor_id).length;
+  const portalBase=window.location.origin+window.location.pathname;
+  const activeCount=S.dealers.filter(d=>d.status==='Active').length;
+  const pricedAsms=S.assemblies.filter(a=>!a.is_subassembly&&!a.discontinued&&(a.msrp||0)>0).length;
   return `
   <div class="grid-2">
   <div class="panel" style="padding:0">
@@ -3438,16 +3436,16 @@ function renderDealers(){
     </div>
     <table><thead><tr><th>Dealer</th><th>Contact</th><th>Discount</th><th>Status</th><th>Price List</th><th></th></tr></thead><tbody>
     ${list.map(d=>{
-      const link=getPriceSheetLink(d);
-      const psVendor=d.price_sheet_vendor_id?psVendors.find(v=>v.id===d.price_sheet_vendor_id):null;
+      const url=portalBase+'?dealer='+d.id;
       return `<tr>
-        <td class="main-col">${d.name}</td>
-        <td style="font-size:11px;color:var(--text2)">${d.contact_name||''}${d.email?'<br><span style="font-size:10px;color:var(--text3);font-family:var(--mono)">'+escHtml(d.email)+'</span>':''}</td>
-        <td><span class="pill pill-orange">${typeof d.discount_pct==='number'?Math.round(d.discount_pct*100)+'%':d.discount_flat||'20%'} off</span>${psVendor?`<br><span style="font-size:9px;color:var(--text3)">PS: ${parseFloat(psVendor.discount||0).toFixed(0)}% off</span>`:''}</td>
+        <td class="main-col">${escHtml(d.name)}</td>
+        <td style="font-size:11px;color:var(--text2)">${escHtml(d.contact_name||'')}${d.email?`<br><span style="font-size:10px;color:var(--text3);font-family:var(--mono)">${escHtml(d.email)}</span>`:''}
+        </td>
+        <td><span class="pill pill-orange">${typeof d.discount_pct==='number'?Math.round(d.discount_pct*100)+'%':'20%'} off</span></td>
         <td><span class="pill ${d.status==='Active'?'pill-teal':'pill-muted'}">${d.status}</span></td>
-        <td style="white-space:nowrap">
-          ${link?`<a href="${link}" target="_blank" class="btn btn-sm btn-teal" style="text-decoration:none;font-size:10px" title="Open this dealer's live price list">📄 Price List ↗</a>`:''}
-          <button class="action-btn" style="font-size:10px;margin-top:2px" onclick="openLinkPriceSheet('${d.id}')" title="${d.price_sheet_vendor_id?'Change price sheet link':'Link to price sheet vendor'}">${d.price_sheet_vendor_id?'🔗 Linked':'🔗 Link'}</button>
+        <td style="white-space:nowrap;display:flex;gap:4px;align-items:center">
+          <a href="${url}" target="_blank" class="btn btn-sm btn-teal" style="text-decoration:none;font-size:10px" title="Open dealer price list">📄 View</a>
+          <button class="action-btn" style="font-size:10px" onclick="copyDealerLink('${d.id}')" title="Copy link to clipboard">🔗 Copy</button>
         </td>
         <td style="display:flex;gap:4px">
           <button class="action-btn" onclick='openModal("editDealer",${JSON.stringify(d)})'>Edit</button>
@@ -3458,44 +3456,31 @@ function renderDealers(){
     </tbody></table>
   </div>
   <div>
-    <div class="panel" style="border:1px solid rgba(42,191,170,.25);background:rgba(42,191,170,.04)">
-      <div class="panel-title" style="color:var(--teal)"><span>📄 Price Sheet Integration</span></div>
-      <div style="font-size:11px;color:var(--text3);margin-bottom:12px">The ERP is the <b style="color:var(--text)">source of truth</b> for pricing. Edit MSRP on any assembly and it auto-pushes to the price sheet instantly. Vendor price lists update live.</div>
-      <div style="margin-bottom:10px">
-        <label class="form-label">Price Sheet URL</label>
-        <div style="display:flex;gap:6px">
-          <input id="ps-url-input" class="form-input" style="font-size:11px" value="${escHtml(S.priceSheetUrl||'')}" placeholder="https://tgkcommand.github.io/TGKPriceSheet/TGK_Price_Sheet.html">
-          <button class="btn btn-sm" onclick="S.priceSheetUrl=document.getElementById('ps-url-input').value.trim();toast('URL saved');render()">Save</button>
-        </div>
-        <div style="font-size:10px;color:var(--text3);margin-top:4px">The hosted URL of TGK_Price_Sheet.html — dealer links append <code>?vendor=[id]</code></div>
+    <div class="panel" style="border:1px solid rgba(42,191,170,.2)">
+      <div class="panel-title"><span>📄 Dealer Price Lists</span></div>
+      <div style="font-size:11px;color:var(--text2);margin-bottom:12px">Each dealer gets a unique read-only URL showing their live prices — automatically calculated from assembly MSRP and their discount. Prices update in real time when you change an MSRP.</div>
+      <div class="inline-stat"><span style="color:var(--text3)">Active Dealers</span><span class="money-retail">${activeCount}</span></div>
+      <div class="inline-stat"><span style="color:var(--text3)">Priced Products</span><span class="money-retail">${pricedAsms}</span></div>
+      <div style="margin-top:12px;padding:10px 12px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)">
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text3);margin-bottom:6px">URL Format</div>
+        <code style="font-size:10px;color:var(--teal);word-break:break-all">${escHtml(portalBase)}?dealer=<span style="color:var(--text3)">[dealer-id]</span></code>
+        <div style="font-size:10px;color:var(--text3);margin-top:6px">Click <b>📄 View</b> to open · <b>🔗 Copy</b> to copy link · Send URL to dealer</div>
       </div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
-        <button class="btn btn-sm btn-teal" onclick="loadAndShowPriceSheetPanel()">↻ Load Price Sheet Vendors${S._psLoading?' …':''}</button>
-        <button class="btn btn-sm" style="background:rgba(42,191,170,.12);color:var(--teal);border-color:rgba(42,191,170,.3)" onclick="pushAllPricesToSheet()" title="Push all ERP assembly MSRP values → price sheet vendor lists">📤 Push All ERP Prices → Sheet</button>
-        <button class="btn btn-sm" style="color:var(--text3)" onclick="syncPricesFromPriceSheet()" title="Pull prices FROM price sheet into ERP (override direction)">📥 Pull Sheet Prices → ERP</button>
+      <div style="margin-top:12px;font-size:10px;color:var(--text3)">
+        ⚠ Make sure the <code>dealers</code> table has RLS disabled so anon reads work:
+        <pre style="margin:4px 0;padding:6px 8px;background:var(--bg4);border-radius:4px;font-size:10px;color:var(--text2);overflow-x:auto">ALTER TABLE dealers DISABLE ROW LEVEL SECURITY;</pre>
       </div>
-      ${psLinkedCount>0?`<div style="font-size:11px;color:var(--teal);margin-bottom:8px">✓ ${psLinkedCount} dealer${psLinkedCount!==1?'s':''} linked to price sheet</div>`:''}
-      ${psVendors.length?`<div style="font-size:10px;color:var(--text3);border-top:1px solid var(--border);padding-top:8px;margin-top:4px">
-        <div style="font-weight:700;color:var(--text2);margin-bottom:6px">Price Sheet Vendors (${psVendors.length})</div>
-        ${psVendors.map(v=>{
-          const linked=S.dealers.find(d=>d.price_sheet_vendor_id===v.id);
-          return `<div style="display:flex;align-items:center;gap:8px;padding:3px 0">
-            <div style="flex:1"><span style="color:var(--text)">${escHtml(v.name)}</span> <span style="color:var(--text3)">${parseFloat(v.discount||0).toFixed(0)}% off</span></div>
-            ${linked?`<span style="color:var(--teal);font-size:10px">→ ${escHtml(linked.name)}</span>`:'<span style="color:var(--text3);font-size:10px">unlinked</span>'}
-          </div>`;
-        }).join('')}
-      </div>`:'<div style="font-size:10px;color:var(--text3)">Click "Load Price Sheet Vendors" to see vendor list and link dealers.</div>'}
     </div>
     <div class="panel">
       <div class="panel-title"><span>Pricing Tiers</span></div>
       ${[['Tier 1','10% off MSRP','Standard'],['Tier 2','20% off MSRP','Most dealers'],['Tier 3','25% off MSRP','High volume'],['WCAVD','10% off MSRP','Special rate']].map(([t,d,n])=>`<div class="margin-analysis-row"><div><span class="money-retail" style="font-weight:600;font-size:12px">${t}</span><span style="font-size:10px;color:var(--text3);margin-left:8px">${n}</span></div><span style="color:var(--text2);font-size:12px">${d}</span></div>`).join('')}
     </div>
-    <div class="panel">
-      <div class="panel-title"><span>Quick Stats</span></div>
-      <div class="inline-stat"><span style="color:var(--text3)">Active Dealers</span><span class="money-retail">${S.dealers.filter(d=>d.status==='Active').length}</span></div>
-      <div class="inline-stat"><span style="color:var(--text3)">Linked to Price Sheet</span><span style="color:var(--teal)">${psLinkedCount} / ${S.dealers.length}</span></div>
-    </div>
   </div></div>`;
+}
+
+function copyDealerLink(id){
+  const url=window.location.origin+window.location.pathname+'?dealer='+id;
+  navigator.clipboard.writeText(url).then(()=>toast('Price list link copied!')).catch(()=>toast(url));
 }
 
 
@@ -6072,159 +6057,187 @@ async function deleteSale(id){
 }
 
 // ============================================================
-// PRICE SHEET INTEGRATION
+// DEALER PORTAL — read-only price list, activated via ?dealer=UUID
+// No auth required. Uses the same Supabase anon key.
+// SQL required: ALTER TABLE dealers DISABLE ROW LEVEL SECURITY;
 // ============================================================
-async function fetchPriceSheetData(force=false){
-  if(S.priceSheetCache&&!force)return S.priceSheetCache;
-  if(S._psLoading)return null;
-  S._psLoading=true;
+async function startDealerPortal(dealerId){
+  // Hide everything — this page becomes the price list
+  ['tgk-loader','auth-gate','tgk-app'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el)el.style.display='none';
+  });
+
+  // Mount a full-page container
+  const wrap=document.createElement('div');
+  wrap.id='dealer-portal';
+  wrap.style.cssText='position:fixed;inset:0;overflow-y:auto;background:#111314;color:#fff;font-family:"DM Sans",sans-serif;';
+  wrap.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:12px"><div style="width:32px;height:32px;border:3px solid #2a2d30;border-top-color:#2ABFAA;border-radius:50%;animation:spin 0.8s linear infinite"></div><div style="color:#8a8a86;font-size:13px">Loading price list…</div></div>';
+  document.body.appendChild(wrap);
+
   try{
-    const{data,error}=await db.from('workspace').select('data').eq('id','tgk_pricesheet_v1').maybeSingle();
-    if(error||!data){toast('Could not read price sheet data: '+(error?.message||'not found'));S._psLoading=false;return null;}
-    S.priceSheetCache=data.data;
-    S._psLoading=false;
-    return data.data;
-  }catch(e){toast('Price sheet read error: '+e.message);S._psLoading=false;return null;}
+    // Fetch dealer record (anon key, RLS must be disabled on dealers table)
+    const{data:dealer,error:dErr}=await db.from('dealers').select('*').eq('id',dealerId).maybeSingle();
+    if(dErr||!dealer){
+      wrap.innerHTML=dealerPortalError('This price list link is invalid or has been removed.');
+      return;
+    }
+    if(dealer.status!=='Active'){
+      wrap.innerHTML=dealerPortalError('This price list is not currently active. Contact TGK Motorsport.');
+      return;
+    }
+
+    // Fetch finished goods with an MSRP set
+    const{data:products}=await db
+      .from('assemblies')
+      .select('pn,new_sku,use_new_sku,description,category,msrp,image_url')
+      .eq('is_subassembly',false)
+      .eq('discontinued',false)
+      .gt('msrp',0)
+      .order('category')
+      .order('pn');
+
+    wrap.innerHTML=buildDealerPortalHTML(dealer,products||[]);
+    attachDealerPortalSearch();
+
+    // Live updates — patch prices in place when MSRP changes in ERP
+    db.channel('dealer-portal-prices')
+      .on('postgres_changes',{event:'UPDATE',schema:'public',table:'assemblies'},payload=>{
+        const row=document.querySelector(`tr[data-dpn="${payload.new.pn}"]`);
+        if(!row||!(payload.new.msrp>0))return;
+        const disc=dealer.discount_pct||0.2;
+        const dp=payload.new.msrp*(1-disc);
+        row.querySelector('.dp-msrp').textContent='$'+payload.new.msrp.toFixed(2);
+        row.querySelector('.dp-price').textContent='$'+dp.toFixed(2);
+        row.querySelector('.dp-save').textContent='-$'+(payload.new.msrp-dp).toFixed(2);
+        row.classList.add('dp-flash');
+        setTimeout(()=>row.classList.remove('dp-flash'),1500);
+        const ts=document.getElementById('dp-ts');
+        if(ts)ts.textContent='Updated '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+      })
+      .subscribe();
+  }catch(e){
+    wrap.innerHTML=dealerPortalError('Could not load price list: '+e.message);
+  }
 }
-async function openLinkPriceSheet(dealerId){
-  const ps=await fetchPriceSheetData(true);
-  if(!ps)return;
-  const dealer=S.dealers.find(d=>d.id===dealerId);
-  const currentLink=dealer?.price_sheet_vendor_id||'';
-  const rows=(ps.vendors||[]).map(v=>`
-    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
-      <div style="flex:1">
-        <div style="font-weight:600;font-size:12px;color:var(--text)">${escHtml(v.name)}</div>
-        <div style="font-size:10px;color:var(--text3)">Universal ${parseFloat(v.discount||0).toFixed(0)}% off · ${Object.keys(v.overrides||{}).length} item overrides</div>
+
+function buildDealerPortalHTML(dealer,products){
+  const disc=dealer.discount_pct||0.2;
+  const discPct=Math.round(disc*100);
+  const now=new Date().toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'});
+
+  // Group by category
+  const catMap={};
+  products.forEach(p=>{
+    const c=p.category||'Other';
+    if(!catMap[c])catMap[c]=[];
+    catMap[c].push(p);
+  });
+  const cats=Object.keys(catMap).sort();
+
+  const sections=cats.map(cat=>{
+    const rows=catMap[cat].map(p=>{
+      const sku=(p.use_new_sku&&p.new_sku)?p.new_sku:p.pn;
+      const dp=p.msrp*(1-disc);
+      const save=p.msrp-dp;
+      return `<tr data-dpn="${p.pn}" data-search="${sku.toLowerCase()} ${(p.description||'').toLowerCase()}">
+        <td style="font-family:monospace;font-size:11px;color:#2ABFAA;padding:8px 10px;border-bottom:1px solid #1c1f21;white-space:nowrap">${escHtml(sku)}</td>
+        <td style="font-size:12px;color:#d8d8d4;padding:8px 10px;border-bottom:1px solid #1c1f21">${escHtml(p.description||'')}</td>
+        <td class="dp-msrp" style="font-family:monospace;font-size:12px;color:#515457;text-align:right;padding:8px 10px;border-bottom:1px solid #1c1f21">$${p.msrp.toFixed(2)}</td>
+        <td class="dp-price" style="font-family:monospace;font-size:13px;color:#4ade80;font-weight:700;text-align:right;padding:8px 10px;border-bottom:1px solid #1c1f21">$${dp.toFixed(2)}</td>
+        <td class="dp-save" style="font-family:monospace;font-size:11px;color:#E07B28;text-align:right;padding:8px 10px;border-bottom:1px solid #1c1f21">-$${save.toFixed(2)}</td>
+      </tr>`;
+    }).join('');
+    return `<div class="dp-section" style="margin-bottom:32px">
+      <div style="font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#515457;padding:6px 10px;background:#161819;border-radius:4px 4px 0 0;border:1px solid #1c1f21">
+        ${escHtml(cat)} <span style="color:#2a2d30;margin-left:4px">${catMap[cat].length}</span>
       </div>
-      <button class="btn btn-sm ${currentLink===v.id?'btn-teal':''}" onclick="linkDealerToPriceSheet('${dealerId}','${v.id}')">
-        ${currentLink===v.id?'✓ Linked':'Link'}
-      </button>
-    </div>`).join('');
-  const unlinkRow=currentLink?`<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)"><button class="btn btn-sm" style="color:var(--red)" onclick="linkDealerToPriceSheet('${dealerId}','')">✕ Unlink</button></div>`:'';
-  const bodyHtml=`<div style="margin-bottom:12px;font-size:11px;color:var(--text3)">Select which price sheet vendor maps to <b style="color:var(--text)">${escHtml(dealer?.name||dealerId)}</b>:</div>
-    <div style="max-height:340px;overflow-y:auto">${rows||'<div style="color:var(--text3);padding:20px;text-align:center">No vendors found in price sheet</div>'}</div>
-    ${unlinkRow}
-    <div class="modal-footer"><button class="btn" onclick="closeModal()">Done</button></div>`;
-  // Inject directly into existing modal
-  const ov=document.getElementById('modal-overlay');
-  const mc=document.getElementById('modal-content');
-  if(ov&&mc){
-    mc.innerHTML=`<div class="modal-title"><span>Link to Price Sheet Vendor</span><button class="modal-close" onclick="closeModal()">✕</button></div>${bodyHtml}`;
-    ov.style.display='flex';
+      <table style="width:100%;border-collapse:collapse;border:1px solid #1c1f21;border-top:none;border-radius:0 0 4px 4px">
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  }).join('');
+
+  return `
+<style>
+  #dealer-portal *{box-sizing:border-box}
+  tr[data-dpn]:hover td{background:rgba(42,191,170,.04)}
+  .dp-flash td{background:rgba(42,191,170,.12)!important;transition:background .3s}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @media print{
+    #dp-topbar,#dp-search-row{display:none!important}
+    .dp-section{page-break-inside:avoid}
+    #dealer-portal{background:#fff!important;color:#000!important}
+    td,th{color:#000!important;border-color:#ddd!important}
+    .dp-msrp,.dp-save{color:#666!important}
+    .dp-price{color:#16a34a!important}
   }
-}
-async function linkDealerToPriceSheet(dealerId,psVendorId){
-  const{error}=await db.from('dealers').update({price_sheet_vendor_id:psVendorId||null}).eq('id',dealerId);
-  if(error){toast('Error: '+error.message);return;}
-  S.dealers=S.dealers.map(d=>d.id===dealerId?{...d,price_sheet_vendor_id:psVendorId||null}:d);
-  if(psVendorId){const v=(S.priceSheetCache?.vendors||[]).find(v=>v.id===psVendorId);toast(`✓ Linked to "${v?.name||psVendorId}"`);}
-  else toast('Unlinked from price sheet');
-  closeModal();render();
-}
-function getPriceSheetLink(dealer){
-  if(!dealer.price_sheet_vendor_id)return null;
-  const base=(S.priceSheetUrl||'').replace(/\/$/,'').trim();
-  if(!base)return null;
-  return base+'?vendor='+dealer.price_sheet_vendor_id;
-}
-// ── Price Sheet push (ERP → Price Sheet) ─────────────────────────────
-// Standard TGK dealer tiers applied to MSRP
-function genPriceSheetNotes(retail){
-  if(!retail||retail<=0)return '';
-  const t1=(retail*0.90).toFixed(2);
-  const t2=(retail*0.80).toFixed(2);
-  const t3=(retail*0.75).toFixed(2);
-  return `T1 10%=$${t1} | T2 20%=$${t2} | T3 25%=$${t3}`;
+  @media(max-width:620px){
+    .dp-msrp,.dp-save{display:none}
+    .dp-hdr-msrp,.dp-hdr-save{display:none}
+  }
+</style>
+
+<div id="dp-topbar" style="position:sticky;top:0;z-index:10;background:#111314;border-bottom:1px solid #1c1f21;padding:12px 20px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">
+  <div style="display:flex;align-items:center;gap:14px">
+    <div style="font-size:16px;font-weight:800;letter-spacing:.05em">TGK<span style="color:#2ABFAA">MOTORSPORT</span></div>
+    <div style="width:1px;height:24px;background:#2a2d30"></div>
+    <div>
+      <div style="font-size:13px;font-weight:600;color:#fff">${escHtml(dealer.name)}</div>
+      <div style="font-size:10px;color:#E07B28;font-weight:600">${discPct}% off MSRP</div>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px">
+    <div id="dp-ts" style="font-size:10px;color:#515457">${now}</div>
+    <span style="font-size:10px;color:#2ABFAA">● Live</span>
+    <button onclick="window.print()" style="padding:5px 12px;background:#1e2022;border:1px solid #2a2d30;border-radius:5px;color:#c8c8c4;font-size:11px;cursor:pointer;font-family:inherit">🖨 Print</button>
+  </div>
+</div>
+
+<div id="dp-search-row" style="padding:14px 20px 0;max-width:1100px;margin:0 auto">
+  <input id="dp-search" type="search" placeholder="Search by SKU or product name…"
+    style="width:100%;padding:8px 14px;background:#1a1c1e;border:1px solid #2a2d30;border-radius:6px;color:#fff;font-size:13px;outline:none;font-family:inherit"
+    oninput="dealerPortalFilter(this.value)">
+</div>
+
+<div style="max-width:1100px;margin:0 auto;padding:16px 20px 60px">
+  <div style="display:grid;grid-template-columns:120px 1fr 90px 90px 80px;padding:0 10px 8px;font-size:9px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:#3a3d40">
+    <div>SKU</div><div>Product</div>
+    <div class="dp-hdr-msrp" style="text-align:right">MSRP</div>
+    <div style="text-align:right">Your Price</div>
+    <div class="dp-hdr-save" style="text-align:right">Savings</div>
+  </div>
+  <div id="dp-products">${sections}</div>
+  <div id="dp-empty" style="display:none;padding:40px 0;text-align:center;color:#515457">No products match your search.</div>
+</div>`;
 }
 
-async function pushAssemblyPriceToSheet(pn, msrp, silent=false){
-  if(!pn||!(msrp>0))return;
-  // Fetch fresh workspace data
-  let ps=S.priceSheetCache;
-  if(!ps){
-    const{data,error}=await db.from('workspace').select('data').eq('id','tgk_pricesheet_v1').maybeSingle();
-    if(error||!data){if(!silent)toast('⚠ Could not connect to price sheet');return;}
-    ps=data.data;
-    S.priceSheetCache=ps;
-  }
-  if(!ps?.items){if(!silent)toast('⚠ Price sheet has no items');return;}
-  // Match by SKU (case-insensitive)
-  const skuUp=pn.toUpperCase();
-  let matched=false;
-  const updatedItems=(ps.items||[]).map(item=>{
-    if((item.sku||'').toUpperCase()===skuUp){
-      matched=true;
-      return {...item,retail:msrp,notes:genPriceSheetNotes(msrp),updatedAt:new Date().toISOString()};
-    }
-    return item;
-  });
-  if(!matched){if(!silent)toast(`ℹ ${pn} not found in price sheet catalog — add it there first`);return;}
-  const updated={...ps,items:updatedItems,ts:Date.now()};
-  const{error}=await db.from('workspace').upsert({id:'tgk_pricesheet_v1',data:updated,updated_at:new Date().toISOString()},{onConflict:'id'});
-  if(error){if(!silent)toast('⚠ Price sheet write failed: '+error.message);return;}
-  S.priceSheetCache=updated;
-  if(!silent)toast(`✓ Price sheet updated — ${pn} → $${msrp.toFixed(2)}`);
+function dealerPortalError(msg){
+  return `<div style="display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:14px;padding:20px;text-align:center">
+    <div style="font-size:18px;font-weight:800">TGK<span style="color:#2ABFAA">MOTORSPORT</span></div>
+    <div style="color:#8a8a86;font-size:14px;max-width:400px">${msg}</div>
+  </div>`;
 }
 
-async function pushAllPricesToSheet(){
-  const candidates=S.assemblies.filter(a=>a.msrp>0&&!a.discontinued);
-  if(!candidates.length){toast('No assemblies have an MSRP set');return;}
-  // Fetch workspace
-  let ps=S.priceSheetCache;
-  if(!ps){
-    const{data,error}=await db.from('workspace').select('data').eq('id','tgk_pricesheet_v1').maybeSingle();
-    if(error||!data){toast('Could not connect to price sheet');return;}
-    ps=data.data;
-    S.priceSheetCache=ps;
-  }
-  if(!ps?.items){toast('Price sheet has no items');return;}
-  // Build SKU→msrp map from ERP
-  const erpPrices={};
-  candidates.forEach(a=>{erpPrices[a.pn.toUpperCase()]=a.msrp;});
-  let updated=0;
-  const updatedItems=(ps.items||[]).map(item=>{
-    const price=erpPrices[(item.sku||'').toUpperCase()];
-    if(price!==undefined&&Math.abs((item.retail||0)-price)>0.001){
-      updated++;
-      return {...item,retail:price,notes:genPriceSheetNotes(price),updatedAt:new Date().toISOString()};
-    }
-    return item;
-  });
-  if(!updated){toast('All price sheet prices already match ERP — nothing to push');return;}
-  const confirmed=confirm(`Push ${updated} updated price${updated!==1?'s':''} from ERP → Price Sheet?\n\nThis will update the live vendor price lists.`);
-  if(!confirmed)return;
-  toast('Pushing prices to price sheet…');
-  const newPs={...ps,items:updatedItems,ts:Date.now()};
-  const{error}=await db.from('workspace').upsert({id:'tgk_pricesheet_v1',data:newPs,updated_at:new Date().toISOString()},{onConflict:'id'});
-  if(error){toast('Push failed: '+error.message);return;}
-  S.priceSheetCache=newPs;
-  toast(`✓ Pushed ${updated} price${updated!==1?'s':''} to price sheet — vendor lists updated`);
+function attachDealerPortalSearch(){
+  // Defined inline in the portal HTML too; this is the JS-side version
+  window.dealerPortalFilter=function(q){
+    const lower=q.toLowerCase().trim();
+    let anyVisible=false;
+    document.querySelectorAll('tr[data-dpn]').forEach(row=>{
+      const show=!lower||row.dataset.search.includes(lower);
+      row.style.display=show?'':'none';
+      if(show)anyVisible=true;
+    });
+    document.querySelectorAll('.dp-section').forEach(sec=>{
+      const vis=[...sec.querySelectorAll('tr[data-dpn]')].some(r=>r.style.display!=='none');
+      sec.style.display=vis?'':'none';
+    });
+    const empty=document.getElementById('dp-empty');
+    if(empty)empty.style.display=anyVisible?'none':'block';
+  };
 }
 
-async function syncPricesFromPriceSheet(){
-  const ps=await fetchPriceSheetData();
-  if(!ps?.items?.length){toast('No price sheet data to sync');return;}
-  const priceMap={};
-  (ps.items||[]).forEach(item=>{if(item.sku&&item.retail>0)priceMap[item.sku.toUpperCase()]=item.retail;});
-  const updates=[];
-  S.assemblies.forEach(a=>{
-    const price=priceMap[a.pn?.toUpperCase()];
-    if(price!==undefined&&price>0&&price!==a.retail_price)updates.push({id:a.id,pn:a.pn,price});
-  });
-  if(!updates.length){toast('All prices already up to date (or no matching SKUs found)');return;}
-  const confirmed=confirm(`Sync ${updates.length} price${updates.length!==1?'s':''} from price sheet?\n\n${updates.slice(0,8).map(u=>`  ${u.pn} → $${u.price.toFixed(2)}`).join('\n')}${updates.length>8?`\n  …and ${updates.length-8} more`:''}\n\nThis updates the retail_price field on matching assembly SKUs.`);
-  if(!confirmed)return;
-  toast('Syncing prices…');
-  let updated=0,errs=0;
-  for(const u of updates){
-    const{error}=await db.from('assemblies').update({retail_price:u.price}).eq('id',u.id);
-    if(!error){S.assemblies=S.assemblies.map(a=>a.id===u.id?{...a,retail_price:u.price}:a);updated++;}
-    else errs++;
-  }
-  toast(`✓ Updated ${updated} retail price${updated!==1?'s':''}${errs?` (${errs} errors)`:''}`);
-  render();
-}
 async function deleteDealer(id){
   if(!confirm('Delete this dealer?'))return;
   const item=S.dealers.find(d=>d.id===id);
@@ -6702,7 +6715,7 @@ function openModal(type,data){
         <span style="font-size:10px;color:var(--text3)">${partCount} part${partCount!==1?'s':''}</span>
         <span style="font-size:10px;color:var(--text3);margin-left:4px">${poCount} PO${poCount!==1?'s':''}</span>
         <button class="action-btn" onclick="renameVendor('${escHtml(v)}')">Rename</button>
-        ${isCustom?`<button class="action-btn" style="color:var(--red)" onclick="deleteVendor('${escHtml(v)}')">Delete</button>`:'<span style="font-size:10px;color:var(--text3);padding:0 4px">via parts</span>'}
+        ${isCustom?`<button class="action-btn" style="color:var(--red)" onclick="deleteCustomVendor('${escHtml(v)}')">Delete</button>`:'<span style="font-size:10px;color:var(--text3);padding:0 4px">via parts</span>'}
       </div>`;
     }).join('');
     body=`<div style="max-height:300px;overflow-y:auto;margin-bottom:12px">
@@ -7022,7 +7035,7 @@ async function renameVendor(oldName){
   openModal('manageVendors',{});
 }
 
-async function deleteVendor(name){
+async function deleteCustomVendor(name){
   const partsCount=S.parts.filter(p=>p.vendor===name).length;
   if(partsCount>0){toast(`Cannot delete — ${partsCount} part${partsCount!==1?'s':''} use "${name}". Reassign them first.`);return;}
   if(!confirm(`Remove vendor "${name}" from the list?`))return;
@@ -7468,10 +7481,6 @@ async function submitAsm(eid){
   }
   closeModal();
   toast(pending.length>0?'Assembly saved with '+pending.length+' BOM line'+(pending.length!==1?'s':''):'Assembly saved');
-  // Auto-push retail price to price sheet if MSRP is set
-  if(payload.msrp>0){
-    pushAssemblyPriceToSheet(pn, payload.msrp, false).catch(e=>console.warn('Price sheet push:',e));
-  }
   render();
 }
 
@@ -12758,6 +12767,9 @@ async function refreshAll(){
       return;
     }
     if(!db)db=supabase.createClient(SUPA_URL,SUPA_KEY);
+    // ── Dealer portal: bypass auth for ?dealer= URLs ──
+    const _dealerParam=new URLSearchParams(window.location.search).get('dealer');
+    if(_dealerParam){startDealerPortal(_dealerParam);return;}
     checkAuthAndConnect();
   }
 
