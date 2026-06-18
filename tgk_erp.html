@@ -586,6 +586,7 @@ const S = {
   // Dealer visit log
   dealerVisitCounts:{},   // { dealer_id: count } — loaded on demand
   dealerVisitsLoaded:false,
+  _visitLogMissing:false,  // true if dealer_visits table doesn't exist
   pricingTiers:[],             // managed pricing tiers (loaded from settings)
 };
 
@@ -815,7 +816,7 @@ async function loadAll(){
       fetchAll((f,t)=>db.from('bom_items').select('*').order('parent_pn').order('sort_order').range(f,t)),
       db.from('warranty_claims').select('*').order('created_at',{ascending:false}).limit(100),
       db.from('shipment_errors').select('*').order('created_at',{ascending:false}).limit(200),
-      db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
+      db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,user_email,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
       db.from('cycle_counts').select('*').order('created_at',{ascending:false}).limit(50),
       db.from('po_lines').select('*').order('po_id'),
       db.from('po_tracking').select('*').order('created_at'),
@@ -2490,7 +2491,7 @@ async function unpackSaleOrder(saleId, pn, qty){
       const{error:aErr}=await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
       if(aErr){toast('Error updating stock for '+linePn+': '+aErr.message);return;}
       S.assemblies=S.assemblies.map(a=>a.pn===linePn?{...a,total_on_hand:newOh}:a);
-      const{data:corrRow}=await db.from('inv_corrections').insert({pn:linePn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:lineQty,reason:'Order unpacked — '+(line.order_number||saleId),source:'unpack'}).select().single();
+      const{data:corrRow}=await db.from('inv_corrections').insert({pn:linePn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:lineQty,reason:'Order unpacked — '+(line.order_number||saleId),user_email:S.currentUser||null,source:'unpack'}).select().single();
       if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
     }
     // Reset sale line to Open
@@ -2632,7 +2633,7 @@ async function processReturn(saleId, pn, qty, orderNum){
       undoOps.push({action:'update',table:'assemblies',data:{...asm,total_on_hand:newOh},prev:{...asm}});
       const{data:corr}=await db.from('inv_corrections').insert({
         pn,previous_qty:prev,new_qty:newOh,adjustment:qty,
-        reason:'Return — '+reason+' (order '+orderNum+')',source:'return'
+        reason:'Return — '+reason+' (order '+orderNum+')',user_email:S.currentUser||null,source:'return'
       }).select().single();
       if(corr)S.corrections=[corr,...S.corrections];
       results.push(qty+' unit(s) restored to stock');
@@ -2728,6 +2729,7 @@ async function processReturn(saleId, pn, qty, orderNum){
     if(wc2){S.warrantyClaims=[wc2,...S.warrantyClaims];results.push('Open follow-up claim created');}
   }
 
+  logAction('Returned '+qty+'× '+pn+' on order #'+orderNum,'sales',pn,null,null).catch(()=>{});
   pushUndoMulti('Return '+pn+' on order '+orderNum,undoOps);
   closeModal();
   await refreshSales();
@@ -2759,7 +2761,7 @@ async function unshipLine(saleId, pn, qty){
     const{data:corr}=await db.from('inv_corrections').insert({
       pn,previous_qty:prev,new_qty:newOh,adjustment:qty,
       reason:`Un-ship — order ${line.order_number||saleId} reverted to ${targetStatus}`,
-      source:'unship'
+      user_email:S.currentUser||null,source:'unship'
     }).select().single();
     if(corr){S.corrections=[corr,...S.corrections];undoOps.push({action:'insert',table:'inv_corrections',data:corr});}
   }
@@ -2901,7 +2903,7 @@ async function markPacked(saleId,pn,qty){
   const{error:ae}=await db.from('assemblies').update({total_on_hand:newOh}).eq('id',asm.id);
   if(ae){toast('Stock update failed: '+ae.message);return;}
   S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
-  await db.from('inv_corrections').insert({pn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Packed — order '+(sale?.order_number||saleId),source:'pack'});
+  await db.from('inv_corrections').insert({pn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Packed — order '+(sale?.order_number||saleId),user_email:S.currentUser||null,source:'pack'});
   const{error:se}=await db.from('sales').update({fulfillment_status:'Packed'}).eq('id',saleId);
   if(se){toast('Sale update failed: '+se.message);return;}
   S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Packed'}:s);
@@ -2921,7 +2923,7 @@ async function submitShipment(saleId,pn,qty){
   // Stock already deducted at markPacked — do NOT deduct again here.
   if(asm){
     const oh=asm.total_on_hand||0;
-    await db.from('inv_corrections').insert({pn,previous_qty:oh,new_qty:oh,adjustment:0,reason:'Shipped order'+(tracking?' — '+tracking:''),source:'shipment'});
+    await db.from('inv_corrections').insert({pn,previous_qty:oh,new_qty:oh,adjustment:0,reason:'Shipped order'+(tracking?' — '+tracking:''),user_email:S.currentUser||null,source:'shipment'});
     S.corrections=[{pn,previous_qty:oh,new_qty:oh,adjustment:0,reason:'Shipped order',source:'shipment',created_at:new Date().toISOString()},...S.corrections];
   }
   // Update sale
@@ -2959,7 +2961,7 @@ async function submitDropShipAll(orderNum){
     await db.from('inv_corrections').insert({
       pn:line.pn,previous_qty:0,new_qty:0,adjustment:0,
       reason:'Drop-ship — order '+orderNum+(tracking?' · '+tracking:''),
-      source:'dropship'
+      user_email:S.currentUser||null,source:'dropship'
     });
     shipped++;
   }
@@ -2983,7 +2985,7 @@ async function submitDropShipment(saleId,pn,qty){
   await db.from('inv_corrections').insert({
     pn,previous_qty:0,new_qty:0,adjustment:0,
     reason:'Drop-ship — order '+(sale?.order_number||saleId)+(tracking?' · '+tracking:''),
-    source:'dropship'
+    user_email:S.currentUser||null,source:'dropship'
   });
   S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Shipped',tracking_number:tracking||null,carrier:carrier||null,shipped_at:now}:s);
   pushUndoMulti('Drop-ship '+qty+'×'+pn,[
@@ -3192,7 +3194,7 @@ async function submitEditOrder(originalOrderNumOrId){
     const{error:ie}=await db.from('assemblies').update({total_on_hand:newOh,updated_at:now}).eq('id',asm.id);
     if(!ie){
       S.assemblies=S.assemblies.map(function(a){return a.id===asm.id?Object.assign({},a,{total_on_hand:newOh}):a;});
-      await db.from('inv_corrections').insert({pn:targetPn,previous_qty:prev,new_qty:newOh,adjustment:delta,reason,source:'order_edit'});
+      await db.from('inv_corrections').insert({pn:targetPn,previous_qty:prev,new_qty:newOh,adjustment:delta,reason,user_email:S.currentUser||null,source:'order_edit'});
     }
   }
 
@@ -3212,7 +3214,8 @@ async function submitEditOrder(originalOrderNumOrId){
     const rr=invChanges.filter(function(x){return x.type==='restore';});
     if(dd.length)tp.push(dd.map(function(x){return x.qty+'x '+x.newPn+' deducted';}).join(', '));
     if(rr.length)tp.push(rr.map(function(x){return x.qty+'x '+x.oldPn+' restored';}).join(', '));
-    toast('Order saved'+(tp.length?' — '+tp.join(' · '):''), invChanges.length?5000:undefined);
+    logAction('Edited order #'+originalOrderNumOrId+(invChanges.length?' — '+invChanges.length+' line change':' — header only'),'sales',null,null,null).catch(()=>{});
+  toast('Order saved'+(tp.length?' — '+tp.join(' · '):''), invChanges.length?5000:undefined);
   }
   render();
 }
@@ -3476,7 +3479,23 @@ function renderDealers(){
       <div style="font-size:11px;color:var(--text2);margin-bottom:12px">Each dealer gets a unique read-only URL showing their live prices — automatically calculated from assembly MSRP and their discount. Prices update in real time when you change an MSRP.</div>
       <div class="inline-stat"><span style="color:var(--text3)">Active Dealers</span><span class="money-retail">${activeCount}</span></div>
       <div class="inline-stat"><span style="color:var(--text3)">Priced Products</span><span class="money-retail">${pricedAsms}</span></div>
-      <div class="inline-stat"><span style="color:var(--text3)">Total Visits</span><span style="color:var(--teal);font-weight:700">${totalVisits}</span></div>
+      <div class="inline-stat"><span style="color:var(--text3)">Total Visits</span><span style="color:var(--teal);font-weight:700">${totalVisits}${S._visitLogMissing?'<span style="color:var(--red);font-size:10px;margin-left:6px">⚠ table missing</span>':''}</span></div>
+      ${S._visitLogMissing?`<div style="margin-top:10px;padding:10px 12px;background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.25);border-radius:6px">
+        <div style="font-size:11px;font-weight:600;color:var(--red);margin-bottom:6px">⚠ dealer_visits table not found</div>
+        <div style="font-size:10px;color:var(--text2);margin-bottom:8px">Run this SQL in Supabase to enable visit tracking:</div>
+        <pre style="font-size:10px;color:var(--text2);background:var(--bg4);padding:8px;border-radius:4px;overflow-x:auto;margin:0">CREATE TABLE dealer_visits (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  dealer_id UUID,
+  dealer_name TEXT,
+  visited_at TIMESTAMPTZ DEFAULT NOW(),
+  user_agent TEXT,
+  referrer TEXT
+);
+ALTER TABLE dealer_visits DISABLE ROW LEVEL SECURITY;
+ALTER PUBLICATION supabase_realtime ADD TABLE dealer_visits;</pre>
+        <button class="btn btn-sm" style="margin-top:8px" onclick="S._visitLogMissing=false;S.dealerVisitsLoaded=false;loadDealerVisitCounts()">↻ Retry</button>
+      </div>`:''}
+      ${!S._visitLogMissing&&S.dealerVisitsLoaded?'':`<button class="btn btn-sm" style="margin-top:8px" onclick="testDealerVisitLog()">🔍 Test Visit Log Setup</button>`}
       <div style="margin-top:12px;padding:10px 12px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)">
         <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text3);margin-bottom:6px">Store Website URL <span style="font-weight:400;text-transform:none;color:var(--text3)">(makes SKUs clickable)</span></div>
         <div style="display:flex;gap:6px">
@@ -5816,7 +5835,7 @@ async function ssManualSync(orderNum,tracking,carrier){
       const newOh=Math.max(0,(asms[0].total_on_hand||0)-(sale.qty||1));
       await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asms[0].id);
       S.assemblies=S.assemblies.map(a=>a.pn===sale.pn?{...a,total_on_hand:newOh}:a);
-      await db.from('inv_corrections').insert({pn:sale.pn,previous_qty:asms[0].total_on_hand||0,new_qty:newOh,adjustment:-(sale.qty||1),reason:'Manual ship — order '+orderNum+' tracking '+tracking,source:'shipment'});
+      await db.from('inv_corrections').insert({pn:sale.pn,previous_qty:asms[0].total_on_hand||0,new_qty:newOh,adjustment:-(sale.qty||1),reason:'Manual ship — order '+orderNum+' tracking '+tracking,user_email:S.currentUser||null,source:'shipment'});
     }
   }
   if(!rows.length){toast('No lines updated — check order number');return;}
@@ -6424,14 +6443,41 @@ function timeAgo(iso){
 async function loadDealerVisitCounts(){
   if(S.dealerVisitsLoaded)return;
   try{
-    const{data}=await db.from('dealer_visits').select('dealer_id').limit(5000);
-    if(!data)return;
+    const{data,error}=await db.from('dealer_visits').select('dealer_id').limit(5000);
+    if(error){
+      const missing=error.code==='42P01'||error.message?.includes('does not exist');
+      S._visitLogMissing=missing;
+      S.dealerVisitsLoaded=true;
+      render();
+      return;
+    }
     const counts={};
-    data.forEach(r=>{counts[r.dealer_id]=(counts[r.dealer_id]||0)+1;});
+    (data||[]).forEach(r=>{counts[r.dealer_id]=(counts[r.dealer_id]||0)+1;});
     S.dealerVisitCounts=counts;
+    S._visitLogMissing=false;
     S.dealerVisitsLoaded=true;
     render();
-  }catch(e){S.dealerVisitsLoaded=true;} // prevent infinite retry if table missing
+  }catch(e){S.dealerVisitsLoaded=true;S._visitLogMissing=true;render();}
+}
+
+async function testDealerVisitLog(){
+  toast('Testing visit log table…');
+  try{
+    const{error}=await db.from('dealer_visits').select('id').limit(1);
+    if(error){
+      const missing=error.code==='42P01'||error.message?.includes('does not exist');
+      S._visitLogMissing=missing;
+      toast('❌ Error: '+error.message);
+    } else {
+      S._visitLogMissing=false;
+      S.dealerVisitsLoaded=false;
+      toast('✓ Table exists! Loading counts…');
+      loadDealerVisitCounts();
+    }
+  }catch(e){
+    toast('❌ '+e.message);
+  }
+  render();
 }
 
 async function showDealerLog(dealerId,dealerName){
@@ -7132,6 +7178,7 @@ async function deletePart(pn, id){
   const{error}=await db.from('parts').delete().eq('id',id);
   if(error){toast('Error: '+error.message);return;}
   S.parts=S.parts.filter(p=>p.id!==id);
+  logAction('Deleted part '+pn,'parts',pn,null,null).catch(()=>{});
   toast('Part '+pn+' deleted');render();
 }
 
@@ -7202,6 +7249,7 @@ async function confirmBulkDiscontinue(table){
   if(isParts){S.parts=S.parts.map(p=>ids.includes(p.id)?{...p,discontinued:true}:p);S.selectedParts=new Set();}
   else{S.assemblies=S.assemblies.map(a=>ids.includes(a.id)?{...a,discontinued:true}:a);S.selectedAsms=new Set();}
   render();
+  logAction('Bulk discontinued '+(count-failed)+' '+table+' items',table,null,null,null).catch(()=>{});
   if(failed)toast('⚠ '+failed+' items failed — check console',5000);
   else toast('🗄 '+ids.length+' '+(ids.length===1?noun+'y':noun+(isParts?'s':'ies'))+' discontinued.',4000);
 }
@@ -7299,7 +7347,8 @@ async function saveBulkEdit(table){
 
   if(errors)toast('Saved '+saved+', '+errors+' errors');
   else{
-    toast('\u2713 '+saved+' '+(isParts?'parts':'assemblies')+' updated');
+    logAction('Bulk edited '+saved+' '+table,''+table,null,null,null).catch(()=>{});
+  toast('\u2713 '+saved+' '+(isParts?'parts':'assemblies')+' updated');
     S.bulkEditMode=null;
     if(isParts)S.selectedParts=new Set();
     else S.selectedAsms=new Set();
@@ -7448,6 +7497,7 @@ async function deleteAsm(pn, id){
   if(error){toast('Error: '+error.message);return;}
   S.assemblies=S.assemblies.filter(a=>a.id!==id);
   if(S.boms[pn])delete S.boms[pn];
+  logAction('Deleted assembly '+pn,'assemblies',pn,null,null).catch(()=>{});
   toast('Assembly '+pn+' deleted');render();
 }
 async function submitManualSale(){
@@ -7553,6 +7603,7 @@ async function submitWarranty(){
   if(error){toast('Error: '+error.message);return;}
   S.wtyItems=[];
   S.warrantyClaims=[data,...S.warrantyClaims];
+  logAction('Created warranty claim — '+issue.slice(0,60),'warranty_claims',pn||null,null,null).catch(()=>{});
   closeModal();toast('Warranty claim logged');render();
 }
 
@@ -8277,7 +8328,7 @@ function startAutoRefresh(){
         fetchAll((f,t)=>db.from('sales').select('*').order('created_at',{ascending:false}).range(f,t)),
         db.from('parts').select('*').order('pn'),
         db.from('purchases').select('*').order('order_date',{ascending:false}),
-        db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
+        db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,user_email,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
       ]);
       S.sales=salesData||[];
       if(partsData.data)S.parts=partsData.data;
@@ -9842,7 +9893,7 @@ async function quickAdjustStock(partId,pn,delta){
   const prev=part.total_unpckgd||0;const newQty=prev+delta;
   const{error}=await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',partId);
   if(error){toast('Error: '+error.message);return;}
-  await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newQty,adjustment:delta,reason:'Quick adjust (±1)',source:'quick_adjust'});
+  await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newQty,adjustment:delta,reason:'Quick adjust (±1)',user_email:S.currentUser||null,source:'quick_adjust'});
   S.parts=S.parts.map(p=>p.id===partId?{...p,total_unpckgd:newQty}:p);
   pushUndo('update','parts',{...part,total_unpckgd:newQty},part,(delta>0?'+':'')+delta+'× '+pn);
   render();
@@ -10305,7 +10356,7 @@ async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
     const po=S.purchases.find(p=>p.id===poId);
     const poRef=po?(' ['+po.vendor+(po.order_date?' '+po.order_date:'')+']'):'';
     const reason='PO Receipt'+poRef+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial — '+remaining+' outstanding)':'')+(note?' — '+note:'');
-    const {data:corrRow}=await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,source:'po_receipt'}).select().single();
+    const {data:corrRow}=await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,user_email:S.currentUser||null,source:'po_receipt'}).select().single();
     if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
     S.corrections = [{pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,source:'po_receipt',created_at:new Date().toISOString()},...S.corrections];
   }
@@ -10350,7 +10401,7 @@ async function closeShortBackorder(lineId, poId, pn, qtyOrdered, qtyAlreadyRecei
       const newQty=(part.total_unpckgd||0)+recvNow;
       await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
       S.parts=S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
-      await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:recvNow,reason:'PO Receipt (closed short, '+remaining+' backordered)',source:'po_receipt'});
+      await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:recvNow,reason:'PO Receipt (closed short, '+remaining+' backordered)',user_email:S.currentUser||null,source:'po_receipt'});
     }
   }
   // close the line as backordered
@@ -10401,7 +10452,7 @@ async function unreceiveLine(lineId, poId){
     undoOps.push({action:'update',table:'parts',data:{...part,total_unpckgd:newQty},prev:{...part}});
     await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
     S.parts=S.parts.map(p=>p.pn===line.pn?{...p,total_unpckgd:newQty}:p);
-    const {data:corrRow}=await db.from('inv_corrections').insert({pn:line.pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:-line.qty_received,reason:'Receipt reversed (received in error)',source:'po_receipt'}).select().single();
+    const {data:corrRow}=await db.from('inv_corrections').insert({pn:line.pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:-line.qty_received,reason:'Receipt reversed (received in error)',user_email:S.currentUser||null,source:'po_receipt'}).select().single();
     if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
   }
   undoOps.push({action:'update',table:'po_lines',data:{id:lineId},prev:{...stripMeta(line)}});
@@ -10429,7 +10480,7 @@ async function checkInLineQuick(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived
     S.parts=S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
     const po=S.purchases.find(p=>p.id===poId);
     const poRef=po?(' ['+po.vendor+(po.order_date?' '+po.order_date:'')+']'):'';
-    await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason:'PO Receipt — Bulk'+poRef,source:'po_receipt'});
+    await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason:'PO Receipt — Bulk'+poRef,user_email:S.currentUser||null,source:'po_receipt'});
   }
   if(S.poLines[poId]) S.poLines[poId]=S.poLines[poId].map(l=>l.id===lineId?{...l,qty_received:newReceived,status:'Complete'}:l);
 }
@@ -10701,7 +10752,7 @@ async function submitCustomPackList(){
           allUndo.push({action:'update',table:'assemblies',data:{...sa,total_on_hand:newOh},prev:{...sa}});
           await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',sa.id);
           S.assemblies=S.assemblies.map(x=>x.pn===item.child_pn?{...x,total_on_hand:newOh}:x);
-          await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:sa.total_on_hand||0,new_qty:newOh,adjustment:delta,reason:'Custom Pack '+qty+'x'+pn+' (sub)',source:'pack'});
+          await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:sa.total_on_hand||0,new_qty:newOh,adjustment:delta,reason:'Custom Pack '+qty+'x'+pn+' (sub)',user_email:S.currentUser||null,source:'pack'});
         }else{
           const p=partMap[item.child_pn];if(!p)continue;
           const newQty=(p.total_unpckgd||0)+delta;
@@ -10709,7 +10760,7 @@ async function submitCustomPackList(){
           await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
           S.parts=S.parts.map(x=>x.pn===item.child_pn?{...x,total_unpckgd:newQty}:x);
           partMap[item.child_pn]={...partMap[item.child_pn],total_unpckgd:newQty};
-          await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:delta,reason:'Custom Pack '+qty+'x'+pn,source:'pack'});
+          await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:delta,reason:'Custom Pack '+qty+'x'+pn,user_email:S.currentUser||null,source:'pack'});
         }
       }
     }
@@ -10719,7 +10770,7 @@ async function submitCustomPackList(){
     await db.from('assemblies').update({total_on_hand:newOh,total_assembled:newAssembled,updated_at:new Date().toISOString()}).eq('id',asm.id);
     S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh,total_assembled:newAssembled}:a);
     await db.from('pack_log').insert({pn,qty,pack_date:new Date().toISOString(),type:'pack',notes:'Custom pack list: '+qty+'x '+pn});
-    await db.from('inv_corrections').insert({pn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:qty,reason:'Custom Pack List',source:'pack'});
+    await db.from('inv_corrections').insert({pn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:qty,reason:'Custom Pack List',user_email:S.currentUser||null,source:'pack'});
     packed++;
   }
   pushUndoMulti('Custom Pack List ('+packed+' SKU'+(packed!==1?'s':'')+')',allUndo);
@@ -11214,7 +11265,7 @@ async function packUnits(pn, asmId, isUnpack) {
         undoOps.push({action:'update',table:'assemblies',data:{...sa,total_on_hand:newOhS},prev:{...sa}});
         await db.from('assemblies').update({total_on_hand:newOhS,updated_at:new Date().toISOString()}).eq('id',sa.id);
         S.assemblies=S.assemblies.map(x=>x.pn===item.child_pn?{...x,total_on_hand:newOhS}:x);
-        await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:sa.total_on_hand||0,new_qty:newOhS,adjustment:delta,reason:(isUnpack?'Unpack':'Pack')+' '+qty+'×'+pn+' (subassembly)',source:isUnpack?'unpack':'pack'});
+        await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:sa.total_on_hand||0,new_qty:newOhS,adjustment:delta,reason:(isUnpack?'Unpack':'Pack')+' '+qty+'×'+pn+' (subassembly)',user_email:S.currentUser||null,source:isUnpack?'unpack':'pack'});
       } else {
         const p=partMap[item.child_pn];
         if(!p) continue;
@@ -11222,7 +11273,7 @@ async function packUnits(pn, asmId, isUnpack) {
         undoOps.push({action:'update',table:'parts',data:{...p,total_unpckgd:newQty},prev:{...p}});
         await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
         S.parts=S.parts.map(x=>x.pn===item.child_pn?{...x,total_unpckgd:newQty}:x);
-        await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:delta,reason:(isUnpack?'Unpack':'Pack')+' '+qty+'×'+pn,source:isUnpack?'unpack':'pack'});
+        await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:delta,reason:(isUnpack?'Unpack':'Pack')+' '+qty+'×'+pn,user_email:S.currentUser||null,source:isUnpack?'unpack':'pack'});
       }
     }
   }
@@ -11509,7 +11560,7 @@ async function applySpotCount(){
     const adj=newQty-prev;
     await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
     S.parts=S.parts.map(x=>x.pn===p.pn?{...x,total_unpckgd:newQty}:x);
-    await db.from('inv_corrections').insert({pn:p.pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason,source:'spot_count'});
+    await db.from('inv_corrections').insert({pn:p.pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason,user_email:S.currentUser||null,source:'spot_count'});
     S.corrections=[{pn:p.pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason,source:'spot_count',created_at:new Date().toISOString()},...S.corrections];
     const histEl=document.getElementById('spot-history');
     if(histEl){histEl.innerHTML=`<div class="panel" style="padding:10px 14px;border-left:3px solid ${adj===0?'var(--teal)':adj>0?'var(--green)':'var(--red)'}"><div style="font-size:12px;font-weight:600">${p.pn} — ${adj===0?'No change':adj>0?'+'+adj+' added':adj+' removed'}</div><div style="font-size:11px;color:var(--text3)">${prev} → ${newQty} · ${reason}</div></div>`;}
@@ -11519,7 +11570,7 @@ async function applySpotCount(){
     const adj=newQty-prev;
     await db.from('assemblies').update({total_on_hand:newQty}).eq('id',a.id);
     S.assemblies=S.assemblies.map(x=>x.pn===a.pn?{...x,total_on_hand:newQty}:x);
-    await db.from('inv_corrections').insert({pn:a.pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason:reason+' (assembly)',source:'spot_count'});
+    await db.from('inv_corrections').insert({pn:a.pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason:reason+' (assembly)',user_email:S.currentUser||null,source:'spot_count'});
     toast(a.pn+': '+prev+' → '+newQty);
   }
   // Clear for next item
@@ -11654,14 +11705,14 @@ async function applyWalkCount(){
       const{error}=await db.from('assemblies').update({total_on_hand:item.counted}).eq('id',a.id);
       if(error){errors++;continue;}
       S.assemblies=S.assemblies.map(x=>x.pn===item.pn?{...x,total_on_hand:item.counted}:x);
-      await db.from('inv_corrections').insert({pn:item.pn,previous_qty:item.exp,new_qty:item.counted,adjustment:item.counted-item.exp,reason:'Walk Count',source:'walk_count'});
+      await db.from('inv_corrections').insert({pn:item.pn,previous_qty:item.exp,new_qty:item.counted,adjustment:item.counted-item.exp,reason:'Walk Count',user_email:S.currentUser||null,source:'walk_count'});
     } else {
       const p=S.parts.find(x=>x.pn===item.pn);
       if(!p){errors++;continue;}
       const{error}=await db.from('parts').update({total_unpckgd:item.counted,updated_at:new Date().toISOString()}).eq('id',p.id);
       if(error){errors++;continue;}
       S.parts=S.parts.map(x=>x.pn===item.pn?{...x,total_unpckgd:item.counted}:x);
-      await db.from('inv_corrections').insert({pn:item.pn,previous_qty:item.exp,new_qty:item.counted,adjustment:item.counted-item.exp,reason:'Walk Count',source:'walk_count'});
+      await db.from('inv_corrections').insert({pn:item.pn,previous_qty:item.exp,new_qty:item.counted,adjustment:item.counted-item.exp,reason:'Walk Count',user_email:S.currentUser||null,source:'walk_count'});
       applied++;
     }
     applied++;
@@ -11765,6 +11816,7 @@ async function deleteCycleCount(countId){
   await db.from('cycle_count_lines').delete().eq('count_id',countId);
   await db.from('cycle_counts').delete().eq('id',countId);
   S.cycleCounts=S.cycleCounts.filter(c=>c.id!==countId);
+  logAction('Deleted cycle count','cycle_counts',null,null,null).catch(()=>{});
   toast('Cycle count deleted');render();
 }
 
@@ -11856,7 +11908,7 @@ async function applyCountCorrections(countId) {
       const prev=asm.total_on_hand||0;
       await db.from('assemblies').update({total_on_hand:newQty,updated_at:new Date().toISOString()}).eq('id',asm.id);
       S.assemblies=S.assemblies.map(a=>a.pn===line.pn?{...a,total_on_hand:newQty}:a);
-      await db.from('inv_corrections').insert({pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count (finished/sub — components untouched)'+(line.notes?' — '+line.notes:''),source:'cycle_count',reference_id:countId});
+      await db.from('inv_corrections').insert({pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count (finished/sub — components untouched)'+(line.notes?' — '+line.notes:''),user_email:S.currentUser||null,source:'cycle_count',reference_id:countId});
       S.corrections=[{pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count',source:'cycle_count',created_at:new Date().toISOString()},...S.corrections];
     } else {
       const part=S.parts.find(p=>p.pn===line.pn);
@@ -11865,13 +11917,14 @@ async function applyCountCorrections(countId) {
       const{error:_pe}=await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
       if(_pe){_corrErrors++;continue;}
       S.parts=S.parts.map(p=>p.pn===line.pn?{...p,total_unpckgd:newQty}:p);
-      await db.from('inv_corrections').insert({pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count '+(line.notes?'— '+line.notes:''),source:'cycle_count',reference_id:countId});
+      await db.from('inv_corrections').insert({pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count '+(line.notes?'— '+line.notes:''),user_email:S.currentUser||null,source:'cycle_count',reference_id:countId});
       S.corrections=[{pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count',source:'cycle_count',created_at:new Date().toISOString()},...S.corrections];
     }
   }
   await db.from('cycle_counts').update({status:'Complete',completed_at:new Date().toISOString()}).eq('id',countId);
   S.cycleCounts=S.cycleCounts.map(c=>c.id===countId?{...c,status:'Complete'}:c);
   updateBadge();
+  logAction('Applied cycle count — '+variances.length+' stock corrections','cycle_counts',null,null,null).catch(()=>{});
   toast(variances.length+' corrections applied');
   render();
 }
@@ -11989,7 +12042,7 @@ function renderCorrections() {
     <span class="filter-count">${list.length} records</span>
   </div>
   <div class="tbl-wrap">
-  <table><thead><tr><th>Date</th><th>Part #</th><th>Adj</th><th>Previous</th><th>New Qty</th><th>Source</th><th>Reason / Reference</th><th></th></tr></thead><tbody>
+  <table><thead><tr><th>Date</th><th>By</th><th>Part #</th><th>Adj</th><th>Prev</th><th>New</th><th>Source</th><th>Reason / Reference</th><th></th></tr></thead><tbody>
   ${list.map(c=>{
     const srcIcon={po_receipt:'📦',pack:'🔧',unpack:'↩',cycle_count:'📋',shipment:'🚚',manual:'✎'}[c.source||'manual']||'✎';
     const poMatch=c.reason&&c.reason.match(/\[(.+?)\]/);
@@ -11997,6 +12050,7 @@ function renderCorrections() {
     const cleanReason=c.reason?(c.reason.replace(/\[.+?\]/,'').trim()):'';
     return `<tr>
     <td style="font-size:10px;color:var(--text3);font-family:var(--mono);white-space:nowrap">${timeAgo(c.created_at)}<br><span style="font-size:8px">${new Date(c.created_at).toLocaleString()}</span></td>
+    <td style="font-size:10px;color:var(--text2);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${c.user_email?escHtml(c.user_email.split('@')[0]):'<span style="color:var(--text3)">—</span>'}</td>
     <td class="pn" style="color:var(--text);cursor:pointer" onclick="lookupGo('part','${escHtml(c.pn)}')">${escHtml(c.pn)}</td>
     <td class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700;font-size:13px">${c.adjustment>0?'+':''}${c.adjustment}</td>
     <td class="money-neutral">${c.previous_qty}</td>
@@ -12024,7 +12078,7 @@ async function submitManualCorrection(pn, newQty, reason) {
   const adj=newQty-prev;
   await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
   S.parts=S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
-  await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason:reason||'Manual adjustment',source:'manual'});
+  await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason:reason||'Manual adjustment',user_email:S.currentUser||null,source:'manual'});
   S.corrections=[{pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason:reason||'Manual adjustment',source:'manual',created_at:new Date().toISOString()},...S.corrections];
   pushUndo('update','parts',{...part,total_unpckgd:newQty},part,'Correction: '+pn+' → '+newQty);
   closeModal();updateBadge();toast('Correction applied');render();
@@ -12156,6 +12210,7 @@ async function advanceWarranty(id, newStatus) {
   const {error}=await db.from('warranty_claims').update({status:newStatus,resolved_at:['Resolved','Denied','Shipped'].includes(newStatus)?new Date().toISOString():null}).eq('id',id);
   if(error){toast('Error');return;}
   S.warrantyClaims=S.warrantyClaims.map(w=>w.id===id?{...w,status:newStatus}:w);
+  logAction('Warranty claim → '+newStatus,'warranty_claims',null,null,null).catch(()=>{});
   toast('Status → '+newStatus);render();
 }
 
@@ -12163,6 +12218,7 @@ async function deleteWarranty(id) {
   if(!confirm('Delete this claim?'))return;
   await db.from('warranty_claims').delete().eq('id',id);
   S.warrantyClaims=S.warrantyClaims.filter(w=>w.id!==id);
+  logAction('Deleted warranty claim','warranty_claims',null,null,null).catch(()=>{});
   toast('Claim deleted');render();
 }
 
@@ -12287,7 +12343,8 @@ async function submitShipmentError(editId){
     if(error){toast('Error: '+error.message);return;}
     S.shipmentErrors=(S.shipmentErrors||[]).map(e=>e.id===editId?{...e,...payload}:e);
     document.getElementById('se-overlay')?.remove();
-    toast('Shipment error updated');render();
+    logAction('Shipment error saved','shipment_errors',null,null,null).catch(()=>{});
+  toast('Shipment error updated');render();
   }else{
     const{data,error}=await db.from('shipment_errors').insert(payload).select().single();
     if(error){toast('Error: '+error.message);return;}
@@ -12310,6 +12367,7 @@ async function deleteShipmentError(id){
   if(!confirm('Delete this shipment error record?'))return;
   await db.from('shipment_errors').delete().eq('id',id);
   S.shipmentErrors=(S.shipmentErrors||[]).filter(e=>e.id!==id);
+  logAction('Deleted shipment error','shipment_errors',null,null,null).catch(()=>{});
   toast('Deleted');updateBadge();render();
 }
 
@@ -12562,7 +12620,7 @@ async function confirmShipWarranty(claimId, pn){
           const newOh=Math.max(0,(a.total_on_hand||0)-qty);
           await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',a.id);
           S.assemblies=S.assemblies.map(function(x){return x.pn===item.pn?{...x,total_on_hand:newOh}:x;});
-          await db.from('inv_corrections').insert({pn:item.pn,previous_qty:a.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Warranty replacement shipped (SS#'+ssOrderId+')',source:'warranty'});
+          await db.from('inv_corrections').insert({pn:item.pn,previous_qty:a.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Warranty replacement shipped (SS#'+ssOrderId+')',user_email:S.currentUser||null,source:'warranty'});
         }
       } else {
         const p=S.parts.find(function(x){return x.pn===item.pn;});
@@ -12570,7 +12628,7 @@ async function confirmShipWarranty(claimId, pn){
           const newQty=Math.max(0,(p.total_unpckgd||0)-qty);
           await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
           S.parts=S.parts.map(function(x){return x.pn===item.pn?{...x,total_unpckgd:newQty}:x;});
-          await db.from('inv_corrections').insert({pn:item.pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:-qty,reason:'Warranty part shipped (SS#'+ssOrderId+')',source:'warranty'});
+          await db.from('inv_corrections').insert({pn:item.pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:-qty,reason:'Warranty part shipped (SS#'+ssOrderId+')',user_email:S.currentUser||null,source:'warranty'});
         }
       }
     }
@@ -13045,7 +13103,7 @@ async function refreshAll(){
       db.from('purchases').select('*').order('order_date',{ascending:false}),
       db.from('warranty_claims').select('*').order('created_at',{ascending:false}).limit(100),
       db.from('shipment_errors').select('*').order('created_at',{ascending:false}).limit(200),
-      db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
+      db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,user_email,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
     ]);
     if(parts.data)S.parts=parts.data;
     if(assemblies.data)S.assemblies=normalizeAssemblies(assemblies.data);
