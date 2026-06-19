@@ -911,8 +911,8 @@ async function loadAll(){
     (poLinesAll.data||[]).forEach(l=>{if(!S.poLines[l.po_id])S.poLines[l.po_id]=[];S.poLines[l.po_id].push(l);});
     S.poTracking={};
     (poTrackingAll.data||[]).forEach(t=>{if(!S.poTracking[t.po_id])S.poTracking[t.po_id]=[];S.poTracking[t.po_id].push(t);});
-    S.labelFiles={};
-    (labelFilesResult.data||[]).forEach(function(lf){if(!S.labelFiles[lf.entity_pn])S.labelFiles[lf.entity_pn]=[];S.labelFiles[lf.entity_pn].push(lf);});
+    if(labelFilesResult.error){console.warn('loadAll: part_files label query failed —',labelFilesResult.error.message,'— label buttons will load on demand');}
+    else{S.labelFiles={};(labelFilesResult.data||[]).forEach(function(lf){if(!S.labelFiles[lf.entity_pn])S.labelFiles[lf.entity_pn]=[];S.labelFiles[lf.entity_pn].push(lf);});console.log('[TGK] Label files loaded:',Object.keys(S.labelFiles).length,'SKUs with labels');}
     // Seed liveActivity from recent data on load (so feed is non-empty on first open)
     S.liveActivity=[];
     S.corrections.slice(0,20).forEach(c=>{
@@ -12756,31 +12756,41 @@ async function deletePartFile(fileId,pn){
 }
 
 function labelBtn(pn,qty){
-  if(!S.labelFiles||!S.labelFiles[pn]||!S.labelFiles[pn].length)return '';
   var q=Math.max(1,qty||1);
-  return '<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3);padding:3px 8px;font-size:11px" data-lbl-pn="'+escHtml(pn)+'" data-lbl-qty="'+q+'" title="Print label for '+escHtml(pn)+'" onclick="openLabelPromptFromBtn(this)">\uD83C\uDFF7</button>';
+  var btn='<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3);padding:3px 8px;font-size:11px" data-lbl-pn="'+escHtml(pn)+'" data-lbl-qty="'+q+'" title="Print label for '+escHtml(pn)+'" onclick="openLabelPromptFromBtn(this)">\uD83C\uDFF7</button>';
+  // Known labels loaded and this PN has one
+  if(S.labelFiles&&S.labelFiles[pn]&&S.labelFiles[pn].length)return btn;
+  // Labels loaded but none for this PN
+  if(S.labelFiles!==null)return '';
+  // Labels not loaded yet — show button anyway, live DB check happens on click
+  return btn;
 }
 function openLabelPromptFromBtn(btn){
   var pn=btn.dataset.lblPn;
   var qty=parseInt(btn.dataset.lblQty)||1;
   openLabelPrompt(pn,qty);
 }
-function openLabelPrompt(pn,qty){
-  var files=(S.labelFiles&&S.labelFiles[pn])||[];
-  if(!files.length){toast('No label on file for '+pn,3000);return;}
+async function openLabelPrompt(pn,qty){
+  // Always do a live DB query so clicks work even if startup cache failed
+  var r=await db.from('part_files').select('*').eq('entity_pn',pn).eq('category','Label');
+  var files=r.data||[];
+  if(r.error||!files.length){toast('No label on file for '+pn,3000);return;}
+  if(!S.labelFiles)S.labelFiles={};
+  S.labelFiles[pn]=files;
   showLabelPrintPrompt(pn,qty,files);
 }
 
 async function checkAndPromptLabel(pn,qty){
   try{
-    var files;
-    if(S.labelFiles!==null){
-      files=S.labelFiles[pn]||[];
-    }else{
-      var r=await db.from('part_files').select('*').eq('entity_pn',pn).eq('category','Label');
-      files=r.data||[];
-    }
+    // Always query DB directly — don't rely on startup cache which may have failed silently
+    var r=await db.from('part_files').select('*').eq('entity_pn',pn).eq('category','Label');
+    if(r.error){console.error('checkAndPromptLabel query error:',r.error);return;}
+    var files=r.data||[];
+    console.log('[TGK] checkAndPromptLabel',pn,'found',files.length,'label(s)');
     if(!files.length)return;
+    // Update cache so labelBtn shows on next render
+    if(!S.labelFiles)S.labelFiles={};
+    S.labelFiles[pn]=files;
     showLabelPrintPrompt(pn,qty,files);
   }catch(e){console.error('checkAndPromptLabel:',e);}
 }
