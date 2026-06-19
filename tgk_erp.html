@@ -587,6 +587,7 @@ const S = {
   warrantyClaims:[],
   // Shipment Errors
   shipmentErrors:[],
+  partFiles:{}, _filesLoading:new Set(),
   // Customer Resolution tab: 'claims' | 'errors'
   wtyTab:'claims',
   // Production
@@ -3004,6 +3005,7 @@ async function markPacked(saleId,pn,qty){
     {action:'update',table:'sales',data:{id:saleId,fulfillment_status:'Packed'},prev:{id:saleId,fulfillment_status:sale?.fulfillment_status||'Open'}}
   ]);
   toast('Packed '+qty+'× '+pn);render();
+  setTimeout(function(){checkAndPromptLabel(pn,qty);},200);
 }
 
 async function refreshAllPOTracking(poId,silent){
@@ -3914,6 +3916,21 @@ CREATE TABLE IF NOT EXISTS shipment_errors (
   created_at timestamptz DEFAULT now()
 );
 ALTER TABLE shipment_errors DISABLE ROW LEVEL SECURITY;
+
+-- Part files table (📎 Files tab on parts and assemblies)
+CREATE TABLE IF NOT EXISTS part_files (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  entity_pn text NOT NULL,
+  entity_type text NOT NULL DEFAULT 'assembly',
+  file_name text NOT NULL,
+  file_url text NOT NULL,
+  category text DEFAULT 'Other',
+  size_bytes bigint,
+  created_by text,
+  created_at timestamptz DEFAULT now()
+);
+ALTER TABLE part_files DISABLE ROW LEVEL SECURITY;
+CREATE INDEX IF NOT EXISTS part_files_pn_idx ON part_files(entity_pn);
 
 -- Vendor directory
 CREATE TABLE IF NOT EXISTS vendors (
@@ -9598,7 +9615,8 @@ function assemblyDossier(pn){
           <span style="font-size:9px;color:var(--text3);font-family:var(--mono)">${timeAgo(c.created_at)}</span>
         </div>`;}).join('')}
     </div>
-  </div></div>`;
+  </div></div>
+  ${renderFilesPanel(pn,'assembly')}`;
 }
 
 function partDossier(pn){
@@ -9700,7 +9718,8 @@ function partDossier(pn){
       <span style="flex:1;font-size:11px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(w.issue||'')}</span>
       <span class="pill ${w.status==='Open'?'pill-red':'pill-muted'}" style="font-size:9px">${w.status}</span></div>`).join('')}
     </div>
-  </div></div>`;
+  </div></div>
+  ${renderFilesPanel(pn,'part')}`;
 }
 
 
@@ -12612,6 +12631,161 @@ async function submitManualCorrection(pn, newQty, reason) {
   S.corrections=[{pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason:reason||'Manual adjustment',source:'manual',created_at:new Date().toISOString()},...S.corrections];
   pushUndo('update','parts',{...part,total_unpckgd:newQty},part,'Correction: '+pn+' → '+newQty);
   closeModal();updateBadge();toast('Correction applied');render();
+}
+
+// ============================================================
+// PART FILES
+// ============================================================
+const FILE_CATS=['Spec Sheet','Drawing','Label','Certificate','Photo','SOP','3D Model','Other'];
+const FILE_CAT_ICON={'Spec Sheet':'📄','Drawing':'📐','Label':'🏷','Certificate':'🏆','Photo':'📷','SOP':'📋','3D Model':'🎲','Other':'📎'};
+const FILE_CAT_COLOR={'Spec Sheet':'var(--blue)','Drawing':'var(--teal)','Label':'var(--orange)','Certificate':'var(--yellow)','Photo':'var(--purple)','SOP':'var(--green)','3D Model':'var(--text2)','Other':'var(--text3)'};
+
+function renderFilesPanel(pn,entityType){
+  if(!S._filesLoading)S._filesLoading=new Set();
+  const files=S.partFiles[pn];
+  if(files===undefined){
+    if(!S._filesLoading.has(pn)){
+      S._filesLoading.add(pn);
+      db.from('part_files').select('*').eq('entity_pn',pn).order('category').order('created_at',{ascending:true})
+        .then(function(r){S._filesLoading.delete(pn);if(!r.error){S.partFiles[pn]=r.data||[];scheduleRender();}});
+    }
+    return '<div class="panel" style="padding:0">'
+      +'<div class="section-header" style="display:flex;align-items:center;justify-content:space-between">'
+      +'<span>📎 Files</span>'
+      +'<button class="btn btn-sm btn-primary" onclick="openFileUploadModal(\''+escHtml(pn)+'\',\''+entityType+'\')">+ Upload</button>'
+      +'</div><div style="padding:12px;font-size:11px;color:var(--text3)">Loading…</div></div>';
+  }
+  const rows=files.length===0
+    ?'<div class="section-empty">No files — click + Upload to add spec sheets, drawings, labels, and more</div>'
+    :files.map(function(f){
+      const icon=FILE_CAT_ICON[f.category]||'📎';
+      const col=FILE_CAT_COLOR[f.category]||'var(--text3)';
+      const kb=f.size_bytes?(f.size_bytes>1048576?(f.size_bytes/1048576).toFixed(1)+'MB':(f.size_bytes/1024).toFixed(0)+'KB'):'';
+      return '<div class="check-row" style="padding:8px 14px;gap:10px">'
+        +'<span style="font-size:18px;flex-shrink:0">'+icon+'</span>'
+        +'<div style="flex:1;min-width:0">'
+        +'<a href="'+escHtml(f.file_url)+'" target="_blank" style="color:var(--text);font-size:12px;font-weight:600;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block">'+escHtml(f.file_name)+' \u2197</a>'
+        +'<div style="font-size:10px;color:var(--text3);margin-top:2px"><span style="color:'+col+';font-weight:600">'+escHtml(f.category||'Other')+'</span>'+(kb?' \u00b7 '+kb:'')+' \u00b7 '+timeAgo(f.created_at)+(f.created_by?' \u00b7 '+escHtml(f.created_by):'')+'</div>'
+        +'</div>'
+        +'<button class="action-btn del" title="Delete file" onclick="deletePartFile(\''+f.id+'\',\''+escHtml(pn)+'\')">×</button>'
+        +'</div>';
+    }).join('');
+  return '<div class="panel" style="padding:0">'
+    +'<div class="section-header" style="display:flex;align-items:center;justify-content:space-between">'
+    +'<span>📎 Files ('+files.length+')</span>'
+    +'<button class="btn btn-sm btn-primary" onclick="openFileUploadModal(\''+escHtml(pn)+'\',\''+entityType+'\')">+ Upload</button>'
+    +'</div>'+rows+'</div>';
+}
+
+function openFileUploadModal(pn,entityType){
+  const overlay=document.createElement('div');
+  overlay.id='pf-overlay';
+  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:center;justify-content:center;padding:20px';
+  const catOpts=FILE_CATS.map(function(c){return '<option value="'+c+'"'+(c==='Other'?' selected':'')+'>'+c+'</option>';}).join('');
+  overlay.innerHTML='<div class="modal" style="width:480px;max-width:96vw">'
+    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">'
+    +'<div style="font-size:15px;font-weight:700;color:var(--text)">📎 Attach File — <span style="color:var(--teal);font-family:var(--mono)">'+escHtml(pn)+'</span></div>'
+    +'<button onclick="document.getElementById(\'pf-overlay\').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer">×</button>'
+    +'</div>'
+    +'<div class="form-group" style="margin-bottom:12px"><label class="form-label">Category</label>'
+    +'<select id="pf-cat" class="form-input">'+catOpts+'</select></div>'
+    +'<div class="form-group" style="margin-bottom:10px"><label class="form-label">Upload File</label>'
+    +'<input id="pf-file" type="file" class="form-input" style="padding:5px"></div>'
+    +'<div style="text-align:center;font-size:11px;color:var(--text3);margin:6px 0">— or —</div>'
+    +'<div class="form-group" style="margin-bottom:10px"><label class="form-label">Paste URL directly</label>'
+    +'<input id="pf-url" class="form-input" placeholder="https://… (existing PDF, image, etc.)" oninput="var r=document.getElementById(\'pf-fname-row\');if(r)r.style.display=this.value.trim()?\'block\':\'none\'"></div>'
+    +'<div id="pf-fname-row" class="form-group" style="display:none;margin-bottom:16px"><label class="form-label">File Name (for URL)</label>'
+    +'<input id="pf-fname" class="form-input" placeholder="e.g. TGK-DMPBX-label-v2.pdf"></div>'
+    +'<div id="pf-status" style="display:none;font-size:11px;padding:8px 12px;border-radius:6px;margin-bottom:10px"></div>'
+    +'<div class="modal-footer">'
+    +'<button class="btn" onclick="document.getElementById(\'pf-overlay\').remove()">Cancel</button>'
+    +'<button class="btn btn-primary" id="pf-submit" onclick="uploadPartFile(\''+escHtml(pn)+'\',\''+entityType+'\')">Save File</button>'
+    +'</div></div>';
+  document.body.appendChild(overlay);
+}
+
+async function uploadPartFile(pn,entityType){
+  const cat=document.getElementById('pf-cat')?.value||'Other';
+  const fileEl=document.getElementById('pf-file');
+  const urlEl=document.getElementById('pf-url');
+  const fnameEl=document.getElementById('pf-fname');
+  const statusEl=document.getElementById('pf-status');
+  const submitBtn=document.getElementById('pf-submit');
+  const file=fileEl?.files?.[0];
+  const pastedUrl=(urlEl?.value||'').trim();
+  if(!file&&!pastedUrl){toast('Select a file or paste a URL');return;}
+  if(submitBtn){submitBtn.disabled=true;submitBtn.textContent='Saving…';}
+  function setStatus(msg,ok){if(statusEl){statusEl.style.display='';statusEl.style.background=ok?'var(--teal-dim)':'var(--red-dim)';statusEl.style.color=ok?'var(--teal)':'var(--red)';statusEl.textContent=msg;}}
+  try{
+    let fileUrl='',fileName='',sizeBytes=null;
+    if(file){
+      setStatus('Uploading '+file.name+'…',true);
+      const safe=file.name.replace(/[^a-zA-Z0-9._\-]/g,'_');
+      const path=entityType+'/'+pn+'/'+Date.now()+'_'+safe;
+      const{data:sd,error:se}=await db.storage.from('part-files').upload(path,file,{upsert:false});
+      if(se){setStatus('Upload failed: '+se.message,false);return;}
+      const{data:ud}=db.storage.from('part-files').getPublicUrl(path);
+      fileUrl=ud?.publicUrl||'';
+      fileName=file.name;
+      sizeBytes=file.size;
+    }else{
+      fileUrl=pastedUrl;
+      fileName=(fnameEl?.value||'').trim()||pastedUrl.split('/').pop().split('?')[0]||'file';
+    }
+    const{data,error}=await db.from('part_files').insert({entity_pn:pn,entity_type:entityType,file_name:fileName,file_url:fileUrl,category:cat,size_bytes:sizeBytes,created_by:S.currentUserEmail||null}).select().single();
+    if(error){setStatus('Save failed: '+error.message,false);return;}
+    if(!S.partFiles[pn])S.partFiles[pn]=[];
+    S.partFiles[pn]=[...S.partFiles[pn],data];
+    document.getElementById('pf-overlay')?.remove();
+    toast('File attached');render();
+  }catch(e){setStatus('Error: '+e.message,false);}
+  finally{if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='Save File';}}
+}
+
+async function deletePartFile(fileId,pn){
+  if(!confirm('Delete this file?'))return;
+  const{error}=await db.from('part_files').delete().eq('id',fileId);
+  if(error){toast('Delete failed: '+error.message);return;}
+  S.partFiles[pn]=(S.partFiles[pn]||[]).filter(function(f){return f.id!==fileId;});
+  toast('File removed');render();
+}
+
+async function checkAndPromptLabel(pn,qty){
+  let files=S.partFiles[pn];
+  if(files===undefined){
+    const{data}=await db.from('part_files').select('*').eq('entity_pn',pn).eq('category','Label');
+    files=data||[];
+    if(!Array.isArray(S.partFiles[pn])){S.partFiles[pn]=files;}
+    else{const ids=new Set(S.partFiles[pn].map(function(f){return f.id;}));files.forEach(function(f){if(!ids.has(f.id))S.partFiles[pn].push(f);});}
+  }else{
+    files=files.filter(function(f){return f.category==='Label';});
+  }
+  if(!files.length)return;
+  showLabelPrintPrompt(pn,qty,files);
+}
+
+function showLabelPrintPrompt(pn,qty,labelFiles){
+  document.getElementById('label-print-overlay')?.remove();
+  const overlay=document.createElement('div');
+  overlay.id='label-print-overlay';
+  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:center;justify-content:center;padding:20px';
+  const rows=labelFiles.map(function(f){
+    return '<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--bg3);border-radius:8px;margin-bottom:8px;border:1px solid var(--border)">'
+      +'<span style="font-size:22px;flex-shrink:0">🏷</span>'
+      +'<div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(f.file_name)+'</div></div>'
+      +'<a href="'+escHtml(f.file_url)+'" target="_blank" class="btn btn-primary btn-sm" onclick="document.getElementById(\'label-print-overlay\').remove();toast(\'Opening label\u2026\',1500)">🖨 Print</a>'
+      +'</div>';
+  }).join('');
+  overlay.innerHTML='<div class="modal" style="width:400px;max-width:96vw">'
+    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'
+    +'<div style="font-size:15px;font-weight:700;color:var(--text)">🏷 Print Label?</div>'
+    +'<button onclick="document.getElementById(\'label-print-overlay\').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">×</button>'
+    +'</div>'
+    +'<div style="font-size:11px;color:var(--text3);margin-bottom:14px">Packed <b>'+qty+'\xd7</b> <span style="color:var(--teal);font-family:var(--mono)">'+escHtml(pn)+'</span></div>'
+    +rows
+    +'<div class="modal-footer"><button class="btn" onclick="document.getElementById(\'label-print-overlay\').remove()">Skip</button></div>'
+    +'</div>';
+  document.body.appendChild(overlay);
 }
 
 // ============================================================
