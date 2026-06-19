@@ -8654,6 +8654,8 @@ function pushUndoMulti(desc, ops){
 
 function stripMeta(row){
   const {created_at, updated_at, ...rest} = row || {};
+  // Also strip any client-side computed properties (underscore-prefixed, e.g. _classificationMismatch)
+  Object.keys(rest).forEach(function(k){if(k.startsWith('_'))delete rest[k];});
   return rest;
 }
 
@@ -12795,15 +12797,28 @@ function _closeOrAdvanceLabel(){
 }
 
 async function _processNextLabelPrompt(){
-  if(!_labelPromptQueue.length){closeModal();return;}
-  var item=_labelPromptQueue.shift();
-  var files=S.labelFiles!==null?(S.labelFiles[item.pn]||[]):[];
-  if(!files.length){
+  try{
+    if(!_labelPromptQueue.length){closeModal();return;}
+    var item=_labelPromptQueue.shift();
+    // Always query DB directly — most reliable path
     var r=await db.from('part_files').select('*').eq('entity_pn',item.pn).eq('category','Label');
-    files=r.data||[];
+    var files=r.data||[];
+    if(r.error){console.error('_processNextLabelPrompt:',r.error);}
+    if(!files.length){
+      // No label for this SKU — skip silently and advance
+      if(_labelPromptQueue.length)_processNextLabelPrompt();
+      else closeModal();
+      return;
+    }
+    // Update cache
+    if(!S.labelFiles)S.labelFiles={};
+    S.labelFiles[item.pn]=files;
+    showLabelPrintPrompt(item.pn,item.qty,files);
+  }catch(e){
+    console.error('_processNextLabelPrompt error:',e);
+    if(_labelPromptQueue.length)_processNextLabelPrompt();
+    else closeModal();
   }
-  if(!files.length){_closeOrAdvanceLabel();return;}
-  showLabelPrintPrompt(item.pn,item.qty,files);
 }
 
 async function checkAndPromptLabel(pn,qty){
