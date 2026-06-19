@@ -587,7 +587,7 @@ const S = {
   warrantyClaims:[],
   // Shipment Errors
   shipmentErrors:[],
-  partFiles:{}, _filesLoading:new Set(),
+  partFiles:{}, labelFiles:null, _filesLoading:new Set(),
   // Customer Resolution tab: 'claims' | 'errors'
   wtyTab:'claims',
   // Production
@@ -867,7 +867,7 @@ function normalizeAssemblies(rows){
 
 async function loadAll(){
   try{
-    const[parts,assemblies,sales,purchases,dealers,vendors,settings,bomItems,warrantyClaims,shipmentErrors,corrections,cycleCounts,poLinesAll,poTrackingAll]=await Promise.all([
+    const[parts,assemblies,sales,purchases,dealers,vendors,settings,bomItems,warrantyClaims,shipmentErrors,corrections,cycleCounts,poLinesAll,poTrackingAll,labelFilesResult]=await Promise.all([
       db.from('parts').select('*').order('pn'),
       db.from('assemblies').select('*').order('pn'),
       db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000),
@@ -882,6 +882,7 @@ async function loadAll(){
       db.from('cycle_counts').select('*').order('created_at',{ascending:false}).limit(50),
       db.from('po_lines').select('*').order('po_id'),
       db.from('po_tracking').select('*').order('created_at'),
+      db.from('part_files').select('*').eq('category','Label'),
     ]);
     if(parts.error)throw parts.error;
     S.parts=parts.data||[];
@@ -910,6 +911,8 @@ async function loadAll(){
     (poLinesAll.data||[]).forEach(l=>{if(!S.poLines[l.po_id])S.poLines[l.po_id]=[];S.poLines[l.po_id].push(l);});
     S.poTracking={};
     (poTrackingAll.data||[]).forEach(t=>{if(!S.poTracking[t.po_id])S.poTracking[t.po_id]=[];S.poTracking[t.po_id].push(t);});
+    S.labelFiles={};
+    (labelFilesResult.data||[]).forEach(function(lf){if(!S.labelFiles[lf.entity_pn])S.labelFiles[lf.entity_pn]=[];S.labelFiles[lf.entity_pn].push(lf);});
     // Seed liveActivity from recent data on load (so feed is non-empty on first open)
     S.liveActivity=[];
     S.corrections.slice(0,20).forEach(c=>{
@@ -1543,7 +1546,7 @@ function renderDashboard(){
         return `<div class="alert-row ${fs==='Open'?(canFill?'alert-row-yellow':'alert-row-red'):''}" style="${fs==='Packed'?'border-left-color:var(--teal)':''}">
           <div style="flex:1"><b>${s.order_number||''}</b> — ${s.pn} ×${s.qty||1}
             <span style="font-size:10px;color:${canFill?'var(--green)':'var(--red)'};margin-left:6px">${stock!==null?'stock: '+stock:''}</span></div>
-          ${fs==='Open'?`<button class="btn btn-teal btn-sm" ${canFill?'':'disabled'} onclick="markPacked('${s.id}','${s.pn}',${s.qty||1})">Pack</button>`:
+          ${fs==='Open'?`<button class="btn btn-teal btn-sm" ${canFill?'':'disabled'} onclick="markPacked('${s.id}','${s.pn}',${s.qty||1})">Pack</button>`+labelBtn(s.pn,s.qty||1):
           `<button class="btn btn-primary btn-sm" onclick="openShipModal('${s.id}','${s.pn}',${s.qty||1})">Ship</button>`}
         </div>`;}).join('')}
     </div>
@@ -2371,7 +2374,7 @@ function renderSales(){
     <td>${fsPill(s.fulfillment_status||'Open')}${s._isPartialShip?` <span style="font-size:9px;color:${s._allPendingOnHold?'var(--orange)':'var(--yellow)'};font-weight:700">✂ ${s._shippedCount} shipped · ${s._pendingCount} ${s._allPendingOnHold?'on hold':'pending'}</span>`:''}${s.on_hold&&!s._isPartialShip?` <span style="font-size:9px;color:var(--orange);font-weight:700">⏸ Hold</span>`:''}</td>
     <td style="font-size:10px;font-family:var(--mono)">${multiTrack?`<span style="color:var(--yellow)" title="${allOrderLines.filter(x=>x.tracking_number).map(x=>(x.carrier?x.carrier+' ':'')+x.tracking_number).join('\n')}">🔀 ${allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length} shipments</span>`:repTracking?`<a href="${trackingUrl(repCarrier,repTracking)}" target="_blank" style="color:var(--teal);text-decoration:none" title="Track ${repCarrier} ${repTracking}">${repCarrier?repCarrier+' ':''}${repTracking} ↗</a>`:'<span style="color:var(--text3)">—</span>'}</td>
     <td style="display:flex;gap:4px">
-      ${fs==='Open'&&stock!==null?`<button class="btn btn-teal btn-sm" ${canFill?'':'disabled title="Insufficient stock"'} onclick="markPacked('${s.id}','${s.pn}',${s.qty||1})">Pack</button>`:''}
+      ${fs==='Open'&&stock!==null?`<button class="btn btn-teal btn-sm" ${canFill?'':'disabled title="Insufficient stock"'} onclick="markPacked('${s.id}','${s.pn}',${s.qty||1})">Pack</button>`+labelBtn(s.pn,s.qty||1):''}
       ${fs==='Open'&&stock===null&&!s._grouped?`<button class="btn btn-sm" style="color:var(--purple);border-color:rgba(124,58,237,.3)" title="Drop-ship: no ERP stock record — mark shipped directly" onclick="openDropShipModal('${s.id}','${s.pn}',${s.qty||1})">↓ Drop Ship</button>`:''}
       ${fs==='Open'&&s._grouped&&allDropShip?`<button class="btn btn-sm" style="color:var(--purple);border-color:rgba(124,58,237,.3)" title="All lines are drop-ship — mark entire order as shipped" onclick="openDropShipAllModal('${s.order_number}')">↓ Drop Ship All</button>`:''}
       ${fs==='Packed'?`<button class="btn btn-primary btn-sm" onclick="openShipModal('${s.id}','${s.pn}',${s.qty||1})">🚚 Ship</button>`:''}
@@ -2533,7 +2536,7 @@ function renderSaleDetail(s){
       <td>${fsPill(lfs)}</td>
       <td style="font-size:10px;font-family:var(--mono)">${line.tracking_number?`<a href="${trackingUrl(line.carrier||'',line.tracking_number)}" target="_blank" style="color:var(--teal);text-decoration:none">${line.carrier?line.carrier+' ':''}${line.tracking_number} ↗</a>`:'<span style="color:var(--text3)">—</span>'}${line.return_tracking?`<div style="font-size:9px;color:var(--purple);margin-top:2px">↩ Return: ${line.return_tracking}${line.return_label_url?` <a href="${line.return_label_url}" target="_blank" style="color:var(--purple)">PDF ↗</a>`:''}</div>`:''}</td>
       <td style="white-space:nowrap;display:flex;gap:4px">
-        ${lfs==='Open'&&lstock!==null?`<button class="btn btn-teal btn-sm" ${lcanFill?'':'disabled'} onclick="markPacked('${line.id}','${line.pn}',${line.qty||1})">Pack</button>`:''}
+        ${lfs==='Open'&&lstock!==null?`<button class="btn btn-teal btn-sm" ${lcanFill?'':'disabled'} onclick="markPacked('${line.id}','${line.pn}',${line.qty||1})">Pack</button>`+labelBtn(line.pn,line.qty||1):''}
         ${lfs==='Open'&&lstock===null?`<button class="btn btn-sm" style="color:var(--purple);border-color:rgba(124,58,237,.3)" title="Drop-ship: mark shipped directly — no inventory deduction" onclick="openDropShipModal('${line.id}','${line.pn}',${line.qty||1})">↓ Drop Ship</button>`:''}
         ${lfs==='Packed'?`<button class="btn btn-primary btn-sm" onclick="openShipModal('${line.id}','${line.pn}',${line.qty||1})">Ship</button>`:''}
         ${lfs==='Packed'?`<button class="action-btn" onclick="unpackSaleOrder('${line.id}','${line.pn}',${line.qty||1})">↩ Unpack</button>`:''}
@@ -12736,6 +12739,7 @@ async function uploadPartFile(pn,entityType){
     if(error){setStatus('Save failed: '+error.message,false);return;}
     if(!S.partFiles[pn])S.partFiles[pn]=[];
     S.partFiles[pn]=[...S.partFiles[pn],data];
+    if(cat==='Label'){if(!S.labelFiles)S.labelFiles={};if(!S.labelFiles[pn])S.labelFiles[pn]=[];S.labelFiles[pn]=[...S.labelFiles[pn],data];}
     document.getElementById('pf-overlay')?.remove();
     toast('File attached');render();
   }catch(e){setStatus('Error: '+e.message,false);}
@@ -12747,21 +12751,38 @@ async function deletePartFile(fileId,pn){
   const{error}=await db.from('part_files').delete().eq('id',fileId);
   if(error){toast('Delete failed: '+error.message);return;}
   S.partFiles[pn]=(S.partFiles[pn]||[]).filter(function(f){return f.id!==fileId;});
+  if(S.labelFiles&&S.labelFiles[pn])S.labelFiles[pn]=S.labelFiles[pn].filter(function(f){return f.id!==fileId;});
   toast('File removed');render();
 }
 
-async function checkAndPromptLabel(pn,qty){
-  let files=S.partFiles[pn];
-  if(files===undefined){
-    const{data}=await db.from('part_files').select('*').eq('entity_pn',pn).eq('category','Label');
-    files=data||[];
-    if(!Array.isArray(S.partFiles[pn])){S.partFiles[pn]=files;}
-    else{const ids=new Set(S.partFiles[pn].map(function(f){return f.id;}));files.forEach(function(f){if(!ids.has(f.id))S.partFiles[pn].push(f);});}
-  }else{
-    files=files.filter(function(f){return f.category==='Label';});
-  }
-  if(!files.length)return;
+function labelBtn(pn,qty){
+  if(!S.labelFiles||!S.labelFiles[pn]||!S.labelFiles[pn].length)return '';
+  var q=Math.max(1,qty||1);
+  return '<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3);padding:3px 8px;font-size:11px" data-lbl-pn="'+escHtml(pn)+'" data-lbl-qty="'+q+'" title="Print label for '+escHtml(pn)+'" onclick="openLabelPromptFromBtn(this)">\uD83C\uDFF7</button>';
+}
+function openLabelPromptFromBtn(btn){
+  var pn=btn.dataset.lblPn;
+  var qty=parseInt(btn.dataset.lblQty)||1;
+  openLabelPrompt(pn,qty);
+}
+function openLabelPrompt(pn,qty){
+  var files=(S.labelFiles&&S.labelFiles[pn])||[];
+  if(!files.length){toast('No label on file for '+pn,3000);return;}
   showLabelPrintPrompt(pn,qty,files);
+}
+
+async function checkAndPromptLabel(pn,qty){
+  try{
+    var files;
+    if(S.labelFiles!==null){
+      files=S.labelFiles[pn]||[];
+    }else{
+      var r=await db.from('part_files').select('*').eq('entity_pn',pn).eq('category','Label');
+      files=r.data||[];
+    }
+    if(!files.length)return;
+    showLabelPrintPrompt(pn,qty,files);
+  }catch(e){console.error('checkAndPromptLabel:',e);}
 }
 
 function showLabelPrintPrompt(pn,qty,labelFiles){
@@ -13945,7 +13966,7 @@ async function refreshAll(){
   const btn=document.getElementById('refresh-btn');
   if(btn){btn.disabled=true;btn.style.display='inline-flex';btn.style.animation='spin .7s linear infinite';}
   try{
-    const[parts,assemblies,sales,purchases,warrantyClaims,shipmentErrors,corrections]=await Promise.all([
+    const[parts,assemblies,sales,purchases,warrantyClaims,shipmentErrors,corrections,labelFilesRefresh]=await Promise.all([
       db.from('parts').select('*').order('pn'),
       db.from('assemblies').select('*').order('pn'),
       fetchAll((f,t)=>db.from('sales').select('*').order('created_at',{ascending:false}).range(f,t)),
@@ -13953,6 +13974,7 @@ async function refreshAll(){
       db.from('warranty_claims').select('*').order('created_at',{ascending:false}).limit(100),
       db.from('shipment_errors').select('*').order('created_at',{ascending:false}).limit(200),
       db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,user_email,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
+      db.from('part_files').select('*').eq('category','Label'),
     ]);
     if(parts.data)S.parts=parts.data;
     if(assemblies.data)S.assemblies=normalizeAssemblies(assemblies.data);
@@ -13963,6 +13985,7 @@ async function refreshAll(){
     if(shipmentErrors.data)S.shipmentErrors=shipmentErrors.data;
     else if(shipmentErrors.error){console.error('refreshAll: shipment_errors',shipmentErrors.error);toast('Shipment errors failed to reload — '+shipmentErrors.error.message,6000);}
     if(corrections.data)S.corrections=corrections.data;
+    if(labelFilesRefresh.data){S.labelFiles={};labelFilesRefresh.data.forEach(function(lf){if(!S.labelFiles[lf.entity_pn])S.labelFiles[lf.entity_pn]=[];S.labelFiles[lf.entity_pn].push(lf);});}
     // Re-subscribe realtime in case connection dropped
     setupRealtime();
     // Also sync ShipStation holds and cancellations so ↺ catches them without needing Sync Orders
