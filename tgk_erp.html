@@ -13934,6 +13934,28 @@ function renderImport() {
     <div id="tracking-diag-result" style="display:none;margin-top:12px"></div>
   </div>
 
+  <!-- Backfill Addresses panel -->
+  <div class="panel" style="border-left:4px solid var(--teal);margin-bottom:18px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+      <div style="font-size:22px">&#128205;</div>
+      <div>
+        <div style="font-size:14px;font-weight:700">Backfill Customer Addresses</div>
+        <div style="font-size:11px;color:var(--text3)">Update existing orders with shipping addresses from Shopify &mdash; no new orders created, no statuses changed.</div>
+      </div>
+    </div>
+    <div style="font-size:12px;color:var(--text2);margin-bottom:12px;line-height:1.9">
+      <b>Step 1:</b> Shopify Admin &rarr; Orders &rarr; <b>Export</b> &rarr; All time &rarr; CSV for Excel<br>
+      <b>Step 2:</b> Choose that CSV file below. Addresses update instantly.
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <label style="display:inline-flex;align-items:center;gap:8px;padding:8px 18px;background:var(--teal-dim);border:1px solid rgba(13,148,136,.3);border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;color:var(--teal)">
+        &#128196; Choose Shopify CSV
+        <input type="file" accept=".csv" style="display:none" onchange="backfillAddressesFromFile(this.files[0])">
+      </label>
+      <span style="font-size:11px;color:var(--text3)" id="addr-backfill-status">No file selected yet</span>
+    </div>
+    <div id="addr-backfill-result" style="display:none;margin-top:12px"></div>
+  </div>
   <div class="grid-2">
   <div>
     <div class="panel">
@@ -14839,6 +14861,126 @@ function printInvoiceForOrder(orderNum,saleId){
   if(!lines.length&&saleId){var single=S.sales.find(function(x){return x.id===saleId;});if(single)lines=[single];}
   if(!lines.length){toast('No order lines found');return;}
   printInvoice(lines);
+}
+
+function backfillAddressesFromFile(file){
+  if(!file)return;
+  var st=document.getElementById('addr-backfill-status');
+  if(st)st.textContent='Reading '+file.name+'...';
+  var reader=new FileReader();
+  reader.onload=function(ev){backfillAddressesFromCSV(ev.target.result);};
+  reader.readAsText(file);
+}
+
+async function backfillAddressesFromCSV(text){
+  var st=document.getElementById('addr-backfill-status');
+  var res=document.getElementById('addr-backfill-result');
+  if(st)st.textContent='Parsing CSV...';
+
+  function parseRow(line){
+    var cols=[],cur='',inQ=false;
+    for(var i=0;i<line.length;i++){
+      var c=line[i];
+      if(c==='"'&&!inQ){inQ=true;}
+      else if(c==='"'&&inQ&&line[i+1]==='"'){cur+='"';i++;}
+      else if(c==='"'&&inQ){inQ=false;}
+      else if(c===','&&!inQ){cols.push(cur.trim());cur='';}
+      else{cur+=c;}
+    }
+    cols.push(cur.trim());
+    return cols;
+  }
+
+  var rows=text.split('\n');
+  if(rows.length<2){toast('CSV appears empty');return;}
+  var headers=parseRow(rows[0]).map(function(h){return h.toLowerCase().replace(/[^a-z0-9 ]/g,'').trim();});
+
+  function col(names){
+    var ns=Array.isArray(names)?names:[names];
+    for(var i=0;i<ns.length;i++){var idx=headers.indexOf(ns[i]);if(idx>=0)return idx;}
+    return null;
+  }
+
+  var C={
+    name:    col('name'),
+    email:   col('email'),
+    custName:col(['shipping name','billing name']),
+    phone:   col(['shipping phone','billing phone','phone']),
+    addr1:   col(['shipping address1','shipping street']),
+    addr2:   col(['shipping address2']),
+    city:    col(['shipping city']),
+    province:col(['shipping province','shipping province code']),
+    zip:     col(['shipping zip']),
+    country: col(['shipping country']),
+  };
+
+  if(C.name===null){
+    if(st)st.textContent='Error: Order Name column not found.';
+    toast('Could not find Order Name column');
+    return;
+  }
+
+  var addrMap={};
+  for(var i=1;i<rows.length;i++){
+    if(!rows[i].trim())continue;
+    var r=parseRow(rows[i]);
+    var orderNum=(r[C.name]||'').trim();
+    if(!orderNum||addrMap[orderNum])continue;
+    var a={
+      customer_name:     C.custName!=null?(r[C.custName]||'').trim()||null:null,
+      customer_email:    C.email!=null?(r[C.email]||'').trim()||null:null,
+      customer_phone:    C.phone!=null?(r[C.phone]||'').trim()||null:null,
+      shipping_address1: C.addr1!=null?(r[C.addr1]||'').trim()||null:null,
+      shipping_address2: C.addr2!=null?(r[C.addr2]||'').trim()||null:null,
+      shipping_city:     C.city!=null?(r[C.city]||'').trim()||null:null,
+      shipping_province: C.province!=null?(r[C.province]||'').trim()||null:null,
+      shipping_zip:      C.zip!=null?(r[C.zip]||'').trim()||null:null,
+      shipping_country:  C.country!=null?(r[C.country]||'').trim()||null:null,
+    };
+    if(a.shipping_address1||a.customer_phone||a.shipping_city)addrMap[orderNum]=a;
+  }
+
+  var orderNums=Object.keys(addrMap);
+  if(!orderNums.length){
+    if(st)st.textContent='No address columns found in this CSV.';
+    if(res){res.style.display='block';res.innerHTML='<div class="alert-row alert-row-yellow">No shipping address columns found. Use Shopify Admin → Orders → Export → CSV for Excel.</div>';}
+    return;
+  }
+
+  if(st)st.textContent='Updating '+orderNums.length+' orders in database...';
+  var updated=0,notFound=0,errors=0;
+
+  for(var j=0;j<orderNums.length;j++){
+    var oNum=orderNums[j];
+    var addr=addrMap[oNum];
+    if(!S.sales.some(function(s){return s.order_number===oNum;})){notFound++;continue;}
+    var payload={updated_at:new Date().toISOString()};
+    Object.keys(addr).forEach(function(k){if(addr[k]!=null)payload[k]=addr[k];});
+    var dbRes=await db.from('sales').update(payload).eq('order_number',oNum);
+    if(dbRes.error){errors++;console.warn('Backfill',oNum,dbRes.error.message);}
+    else{
+      S.sales=S.sales.map(function(s){return s.order_number===oNum?Object.assign({},s,addr):s;});
+      updated++;
+    }
+    if(st&&j%25===0)st.textContent='Updated '+updated+' of '+orderNums.length+'...';
+  }
+
+  if(res){
+    res.style.display='block';
+    var ok=errors===0;
+    res.innerHTML='<div style="padding:12px 16px;border-radius:6px;background:'
+      +(ok?'var(--teal-dim)':'var(--red-dim)')
+      +';border:1px solid '+(ok?'rgba(13,148,136,.3)':'rgba(220,38,38,.3)')+';">'
+      +'<div style="font-weight:700;font-size:13px;color:'+(ok?'var(--teal)':'var(--red)')+';">'
+      +(ok?'&#10003;':'&#9888;')+' '+updated+' orders updated'+(errors?' · '+errors+' errors':'')+
+      '</div>'
+      +'<div style="font-size:11px;color:var(--text3);margin-top:4px;line-height:1.7">'
+      +(notFound?notFound+' orders in CSV were not in your ERP (older than your sales history).<br>':'')
+      +'Open any Sales Order to see the customer address and updated invoice now.'
+      +'</div></div>';
+  }
+  if(st)st.textContent=updated+' orders updated.';
+  toast('✓ Address backfill: '+updated+' orders updated');
 }
 </script>
 <div id="cart-overlay" onclick="closeCart()"></div>
