@@ -626,7 +626,8 @@ const S = {
   countMode:'home', // home|spot|walk|sheet
   walkItems:[], walkIdx:0,
   // Min/Max suggestions
-  mmSuggest:null, mmLoading:false,
+  mmSuggest:null, mmLoading:false, mmSelectedPns:new Set(),
+  _navCtx:null, _navIdx:-1,
   // Edge function live status
   fnStatus:null,
   // Live activity feed — enriched events pushed by realtime handlers
@@ -1226,7 +1227,11 @@ function openSubBuild(subPn, parentPn, parentQty){
   S.buildQty=null;
   pushHist();render();
 }
-function lookupGo(type,pn){S.lookupSel={type,pn};S.lookupQ=pn;if(S.view!=='lookup')nav('lookup');else{pushHist();render();}}
+function lookupGo(type,pn){
+  S.lookupSel={type,pn};S.lookupQ=pn;
+  S._navIdx=(S._navCtx&&S._navCtx.type===type)?S._navCtx.pns.indexOf(pn):-1;
+  if(S.view!=='lookup')nav('lookup');else{pushHist();render();}
+}
 
 function trackingUrl(carrier, tracking){
   if(!tracking)return'';
@@ -1635,6 +1640,7 @@ function renderParts(){
   else if(sortBy==='vendor')list=[...list].sort((a,b)=>(a.vendor||'').localeCompare(b.vendor||'')||a.pn.localeCompare(b.pn));
   else list=[...list].sort((a,b)=>a.pn.localeCompare(b.pn));
   const selCount=S.selectedParts.size;
+  S._navCtx={type:'part',pns:list.map(function(p){return p.pn;})};
   return `
   <div class="filter-bar">
     <div class="search-wrap"><span class="search-icon">&#8981;</span>
@@ -1716,6 +1722,7 @@ function renderAssemblies(){
   if(sf.status)list=list.filter(a=>liveStatus(a)===sf.status);
   const hasFilter=!!(sf.search||sf.cat||sf.status||sf.kind||sf.showDisc);
   const asmSelCount=S.selectedAsms.size;
+  S._navCtx={type:'assembly',pns:list.map(function(a){return a.pn;})};
   return `
   <div class="filter-bar">
     <div class="search-wrap"><span class="search-icon">⌕</span>
@@ -1778,6 +1785,7 @@ function renderAssemblies(){
 function renderBOMs(){
   const keys=Object.keys(S.boms).sort();
   const sel=S.selBOM||keys[0]||'';
+  const selIdx=keys.indexOf(sel);
   const items=sel?S.boms[sel]||[]:[];
   const totalCost=items.reduce((s,i)=>s+lineCost(i),0);
   const asm=S.assemblies.find(a=>a.pn===sel);
@@ -1792,7 +1800,7 @@ function renderBOMs(){
   <div class="grid-2-lg">
   <div>
     <div class="panel">
-      <div class="panel-title"><span>Select Assembly</span></div>
+      <div class="panel-title" style="display:flex;align-items:center"><span style="flex:1">Select Assembly</span><div style="display:flex;align-items:center;gap:5px"><span style="font-size:10px;color:var(--text3);white-space:nowrap">${selIdx+1}&thinsp;/&thinsp;${keys.length}</span><button class="btn btn-sm" onclick="selBOMNav(-1)" ${selIdx===0?"disabled":""}>&larr;</button><button class="btn btn-sm" onclick="selBOMNav(1)" ${selIdx===keys.length-1?"disabled":""}>&#8594;</button></div></div>
       <div id="bom-sel-wrap" style="position:relative">
         <input id="bom-sel-input" class="form-input" value="${escHtml(selDisplay)}"
           placeholder="Search assemblies…" autocomplete="off"
@@ -9645,9 +9653,12 @@ function renderLookup(){
   const sel=S.lookupSel;
   return `
   <div class="panel" style="padding:18px">
-    <div class="search-wrap" style="max-width:100%">
+    <div style="display:flex;align-items:center;gap:8px">
+    <div class="search-wrap" style="flex:1">
       <span class="search-icon" style="font-size:16px">⌕</span>
-      <input style="font-size:15px;padding:12px 12px 12px 38px" placeholder="Type any part # or finished good… (e.g. TGK-DMPBX, endlink, HPFP)" value="${S.lookupQ||''}" oninput="S.lookupQ=this.value;S.lookupSel=null;render()" autofocus>
+      <input style="font-size:15px;padding:12px 12px 12px 38px" placeholder="Type any part # or finished good… (e.g. TGK-DMPBX, endlink, HPFP)" value="${S.lookupQ||''}" oninput="S.lookupQ=this.value;S.lookupSel=null;S._navCtx=null;render()" autofocus>
+    </div>
+    ${S._navCtx&&S._navIdx>=0&&S.lookupSel?`<div style="display:flex;align-items:center;gap:5px;flex-shrink:0"><span style="font-size:10px;color:var(--text3);white-space:nowrap">${S._navIdx+1}&thinsp;/&thinsp;${S._navCtx.pns.length}</span><button class="btn btn-sm" onclick="navItem(-1)" ${S._navIdx===0?"disabled":""}>&larr; Prev</button><button class="btn btn-sm" onclick="navItem(1)" ${S._navIdx===S._navCtx.pns.length-1?"disabled":""}>Next &rarr;</button></div>`:""}
     </div>
     ${q.length>=2&&!sel?`<div style="margin-top:10px;max-height:300px;overflow-y:auto">
       ${matches.length===0?'<div class="section-empty">No matches</div>':matches.map(m=>`
@@ -9907,11 +9918,13 @@ function statSuggest(p){
   return{min,max,safety,avg:+avg.toFixed(3),sd:+sd.toFixed(3)};
 }
 
-async function aiSuggestMinMax(singlePn){
+async function aiSuggestMinMax(singlePn, pnList){
   // Include parts with ANY demand signal: live sales, spreadsheet avg, or series data
   const tracked=singlePn
     ? S.parts.filter(p=>p.pn===singlePn)
-    : S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||(p.avg_sales_wk||0)>0||weeklySeries(p.pn,26).some(x=>x>0)));
+    : (pnList&&pnList.length)
+      ? S.parts.filter(p=>pnList.includes(p.pn)&&!p.discontinued)
+      : S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||(p.avg_sales_wk||0)>0||weeklySeries(p.pn,26).some(x=>x>0)));
   if(!tracked.length){toast('No items with demand history to analyze');return;}
 
   // Statistical baseline for every item (always available)
@@ -10414,7 +10427,6 @@ function renderPlanning() {
       </select>
       ${sf.vendor?`<button class="btn btn-teal btn-sm" onclick="createVendorPO('${sf.vendor}')">📄 One PO — ${sf.vendor}</button>`:''}
       <button class="btn btn-sm" onclick="nav('pobuilder')">🛒 PO Builder</button>
-      <button class="btn btn-teal btn-sm" style="margin-left:auto" ${S.mmLoading?'disabled':''} onclick="aiSuggestMinMax()">${S.mmLoading?'Analyzing...':' AI Suggest Min/Max'}</button>
       <button class="btn btn-primary btn-sm" onclick="createSuggestedPOs()">+ Create Suggested POs (${needsReorder.length})</button>
     </div>
     <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--border)">
@@ -10441,7 +10453,6 @@ function renderPlanning() {
       ${[4,8,12,26,52].map(w=>`<button class="filter-chip ${weeks===w?'on-teal':''}" onclick="S.forecastWeeks=${w};render()">${w}w</button>`).join('')}
     </div>
   </div>
-  ${S.mmSuggest?renderMMReview():''}
   <div class="tbl-wrap">
   <table style="font-size:12px"><thead class="sticky-header"><tr>
     <th style="cursor:pointer;padding:6px 8px" onclick="(()=>{const d=sortField==='pn'&&sortDir==='asc'?'desc':'asc';setFilter('planning','sort','pn');setFilter('planning','dir',d)})()">Part # ${sortField==='pn'?(sortDir==='asc'?'↑':'↓'):''}</th>
@@ -10594,9 +10605,32 @@ function renderPlanning() {
 }
 
 function renderMinMaxTab(parts){
-  const sf=S.filters.planning||{};
-  return `<div class="tbl-wrap">
+  if(!S.mmSelectedPns)S.mmSelectedPns=new Set();
+  const selCount=S.mmSelectedPns.size;
+  const allSelected=parts.length>0&&parts.every(p=>S.mmSelectedPns.has(p.pn));
+  const someSelected=selCount>0&&!allSelected;
+  return `
+  ${S.mmSuggest?renderMMReview():''}
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap;padding:4px 0">
+    <button class="btn btn-teal btn-sm" ${S.mmLoading?'disabled':''} onclick="aiSuggestMinMax()">
+      ${S.mmLoading?'Analyzing...':'&#10024; AI Suggest All ('+parts.length+')'}
+    </button>
+    <button class="btn btn-sm ${selCount>0?'chip-teal':''}" ${selCount===0||S.mmLoading?'disabled':''}
+      data-mm-sel="1" onclick="aiSuggestMinMax(null,[...S.mmSelectedPns])">
+      &#10024; AI Suggest Selected${selCount>0?' ('+selCount+')':''}
+    </button>
+    <span style="font-size:11px;color:var(--text3)" id="mm-sel-count">${selCount>0?selCount+' selected':''}</span>
+    ${selCount>0?`<button class="btn btn-sm" onclick="S.mmSelectedPns=new Set();render()">&#10005; Clear</button>`:''}
+    <span style="flex:1"></span>
+    <span style="font-size:11px;color:var(--text3)">${parts.length} parts &nbsp;&middot;&nbsp; Edit values inline or run AI Suggest to auto-fill</span>
+  </div>
+  <div class="tbl-wrap">
   <table style="font-size:12px"><thead class="sticky-header"><tr>
+    <th style="width:32px;padding:4px 8px">
+      <input type="checkbox" id="mm-chk-all" title="Select all"
+        ${allSelected?'checked':''} ${someSelected?'indeterminate':''} 
+        onchange="mmSelAll(this.checked)">
+    </th>
     <th>Part #</th><th>Description</th><th>Vendor</th>
     <th style="text-align:center">Min</th>
     <th style="text-align:center">Max</th>
@@ -10613,8 +10647,17 @@ function renderMinMaxTab(parts){
     const status=getPlanningStatus(p);
     const statusCls={Critical:'pill-red',Reorder:'pill-orange','On Order':'pill-teal','Below MOQ':'pill-muted',Overstock:'pill-yellow',OK:'pill-teal'}[status]||'pill-muted';
     const wkd=avgWk(p)||calcForecast(p.pn);
-    return `<tr class="rowlink" onclick="rowClick(event,function(){lookupGo('part','${p.pn}')})">
-      <td class="pn" style="color:var(--text)">${p.pn}</td>
+    const sel=S.mmSelectedPns.has(p.pn);
+    const pending=S.mmSuggest&&S.mmSuggest.find(s=>s.pn===p.pn);
+    return `<tr class="rowlink ${sel?'row-selected':''}" onclick="rowClick(event,function(){lookupGo('part','${p.pn}')})">
+      <td onclick="event.stopPropagation()" style="padding:4px 8px">
+        <input type="checkbox" class="mm-row-chk" data-pn="${p.pn}" ${sel?'checked':''}
+          onchange="mmSelToggle('${p.pn}',this.checked)">
+      </td>
+      <td class="pn" style="color:var(--text)">
+        ${p.pn}
+        ${pending?'<span style="font-size:9px;color:var(--teal);margin-left:4px;background:var(--teal-dim);padding:1px 4px;border-radius:3px">AI ready</span>':''}
+      </td>
       <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${p.description||''}</td>
       <td style="font-size:10px;color:var(--text3)">${p.vendor||''}</td>
       <td style="padding:4px 6px;text-align:center"><input class="inline-edit" style="width:52px;padding:3px 5px;text-align:center" type="number" min="0" value="${p.min_qty||0}" onclick="event.stopPropagation()" onchange="savePlanField('${p.id}','min_qty',+this.value,'${p.pn}')"></td>
@@ -10639,6 +10682,7 @@ function renderMinMaxTab(parts){
   }).join('')}
   </tbody></table></div>`;
 }
+
 
 async function savePlanField(id, field, value, pn) {
   const prev = S.parts.find(p=>p.id===id);
@@ -15036,6 +15080,55 @@ function ccCountKeydown(e,inp){
       else if(rowTop>wrap.scrollTop+wrapH-80)wrap.scrollTop=rowTop-wrapH+80;
     }
   }
+}
+
+function mmSelToggle(pn, checked){
+  if(!S.mmSelectedPns)S.mmSelectedPns=new Set();
+  if(checked)S.mmSelectedPns.add(pn);else S.mmSelectedPns.delete(pn);
+  const n=S.mmSelectedPns.size;
+  const total=document.querySelectorAll('.mm-row-chk').length;
+  const btn=document.querySelector('[data-mm-sel]');
+  if(btn){btn.textContent='✨ AI Suggest Selected'+(n>0?' ('+n+')':'');btn.disabled=n===0||S.mmLoading;}
+  const lbl=document.getElementById('mm-sel-count');
+  if(lbl)lbl.textContent=n>0?n+' selected':'';
+  const allChk=document.getElementById('mm-chk-all');
+  if(allChk){allChk.checked=n===total&&total>0;allChk.indeterminate=n>0&&n<total;}
+}
+function mmSelAll(checked){
+  if(!S.mmSelectedPns)S.mmSelectedPns=new Set();
+  document.querySelectorAll('.mm-row-chk').forEach(function(chk){
+    chk.checked=checked;
+    if(checked)S.mmSelectedPns.add(chk.dataset.pn);
+    else S.mmSelectedPns.delete(chk.dataset.pn);
+  });
+  const n=S.mmSelectedPns.size;
+  const btn=document.querySelector('[data-mm-sel]');
+  if(btn){btn.textContent='✨ AI Suggest Selected'+(n>0?' ('+n+')':'');btn.disabled=n===0||S.mmLoading;}
+  const lbl=document.getElementById('mm-sel-count');
+  if(lbl)lbl.textContent=n>0?n+' selected':'';
+}
+
+function navItem(dir){
+  if(!S._navCtx)return;
+  const newIdx=Math.max(0,Math.min(S._navCtx.pns.length-1,S._navIdx+dir));
+  if(newIdx===S._navIdx)return;
+  const pn=S._navCtx.pns[newIdx];
+  S._navIdx=newIdx;
+  S.lookupSel={type:S._navCtx.type,pn:pn};
+  S.lookupQ=pn;
+  render();
+  // Scroll detail to top
+  const content=document.getElementById('content');
+  if(content)content.scrollTop=0;
+}
+function selBOMNav(dir){
+  const keys=Object.keys(S.boms).sort();
+  const idx=keys.indexOf(S.selBOM||(S.assemblies[0]&&S.assemblies[0].pn)||'');
+  const newIdx=Math.max(0,Math.min(keys.length-1,idx+dir));
+  S.selBOM=keys[newIdx];
+  render();
+  const content=document.getElementById('content');
+  if(content)content.scrollTop=0;
 }
 </script>
 <div id="cart-overlay" onclick="closeCart()"></div>
