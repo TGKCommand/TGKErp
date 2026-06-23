@@ -633,6 +633,7 @@ const S = {
   // Min/Max suggestions
   mmSuggest:null, mmLoading:false, mmSelectedPns:new Set(),
   _navCtx:null, _navIdx:-1,
+  poBuild:{asmPn:'',qty:1,lines:[],computed:false},
   // Edge function live status
   fnStatus:null,
   // Live activity feed — enriched events pushed by realtime handlers
@@ -10418,8 +10419,9 @@ function renderPlanning() {
   <div class="tabs-row" style="margin-bottom:0">
     <div class="tab ${(!S.planTab||S.planTab==='purchasing')?'active':''}" onclick="S.planTab='purchasing';render()">&#128462; Purchasing</div>
     <div class="tab ${S.planTab==='minmax'?'active':''}" onclick="S.planTab='minmax';render()">&#128208; Min / Max &amp; Safety</div>
+    <div class="tab ${S.planTab==='builder'?'active':''}" onclick="S.planTab='builder';render()">&#127959; Finished Goods</div>
   </div>
-  <div class="panel" style="padding:12px 16px">
+  ${S.planTab!=='builder'?`  <div class="panel" style="padding:12px 16px">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
       <div class="search-wrap" style="flex:1;min-width:160px"><span class="search-icon">⌕</span><input placeholder="Search part, description, vendor…" value="${sf.search||''}" oninput="setFilter('planning','search',this.value)"></div>
       <select class="form-input" style="width:auto;padding:6px 10px;font-size:11px" onchange="setFilter('planning','cat',this.value)">
@@ -10457,8 +10459,8 @@ function renderPlanning() {
       <span style="font-size:11px;color:var(--text3);margin-left:8px;flex-shrink:0">Window:</span>
       ${[4,8,12,26,52].map(w=>`<button class="filter-chip ${weeks===w?'on-teal':''}" onclick="S.forecastWeeks=${w};render()">${w}w</button>`).join('')}
     </div>
-  </div>
-  ${S.planTab==='minmax'?renderMinMaxTab(parts):`
+  </div>`:''}
+  ${S.planTab==='minmax'?renderMinMaxTab(parts):S.planTab==='builder'?renderPOBuilderTab():`
   <div class="tbl-wrap">
   <table data-tid="planning" style="font-size:12px"><thead class="sticky-header"><tr>
     <th style="cursor:pointer;padding:6px 8px" onclick="(()=>{const d=sortField==='pn'&&sortDir==='asc'?'desc':'asc';setFilter('planning','sort','pn');setFilter('planning','dir',d)})()">Part # ${sortField==='pn'?(sortDir==='asc'?'↑':'↓'):''}</th>
@@ -14766,6 +14768,7 @@ function printInvoice(lines){
     +'  table{page-break-inside:avoid}'
     +'  .inv-wrap{border:none;border-radius:0;max-width:100%;width:100%;margin:0;box-shadow:none}'
     +'  td{vertical-align:top!important}'
+    +'  td:first-child .print-val{white-space:nowrap!important;font-size:9px!important;display:inline-block!important}'
     +'  .print-val{white-space:normal!important;word-break:break-word!important;overflow-wrap:break-word!important;max-width:100%!important}'
     +'}'
     +'</style></head><body>'
@@ -14833,7 +14836,7 @@ function printInvoice(lines){
 
     // ── Line items ──
     +'<table>'
-    +'<colgroup><col style="width:17%"><col style="width:46%"><col style="width:7%"><col style="width:14%"><col style="width:13%"><col style="width:3%" class="no-print"></colgroup>'
+    +'<colgroup><col style="width:22%"><col><col style="width:5%"><col style="width:13%"><col style="width:12%"><col style="width:3%" class="no-print"></colgroup>'
     +'<thead><tr style="background:#f0f2f5;border-bottom:2px solid #e2e6eb">'
     +'<th style="padding:8px 12px 8px 24px;text-align:left;color:#374151;font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase">SKU</th>'
     +'<th style="padding:8px 12px;text-align:left;color:#374151;font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase">Description</th>'
@@ -15168,6 +15171,182 @@ function _mkResizable(tbl){
   });
 }
 function initResizableTables(){document.querySelectorAll('.tbl-wrap table[data-tid]').forEach(_mkResizable);}
+
+function explodeBOM(rootPn, targetQty){
+  var result={};
+  function walk(pn, qty, visited){
+    if(visited.has(pn))return;
+    visited.add(pn);
+    var lines=S.boms[pn]||[];
+    lines.forEach(function(line){
+      var lQty=(line.qty||1)*qty;
+      if(line.item_type==='assembly'){
+        walk(line.child_pn,lQty,new Set(visited));
+      } else {
+        var prt=S.parts.find(function(p){return p.pn===line.child_pn;});
+        if(!prt||!prt.discontinued){
+          result[line.child_pn]=(result[line.child_pn]||0)+lQty;
+        }
+      }
+    });
+  }
+  walk(rootPn,targetQty,new Set());
+  return result;
+}
+
+function computePOBuild(){
+  if(!S.poBuild)S.poBuild={asmPn:'',qty:1,lines:[],computed:false};
+  var asmPn=S.poBuild.asmPn;
+  var qty=Math.max(1,S.poBuild.qty||1);
+  if(!asmPn){toast('Select an assembly first');return;}
+  if(!S.boms[asmPn]||!S.boms[asmPn].length){toast('No BOM found for '+asmPn);return;}
+  var needed=explodeBOM(asmPn,qty);
+  var prtMap={};S.parts.forEach(function(p){prtMap[p.pn]=p;});
+  var lines=Object.entries(needed).map(function(e){
+    var pn=e[0],neededQty=Math.ceil(e[1]);
+    var p=prtMap[pn];
+    if(!p)return{pn:pn,desc:'(unknown)',vendor:'',neededQty:neededQty,oh:0,onOrder:0,net:neededQty,orderQty:neededQty,unitCost:0,tierLabel:'',moq:0,include:true};
+    var oh=Math.max(0,p.total_unpckgd||0);
+    var onOrd=openOrderedQty(pn);
+    var net=Math.max(0,neededQty-oh-onOrd);
+    var moq=p.moq||0;
+    var orderQty=net>0?(moq>0?Math.max(net,moq):net):0;
+    var tiers=Array.isArray(p.price_breaks)?[...p.price_breaks].sort(function(a,b){return a.qty-b.qty;}):[];
+    var unitCost=p.unit_cost||0;var tierLabel='base';
+    tiers.forEach(function(t){if(orderQty>=t.qty){unitCost=t.price;tierLabel='\u2265'+t.qty;}});
+    return{pn:pn,desc:p.description||'',vendor:p.vendor||'',neededQty:neededQty,oh:oh,onOrder:onOrd,net:net,orderQty:orderQty,unitCost:unitCost,tierLabel:tierLabel,moq:moq,include:orderQty>0};
+  }).filter(Boolean).sort(function(a,b){return (b.net>0?1:0)-(a.net>0?1:0)||a.pn.localeCompare(b.pn);});
+  S.poBuild.lines=lines;
+  S.poBuild.computed=true;
+  render();
+  toast('\u2713 '+lines.length+' parts computed from '+asmPn+' \xd7'+qty);
+}
+
+function poBuildUpdateTotal(){
+  var lines=(S.poBuild||{}).lines||[];
+  var t=lines.filter(function(l){return l.include;}).reduce(function(s,l){return s+l.orderQty*l.unitCost;},0);
+  var el=document.getElementById('pb-grand');if(el)el.textContent='$'+t.toFixed(2);
+  var cnt=lines.filter(function(l){return l.include&&l.orderQty>0&&l.pn;}).length;
+  var btn=document.getElementById('pb-cart-btn');
+  if(btn){btn.textContent='\uD83D\uDED2 Add to PO Cart ('+cnt+' lines)';btn.disabled=cnt===0;}
+}
+
+function poBuildRowUpdate(i,field,val){
+  if(!S.poBuild||!S.poBuild.lines[i])return;
+  S.poBuild.lines[i][field]=val;
+  var l=S.poBuild.lines[i];
+  var tot=l.orderQty*l.unitCost;
+  var tc=document.getElementById('pb-lt-'+i);if(tc)tc.textContent='$'+tot.toFixed(2);
+  poBuildUpdateTotal();
+}
+
+function poBuildRemoveLine(i){
+  if(!S.poBuild)return;
+  S.poBuild.lines.splice(i,1);
+  render();
+}
+
+function poBuildAddLine(){
+  if(!S.poBuild)S.poBuild={asmPn:'',qty:1,lines:[],computed:true};
+  S.poBuild.lines.push({pn:'',desc:'',vendor:'',neededQty:0,oh:0,onOrder:0,net:0,orderQty:0,unitCost:0,tierLabel:'',moq:0,include:true});
+  render();
+  setTimeout(function(){
+    var rows=document.querySelectorAll('[data-pb-pn]');
+    if(rows.length)rows[rows.length-1].focus();
+  },100);
+}
+
+function poBuildToCart(){
+  var lines=(S.poBuild||{}).lines||[];
+  var toAdd=lines.filter(function(l){return l.include&&l.orderQty>0&&l.pn;});
+  if(!toAdd.length){toast('No lines selected to add');return;}
+  toAdd.forEach(function(l){
+    var ex=S.poCart.find(function(c){return c.pn===l.pn;});
+    if(ex){ex.qty+=l.orderQty;ex.unitCost=l.unitCost;}
+    else{S.poCart.push({pn:l.pn,qty:l.orderQty,unitCost:l.unitCost});}
+  });
+  if(!S.poCartShipping)S.poCartShipping={};
+  toast('\u2713 '+toAdd.length+' lines added to PO Cart');
+  renderCartPanel();
+  render();
+}
+
+function renderPOBuilderTab(){
+  var pb=S.poBuild||(S.poBuild={asmPn:'',qty:1,lines:[],computed:false});
+  var lines=pb.lines||[];
+  var asmOpts=S.assemblies.filter(function(a){return !a.discontinued;})
+    .sort(function(a,b){return dispPn(a).localeCompare(dispPn(b));})
+    .map(function(a){
+      return '<option value="'+escHtml(a.pn)+'" '+(pb.asmPn===a.pn?'selected':'')+'>'
+        +escHtml(dispPn(a))+' \u2014 '+escHtml(a.description||'')+'</option>';
+    }).join('');
+  var included=lines.filter(function(l){return l.include&&l.orderQty>0&&l.pn;});
+  var grandTotal=lines.filter(function(l){return l.include;}).reduce(function(t,l){return t+l.orderQty*l.unitCost;},0);
+  var rowsHtml=lines.map(function(l,i){
+    var rowTotal=l.orderQty*l.unitCost;
+    var isNeeded=l.net>0;
+    return '<tr style="'+(l.include?'':'opacity:.45;')+(!isNeeded&&pb.computed?'background:var(--bg2);':'')+'">'+
+      '<td style="padding:4px 8px"><input type="checkbox" '+(l.include?'checked':'')+' onchange="S.poBuild.lines['+i+'].include=this.checked;poBuildUpdateTotal()"></td>'+
+      '<td class="pn" style="padding:4px 8px"><input class="inline-edit" data-pb-pn="1" value="'+escHtml(l.pn)+'" placeholder="Part #" style="width:100%;font-family:var(--mono);font-size:11px;color:var(--teal)" oninput="S.poBuild.lines['+i+'].pn=this.value"></td>'+
+      '<td style="padding:4px 8px;font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+escHtml(l.desc)+'">'+escHtml(l.desc)+'</td>'+
+      '<td style="font-size:10px;color:var(--text3);padding:4px 8px">'+escHtml(l.vendor)+'</td>'+
+      '<td style="text-align:center;font-size:11px;padding:4px 6px">'+(pb.computed?l.neededQty:'')+'</td>'+
+      '<td style="text-align:center;font-size:11px;color:'+(l.oh>0?'var(--teal)':'var(--text3)')+';padding:4px 6px">'+(pb.computed?l.oh:'')+'</td>'+
+      '<td style="text-align:center;font-size:11px;color:var(--text3);padding:4px 6px">'+(pb.computed&&l.onOrder?l.onOrder:'')+'</td>'+
+      '<td style="text-align:center;font-weight:700;padding:4px 6px;color:'+(isNeeded?'var(--orange)':'var(--teal)')+'">'+(pb.computed?(isNeeded?l.net:'\u2713'):'')+'</td>'+
+      '<td style="padding:2px 6px"><input class="inline-edit" type="number" min="0" value="'+l.orderQty+'" style="width:60px;text-align:center;font-weight:700;font-size:13px" onclick="event.stopPropagation()" oninput="poBuildRowUpdate('+i+',\'orderQty\',Math.max(0,+this.value||0))"></td>'+
+      '<td style="padding:2px 6px"><input class="inline-edit" type="number" min="0" step="0.0001" value="'+l.unitCost.toFixed(4)+'" style="width:72px;text-align:right;font-family:var(--mono);font-size:11px" onclick="event.stopPropagation()" oninput="poBuildRowUpdate('+i+',\'unitCost\',parseFloat(this.value)||0)"></td>'+
+      '<td style="font-size:9px;color:var(--teal);white-space:nowrap;padding:4px 6px">'+escHtml(l.tierLabel||'')+'</td>'+
+      '<td style="text-align:right;font-family:var(--mono);font-size:11px;font-weight:600;padding:4px 8px" id="pb-lt-'+i+'">$'+rowTotal.toFixed(2)+'</td>'+
+      '<td style="padding:2px 6px"><button class="action-btn" style="color:var(--red);border-color:rgba(220,38,38,.25)" onclick="poBuildRemoveLine('+i+')">\u2715</button></td>'+
+      '</tr>';
+  }).join('');
+  return '<div class="panel" style="padding:14px 16px;margin-bottom:12px">'
+    +'<div style="font-size:14px;font-weight:700;margin-bottom:12px">&#127959; Finished Goods &mdash; Order by Build Quantity</div>'
+    +'<div style="font-size:11px;color:var(--text3);margin-bottom:12px">Select any assembly, enter the quantity you want to build, and get the exact parts list with quantities, current stock, and pricing &mdash; ready to send to the PO Cart.</div>'
+    +'<div style="display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap">'
+    +'<div style="flex:1;min-width:220px"><label class="form-label">Assembly / Finished Good</label>'
+    +'<select class="form-input" style="width:100%" onchange="S.poBuild.asmPn=this.value;S.poBuild.computed=false">'
+    +'<option value="">\u2014 Select assembly \u2014</option>'+asmOpts
+    +'</select></div>'
+    +'<div style="width:110px"><label class="form-label">Qty to Build</label>'
+    +'<input type="number" class="form-input" min="1" value="'+pb.qty+'" style="text-align:center;font-weight:700;font-size:16px" oninput="S.poBuild.qty=Math.max(1,+this.value||1)"></div>'
+    +'<div><button class="btn btn-primary" onclick="computePOBuild()">&#128203; Compute Parts</button></div>'
+    +'</div></div>'
+    +(pb.computed&&lines.length?
+    '<div class="tbl-wrap"><table data-tid="pobuilder"><thead class="sticky-header"><tr>'
+    +'<th style="width:30px"></th>'
+    +'<th style="min-width:120px">Part #</th>'
+    +'<th>Description</th>'
+    +'<th>Vendor</th>'
+    +'<th style="text-align:center" title="Total BOM quantity needed for this build">BOM Qty</th>'
+    +'<th style="text-align:center" title="Currently available (unpacked)">On Hand</th>'
+    +'<th style="text-align:center" title="Qty on open purchase orders">On PO</th>'
+    +'<th style="text-align:center;color:var(--orange)" title="Net to order = BOM Qty \u2212 On Hand \u2212 On PO">To Order</th>'
+    +'<th style="text-align:center">Order Qty</th>'
+    +'<th style="text-align:right">Unit Cost</th>'
+    +'<th title="Price tier applied">Tier</th>'
+    +'<th style="text-align:right">Line Total</th>'
+    +'<th></th>'
+    +'</tr></thead><tbody>'
+    +rowsHtml
+    +'</tbody></table></div>'
+    +'<div style="display:flex;align-items:center;gap:12px;margin-top:10px;padding:10px 16px;background:var(--bg2);border-radius:8px;flex-wrap:wrap">'
+    +'<button class="btn btn-sm" onclick="poBuildAddLine()">+ Add Line</button>'
+    +'<button class="btn btn-sm" onclick="S.poBuild.computed=false;S.poBuild.lines=[];render()">&#8635; Clear</button>'
+    +'<div style="flex:1"></div>'
+    +'<div style="font-size:12px;color:var(--text2)">'
+    +included.length+' of '+lines.length+' lines &nbsp;&middot;&nbsp; Grand Total: <span id="pb-grand" style="font-weight:700;color:var(--text);font-family:var(--mono)">$'+grandTotal.toFixed(2)+'</span>'
+    +'</div>'
+    +'<button class="btn btn-primary" id="pb-cart-btn" '+(included.length===0?'disabled':'')+' onclick="poBuildToCart()">'
+    +'\uD83D\uDED2 Add to PO Cart ('+included.length+' lines)'
+    +'</button>'
+    +'</div>'
+    : pb.computed&&!lines.length
+    ? '<div style="padding:40px;text-align:center;color:var(--text3)">No parts found in BOM for this assembly. Check that the BOM is configured in Bill of Materials.</div>'
+    : '<div style="padding:40px;text-align:center;color:var(--text3)">Select an assembly above and click <b>Compute Parts</b> to build the order list.</div>'
+    );
+}
 </script>
 <div id="cart-overlay" onclick="closeCart()"></div>
 <div id="cart-panel">
