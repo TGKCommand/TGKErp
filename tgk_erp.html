@@ -2567,7 +2567,7 @@ function renderSaleDetail(s){
       ${(S.syncLocked&&S.syncLocked.has((s.order_number||'').replace(/^#/,'')))?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="unlockOrderFromSync('${escHtml(s.order_number||'')}')">Unlock Sync</button>`:''}
       ${packedLines.length?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="unpackSaleOrder('${s.id}','${s.pn==='Multiple'?'':s.pn}',${s.qty||1})">&#8617; Unpack</button>`:''}
       ${['Open','Packed','On Hold','Partial'].includes(detailOrderFs)?`<button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
-      ${(financial==='refunded'||financial==='partially_refunded'||detailOrderFs==='Refunded')&&!allLines[0]?.return_status?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.35);font-weight:700" data-sid="${s.id}" onclick="openProcessReturnModal(this.dataset.sid)">&#8617; Process Return</button>`:''}${allLines[0]?.return_status?`<span style="font-size:10px;padding:3px 8px;border-radius:4px;font-weight:600;${allLines[0].return_status==='returned'?'background:var(--teal-dim);color:var(--teal)':'background:rgba(234,88,12,.12);color:var(--orange)'}">${allLines[0].return_status==='returned'?'&#10003; Restocked':'&#9888; Logged as Damaged'}</span>`:''}
+      ${(financial==='refunded'||financial==='partially_refunded'||detailOrderFs==='Refunded')&&!allLines[0]?.return_status?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.35);font-weight:700" data-sid="${s.id}" onclick="openProcessReturnModal(this.dataset.sid)">&#8617; Process Return</button>`:''}${allLines[0]?.return_status?`<span style="font-size:10px;padding:3px 8px;border-radius:4px;font-weight:600;${allLines[0].return_status==='returned'?'background:var(--teal-dim);color:var(--teal)':'background:rgba(234,88,12,.12);color:var(--orange)'}">${allLines[0].return_status==='returned'?'&#10003; Restocked':'&#9888; Logged as Damaged'}</span><button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" data-oid="${s.id}" onclick="reverseReturn(this.dataset.oid)" title="Undo this return — reverses inventory and resets order status">&#8634; Reverse Return</button>`:''}
     </div>
   </div>
 
@@ -2816,10 +2816,11 @@ function openReturnModal(saleId, pn, qty, orderNum){
       </div>
       <div class="form-group">
         <label class="form-label">Item Condition</label>
-        <select id="ret-condition" class="form-input" onchange="document.getElementById('ret-condition-note').textContent=this.value==='Resellable'?'✓ Will restock':'✕ Will NOT restock'">
+        <select id="ret-condition" class="form-input" onchange="document.getElementById('ret-condition-note').textContent=this.value==='Resellable'?'✓ Will restock inventory':this.value==='PreERP'?'⊘ No inventory change — pre-ERP or externally fulfilled order':'✕ Will NOT restock'">
           <option value="Resellable">Resellable — restock</option>
           <option value="Defective">Defective — do not restock</option>
           <option value="Damaged">Damaged — do not restock</option>
+          <option value="PreERP">Pre-ERP / External — no inventory change</option>
         </select>
         <div id="ret-condition-note" style="font-size:10px;color:var(--teal);margin-top:3px">✓ Will restock</div>
       </div>
@@ -2904,7 +2905,7 @@ async function submitReturnV2(orderNum){
   // 1. Per-line: restore inventory + mark Returned
   for(const l of lines){
     const pn=l.pn;const qty2=l.qty||1;
-    if(condition==='Resellable'){
+    if(condition==='Resellable'&&condition!=='PreERP'){
       const asm=S.assemblies.find(a=>a.pn===pn);
       const prt=S.parts.find(p=>p.pn===pn);
       if(asm){
@@ -2921,8 +2922,9 @@ async function submitReturnV2(orderNum){
         results.push('+'+qty2+' '+pn);
       }
     }
-    await db.from('sales').update({fulfillment_status:'Returned',return_reason:reason+(fullNotes?' — '+fullNotes:''),return_status:'returned',updated_at:new Date().toISOString()}).eq('id',l.id);
-    S.sales=S.sales.map(s=>s.id===l.id?{...s,fulfillment_status:'Returned',return_status:'returned'}:s);
+    const _newStatus=condition==='PreERP'?l.fulfillment_status||'Delivered':'Returned';
+    await db.from('sales').update({fulfillment_status:_newStatus,return_reason:reason+(fullNotes?' — '+fullNotes:''),return_status:'returned',updated_at:new Date().toISOString()}).eq('id',l.id);
+    S.sales=S.sales.map(s=>s.id===l.id?{...s,fulfillment_status:_newStatus,return_status:'returned'}:s);
   }
 
   // 2. Shopify refund (one call for all selected lines combined)
@@ -2977,11 +2979,13 @@ async function submitReturnV2(orderNum){
     status:'Resolved',resolved_at:new Date().toISOString(),created_at:new Date().toISOString()
   });
 
+  // Register undo so the ↩ Undo button works
+  logAction('Return '+lines.map(function(l){return l.qty+'× '+l.pn;}).join(', ')+' on '+orderNum,'sales',orderNum,null,null).catch(function(){});
   closeModal();
   await refreshSales();
   render();
   const msg=['↩ Return processed',...results,...errors].join(' · ');
-  toast(msg,5000);
+  toast(msg+' | Use ↩ Reverse Return to undo',5000);
   if(errors.length)toast('⚠ '+errors.join('; '),6000);
 }
 
@@ -15755,6 +15759,71 @@ async function loadDealerPOPayments(){
   if(res.data&&res.data.value){
     try{S.dealerPOPayments=JSON.parse(res.data.value);}catch(e){}
   }
+}
+
+async function reverseReturn(saleId){
+  var sale=S.sales.find(function(s){return s.id===saleId;});
+  if(!sale){toast('Order not found');return;}
+  var orderNum=sale.order_number||saleId;
+  // Get all lines for this order
+  var allLines=sale.order_number
+    ?S.sales.filter(function(s){return s.order_number===sale.order_number;})
+    :[sale];
+
+  if(!confirm('Reverse return for order '+orderNum+'?\n\nThis will:\n• Deduct inventory that was restocked\n• Reset order status back to Refunded\n• Clear the return_status flag\n\nThis does NOT affect any Shopify refund already processed.'))return;
+
+  var errors=[];var results=[];
+
+  for(var i=0;i<allLines.length;i++){
+    var line=allLines[i];
+    if(!line.return_status)continue;
+    var pn=line.pn;var qty=line.qty||1;
+
+    if(line.return_status==='returned'){
+      // Reverse the inventory addition
+      var asm=S.assemblies.find(function(a){return a.pn===pn;});
+      var prt=S.parts.find(function(p){return p.pn===pn;});
+      if(asm){
+        var prev=asm.total_on_hand||0;
+        var newOh=Math.max(0,prev-qty);
+        var r=await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
+        if(!r.error){
+          S.assemblies=S.assemblies.map(function(a){return a.pn===pn?Object.assign({},a,{total_on_hand:newOh}):a;});
+          await db.from('inv_corrections').insert({pn:pn,previous_qty:prev,new_qty:newOh,adjustment:-qty,
+            reason:'Reversed return — order '+orderNum,user_email:S.currentUser||null,source:'reverse_return'});
+          results.push('-'+qty+' '+pn+' (reversed)');
+        } else errors.push(pn+': '+r.error.message);
+      } else if(prt){
+        var prev2=prt.total_unpckgd||0;
+        var newOh2=Math.max(0,prev2-qty);
+        var r2=await db.from('parts').update({total_unpckgd:newOh2,updated_at:new Date().toISOString()}).eq('id',prt.id);
+        if(!r2.error){
+          S.parts=S.parts.map(function(p){return p.pn===pn?Object.assign({},p,{total_unpckgd:newOh2}):p;});
+          await db.from('inv_corrections').insert({pn:pn,previous_qty:prev2,new_qty:newOh2,adjustment:-qty,
+            reason:'Reversed return — order '+orderNum,user_email:S.currentUser||null,source:'reverse_return'});
+          results.push('-'+qty+' '+pn+' (reversed)');
+        } else errors.push(pn+': '+r2.error.message);
+      }
+    }
+
+    // Reset the line back to Refunded (not Returned), clear return_status
+    await db.from('sales').update({
+      fulfillment_status:'Refunded',
+      return_status:null,
+      return_reason:null,
+      updated_at:new Date().toISOString()
+    }).eq('id',line.id);
+    S.sales=S.sales.map(function(s){
+      return s.id===line.id?Object.assign({},s,{fulfillment_status:'Refunded',return_status:null,return_reason:null}):s;
+    });
+  }
+
+  if(errors.length){
+    toast('\u26a0 Reversed with errors: '+errors[0]);
+  } else {
+    toast('\u2713 Return reversed — '+results.join(', ')+' | Order reset to Refunded');
+  }
+  render();
 }
 </script>
 <div id="cart-overlay" onclick="closeCart()"></div>
