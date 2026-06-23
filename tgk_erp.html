@@ -1317,6 +1317,19 @@ function carrierLabel(code){
 
 function escHtml(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function dispPn(a){return(a&&a.use_new_sku&&a.new_sku)?a.new_sku:((a&&a.pn)||'');}
+function findAsm(pn){
+  if(!pn)return undefined;
+  // 1. Direct match on canonical pn (most common path)
+  var a=S.assemblies.find(function(x){return x.pn===pn;});
+  if(a)return a;
+  // 2. Match on new_sku — covers: new SKU from Shopify, orders typed with new SKU
+  return S.assemblies.find(function(x){return x.new_sku&&x.new_sku===pn;});
+}
+function resolveToCanonicalPn(pn){
+  // If this pn is a new_sku for some assembly, return that assembly's pn
+  var a=S.assemblies.find(function(x){return x.new_sku&&x.new_sku===pn;});
+  return a?a.pn:pn;
+}
 function timeAgo(ts){
   if(!ts)return'';
   const d=new Date(ts);if(isNaN(d))return'';
@@ -1611,7 +1624,7 @@ function renderDashboard(){
       ${freshOpenLines.length===0&&packedLines.length===0?'<div class="section-empty">All orders fulfilled ✓</div>':
       (()=>{
         const _score=s=>{
-          const a=S.assemblies.find(a=>a.pn===s.pn);
+          const a=findAsm(s.pn);
           const st=a?(a.total_on_hand||0):null;
           const fs=s.fulfillment_status||'Open';
           if(fs==='Packed')return 0;           // ship now
@@ -1623,7 +1636,7 @@ function renderDashboard(){
           .sort((a,b)=>_score(a)-_score(b)||_date(a).localeCompare(_date(b)))
           .slice(0,7);
       })().map(s=>{
-        const asm=S.assemblies.find(a=>a.pn===s.pn);
+        const asm=findAsm(s.pn);
         const stock=asm?(asm.total_on_hand||0):null;
         const canFill=stock!==null&&stock>=(s.qty||1);
         const fs=s.fulfillment_status||'Open';
@@ -2462,13 +2475,13 @@ function renderSales(){
   <table data-tid="sales"><thead class="sticky-header"><tr><th>Date</th><th>Order #</th><th>Customer</th><th>SKU</th><th>Qty</th><th>Stock</th><th>Fulfillment</th><th>Tracking</th><th>Actions</th></tr></thead><tbody>
   ${list.map(s=>{
     const fs=s.fulfillment_status||'Open';
-    const asm=S.assemblies.find(a=>a.pn===s.pn);
+    const asm=findAsm(s.pn);
     const prt=asm?null:S.parts.find(p=>p.pn===s.pn)||null;
     const stock=asm?(asm.total_on_hand||0):prt?(prt.total_unpckgd||0):null;
     const canFill=stock!==null&&stock>=(s.qty||1);
     const split=s._grouped&&isSplitOrder(s.order_number);
     const allOrderLines=s._grouped?S.sales.filter(x=>x.order_number===s.order_number):[];
-    const dsLineCount=s._grouped?allOrderLines.filter(l=>!S.assemblies.find(a=>a.pn===l.pn)&&!S.parts.find(p=>p.pn===l.pn)).length:0;
+    const dsLineCount=s._grouped?allOrderLines.filter(l=>!findAsm(l.pn)&&!S.parts.find(p=>p.pn===l.pn)).length:0;
     const allDropShip=s._grouped&&allOrderLines.length>0&&dsLineCount===allOrderLines.length;
     const repTracking=s.tracking_number||(allOrderLines.find(x=>x.tracking_number)?.tracking_number)||'';
     const repCarrier=s.carrier||(allOrderLines.find(x=>x.tracking_number)?.carrier)||'';
@@ -2540,7 +2553,7 @@ function renderSaleDetail(s){
   // Order-level: can we pack ALL open lines?
   const allCanPack=allLines.every(x=>{
     if((x.fulfillment_status||'Open')!=='Open')return true;
-    const a=S.assemblies.find(a=>a.pn===x.pn);
+    const a=findAsm(x.pn);
     if(!a)return true; // drop-ship line — no stock to check, has its own fulfillment button
     return(a.total_on_hand||0)>=(x.qty||1);
   });
@@ -2666,7 +2679,7 @@ function renderSaleDetail(s){
     <th>In Stock</th><th>Status</th><th>Tracking</th><th>Actions</th>
   </tr></thead><tbody>
   ${allLines.map(line=>{
-    const la=S.assemblies.find(a=>a.pn===line.pn);
+    const la=findAsm(line.pn);
     const lp=la?null:S.parts.find(p=>p.pn===line.pn)||null;
     const lstock=la?(la.total_on_hand||0):lp?(lp.total_unpckgd||0):null;
     const lfs=line.fulfillment_status||'Open';
@@ -3026,7 +3039,7 @@ async function unshipLine(saleId, pn, qty){
     `OK → set back to Open\nCancel → set back to On Hold`
   )?'Open':'On Hold';
 
-  const asm=S.assemblies.find(a=>a.pn===pn);
+  const asm=findAsm(pn);
   const undoOps=[];
 
   // Restore assembly inventory
@@ -3174,7 +3187,7 @@ async function closeHistoricalOrders(){
 
 // ── Fulfillment actions ──
 async function markPacked(saleId,pn,qty){
-  const asm=S.assemblies.find(a=>a.pn===pn);
+  const asm=findAsm(pn);
   if(!asm){toast('Assembly '+pn+' not found');return;}
   const oh=asm.total_on_hand||0;
   // Stock is NOT deducted at Pack — deduction happens when the order ships
@@ -3253,7 +3266,7 @@ function openShipModal(saleId,pn,qty){openModal('shipOrder',{saleId,pn,qty});}
 async function submitShipment(saleId,pn,qty){
   const tracking=document.getElementById('ship-tracking').value.trim();
   const carrier=document.getElementById('ship-carrier').value;
-  const asm=S.assemblies.find(a=>a.pn===pn);
+  const asm=findAsm(pn);
   // Deduct stock at Ship (not at Pack) — works for both ERP-packed and SS-direct flows
   const asmPrev=asm?{...asm}:null;
   if(asm){
@@ -7210,7 +7223,7 @@ function bomChildLookup(){
   const pn=(el.value||'').trim().toUpperCase();
   if(!pn){if(hint)hint.textContent='';return;}
   const part=S.parts.find(p=>p.pn===pn);
-  const asm=S.assemblies.find(a=>a.pn===pn);
+  const asm=findAsm(pn);
   if(part){
     if(hint)hint.textContent=escHtml(part.description||'')+(part.vendor?' · '+escHtml(part.vendor):'');
     if(typeEl)typeEl.value='part';
@@ -7238,7 +7251,7 @@ async function saveBOMItem(){
 async function recordPack(pn,asmId){
   const{error}=await db.from('pack_log').insert({pn,qty:1,pack_date:new Date().toISOString()});
   if(error){toast('Error: '+error.message);return;}
-  const asm=S.assemblies.find(a=>a.pn===pn);
+  const asm=findAsm(pn);
   if(asm){
     const oh=(asm.total_on_hand||0)+1;
     await db.from('assemblies').update({total_on_hand:oh,total_assembled:(asm.total_assembled||0)+1,updated_at:new Date().toISOString()}).eq('id',asm.id);
