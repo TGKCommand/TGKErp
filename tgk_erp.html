@@ -12064,7 +12064,8 @@ function renderBuildPlanner(asm){
         donors.forEach(d=>{
           out+='<div class="check-row">'
             +'<span class="pn" style="color:var(--teal)">'+d.pn+'</span>'
-            +'<span style="font-size:10px;color:var(--text3);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+d.desc+'</span>'
+            +'<span style="font-size:10px;color:var(--text3);max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+d.desc+'</span>'
+            +(d.steps?'<span style="font-size:9px;color:var(--orange);font-style:italic">'+d.steps+'</span>':'')
             +'<span style="font-size:10px;color:var(--text3)">'+d.onHand+' on hand · '+d.perUnit+'/unit · '+(d.wkDemand>0?d.wkDemand.toFixed(1)+'/wk sales':'no recent sales')+'</span>'
             +'<span style="flex:1"></span>'
             +'<span style="font-size:11px;color:'+(d.covers?'var(--green)':'var(--yellow)')+';font-weight:600">frees '+d.frees+(d.covers?' ✓':' (partial)')+'</span>'
@@ -12081,25 +12082,74 @@ function renderBuildPlanner(asm){
 }
 
 function donorOptions(partPn, shortQty, excludePn){
-  // Which in-stock assemblies could be unpacked to free this part?
+  // Which in-stock assemblies could be unpacked to free this part or subassembly?
+  const pm={}; S.parts.forEach(p=>pm[p.pn]=p);
+  const am={}; S.assemblies.forEach(a=>am[a.pn]=a);
   const donors=[];
+  const seen=new Set();
+
+  // ── Level 1: direct BOM child (part OR subassembly) ──────────────────────
   Object.entries(S.boms).forEach(([parent,items])=>{
     if(parent===excludePn)return;
-    const line=items.find(i=>i.item_type==='part'&&i.child_pn===partPn);
+    // Fix: remove item_type==='part' filter — match any child regardless of type
+    const line=items.find(i=>i.child_pn===partPn);
     if(!line)return;
     const asm=S.assemblies.find(a=>a.pn===parent&&!a.discontinued);
     if(!asm||(asm.total_on_hand||0)<=0)return;
+    if(seen.has(parent))return;
+    seen.add(parent);
     const perUnit=line.qty||1;
     const unitsNeeded=Math.ceil(shortQty/perUnit);
     const unitsAvail=asm.total_on_hand||0;
     const units=Math.min(unitsNeeded,unitsAvail);
     const frees=units*perUnit;
     const demand=asmAvgWk(asm);
-    donors.push({pn:parent,id:asm.id,desc:asm.description||'',onHand:unitsAvail,perUnit,units,frees,covers:frees>=shortQty,wkDemand:demand});
+    donors.push({
+      pn:parent, id:asm.id, desc:asm.description||'',
+      onHand:unitsAvail, perUnit, units, frees,
+      covers:frees>=shortQty, wkDemand:demand,
+      steps:null  // direct unpack
+    });
   });
-  // best donors first: covers the shortage, then lowest sales demand (least painful to unpack)
+
+  // ── Level 2: part is nested inside a subassembly ──────────────────────────
+  // e.g. need part X → sub B contains X → assembly A contains sub B
+  // Unpacking A gives sub B, then unpacking B gives part X
+  Object.entries(S.boms).forEach(([subPn, subItems])=>{
+    if(subPn===excludePn)return;
+    const subLine=subItems.find(i=>i.child_pn===partPn);
+    if(!subLine)return;
+    // subPn contains partPn — now find top-level assemblies that contain subPn
+    Object.entries(S.boms).forEach(([parent,parentItems])=>{
+      if(parent===excludePn||parent===subPn)return;
+      if(seen.has(parent))return;
+      const parentLine=parentItems.find(i=>i.child_pn===subPn);
+      if(!parentLine)return;
+      const asm=S.assemblies.find(a=>a.pn===parent&&!a.discontinued);
+      if(!asm||(asm.total_on_hand||0)<=0)return;
+      seen.add(parent);
+      // How many of the sub would unpacking give us?
+      const subsPerAsm=parentLine.qty||1;
+      const partsPerSub=subLine.qty||1;
+      const partsPerAsm=subsPerAsm*partsPerSub;
+      const unitsAvail=asm.total_on_hand||0;
+      const unitsNeeded=Math.ceil(shortQty/partsPerAsm);
+      const units=Math.min(unitsNeeded,unitsAvail);
+      const frees=units*partsPerAsm;
+      const demand=asmAvgWk(asm);
+      donors.push({
+        pn:parent, id:asm.id, desc:asm.description||'',
+        onHand:unitsAvail, perUnit:partsPerAsm, units, frees,
+        covers:frees>=shortQty, wkDemand:demand,
+        // Two-step label so user knows they also need to unpack the sub
+        steps:'Unpack \u2192 then unpack '+subPn
+      });
+    });
+  });
+
+  // Best donors first: covers shortage, then lowest sales demand (least painful to unpack)
   donors.sort((a,b)=>(b.covers-a.covers)||(a.wkDemand-b.wkDemand));
-  return donors.slice(0,4);
+  return donors.slice(0,5);
 }
 
 async function unpackPlanned(pn,asmId,qty){
