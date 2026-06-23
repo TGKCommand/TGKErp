@@ -3587,6 +3587,9 @@ async function submitEditOrder(originalOrderNumOrId){
 
   document.getElementById('edit-order-overlay')?.remove();
 
+  // Prompt about inventory if any SKUs changed
+  if(invChanges.length)_promptInvChanges(invChanges,newOrderNum,now);
+
   // Auto-lock order so Shopify sync won't overwrite ERP changes
   if(!errors&&newOrderNum) await lockOrderFromSync(newOrderNum);
 
@@ -14838,11 +14841,11 @@ function renderPriceList(){
     +'<div style="overflow:auto;flex:1"><table class="data-table" style="min-width:950px">'
     +'<thead><tr style="position:sticky;top:0;z-index:2;background:var(--bg3)">'
     +'<th style="text-align:center;width:36px" title="Live on vendor price list">Live</th>'
-    +'<th class="pn">SKU</th><th>Category</th><th>Description</th><th style="color:var(--blue)">Product Page</th>'
+    +'<th class="pn">SKU</th><th>Category</th><th>Description</th>'
     +'<th class="money-retail">MSRP</th><th class="money-retail" style="color:var(--teal)">Std 10%</th>'
     +'<th class="money-retail" style="color:var(--orange)">Pref 20%</th>'
     +'<th>US Ship</th><th>Canada</th><th>Intl</th>'
-    +'<th class="money-retail">Sales Price</th><th>Notes</th>'
+    +'<th class="money-retail">Sales Price</th><th>Notes</th><th style="color:var(--blue)">Product Page</th>'
     +'</tr></thead><tbody>'+tbody+'</tbody></table></div>';
 }
 async function publishPriceListNow(){
@@ -15846,6 +15849,21 @@ async function setPartImageUrl(pn){
 if(!S.dealerPOPayments)S.dealerPOPayments={};
 if(!S.dealerDetailTab)S.dealerDetailTab='open';
 
+function parseDealerPO(discountCode,dealers){
+  if(!discountCode)return null;
+  var code=discountCode.trim();
+  for(var i=0;i<dealers.length;i++){
+    var d=dealers[i];
+    var prefix=(d.po_code_prefix||'').trim().toLowerCase();
+    if(!prefix||!d.billing_required)continue;
+    if(code.toLowerCase().startsWith(prefix)){
+      var rest=code.slice(prefix.length).replace(/^[\s\-\*_]+/,'').trim();
+      if(rest)return{dealer:d,poNumber:rest,rawCode:code};
+    }
+  }
+  return null;
+}
+
 function _buildDealerPOs(dealerId){
   var poMap={};
   S.sales.forEach(function(s){
@@ -16042,6 +16060,37 @@ async function reverseReturn(saleId){
   }
   render();
 }
+
+async function dismissPreERPRefund(orderNum,evt){
+  if(evt)evt.stopPropagation();
+  var lines=S.sales.filter(function(s){return (s.order_number||s.id)===orderNum;});
+  if(!lines.length){toast('Order not found');return;}
+  var ids=lines.map(function(s){return s.id;});
+  for(var i=0;i<ids.length;i++){
+    await db.from('sales').update({return_status:'dismissed',return_reason:'Pre-ERP / no inventory action',updated_at:new Date().toISOString()}).eq('id',ids[i]);
+  }
+  S.sales=S.sales.map(function(s){return ids.includes(s.id)?Object.assign({},s,{return_status:'dismissed',return_reason:'Pre-ERP / no inventory action'}):s;});
+  toast('Order '+orderNum+' dismissed — no inventory change');
+  render();
+}
+
+async function dismissAllPreERPRefunds(){
+  var toMark=S.sales.filter(function(s){
+    return (s.financial_status==='refunded'||s.fulfillment_status==='Refunded'||s.financial_status==='partially_refunded')&&!s.return_status;
+  });
+  if(!toMark.length){toast('No refunds to dismiss');return;}
+  if(!confirm('Mark all '+toMark.length+' refunds as dismissed?\n\nNo inventory changes will be made.'))return;
+  for(var i=0;i<toMark.length;i+=100){
+    var batch=toMark.slice(i,i+100).map(function(s){return s.id;});
+    await db.from('sales').update({return_status:'dismissed',return_reason:'Pre-ERP bulk dismiss',updated_at:new Date().toISOString()}).in('id',batch);
+  }
+  S.sales=S.sales.map(function(s){
+    return toMark.find(function(t){return t.id===s.id;})?Object.assign({},s,{return_status:'dismissed'}):s;
+  });
+  toast('\u2713 All refunds dismissed');
+  render();
+}
+
 
 function _buildRefundCard(unref){
   var badges=unref.slice(0,6).map(function(s){
@@ -16310,6 +16359,82 @@ function _chatInit(){
   initChat();
 }
 
+
+// ── Inventory prompt on SKU change in order edit ──────────────────
+window._pendingInvChanges=null;
+
+async function _promptInvChanges(changes,orderNum,now){
+  if(!changes.length)return;
+  window._pendingInvChanges={changes:changes,orderNum:orderNum,now:now};
+  var rows=changes.map(function(chg){
+    var oldAsm=findAsm(chg.oldPn);
+    var newAsm=findAsm(chg.newPn);
+    var oldOh=oldAsm?(oldAsm.total_on_hand||0):null;
+    var newOh=newAsm?(newAsm.total_on_hand||0):null;
+    return '<tr style="border-bottom:1px solid var(--border)">'
+      +'<td style="padding:8px 12px;font-family:var(--mono);font-size:11px;color:var(--text3)">'+escHtml(chg.oldPn)+'</td>'
+      +'<td style="padding:8px 6px;font-size:14px;color:var(--text3)">\u2192</td>'
+      +'<td style="padding:8px 12px;font-family:var(--mono);font-size:11px;font-weight:700;color:var(--teal)">'+escHtml(chg.newPn)+'</td>'
+      +'<td style="padding:8px 12px;font-size:11px;text-align:center">'+chg.qty+'</td>'
+      +'<td style="padding:8px 12px;font-size:11px">'
+        +(oldAsm?'<span style="color:var(--teal)">+'+chg.qty+' '+escHtml(chg.oldPn)+'</span> ('+oldOh+'\u2192'+(oldOh+chg.qty)+')<br>':'')
+        +(newAsm?'<span style="color:var(--red)">\u2212'+chg.qty+' '+escHtml(chg.newPn)+'</span> ('+newOh+'\u2192'+Math.max(0,newOh-chg.qty)+')':'<span style="color:var(--text3)">'+escHtml(chg.newPn)+' not in ERP</span>')
+      +'</td>'
+      +'</tr>';
+  }).join('');
+  openModal('custom',{
+    title:'\u25b3 Update Inventory? \u2014 Order '+orderNum,
+    html:'<div style="font-size:12px;color:var(--text2);margin-bottom:14px">You changed SKUs on this order. Should the ERP adjust inventory to match?</div>'
+      +'<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:14px">'
+      +'<thead><tr style="background:var(--bg2);border-bottom:2px solid var(--border)">'
+      +'<th style="padding:8px 12px;text-align:left;font-size:10px;text-transform:uppercase;color:var(--text3)">Old SKU</th>'
+      +'<th></th>'
+      +'<th style="padding:8px 12px;text-align:left;font-size:10px;text-transform:uppercase;color:var(--text3)">New SKU</th>'
+      +'<th style="padding:8px 12px;text-align:center;font-size:10px;text-transform:uppercase;color:var(--text3)">Qty</th>'
+      +'<th style="padding:8px 12px;text-align:left;font-size:10px;text-transform:uppercase;color:var(--text3)">Effect</th>'
+      +'</tr></thead><tbody>'+rows+'</tbody></table>'
+      +'<div style="font-size:10px;color:var(--text3);margin-bottom:14px">Old SKU will be restocked. New SKU will be deducted. Click Skip if already handled.</div>'
+      +'<div class="modal-footer">'
+      +'<button class="btn" onclick="closeModal()">Skip \u2014 no change</button>'
+      +'<button class="btn btn-primary" onclick="window._applyPendingInv()">Yes \u2014 Update Inventory</button>'
+      +'</div>'
+  });
+}
+
+window._applyPendingInv=async function(){
+  closeModal();
+  var d=window._pendingInvChanges;
+  if(!d)return;
+  var changes=d.changes,orderNum=d.orderNum;
+  var applied=[];var errs=[];
+  for(var i=0;i<changes.length;i++){
+    var chg=changes[i];
+    var oldAsm=findAsm(chg.oldPn);
+    if(oldAsm){
+      var prev=oldAsm.total_on_hand||0;var noh=prev+chg.qty;
+      var r=await db.from('assemblies').update({total_on_hand:noh,updated_at:new Date().toISOString()}).eq('id',oldAsm.id);
+      if(!r.error){
+        S.assemblies=S.assemblies.map(function(a){return a.id===oldAsm.id?Object.assign({},a,{total_on_hand:noh}):a;});
+        await db.from('inv_corrections').insert({pn:chg.oldPn,previous_qty:prev,new_qty:noh,adjustment:chg.qty,reason:'SKU swap on order '+orderNum+' ('+chg.oldPn+'\u2192'+chg.newPn+') \u2014 restocked',user_email:S.currentUser||null,source:'order_edit'});
+        applied.push('+'+chg.qty+'\xd7'+chg.oldPn);
+      }else errs.push(chg.oldPn+': '+r.error.message);
+    }
+    var newAsm=findAsm(chg.newPn);
+    if(newAsm){
+      var prev2=newAsm.total_on_hand||0;var noh2=Math.max(0,prev2-chg.qty);
+      var r2=await db.from('assemblies').update({total_on_hand:noh2,updated_at:new Date().toISOString()}).eq('id',newAsm.id);
+      if(!r2.error){
+        S.assemblies=S.assemblies.map(function(a){return a.id===newAsm.id?Object.assign({},a,{total_on_hand:noh2}):a;});
+        await db.from('inv_corrections').insert({pn:chg.newPn,previous_qty:prev2,new_qty:noh2,adjustment:-chg.qty,reason:'SKU swap on order '+orderNum+' ('+chg.oldPn+'\u2192'+chg.newPn+') \u2014 deducted',user_email:S.currentUser||null,source:'order_edit'});
+        applied.push('-'+chg.qty+'\xd7'+chg.newPn);
+      }else errs.push(chg.newPn+': '+r2.error.message);
+    }
+  }
+  window._pendingInvChanges=null;
+  if(errs.length)toast('\u26a0 Inventory errors: '+errs.join('; '));
+  else toast('\u2713 Inventory updated: '+applied.join(' | '));
+  render();
+};
 </script>
 <div id="cart-overlay" onclick="closeCart()"></div>
 <div id="cart-panel">
