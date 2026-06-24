@@ -1037,6 +1037,15 @@ function setupRealtime(){
             const row=document.querySelector(`tr[data-order="${p.new.order_number}"]`);
             if(row){row.classList.remove('rt-flash');void row.offsetWidth;row.classList.add('rt-flash');}
           },100);
+          // Auto-prompt box log when ShipStation marks a multi-SKU order as Shipped
+          if(p.new.fulfillment_status==='Shipped'&&p.new.order_number){
+            setTimeout(function(){
+              var orderLines=S.sales.filter(function(s){return s.order_number===p.new.order_number;});
+              if(orderLines.length>1&&!hasBoxLog(p.new.order_number)){
+                openShippingBoxModal(p.new.order_number);
+              }
+            },1200); // delay so S.sales is fully updated
+          }
         }
       } else if(p.eventType==='DELETE'){
         S.sales=S.sales.filter(s=>s.id!==p.old.id);
@@ -1621,6 +1630,7 @@ function renderDashboard(){
     <span style="font-size:11px;color:var(--text2);flex:1">Orders older than 60 days still showing as Open — likely fulfilled before the ERP existed.</span>
     <button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="closeHistoricalOrders()">🧹 Close old orders</button>
   </div>`:''}
+  ${(function(){var pending=_pendingBoxOrders();return pending.length?'<div class="panel" style="padding:10px 18px;display:flex;gap:12px;align-items:center;border-left:3px solid var(--orange);flex-wrap:wrap">'+'<span style="font-size:13px">&#128230;</span>'+'<span style="font-size:12px;font-weight:700;color:var(--orange)">'+pending.length+' shipped order'+(pending.length!==1?'s':'')+' missing shipping box log</span>'+'<span style="font-size:11px;color:var(--text2);flex:1">Multi-SKU orders shipped via ShipStation — outer box not yet deducted from inventory.</span>'+'<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="setFilter(\'sales\',\'fstatus\',\'Shipped\');nav(\'sales\')">View Orders &rarr;</button>'+'</div>':'';})()}
   ${openWarranty>0||openCounts>0?`<div class="panel" style="padding:10px 18px;display:flex;gap:18px;align-items:center;border-left:3px solid var(--yellow)">
     <span style="font-size:11px;color:var(--text2)">⚑ Pending tasks:</span>
     ${openWarranty>0?`<button class="filter-chip" onclick="nav('warranty')">${openWarranty} open warranty claim${openWarranty>1?'s':''}</button>`:''}
@@ -2516,7 +2526,7 @@ function renderSales(){
     <td class="pn" style="color:${s._grouped?'var(--text3)':'var(--teal)'}">${s._grouped?'Multiple SKUs':s.pn}</td>
     <td class="money-neutral" style="font-weight:700">${s._grouped?s.qty+' total':(s.qty||1)}</td>
     <td>${s._grouped?(allDropShip?`<span style="font-size:10px;color:var(--purple);font-weight:600">↓ Drop-ship</span>`:dsLineCount>0?`<span style="font-size:10px;color:var(--text3)">${dsLineCount} DS line${dsLineCount>1?'s':''}</span>`:`<span style="color:var(--text3)">—</span>`):stock===null?`<span style="font-size:10px;color:var(--purple);font-weight:600">↓ Drop-ship</span>`:`<span class="money" style="color:${canFill?'var(--green)':'var(--red)'};font-weight:700">${stock}</span>`}</td>
-    <td>${fsPill(s.fulfillment_status||'Open')}${s._isPartialShip?` <span style="font-size:9px;color:${s._allPendingOnHold?'var(--orange)':'var(--yellow)'};font-weight:700">✂ ${s._shippedCount} shipped · ${s._pendingCount} ${s._allPendingOnHold?'on hold':'pending'}</span>`:''}${s.on_hold&&!s._isPartialShip?` <span style="font-size:9px;color:var(--orange);font-weight:700">⏸ Hold</span>`:''}</td>
+    <td>${fsPill(s.fulfillment_status||'Open')}${s._grouped&&['Shipped','Delivered'].includes(s.fulfillment_status||'')&&!hasBoxLog(s.order_number||s.id)?'<span title="Shipping box not yet logged" style="font-size:10px;margin-left:4px;cursor:pointer;opacity:.7" onclick="event.stopPropagation();openShippingBoxModal(\'\'${escHtml(s.order_number||s.id)}\'\')">&#128230;</span>':''}${s._isPartialShip?` <span style="font-size:9px;color:${s._allPendingOnHold?'var(--orange)':'var(--yellow)'};font-weight:700">✂ ${s._shippedCount} shipped · ${s._pendingCount} ${s._allPendingOnHold?'on hold':'pending'}</span>`:''}${s.on_hold&&!s._isPartialShip?` <span style="font-size:9px;color:var(--orange);font-weight:700">⏸ Hold</span>`:''}</td>
     <td style="font-size:10px;font-family:var(--mono)">${multiTrack?`<span style="color:var(--yellow)" title="${allOrderLines.filter(x=>x.tracking_number).map(x=>(x.carrier?x.carrier+' ':'')+x.tracking_number).join('\n')}">🔀 ${allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length} shipments</span>`:repTracking?`<a href="${trackingUrl(repCarrier,repTracking)}" target="_blank" style="color:var(--teal);text-decoration:none" title="Track ${repCarrier} ${repTracking}">${repCarrier?repCarrier+' ':''}${repTracking} ↗</a>`:'<span style="color:var(--text3)">—</span>'}</td>
     <td style="display:flex;gap:4px">
       ${fs==='Open'&&stock!==null?`<button class="btn btn-teal btn-sm" ${canFill?'':'disabled title="Insufficient stock"'} onclick="markPacked('${s.id}','${s.pn}',${s.qty||1})">Pack</button>`:''}
@@ -2618,6 +2628,7 @@ function renderSaleDetail(s){
       ${openLines.length?`<button class="btn btn-teal btn-sm" ${allCanPack?'':`disabled title="Insufficient stock"`} onclick="packAllLines('${s.order_number||s.id}')">Pack All (${openLines.length})</button>`:''}
 
       ${packedLines.length?`<button class="btn btn-primary btn-sm" onclick="openShipModal('${packedLines[0].id}','${packedLines[0].pn}',${packedLines[0].qty||1})">&#128666; Ship</button>`:''}
+      ${(allLines.length>1&&(openLines.length||packedLines.length||shippedLines.length)&&!hasBoxLog(s.order_number||s.id))?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="openShippingBoxModal('${s.order_number||s.id}')">&#128230; Log Box</button>`:''}
       ${detailOrderFs==='Shipped'?`<button class="btn btn-sm chip-teal" onclick="markDelivered('${s.id}')">&#10003; Delivered</button>`:''}
     </div>
     <div style="width:1px;height:24px;background:var(--border);flex-shrink:0"></div>`:``}
@@ -2744,11 +2755,156 @@ function renderSaleDetail(s){
 }
 
 // Pack all open lines on an order at once
+/* ── SHIPPING BOX LOG ─────────────────────────────────────────────────── */
+/* ── BOX LOG HELPERS ──────────────────────────────────────────────────── */
+function hasBoxLog(orderNum){
+  return S.corrections.some(function(c){
+    return c.source==='pack'&&(c.reason||'').indexOf('Shipping box')!==-1&&(c.reason||'').indexOf(orderNum)!==-1;
+  });
+}
+
+function _pendingBoxOrders(){
+  // Multi-SKU shipped orders with no box log yet
+  var groups={};
+  S.sales.forEach(function(s){
+    if(!['Shipped','Delivered','Partial'].includes(s.fulfillment_status||''))return;
+    var k=s.order_number||s.id;
+    if(!groups[k])groups[k]=[];
+    groups[k].push(s);
+  });
+  return Object.keys(groups).filter(function(k){
+    return groups[k].length>1&&!hasBoxLog(k);
+  });
+}
+
+function openShippingBoxModal(orderNum){
+  // Build box list: parts with box-like category or PN, sorted by stock
+  var boxParts=S.parts.filter(function(p){
+    if(p.discontinued)return false;
+    var cat=(p.category||'').toLowerCase();
+    var pn=(p.pn||'').toLowerCase();
+    return cat.includes('box')||cat.includes('packaging')||cat.includes('shipping')
+      ||pn.includes('box')||pn.includes('pkg')||pn.includes('-ship');
+  }).sort(function(a,b){return (b.total_unpckgd||0)-(a.total_unpckgd||0);});
+
+  // Also include ALL parts as fallback options for the search
+  var allOpts=S.parts.filter(function(p){return !p.discontinued;})
+    .sort(function(a,b){return a.pn.localeCompare(b.pn);});
+
+  function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+  var old=document.getElementById('shpbox-ov');if(old)old.remove();
+  var ov=document.createElement('div');
+  ov.id='shpbox-ov';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9100;display:flex;align-items:center;justify-content:center;padding:16px';
+
+  var boxRows=boxParts.length
+    ?boxParts.map(function(p){
+      var stock=p.total_unpckgd||0;
+      var low=p.min_qty&&stock<p.min_qty;
+      return '<button class="shpbox-opt" data-pn="'+esc(p.pn)+'" onclick="selectShpBox(this)" '
+        +'style="display:flex;align-items:center;gap:10px;width:100%;padding:9px 12px;border:1.5px solid var(--border);border-radius:7px;background:var(--bg3);cursor:pointer;text-align:left;margin-bottom:6px;transition:.12s">'
+        +'<span style="font-family:var(--mono);font-size:12px;font-weight:700;color:var(--teal);flex-shrink:0">'+esc(p.pn)+'</span>'
+        +'<span style="font-size:12px;color:var(--text2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(p.description||'')+'</span>'
+        +'<span style="font-size:11px;font-family:var(--mono);font-weight:700;color:'+(low?'var(--red)':'var(--green)')+'">'+stock+' left</span>'
+        +'</button>';
+    }).join('')
+    :'<div style="font-size:12px;color:var(--text3);padding:12px 0">No box parts found — add parts with category "Box" or "Packaging" to see them here.</div>';
+
+  ov.innerHTML='<div style="background:var(--bg);border-radius:12px;max-width:480px;width:100%;max-height:82vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.4);overflow:hidden">'
+    +'<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-shrink:0">'
+      +'<div style="font-size:20px">&#128230;</div>'
+      +'<div style="flex:1">'
+        +'<div style="font-size:15px;font-weight:700;color:var(--text)">Log Shipping Box</div>'
+        +'<div style="font-size:11px;color:var(--text3);margin-top:2px">Order '+esc(orderNum)+' &nbsp;&middot;&nbsp; Multi-SKU shipment</div>'
+      +'</div>'
+      +'<button onclick="document.getElementById(\'shpbox-ov\').remove()" style="background:none;border:none;font-size:22px;cursor:pointer;color:var(--text3);line-height:1">\u00d7</button>'
+    +'</div>'
+    // Search override
+    +'<div style="padding:10px 16px;border-bottom:1px solid var(--border);flex-shrink:0">'
+      +'<div style="font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text3);margin-bottom:6px">Or search any part</div>'
+      +'<div style="display:flex;gap:8px;align-items:center">'
+        +'<input id="shpbox-search" list="shpbox-list" placeholder="Search PN or description…" '
+          +'style="flex:1;padding:6px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;font-family:var(--mono)">'
+        +'<datalist id="shpbox-list">'
+          +allOpts.map(function(p){return'<option value="'+esc(p.pn)+'">'+esc(p.description||'')+'</option>';}).join('')
+        +'</datalist>'
+        +'<button class="btn btn-teal btn-sm" onclick="confirmShpBoxSearch(\''+esc(orderNum)+'\')">Log</button>'
+      +'</div>'
+    +'</div>'
+    // Box list
+    +'<div style="padding:12px 16px;overflow-y:auto;flex:1">'
+      +(boxParts.length?'<div style="font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text3);margin-bottom:8px">Box Parts</div>':'')
+      +boxRows
+    +'</div>'
+    // Footer
+    +'<div style="padding:12px 16px;border-top:1px solid var(--border);flex-shrink:0;display:flex;justify-content:flex-end">'
+      +'<button class="btn" onclick="document.getElementById(\'shpbox-ov\').remove()">Skip — no outer box</button>'
+    +'</div>'
+  +'</div>';
+
+  document.body.appendChild(ov);
+  // Store order num for confirm handlers
+  ov.dataset.orderNum=orderNum;
+  // Highlight on click
+  ov.querySelectorAll('.shpbox-opt').forEach(function(b){
+    b.addEventListener('click',function(){
+      ov.querySelectorAll('.shpbox-opt').forEach(function(x){x.style.borderColor='var(--border)';x.style.background='var(--bg3)';});
+      b.style.borderColor='var(--teal)';b.style.background='var(--teal-dim)';
+      // Show confirm button
+      var cf=document.getElementById('shpbox-confirm');
+      if(!cf){
+        cf=document.createElement('button');
+        cf.id='shpbox-confirm';
+        cf.className='btn btn-teal btn-sm';
+        cf.textContent='Deduct & Log';
+        cf.style.marginLeft='8px';
+        var footer=ov.querySelector('[style*="justify-content:flex-end"]');
+        if(footer)footer.insertBefore(cf,footer.firstChild);
+      }
+      cf.onclick=function(){deductShippingBox(b.dataset.pn,ov.dataset.orderNum);};
+    });
+  });
+}
+
+function selectShpBox(btn){}  // handled by event delegation above
+
+function confirmShpBoxSearch(orderNum){
+  var inp=document.getElementById('shpbox-search');
+  var pn=(inp&&inp.value||'').trim();
+  if(!pn){toast('Enter a box PN');return;}
+  deductShippingBox(pn,orderNum);
+}
+
+async function deductShippingBox(pn,orderNum){
+  var part=S.parts.find(function(p){return p.pn===pn;});
+  if(!part){toast('Part '+pn+' not found');return;}
+  var prev=part.total_unpckgd||0;
+  var newQty=prev-1;
+  var r=await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
+  if(r.error){toast('\u26a0 '+r.error.message);return;}
+  S.parts=S.parts.map(function(p){return p.id===part.id?Object.assign({},p,{total_unpckgd:newQty}):p;});
+  await db.from('inv_corrections').insert({
+    pn:pn,previous_qty:prev,new_qty:newQty,adjustment:-1,
+    reason:'Shipping box \u2014 multi-SKU order '+orderNum,
+    user_email:S.currentUser||null,source:'pack'
+  });
+  logAction('Shipping box '+pn+' deducted for order '+orderNum,'parts',pn,{total_unpckgd:prev},{total_unpckgd:newQty}).catch(function(){});
+  document.getElementById('shpbox-ov')?.remove();
+  toast('\u2713 '+pn+' logged \u2014 '+newQty+' remaining');
+  render();
+}
+
 async function packAllLines(orderNumOrId){
   const lines=S.sales.filter(s=>s.order_number===orderNumOrId||(s.id===orderNumOrId)).filter(s=>(s.fulfillment_status||'Open')==='Open');
   if(!lines.length){toast('No open lines to pack');return;}
   for(const line of lines){
     await markPacked(line.id,line.pn,line.qty||1);
+  }
+  // Multi-SKU order: prompt for outer shipping box
+  if(lines.length>1){
+    var orderNum=lines[0].order_number||orderNumOrId;
+    openShippingBoxModal(orderNum);
   }
 }
 
@@ -16435,6 +16591,7 @@ function _buildDealerPOs(dealerId){
     if(!parsed||parsed.dealer.id!==dealerId)return;
     var po=parsed.poNumber;
     var msrp=s.msrp||0;
+    if(!msrp){var _fa=S.assemblies.find(function(a){return a.pn===s.pn;});msrp=_fa?(_fa.sales_price!=null?parseFloat(_fa.sales_price)||0:_fa.msrp||0):0;}
     var dealerPrice=+(msrp*(1-disc)).toFixed(4);
     var lineTotal=+(dealerPrice*(s.qty||1)).toFixed(4);
     var msrpLine=+(msrp*(s.qty||1)).toFixed(4);
@@ -16476,7 +16633,7 @@ function _dealerPORows(pos,dealerId,isPaid){
       return '<tr style="border-bottom:1px solid var(--border)">'
         +'<td style="padding:10px 16px;font-family:var(--mono);font-size:13px;font-weight:700">'+escHtml(po.poNumber)+'</td>'
         +'<td style="padding:10px 12px">'+badges+'</td>'
-        +'<td style="padding:10px 12px;font-size:11px;color:var(--text3)">'+(po.orders[0]?.sale_date||'')+'</td>'
+        +'<td style="padding:10px 12px;font-size:11px;color:var(--text3)">'+((po.orders[0]?.sale_date||'').slice(0,10)||'—')+'</td>'
         +'<td style="padding:10px 12px;text-align:right">'+'<div style="font-family:var(--mono);font-weight:800;color:var(--text)">$'+po.total.toFixed(2)+'</div>'+(po.msrpTotal&&Math.abs(po.msrpTotal-po.total)>0.01?'<div style="font-size:10px;color:var(--text3)">MSRP $'+po.msrpTotal.toFixed(2)+'</div>':'')+'</td>'
         +(isPaid?'<td style="padding:10px 12px;font-size:11px;color:var(--teal)"><b>'+escHtml(po.payment?.paid_at||'')+'</b></td>':'')
         +'<td style="padding:10px 16px"><div style="display:flex;gap:6px;justify-content:flex-end">'
@@ -16506,8 +16663,28 @@ function _renderDealerDetailContent(dealerId){
       +'</div>'
     +'</div>'
     +'<button class="btn btn-sm" onclick="openModal(\'editDealer\',S.dealers.find(function(x){return x.id===\''+dealerId+'\';}));document.getElementById(\'dd-ov\')?.remove()">&#9998; Edit</button>'
+    +'<button onclick="document.getElementById(\'dd-ov\').remove()" style="background:none;border:none;font-size:22px;cursor:pointer;color:var(--text3);line-height:1">\u2715</button>';
+}
+
+function _renderDealerDetailContent(dealerId){
+  var dealer=S.dealers.find(function(d){return d.id===dealerId;});
+  if(!dealer)return'';
+  var tab=S.dealerDetailTab||'open';
+  var data=_buildDealerPOs(dealerId);
+  var discPct=typeof dealer.discount_pct==='number'?Math.round(dealer.discount_pct*100)+'%':'20%';
+  var noPO=!dealer.billing_required||!dealer.po_code_prefix;
+  return '<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-shrink:0">'
+    +'<div style="flex:1">'
+      +'<div style="font-size:18px;font-weight:800;color:var(--text)">'+escHtml(dealer.name)+'</div>'
+      +'<div style="font-size:11px;color:var(--text3);margin-top:3px;display:flex;gap:12px;flex-wrap:wrap">'
+        +(dealer.contact_name?'<span>'+escHtml(dealer.contact_name)+'</span>':'')
+        +(dealer.email?'<a href="mailto:'+escHtml(dealer.email)+'" style="color:var(--teal)">'+escHtml(dealer.email)+'</a>':'')
+        +'<span>'+discPct+' off MSRP</span>'
+        +'<span class="pill '+(dealer.status==='Active'?'pill-teal':'pill-muted')+'" style="font-size:9px">'+escHtml(dealer.status||'')+'</span>'
+      +'</div>'
+    +'</div>'
+    +'<button class="btn btn-sm" onclick="openModal(\'editDealer\',S.dealers.find(function(x){return x.id===\''+dealerId+'\';}));document.getElementById(\'dd-ov\')?.remove()">&#9998; Edit</button>'
     +'<button onclick="document.getElementById(\'dd-ov\').remove()" style="background:none;border:none;font-size:22px;cursor:pointer;color:var(--text3);line-height:1">\u2715</button>'
-  +(data.open.length?'<button class="btn btn-sm" style="color:var(--blue);border-color:rgba(37,99,235,.3)" data-did="'+dealerId+'" onclick="printDealerBulkInvoice(this.dataset.did)">&#128438; Weekly Invoice</button>'+'<button class="btn btn-sm btn-teal" data-did="'+dealerId+'" onclick="markAllDealerPOsPaid(this.dataset.did)">&#10003; Mark All Paid</button>':'')
   +'</div>'
   +(noPO
     ?'<div style="flex:1;padding:40px;text-align:center;color:var(--text3)">'
