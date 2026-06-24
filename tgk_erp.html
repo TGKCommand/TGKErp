@@ -2388,7 +2388,16 @@ function renderSales(){
   if(q)list=list.filter(s=>s.pn.toLowerCase().includes(q)||(s.order_number||'').toLowerCase().includes(q)||(s.source||'').toLowerCase().includes(q)||(s.customer_name||'').toLowerCase().includes(q));
   if(sf.fstatus){
     const allowed=new Set(sf.fstatus.split('|'));
-    list=list.filter(s=>allowed.has(s.fulfillment_status||'Open'));
+    const _inclRef=allowed.has('Refunded');
+    list=list.filter(s=>{
+      if(allowed.has(s.fulfillment_status||'Open'))return true;
+      // When Refunded is selected, also surface partially_refunded orders
+      if(_inclRef){
+        const _lines=s._grouped?s._allLines:[s];
+        return _lines.some(function(l){return l.financial_status==='partially_refunded';});
+      }
+      return false;
+    });
   }
 
   // KPIs — all derived from allGrouped (same as the list, just unfiltered)
@@ -16416,16 +16425,25 @@ function parseDealerPO(discountCode,dealers){
 }
 
 function _buildDealerPOs(dealerId){
+  var dealer=S.dealers.find(function(d){return d.id===dealerId;})||{};
+  var disc=typeof dealer.discount_pct==='number'?dealer.discount_pct:0.20;
   var poMap={};
   S.sales.forEach(function(s){
     if(!s.discount_code)return;
     var parsed=parseDealerPO(s.discount_code,S.dealers);
     if(!parsed||parsed.dealer.id!==dealerId)return;
     var po=parsed.poNumber;
-    if(!poMap[po])poMap[po]={poNumber:po,rawCode:parsed.rawCode,orders:[],total:0};
-    if(!poMap[po].orders.find(function(o){return o.order_number===s.order_number;}))
-      poMap[po].orders.push({id:s.id,order_number:s.order_number,sale_date:s.sale_date,pn:s.pn,qty:s.qty,msrp:s.msrp});
-    poMap[po].total+=(s.msrp||0)*(s.qty||1);
+    var msrp=s.msrp||0;
+    var dealerPrice=+(msrp*(1-disc)).toFixed(4);
+    var lineTotal=+(dealerPrice*(s.qty||1)).toFixed(4);
+    var msrpLine=+(msrp*(s.qty||1)).toFixed(4);
+    if(!poMap[po])poMap[po]={poNumber:po,rawCode:parsed.rawCode,orders:[],total:0,msrpTotal:0};
+    if(!poMap[po].orders.find(function(o){return o.id===s.id;})){
+      poMap[po].orders.push({id:s.id,order_number:s.order_number,sale_date:s.sale_date,
+        pn:s.pn,qty:s.qty||1,msrp:msrp,dealerPrice:dealerPrice,lineTotal:lineTotal});
+    }
+    poMap[po].total+=lineTotal;
+    poMap[po].msrpTotal+=msrpLine;
   });
   var all=Object.values(poMap).sort(function(a,b){
     return(b.orders[0]?.sale_date||'').localeCompare(a.orders[0]?.sale_date||'');
@@ -16436,7 +16454,7 @@ function _buildDealerPOs(dealerId){
     if(S.dealerPOPayments[k]){po.payment=S.dealerPOPayments[k];paid.push(po);}
     else open.push(po);
   });
-  return{open:open,paid:paid};
+  return{open:open,paid:paid,disc:disc};
 }
 
 function _dealerPORows(pos,dealerId,isPaid){
@@ -16445,7 +16463,7 @@ function _dealerPORows(pos,dealerId,isPaid){
     +'<th style="padding:8px 16px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">PO #</th>'
     +'<th style="padding:8px 12px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Orders</th>'
     +'<th style="padding:8px 12px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Date</th>'
-    +'<th style="padding:8px 12px;text-align:right;font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Amount (MSRP)</th>'
+    +'<th style="padding:8px 12px;text-align:right;font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Dealer Price</th>'
     +(isPaid?'<th style="padding:8px 12px;font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Paid On</th>':'')
     +'<th style="padding:8px 16px;text-align:right;font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Actions</th>'
     +'</tr></thead><tbody>'
@@ -16458,7 +16476,7 @@ function _dealerPORows(pos,dealerId,isPaid){
         +'<td style="padding:10px 16px;font-family:var(--mono);font-size:13px;font-weight:700">'+escHtml(po.poNumber)+'</td>'
         +'<td style="padding:10px 12px">'+badges+'</td>'
         +'<td style="padding:10px 12px;font-size:11px;color:var(--text3)">'+(po.orders[0]?.sale_date||'')+'</td>'
-        +'<td style="padding:10px 12px;text-align:right;font-family:var(--mono);font-weight:700">$'+po.total.toFixed(2)+'</td>'
+        +'<td style="padding:10px 12px;text-align:right">'+'<div style="font-family:var(--mono);font-weight:800;color:var(--text)">$'+po.total.toFixed(2)+'</div>'+(po.msrpTotal&&Math.abs(po.msrpTotal-po.total)>0.01?'<div style="font-size:10px;color:var(--text3)">MSRP $'+po.msrpTotal.toFixed(2)+'</div>':'')+'</td>'
         +(isPaid?'<td style="padding:10px 12px;font-size:11px;color:var(--teal)"><b>'+escHtml(po.payment?.paid_at||'')+'</b></td>':'')
         +'<td style="padding:10px 16px"><div style="display:flex;gap:6px;justify-content:flex-end">'
         +(isPaid
@@ -16496,7 +16514,16 @@ function _renderDealerDetailContent(dealerId){
       +'<div style="font-size:12px;margin-top:8px;max-width:320px;margin-left:auto;margin-right:auto">Edit this dealer to enable billing and set a discount code prefix for PO tracking.</div>'
       +'<button class="btn btn-primary" style="margin-top:16px" onclick="openModal(\'editDealer\',S.dealers.find(function(x){return x.id===\''+dealerId+'\';}));document.getElementById(\'dd-ov\')?.remove()">&#9998; Edit Dealer</button>'
     +'</div>'
-    :'<div style="display:flex;border-bottom:1px solid var(--border);flex-shrink:0">'
+    :'<div id="dd-bulk-bar" style="display:flex;align-items:center;gap:12px;padding:10px 20px;background:var(--bg2);border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap">'
+    +'<div style="flex:1">'
+    +'<div style="font-size:11px;color:var(--text3)">Open POs: <b style="color:var(--teal)">'+data.open.length+'</b></div>'
+    +'<div style="font-size:16px;font-weight:800;color:var(--text);font-family:var(--mono)">$'+(data.open.reduce(function(t,p){return t+p.total;},0)).toFixed(2)+' due</div>'
+    +'<div style="font-size:10px;color:var(--text3);margin-top:2px">'+(data.disc?Math.round(data.disc*100)+'% dealer discount':'')+'</div>'
+    +'</div>'
+    +'<button class="btn btn-sm" style="color:var(--blue);border-color:rgba(37,99,235,.3)" data-did="'+dealerId+'" onclick="sendDealerBulkInvoice(this.dataset.did)">&#128231; Weekly Invoice</button>'
+    +'<button class="btn btn-sm btn-teal" data-did="'+dealerId+'" onclick="markAllDealerPOsPaid(this.dataset.did)">&#10003; Mark All Paid</button>'
+    +'</div>'
+    +'<div style="display:flex;border-bottom:1px solid var(--border);flex-shrink:0">'
       +'<button id="dd-tab-open" style="padding:10px 24px;font-size:13px;font-weight:700;border:none;cursor:pointer;border-bottom:3px solid '+(tab==='open'?'var(--teal)':'transparent')+';color:'+(tab==='open'?'var(--teal)':'var(--text3)')+';background:transparent" onclick="S.dealerDetailTab=\'open\';document.getElementById(\'dd-content\').innerHTML=_dealerPORows(_buildDealerPOs(\''+dealerId+'\').open,\''+dealerId+'\',false);_updateDDTabs(\'open\')">'
         +'&#128220; Open POs <span style="font-size:11px;background:var(--bg3);border-radius:10px;padding:1px 7px;margin-left:4px">'+data.open.length+'</span></button>'
       +'<button id="dd-tab-paid" style="padding:10px 24px;font-size:13px;font-weight:700;border:none;cursor:pointer;border-bottom:3px solid '+(tab==='paid'?'var(--teal)':'transparent')+';color:'+(tab==='paid'?'var(--teal)':'var(--text3)')+';background:transparent" onclick="S.dealerDetailTab=\'paid\';document.getElementById(\'dd-content\').innerHTML=_dealerPORows(_buildDealerPOs(\''+dealerId+'\').paid,\''+dealerId+'\',true);_updateDDTabs(\'paid\')">'
@@ -16529,14 +16556,109 @@ function openDealerDetail(dealerId){
   ov.addEventListener('click',function(e){if(e.target===ov)ov.remove();});
 }
 
+
+
+
+async function saveDealerPOPayments(){
+  try{
+    var r=await db.from('settings').upsert({key:'dealer_po_payments',value:JSON.stringify(S.dealerPOPayments),updated_at:new Date().toISOString()},{onConflict:'key'});
+    if(r.error)console.warn('[dealer billing] save:',r.error.message);
+  }catch(e){console.warn('[dealer billing]',e.message);}
+}
+
+async function markDealerPOPaid(dealerId,poNumber){
+  var k=dealerId+'_'+poNumber;
+  S.dealerPOPayments[k]={paid_at:new Date().toISOString().slice(0,10),paid_by:S.currentUser||''};
+  await saveDealerPOPayments();
+  logAction('Dealer PO paid: '+poNumber,'dealers',dealerId,null,{poNumber,paid_at:S.dealerPOPayments[k].paid_at}).catch(function(){});
+  var d=_buildDealerPOs(dealerId);
+  var c=document.getElementById('dd-content');
+  if(c)c.innerHTML=_dealerPORows(d.open,dealerId,false);
+  _updateDDTabs('open');
+  toast('✓ PO #'+poNumber+' marked paid');
+}
+
+async function unmarkDealerPO(dealerId,poNumber){
+  var k=dealerId+'_'+poNumber;
+  delete S.dealerPOPayments[k];
+  await saveDealerPOPayments();
+  var d=_buildDealerPOs(dealerId);
+  var c=document.getElementById('dd-content');
+  if(c)c.innerHTML=_dealerPORows(d.paid,dealerId,true);
+  _updateDDTabs('paid');
+  toast('PO #'+poNumber+' reopened');
+}
+
+async function markAllDealerPOsPaid(dealerId){
+  var data=_buildDealerPOs(dealerId);
+  if(!data.open.length){toast('No open POs to mark paid');return;}
+  var total=data.open.reduce(function(t,p){return t+p.total;},0);
+  var discPct=Math.round((data.disc||0.20)*100);
+  if(!confirm('Mark all '+data.open.length+' open PO'+(data.open.length!==1?'s':'')+' as paid?\n\nTotal: $'+total.toFixed(2)+' ('+discPct+'% dealer pricing)'))return;
+  var now=new Date().toISOString().slice(0,10);
+  data.open.forEach(function(po){
+    S.dealerPOPayments[dealerId+'_'+po.poNumber]={paid_at:now,paid_by:S.currentUser||''};
+  });
+  await saveDealerPOPayments();
+  logAction('Dealer bulk paid: '+data.open.map(function(p){return p.poNumber;}).join(', '),'dealers',dealerId,null,{count:data.open.length,total:total.toFixed(2)}).catch(function(){});
+  toast('✓ '+data.open.length+' PO'+(data.open.length!==1?'s':'')+' marked paid — $'+total.toFixed(2));
+  var dd=document.getElementById('dd-ov');
+  if(dd&&dd.firstElementChild)dd.firstElementChild.innerHTML=_renderDealerDetailContent(dealerId);
+}
+
+function sendDealerBulkInvoice(dealerId){
+  var dealer=S.dealers.find(function(d){return d.id===dealerId;});
+  var data=_buildDealerPOs(dealerId);
+  if(!dealer||!data.open.length){toast('No open POs to invoice');return;}
+  var disc=data.disc||0.20;
+  var discPct=Math.round(disc*100);
+  var grandTotal=data.open.reduce(function(t,p){return t+p.total;},0);
+  var grandMsrp=data.open.reduce(function(t,p){return t+(p.msrpTotal||0);},0);
+  var today=new Date().toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'});
+  var poBlocks=data.open.map(function(po){
+    var rows=po.orders.map(function(o){
+      return '  '+(o.order_number||'')+' - '+(o.pn||'')+' x'+o.qty
+        +' | MSRP $'+((o.msrp||0)*o.qty).toFixed(2)
+        +' | Your price $'+((o.dealerPrice||0)*o.qty).toFixed(2);
+    }).join('\n');
+    return 'PO #'+po.poNumber+'\n'+rows+'\n  Subtotal: $'+po.total.toFixed(2);
+  }).join('\n\n');
+  var body='Hi '+(dealer.contact_name||dealer.name)+','
+    +'\n\nWeekly billing statement from TGK Motorsport.'
+    +'\n\nDate: '+today+'  |  Dealer: '+dealer.name+'  |  Discount: '+discPct+'% off MSRP'
+    +'\n\n==================================================\n\n'
+    +poBlocks
+    +'\n\n=================================================='
+    +'\n\nMSRP Total:              $'+grandMsrp.toFixed(2)
+    +'\nDealer discount ('+discPct+'%):  -$'+(grandMsrp-grandTotal).toFixed(2)
+    +'\nAMOUNT DUE:              $'+grandTotal.toFixed(2)
+    +'\n\nPlease remit at your earliest convenience.\n\nThank you,\nTGK Motorsport';
+  var subject='TGK Motorsport - Weekly Statement - '+today+' - $'+grandTotal.toFixed(2)+' due';
+  window.open('mailto:'+encodeURIComponent(dealer.email||'')+'?subject='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body));
+}
+
 function sendDealerInvoice(dealerId,poNumber){
   var dealer=S.dealers.find(function(d){return d.id===dealerId;});
   var data=_buildDealerPOs(dealerId);
   var po=data.open.concat(data.paid).find(function(p){return p.poNumber===poNumber;});
   if(!dealer||!po){toast('PO not found');return;}
-  var lines=po.orders.map(function(o){return'  Order '+o.order_number+' — '+(o.sale_date||'');}).join('\n');
-  var body='Hi '+(dealer.contact_name||dealer.name)+',\n\nPlease find your invoice summary for PO #'+po.poNumber+':\n\n'+lines+'\n\nTotal: $'+po.total.toFixed(2)+'\n\nPlease remit payment at your earliest convenience.\n\nThank you,\nTGK Motorsport';
-  var subject='TGK Motorsport — Invoice for PO #'+po.poNumber;
+  var disc=data.disc||0.20;
+  var discPct=Math.round(disc*100);
+  var msrpTotal=po.msrpTotal||0;
+  var lines=po.orders.map(function(o){
+    return '  Order '+(o.order_number||'')+' - '+(o.pn||'')+' x'+o.qty
+      +' | MSRP $'+((o.msrp||0)*o.qty).toFixed(2)
+      +' | Your price $'+((o.dealerPrice||0)*o.qty).toFixed(2);
+  }).join('\n');
+  var body='Hi '+(dealer.contact_name||dealer.name)+','
+    +'\n\nInvoice for PO #'+po.poNumber+':'
+    +'\n\n'+lines
+    +'\n\n========================================'
+    +'\nMSRP Total:        $'+msrpTotal.toFixed(2)
+    +'\nDealer discount ('+discPct+'%): -$'+(msrpTotal-po.total).toFixed(2)
+    +'\nAMOUNT DUE:        $'+po.total.toFixed(2)
+    +'\n\nPlease remit at your earliest convenience.\n\nThank you,\nTGK Motorsport';
+  var subject='TGK Motorsport - Invoice PO #'+po.poNumber+' - $'+po.total.toFixed(2)+' due';
   window.open('mailto:'+encodeURIComponent(dealer.email||'')+'?subject='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body));
 }
 
