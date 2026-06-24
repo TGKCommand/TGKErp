@@ -4655,16 +4655,25 @@ Deno.serve(async (req) => {
         // Dedup: skip if this (order_number, pn) already exists — prevents double-inserts on Shopify retries
         const { data: existing } = await db.from('sales').select('id').eq('order_number', order.name).eq('pn', pn).limit(1)
         if (existing?.length) { console.log('[shopify-orders] skipping duplicate', order.name, pn); continue }
+        const shipAddr = order.shipping_address || {}
         await db.from('sales').insert({
           order_number: order.name,
           pn,
           qty: li.quantity || 1,
+          msrp: parseFloat(li.price || '0') || null,
           source: 'Shopify',
           fulfillment_status: 'Open',
           financial_status: order.financial_status || 'pending',
           sale_date: (order.created_at || new Date().toISOString()).slice(0, 10),
           customer_name: custName || null,
           customer_email: custEmail || null,
+          customer_phone: shipAddr.phone || order.customer?.phone || null,
+          shipping_address1: shipAddr.address1 || null,
+          shipping_address2: shipAddr.address2 || null,
+          shipping_city: shipAddr.city || null,
+          shipping_province: shipAddr.province_code || shipAddr.province || null,
+          shipping_zip: shipAddr.zip || null,
+          shipping_country: shipAddr.country_code || shipAddr.country || null,
           discount_code: (order.discount_codes && order.discount_codes.length ? order.discount_codes[0].code : null),
           shopify_order_id: String(order.id),
           shopify_line_item_id: String(li.id),
@@ -4675,10 +4684,24 @@ Deno.serve(async (req) => {
         .update({ fulfillment_status: 'Cancelled', cancelled_at: order.cancelled_at })
         .eq('order_number', order.name)
     } else if (topic === 'orders/updated') {
+      const updFields: Record<string,any> = {}
       if (fin === 'refunded' || fin === 'voided' || fin === 'partially_refunded') {
-        await db.from('sales')
-          .update({ fulfillment_status: 'Refunded', financial_status: fin })
-          .eq('order_number', order.name)
+        updFields.fulfillment_status = 'Refunded'
+        updFields.financial_status = fin
+      }
+      // Backfill address whenever Shopify sends an update with shipping info
+      const ua = order.shipping_address || {}
+      if (ua.address1) {
+        updFields.shipping_address1 = ua.address1 || null
+        updFields.shipping_address2 = ua.address2 || null
+        updFields.shipping_city = ua.city || null
+        updFields.shipping_province = ua.province_code || ua.province || null
+        updFields.shipping_zip = ua.zip || null
+        updFields.shipping_country = ua.country_code || ua.country || null
+        updFields.customer_phone = ua.phone || order.customer?.phone || null
+      }
+      if (Object.keys(updFields).length) {
+        await db.from('sales').update(updFields).eq('order_number', order.name)
       }
     }
     if (body.action === 'create_refund') {
@@ -6468,12 +6491,21 @@ async function syncOrdersNow(){
           // Truly new order+line — insert it
           const custName=((order.shipping_address?.name||order.billing_address?.name||(order.customer?(order.customer.first_name||'')+' '+(order.customer.last_name||''):''))||'').trim()||null;
           const custEmail=(order.email||order.customer?.email||'')||null;
+          const _sAddr=order.shipping_address||{};
           const{data}=await db.from('sales').insert({
             order_number:orderNum,pn,qty:li.quantity||1,
+            msrp:parseFloat(li.price||'0')||null,
             fulfillment_status:fs,source:'Shopify Sync',
             sale_date:(order.created_at||new Date().toISOString()).slice(0,10),
             customer_name:custName,
             customer_email:custEmail,
+            customer_phone:_sAddr.phone||order.customer?.phone||null,
+            shipping_address1:_sAddr.address1||null,
+            shipping_address2:_sAddr.address2||null,
+            shipping_city:_sAddr.city||null,
+            shipping_province:_sAddr.province_code||_sAddr.province||null,
+            shipping_zip:_sAddr.zip||null,
+            shipping_country:_sAddr.country_code||_sAddr.country||null,
           }).select().single();
           if(data){
             existingMap[k]=fs;
