@@ -1574,6 +1574,7 @@ function renderDashboard(){
   });
   const _unref=Object.values(_rOrders);
   return `
+  ${_buildWorkflowAlerts()}
   ${_unref.length>0?_buildRefundCard(_unref):''}
   <div class="kpi-grid kpi-grid-3">
     <div class="kpi kpi-green" style="cursor:pointer" onclick="nav('sales')" title="MSRP × qty for all orders this calendar month">
@@ -2472,8 +2473,9 @@ function renderSales(){
     <button class="btn btn-sm" style="color:var(--text3)" onclick="diagHolds()" title="Diagnose hold sync issues">🔍 Diagnose</button>
     <button class="btn btn-sm" style="color:var(--text3)" title="Remove duplicate order lines, preserve tracking" onclick="dedupeOrders()">🧽 Dedupe</button>
   </div>
+  <div id="bulk-bar" style="display:none;position:sticky;top:0;z-index:50;background:#1e2022;border-bottom:2px solid #2ABFAA;padding:8px 16px;align-items:center;gap:10px;flex-wrap:wrap"><span class="bulk-cnt" style="font-size:13px;font-weight:700;color:#fff;margin-right:4px"></span><button class="btn btn-teal btn-sm" onclick="bulkMarkShipped()">&#128666; Mark Shipped</button><button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="bulkMarkDelivered()">&#10003; Mark Delivered</button><button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="bulkMarkCancelled()">&#215; Cancel</button><button class="btn btn-sm" style="color:var(--text3)" onclick="window._salesSel.clear();refreshBulkBar();render()">Clear</button></div>
   <div class="tbl-wrap">
-  <table data-tid="sales"><thead class="sticky-header"><tr><th>Date</th><th>Order #</th><th>Customer</th><th>SKU</th><th>Qty</th><th>Stock</th><th>Fulfillment</th><th>Tracking</th><th>Actions</th></tr></thead><tbody>
+  <table data-tid="sales"><thead class="sticky-header"><tr><th style="width:34px;padding:6px 8px;text-align:center"><input type="checkbox" title="Select/deselect all visible" onchange="bulkSelAll(this.checked)" style="cursor:pointer;accent-color:#2ABFAA"></th><th>Date</th><th>Order #</th><th>Customer</th><th>SKU</th><th>Qty</th><th>Stock</th><th>Fulfillment</th><th>Tracking</th><th>Actions</th></tr></thead><tbody>
   ${list.map(s=>{
     const fs=s.fulfillment_status||'Open';
     const asm=findAsm(s.pn);
@@ -2488,7 +2490,9 @@ function renderSales(){
     const repCarrier=s.carrier||(allOrderLines.find(x=>x.tracking_number)?.carrier)||'';
     const multiTrack=s._grouped&&allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length>1;
     const custName=s.customer_name||(s._grouped?S.sales.find(x=>x.order_number===s.order_number&&x.customer_name)?.customer_name:'');
+    const _okey=s.order_number||s.id;
     return `<tr class="rowlink" data-order="${escHtml(s.order_number||s.id)}" onclick="rowClick(event,function(){S.activeSale='${s.id}';pushHist();render()})">
+    <td onclick="event.stopPropagation()" style="padding:4px 8px;text-align:center;width:34px"><input type="checkbox" class="sales-row-cb" data-okey="${escHtml(_okey)}" ${window._salesSel&&window._salesSel.has(_okey)?'checked':''} onchange="toggleBulkSel(event,this)" style="cursor:pointer;accent-color:#2ABFAA"></td>
     <td style="font-size:10px;color:var(--text3);font-family:var(--mono);white-space:nowrap">${(()=>{const ts=s.sale_date||s.created_at;if(!ts)return'—';const d=new Date(ts);const dt=d.toLocaleDateString('en-US',{month:'2-digit',day:'2-digit',year:'2-digit'});const tm=(!s.sale_date&&s.created_at)?d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}):'';return dt+(tm?`<div style="font-size:9px;opacity:.65">${tm}</div>`:'');})()}</td>
     <td class="pn">${(function(){const norm=(s.order_number||'').replace(/^#/,'');const lkd=S.syncLocked&&S.syncLocked.has(norm);return(s.order_number||'')+(s._grouped?` <span style="font-size:9px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 5px;border-radius:8px;font-family:var(--mono);font-weight:600">${s._lineCount} items</span>`:'')+(lkd?` <span title="Locked from Shopify sync. Click to unlock." style="font-size:9px;color:var(--orange);cursor:pointer" onclick="event.stopPropagation();if(confirm('Unlock order ${escHtml(s.order_number||'')} from sync?'))unlockOrderFromSync('${escHtml(s.order_number||'')}')">&#128274;</span>` : '');})()}</td>
     <td style="font-size:11px;color:var(--text2);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(custName||'—')}</td>
@@ -15250,6 +15254,178 @@ function printInvoice(lines){
   const w=window.open('','_blank','width=860,height=980');
   if(w){w.document.write(html);w.document.close();}
   else toast('Pop-up blocked \u2014 allow pop-ups and try again');
+}
+
+/* ── BULK SALES SELECTION ───────────────────────────────────────────────── */
+window._salesSel = window._salesSel || new Set();
+
+function toggleBulkSel(e, cb) {
+  e.stopPropagation();
+  var key = cb.dataset.okey;
+  if (cb.checked) window._salesSel.add(key);
+  else window._salesSel.delete(key);
+  refreshBulkBar();
+}
+
+function bulkSelAll(checked) {
+  document.querySelectorAll('.sales-row-cb').forEach(function(cb) {
+    cb.checked = checked;
+    if (checked) window._salesSel.add(cb.dataset.okey);
+  });
+  if (!checked) window._salesSel.clear();
+  refreshBulkBar();
+}
+
+function refreshBulkBar() {
+  var bar = document.getElementById('bulk-bar');
+  if (!bar) return;
+  var n = window._salesSel.size;
+  if (n === 0) { bar.style.display = 'none'; return; }
+  bar.style.display = 'flex';
+  var cnt = bar.querySelector('.bulk-cnt');
+  if (cnt) cnt.textContent = n + ' order' + (n !== 1 ? 's' : '') + ' selected';
+}
+
+async function bulkMarkShipped() {
+  var keys = window._salesSel ? Array.from(window._salesSel) : [];
+  if (!keys.length) return;
+  var tracking = (prompt('Tracking number (optional — leave blank to skip):') || '').trim();
+  var carrier = tracking ? ((prompt('Carrier (UPS, USPS, FedEx, DHL…):') || '').trim()) : '';
+  if (!confirm('Mark ' + keys.length + ' order' + (keys.length > 1 ? 's' : '') + ' as Shipped?')) return;
+  var now = new Date().toISOString();
+  var done = 0, errors = 0;
+  for (var i = 0; i < keys.length; i++) {
+    var oKey = keys[i];
+    var lines = S.sales.filter(function(s) {
+      return (s.order_number || s.id) === oKey && !['Shipped','Delivered','Cancelled','Refunded'].includes(s.fulfillment_status || 'Open');
+    });
+    for (var j = 0; j < lines.length; j++) {
+      var payload = { fulfillment_status: 'Shipped', shipped_at: now, updated_at: now };
+      if (tracking) { payload.tracking_number = tracking; payload.carrier = carrier || null; }
+      var res = await db.from('sales').update(payload).eq('id', lines[j].id);
+      if (res.error) { errors++; console.warn('[bulk ship]', res.error.message); }
+      else {
+        var lid = lines[j].id;
+        S.sales = S.sales.map(function(s) { return s.id === lid ? Object.assign({}, s, payload) : s; });
+        done++;
+      }
+    }
+  }
+  window._salesSel.clear();
+  toast((errors ? '\u26a0 ' : '\u2713 ') + done + ' line' + (done !== 1 ? 's' : '') + ' marked Shipped' + (errors ? ' \u00b7 ' + errors + ' errors' : ''));
+  logAction('Bulk mark Shipped: ' + keys.join(', ') + (tracking ? ' \u00b7 ' + (carrier || '') + ' ' + tracking : ''), 'sales', null, null, { keys: keys, tracking: tracking, carrier: carrier });
+  render();
+}
+
+async function bulkMarkDelivered() {
+  var keys = window._salesSel ? Array.from(window._salesSel) : [];
+  if (!keys.length) return;
+  if (!confirm('Mark ' + keys.length + ' order' + (keys.length > 1 ? 's' : '') + ' as Delivered?')) return;
+  var now = new Date().toISOString();
+  var done = 0, errors = 0;
+  for (var i = 0; i < keys.length; i++) {
+    var oKey = keys[i];
+    var lines = S.sales.filter(function(s) {
+      return (s.order_number || s.id) === oKey && s.fulfillment_status === 'Shipped';
+    });
+    for (var j = 0; j < lines.length; j++) {
+      var res = await db.from('sales').update({ fulfillment_status: 'Delivered', updated_at: now }).eq('id', lines[j].id);
+      if (res.error) errors++;
+      else {
+        var lid = lines[j].id;
+        S.sales = S.sales.map(function(s) { return s.id === lid ? Object.assign({}, s, { fulfillment_status: 'Delivered' }) : s; });
+        done++;
+      }
+    }
+  }
+  window._salesSel.clear();
+  toast((errors ? '\u26a0 ' : '\u2713 ') + done + ' line' + (done !== 1 ? 's' : '') + ' marked Delivered' + (errors ? ' \u00b7 ' + errors + ' errors' : ''));
+  logAction('Bulk mark Delivered: ' + keys.join(', '), 'sales', null, null, { keys: keys });
+  render();
+}
+
+async function bulkMarkCancelled() {
+  var keys = window._salesSel ? Array.from(window._salesSel) : [];
+  if (!keys.length) return;
+  if (!confirm('Cancel ' + keys.length + ' order' + (keys.length > 1 ? 's' : '') + '? This cannot be undone easily.')) return;
+  var now = new Date().toISOString();
+  var done = 0, errors = 0;
+  for (var i = 0; i < keys.length; i++) {
+    var oKey = keys[i];
+    var lines = S.sales.filter(function(s) {
+      return (s.order_number || s.id) === oKey && ['Open','On Hold','Partial'].includes(s.fulfillment_status || 'Open');
+    });
+    for (var j = 0; j < lines.length; j++) {
+      var res = await db.from('sales').update({ fulfillment_status: 'Cancelled', updated_at: now }).eq('id', lines[j].id);
+      if (res.error) errors++;
+      else {
+        var lid = lines[j].id;
+        S.sales = S.sales.map(function(s) { return s.id === lid ? Object.assign({}, s, { fulfillment_status: 'Cancelled' }) : s; });
+        done++;
+      }
+    }
+  }
+  window._salesSel.clear();
+  toast((errors ? '\u26a0 ' : '\u2713 ') + done + ' line' + (done !== 1 ? 's' : '') + ' cancelled' + (errors ? ' \u00b7 ' + errors + ' errors' : ''));
+  logAction('Bulk cancel: ' + keys.join(', '), 'sales', null, null, { keys: keys });
+  render();
+}
+
+/* ── WORKFLOW ALERTS ────────────────────────────────────────────────────── */
+function _buildWorkflowAlerts() {
+  if (!S.purchases || !S.sales || !S.assemblies) return '';
+  var alerts = [];
+
+  // Overdue POs
+  var today = new Date().toISOString().slice(0, 10);
+  var overduePOs = S.purchases.filter(function(p) {
+    return p.status !== 'Received' && p.expected_date && p.expected_date < today;
+  });
+  if (overduePOs.length) {
+    alerts.push({ level: 'red', icon: '\u23f0', text: overduePOs.length + ' overdue PO' + (overduePOs.length > 1 ? 's' : '') + ' \u2014 past expected delivery date', nav: "nav('purchases')", lbl: 'View POs' });
+  }
+
+  // Zero-stock assemblies with min_qty set
+  var zeroAsms = S.assemblies.filter(function(a) {
+    return !a.discontinued && !a.is_subassembly && (a.min_qty || 0) > 0 && (a.total_on_hand || 0) <= 0;
+  });
+  if (zeroAsms.length) {
+    alerts.push({ level: 'red', icon: '\u26a0', text: zeroAsms.length + ' assembl' + (zeroAsms.length > 1 ? 'ies' : 'y') + ' at zero stock: ' + zeroAsms.slice(0, 3).map(function(a) { return a.pn; }).join(', ') + (zeroAsms.length > 3 ? '\u2026' : ''), nav: "nav('assemblies')", lbl: 'Assemblies' });
+  }
+
+  // Open orders 14-60 days old (not already caught by 60-day stale alert)
+  var d14 = daysAgo(14);
+  var stale14 = new Set(S.sales.filter(function(s) {
+    return !isInternal(s.order_number) && (s.fulfillment_status === 'Open' || !s.fulfillment_status)
+      && s.sale_date && s.sale_date < d14 && s.sale_date >= daysAgo(60);
+  }).map(function(s) { return s.order_number || s.id; }));
+  if (stale14.size) {
+    alerts.push({ level: 'yellow', icon: '\ud83d\udd52', text: stale14.size + ' open order' + (stale14.size > 1 ? 's' : '') + ' unfulfilled for 14+ days', nav: "setFilter('sales','fstatus','Open');nav('sales')", lbl: 'View Orders' });
+  }
+
+  // Parts with open orders but zero stock (backorder risk)
+  var partBOCount = 0;
+  S.sales.filter(function(s) { return (s.fulfillment_status === 'Open' || !s.fulfillment_status) && s.pn; }).forEach(function(s) {
+    var p = S.parts.find(function(x) { return x.pn === s.pn; });
+    if (p && (p.total_unpckgd || 0) < (s.qty || 1)) partBOCount++;
+  });
+  if (partBOCount > 0) {
+    alerts.push({ level: 'yellow', icon: '\ud83d\udce6', text: partBOCount + ' open order line' + (partBOCount > 1 ? 's' : '') + ' with insufficient stock to pack', nav: "nav('planning')", lbl: 'Planning' });
+  }
+
+  if (!alerts.length) return '';
+
+  return '<div class="panel" style="padding:10px 16px;border-left:3px solid var(--red);margin-bottom:14px">'
+    + '<div style="font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text3);margin-bottom:8px">\u26a1 Workflow Alerts</div>'
+    + alerts.map(function(a) {
+      var col = a.level === 'red' ? 'var(--red)' : 'var(--yellow)';
+      return '<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)">'
+        + '<span style="font-size:13px;flex-shrink:0">' + a.icon + '</span>'
+        + '<span style="font-size:12px;color:var(--text2);flex:1">' + a.text + '</span>'
+        + '<button class="btn btn-sm" style="flex-shrink:0;color:' + col + ';border-color:' + col + ';opacity:.6" onclick="' + a.nav + '">' + a.lbl + ' \u2192</button>'
+        + '</div>';
+    }).join('')
+    + '</div>';
 }
 
 /* ── PACKING SLIP ───────────────────────────────────────────────────────── */
