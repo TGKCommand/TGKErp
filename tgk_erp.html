@@ -1568,21 +1568,32 @@ function renderDashboard(){
     ?'<span style="color:'+(revChange>=0?'var(--green)':'var(--red)')+'">'+(revChange>=0?'&#9650;':'&#9660;')+Math.abs(revChange).toFixed(0)+'%</span> vs last month'
     :'first month of data';
   const thisMonthOrderCount=new Set(thisMonthSales.map(s=>s.order_number||s.id)).size;
-  // Unprocessed refunds — grouped by order number.
-  // An order is shown only if it has at least one refunded line still without a return_status.
-  // This prevents split orders where some lines are already processed from re-appearing.
+  // Unprocessed refunds — grouped by order number, 7-day window only.
+  // Uses updated_at (set by Shopify webhook when refund arrives) as the cutoff date.
+  // Only flags lines where the specific line is refunded (fulfillment_status Refunded or
+  // financial_status refunded) — prevents partially_refunded orders from showing lines
+  // that aren't actually the returned items.
+  const _rCutoff=new Date();_rCutoff.setDate(_rCutoff.getDate()-7);
+  const _rCutoffStr=_rCutoff.toISOString().slice(0,10);
   const _rMap={};
   S.sales.forEach(function(s){
     if(s.fulfillment_status==='Cancelled')return;
     var _isRef=(s.financial_status==='refunded'||s.fulfillment_status==='Refunded'||s.financial_status==='partially_refunded');
     if(!_isRef)return;
     var k=s.order_number||s.id;
-    if(!_rMap[k]){_rMap[k]={lead:s,hasUnprocessed:false};}
-    if(!s.return_status)_rMap[k].hasUnprocessed=true;
+    if(!_rMap[k]){_rMap[k]={lead:s,hasUnprocessed:false,newestDate:''};}
+    // Only flag if this specific line is the refunded one — not just the order
+    var lineRefunded=(s.financial_status==='refunded'||s.fulfillment_status==='Refunded');
+    if(lineRefunded&&!s.return_status)_rMap[k].hasUnprocessed=true;
+    // Track newest updated_at to enforce 7-day window from when refund hit the ERP
+    var d=(s.updated_at||s.sale_date||'').slice(0,10);
+    if(d>_rMap[k].newestDate)_rMap[k].newestDate=d;
     // prefer the lead line that has the most info
     if(!_rMap[k].lead.customer_name&&s.customer_name)_rMap[k].lead=s;
   });
-  const _unref=Object.values(_rMap).filter(function(o){return o.hasUnprocessed;}).map(function(o){return o.lead;});
+  const _unref=Object.values(_rMap).filter(function(o){
+    return o.hasUnprocessed&&o.newestDate>=_rCutoffStr;
+  }).map(function(o){return o.lead;});
   return `
   ${_buildWorkflowAlerts()}
   ${_unref.length>0?_buildRefundCard(_unref):''}
