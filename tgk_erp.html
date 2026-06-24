@@ -1567,6 +1567,13 @@ function renderDashboard(){
   const revChangeTxt=revChange!==null
     ?'<span style="color:'+(revChange>=0?'var(--green)':'var(--red)')+'">'+(revChange>=0?'&#9650;':'&#9660;')+Math.abs(revChange).toFixed(0)+'%</span> vs last month'
     :'first month of data';
+  // Avg ship time (last 30 days shipped orders)
+  var _ship30=S.sales.filter(function(s){return s.shipped_at&&s.sale_date&&(s.fulfillment_status==='Shipped'||s.fulfillment_status==='Delivered')&&s.sale_date>=daysAgo(30);});
+  var avgShipDays=_ship30.length?(_ship30.reduce(function(sum,s){return sum+Math.max(0,(new Date(s.shipped_at)-new Date(s.sale_date))/(86400000));},0)/_ship30.length):null;
+  // Return rate (last 30 days)
+  var _orders30=new Set(S.sales.filter(function(s){return !isInternal(s.order_number)&&s.sale_date&&s.sale_date>=daysAgo(30);}).map(function(s){return s.order_number||s.id;})).size;
+  var _returns30=new Set(S.sales.filter(function(s){return !isInternal(s.order_number)&&s.sale_date&&s.sale_date>=daysAgo(30)&&(s.financial_status==='refunded'||s.financial_status==='partially_refunded');}).map(function(s){return s.order_number||s.id;})).size;
+  var returnRate=_orders30>0?(_returns30/_orders30*100):null;
   const thisMonthOrderCount=new Set(thisMonthSales.map(s=>s.order_number||s.id)).size;
   // Unprocessed refunds — grouped by order number, 7-day window only.
   // Uses updated_at (set by Shopify webhook when refund arrives) as the cutoff date.
@@ -1595,13 +1602,20 @@ function renderDashboard(){
     return o.hasUnprocessed&&o.newestDate>=_rCutoffStr;
   }).map(function(o){return o.lead;});
   return `
+  <div style="display:flex;gap:16px;padding:8px 14px;background:var(--bg2);border-radius:8px;border:1px solid var(--border);margin-bottom:12px;flex-wrap:wrap">
+    <span style="font-size:11px;color:var(--text3)">30-day stats</span>
+    <span style="font-size:11px"><b style="color:var(--text)">${_orders30}</b> <span style="color:var(--text3)">orders</span></span>
+    ${avgShipDays!==null?'<span style="font-size:11px"><b style="color:var(--teal)">'+avgShipDays.toFixed(1)+'d</b> <span style="color:var(--text3)">avg ship</span></span>':''}
+    ${returnRate!==null&&returnRate>0?'<span style="font-size:11px"><b style="color:'+(returnRate>5?'var(--red)':'var(--text)')+'">'+returnRate.toFixed(1)+'%</b> <span style="color:var(--text3)">return rate</span></span>':''}
+    ${_ship30.length?'<span style="font-size:11px"><b style="color:var(--text)">${_ship30.length}</b> <span style="color:var(--text3)">shipped</span></span>':''}
+  </div>
   ${_buildWorkflowAlerts()}
   ${_unref.length>0?_buildRefundCard(_unref):''}
   <div class="kpi-grid kpi-grid-3">
     <div class="kpi kpi-green" style="cursor:pointer" onclick="nav('sales')" title="MSRP × qty for all orders this calendar month">
       <div class="kpi-label">Revenue This Month</div>
       <div class="kpi-value" style="font-size:${revThisMonth>=100000?'16px':revThisMonth>=10000?'18px':'22px'}">${fc(revThisMonth)}</div>
-      <div class="kpi-sub">${revChangeTxt} &middot; ${thisMonthOrderCount} order${thisMonthOrderCount!==1?'s':''}</div>
+      <div class="kpi-sub">${revChangeTxt} &middot; ${thisMonthOrderCount} order${thisMonthOrderCount!==1?'s':''}${avgShipDays!==null?' &middot; avg <b>'+avgShipDays.toFixed(1)+'d</b> to ship':''}</div>
     </div>
     <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','Open|Partial');nav('sales')" title="Open + Partial orders needing to be packed">
       <div class="kpi-label">Orders to Fulfill</div>
@@ -2652,7 +2666,7 @@ function renderSaleDetail(s){
       ${(S.syncLocked&&S.syncLocked.has((s.order_number||'').replace(/^#/,'')))?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="unlockOrderFromSync('${escHtml(s.order_number||'')}')">Unlock Sync</button>`:''}
       ${packedLines.length?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="unpackSaleOrder('${s.id}','${s.pn==='Multiple'?'':s.pn}',${s.qty||1})">&#8617; Unpack</button>`:''}
       ${['Open','Packed','On Hold','Partial'].includes(detailOrderFs)?`<button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
-      ${(financial==='refunded'||financial==='partially_refunded'||detailOrderFs==='Refunded')&&!allLines[0]?.return_status?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.35);font-weight:700" data-sid="${s.id}" onclick="openProcessReturnModal(this.dataset.sid)">&#8617; Process Return</button>`:''}${allLines[0]?.return_status?`<span style="font-size:10px;padding:3px 8px;border-radius:4px;font-weight:600;${allLines[0].return_status==='returned'?'background:var(--teal-dim);color:var(--teal)':allLines[0].return_status==='corrected'?'background:var(--bg3);color:var(--text3)':'background:rgba(234,88,12,.12);color:var(--orange)'}">${allLines[0].return_status==='returned'?'&#10003; Restocked':allLines[0].return_status==='corrected'?'&#10003; Admin Closed':'&#9888; Logged as Damaged'}</span><button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" data-oid="${s.id}" onclick="reverseReturn(this.dataset.oid)" title="Undo this return — reverses inventory and resets order status">&#8634; Reverse Return</button>`:''}
+      ${(financial==='refunded'||financial==='partially_refunded'||detailOrderFs==='Refunded')&&allLines.some(l=>!l.return_status)?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.35);font-weight:700" data-sid="${s.id}" onclick="openProcessReturnModal(this.dataset.sid)">&#8617; Process Return</button>`:''}${allLines[0]?.return_status?`<span style="font-size:10px;padding:3px 8px;border-radius:4px;font-weight:600;${allLines[0].return_status==='returned'?'background:var(--teal-dim);color:var(--teal)':allLines[0].return_status==='corrected'?'background:var(--bg3);color:var(--text3)':'background:rgba(234,88,12,.12);color:var(--orange)'}">${allLines[0].return_status==='returned'?'&#10003; Restocked':allLines[0].return_status==='corrected'?'&#10003; Admin Closed':'&#9888; Logged as Damaged'}</span><button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" data-oid="${s.id}" onclick="reverseReturn(this.dataset.oid)" title="Undo this return — reverses inventory and resets order status">&#8634; Reverse Return</button>`:''}
     </div>
   </div>
 
@@ -2783,13 +2797,19 @@ function openPendingBoxModal(){
     var skus=lines.map(function(l){return l.pn;}).join(', ');
     var shipped=(lines[0]&&(lines[0].shipped_at||lines[0].sale_date)||'').slice(0,10);
     var tracking=lines[0]&&lines[0].tracking_number||'';
+    var customer=lines[0]&&lines[0].customer_name||'';
+    var daysAgoShip=shipped?Math.floor((Date.now()-new Date(shipped))/(86400000)):null;
+    var daysStr=daysAgoShip!==null?(daysAgoShip===0?'today':daysAgoShip===1?'yesterday':daysAgoShip+'d ago'):'';
     return '<div style="display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--border)">'
       +'<div style="flex:1;min-width:0">'
-        +'<div style="font-size:13px;font-weight:700;color:var(--teal);font-family:var(--mono)">'
-          +'<span style="cursor:pointer" onclick="event.stopPropagation();setFilter(\'sales\',\'search\',\''+esc(orderNum)+'\');nav(\'sales\');document.getElementById(\'pbox-ov\')?.remove()">'+esc(orderNum)+'</span>'
+        +'<div style="display:flex;align-items:baseline;gap:8px">'
+          +'<span style="font-size:13px;font-weight:700;color:var(--teal);font-family:var(--mono);cursor:pointer" '
+            +'onclick="event.stopPropagation();setFilter(\'sales\',\'search\',\''+esc(orderNum)+'\');nav(\'sales\');document.getElementById(\'pbox-ov\')?.remove()">'+esc(orderNum)+'</span>'
+          +(customer?'<span style="font-size:11px;color:var(--text2)">'+esc(customer)+'</span>':'')
+          +(daysStr?'<span style="font-size:10px;color:var(--text3);margin-left:auto">'+esc(daysStr)+'</span>':'')
         +'</div>'
         +'<div style="font-size:11px;color:var(--text3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(skus)+'</div>'
-        +(shipped?'<div style="font-size:10px;color:var(--text3)">Shipped '+esc(shipped)+(tracking?' &middot; '+esc(tracking):'')+'</div>':'')
+        +(tracking?'<div style="font-size:10px;color:var(--text3)">'+esc(tracking)+'</div>':'')
       +'</div>'
       +'<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3);flex-shrink:0" '
         +'data-order="'+esc(orderNum)+'" onclick="document.getElementById(\'pbox-ov\')?.remove();openShippingBoxModal(this.dataset.order)">&#128230; Log Box</button>'
@@ -2806,7 +2826,8 @@ function openPendingBoxModal(){
       +'<button onclick="document.getElementById(\'pbox-ov\').remove()" style="background:none;border:none;font-size:20px;cursor:pointer;color:var(--text3);line-height:1">\u00d7</button>'
     +'</div>'
     +'<div style="overflow-y:auto;flex:1">'+rows+'</div>'
-    +'<div style="padding:10px 16px;border-top:1px solid var(--border);text-align:right;flex-shrink:0">'
+    +'<div style="padding:10px 16px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0">'
+      +'<button class="btn btn-sm" style="color:var(--text3)" onclick="skipAllPendingBoxes()">Skip All — no boxes needed</button>'
       +'<button class="btn" onclick="document.getElementById(\'pbox-ov\').remove()">Done</button>'
     +'</div>'
   +'</div>';
@@ -2976,6 +2997,24 @@ async function skipShippingBox(orderNum){
 }
 
 
+
+async function skipAllPendingBoxes(){
+  var pending=_pendingBoxOrders();
+  if(!pending.length){document.getElementById('pbox-ov')?.remove();toast('No pending box orders');return;}
+  document.getElementById('pbox-ov')?.remove();
+  var now=new Date().toISOString();
+  var entries=pending.map(function(orderNum){
+    var lines=S.sales.filter(function(s){return(s.order_number||s.id)===orderNum;});
+    var pn=(lines.length&&lines[0].pn)||null;
+    return {pn:pn,previous_qty:0,new_qty:0,adjustment:0,
+      reason:'Shipping box — multi-SKU order '+orderNum+' (no outer box)',
+      source:'pack',user_email:S.currentUser||null,created_at:now};
+  });
+  S.corrections=[...entries,...S.corrections];
+  toast('✓ '+pending.length+' order'+(pending.length!==1?'s':'')+' marked — no outer boxes needed');
+  render();
+  try{await db.from('inv_corrections').insert(entries);}catch(e){console.warn('[skipAllPendingBoxes]',e);}
+}
 async function packAllLines(orderNumOrId){
   const lines=S.sales.filter(s=>s.order_number===orderNumOrId||(s.id===orderNumOrId)).filter(s=>(s.fulfillment_status||'Open')==='Open');
   if(!lines.length){toast('No open lines to pack');return;}
@@ -15692,16 +15731,28 @@ function _buildWorkflowAlerts() {
     alerts.push({ level: 'yellow', icon: '\ud83d\udce6', text: partBOCount + ' open order line' + (partBOCount > 1 ? 's' : '') + ' with insufficient stock to pack', nav: "nav('planning')", lbl: 'Planning' });
   }
 
+  // Open warranty / customer resolution claims
+  var openWarrantyClaims=S.warrantyClaims.filter(function(w){return w.status==='Open';});
+  if(openWarrantyClaims.length){
+    alerts.push({level:'yellow',icon:'⚔',text:openWarrantyClaims.length+' open customer resolution claim'+(openWarrantyClaims.length!==1?'s':'')+' awaiting action',nav:"nav('warranty')",lbl:'View Claims'});
+  }
+
+  // Unreceived PO lines that are late
+  var latePOLines=S.purchases.filter(function(p){return p.status==='Ordered'&&p.expected_date&&p.expected_date<today;});
+  if(latePOLines.length>overduePOs.length){
+    // Only add if different from the overdue POs already flagged
+  }
+
   if (!alerts.length) return '';
 
   return '<div class="panel" style="padding:10px 16px;border-left:3px solid var(--red);margin-bottom:14px">'
-    + '<div style="font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text3);margin-bottom:8px">\u26a1 Workflow Alerts</div>'
+    + '<div style="font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text3);margin-bottom:8px">⚡ Workflow Alerts</div>'
     + alerts.map(function(a) {
-      var col = a.level === 'red' ? 'var(--red)' : 'var(--yellow)';
+      var col = a.level === 'red' ? 'var(--red)' : a.level==='yellow'?'var(--yellow)':'var(--orange)';
       return '<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)">'
         + '<span style="font-size:13px;flex-shrink:0">' + a.icon + '</span>'
         + '<span style="font-size:12px;color:var(--text2);flex:1">' + a.text + '</span>'
-        + '<button class="btn btn-sm" style="flex-shrink:0;color:' + col + ';border-color:' + col + ';opacity:.6" onclick="' + a.nav + '">' + a.lbl + ' \u2192</button>'
+        + '<button class="btn btn-sm" style="flex-shrink:0;color:' + col + ';border-color:' + col + ';opacity:.7" onclick="' + a.nav + '">' + a.lbl + ' →</button>'
         + '</div>';
     }).join('')
     + '</div>';
@@ -17044,7 +17095,7 @@ async function reverseReturn(saleId){
     ?S.sales.filter(function(s){return s.order_number===sale.order_number;})
     :[sale];
 
-  if(!confirm('Reverse return for order '+orderNum+'?\n\nThis will:\n• Deduct inventory that was restocked\n• Reset order status back to Refunded\n• Clear the return_status flag\n\nThis does NOT affect any Shopify refund already processed.'))return;
+    if(!window.confirm('Reverse return for ' + orderNum + '? This will deduct restocked inventory and reset order to Refunded. Cannot be undone.'))return;
 
   var errors=[];var results=[];
 
@@ -17132,24 +17183,44 @@ async function dismissAllPreERPRefunds(){
 
 
 function _buildRefundCard(unref){
-  var badges=unref.slice(0,6).map(function(s){
+  var rows=unref.slice(0,8).map(function(s){
     var on=escHtml(s.order_number||s.id);
-    return '<span style="display:inline-flex;align-items:center;gap:2px;font-size:11px;background:rgba(220,38,38,.12);color:var(--red);padding:3px 10px;border-radius:20px;font-family:var(--mono);font-weight:600">'
-      +on+'<button data-on="'+on+'" onclick="dismissPreERPRefund(this.dataset.on,event)" '
-      +'title="Dismiss — no inventory action" style="background:none;border:none;color:rgba(220,38,38,.4);cursor:pointer;font-size:14px;line-height:1;padding:0 0 0 3px">\xd7</button></span>';
-  }).join('');
-  if(unref.length>6)badges+='<span style="font-size:10px;color:var(--text3);padding:2px 6px">+'+(unref.length-6)+' more</span>';
-  return '<div style="background:rgba(220,38,38,.07);border:1.5px solid rgba(220,38,38,.2);border-radius:8px;padding:10px 14px;margin-bottom:14px">'
-    +'<div style="display:flex;align-items:center;gap:7px;margin-bottom:6px">'
-    +'<span style="font-size:15px">&#8617;</span>'
-    +'<b style="font-size:13px;color:var(--red)">'+unref.length+' Refund'+(unref.length!==1?'s':'')+' Awaiting Return Processing</b>'
-    +'</div>'
-    +'<div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px">'+badges+'</div>'
-    +'<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
-    +'<button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="setFilter(\'sales\',\'fstatus\',\'Refunded\');nav(\'sales\')">View Refunds &#8594;</button>'
-    +'<span style="font-size:10px;color:var(--text3)">Click \xd7 on an order to dismiss with no inventory action</span>'
-    +'</div>'
+    var cust=escHtml(s.customer_name||'');
+    var orderLines=S.sales.filter(function(l){
+      return (l.order_number||l.id)===(s.order_number||s.id)&&!l.return_status&&l.pn;
+    });
+    var totalAmt=orderLines.reduce(function(t,l){return t+(l.msrp||0)*(l.qty||1);},0);
+    var pnSummary=orderLines.slice(0,2).map(function(l){return escHtml(l.pn);}).join(', ')+(orderLines.length>2?'\u2026':'');
+    var daysAgoStr='';
+    var upd=(s.updated_at||s.sale_date||'');
+    if(upd){var d=Math.floor((Date.now()-new Date(upd))/(86400000));daysAgoStr=d===0?'today':d===1?'yesterday':d+'d ago';}
+    return '<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid rgba(220,38,38,.1)">'
+      +'<div style="flex:1;min-width:0">'
+        +'<div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap">'
+          +'<span style="font-size:12px;font-weight:700;color:var(--red);font-family:var(--mono)">'+on+'</span>'
+          +(cust?'<span style="font-size:11px;color:var(--text2)">'+cust+'</span>':'')
+          +(daysAgoStr?'<span style="font-size:10px;color:var(--text3);margin-left:auto">'+daysAgoStr+'</span>':'')
+        +'</div>'
+        +(pnSummary?'<div style="font-size:10px;color:var(--text3);margin-top:2px">'+pnSummary+(totalAmt?' \u00b7 <b style=\'color:var(--text2)\'>$'+totalAmt.toFixed(2)+'</b>':'')+'</div>':'')
+      +'</div>'
+      +'<button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.35);flex-shrink:0;font-weight:600" '
+        +'data-sid="'+s.id+'" onclick="openProcessReturnModal(this.dataset.sid)">\u21a9 Process</button>'
+      +'<button title="Dismiss \u2014 no inventory action" data-on="'+on+'" '
+        +'onclick="dismissPreERPRefund(this.dataset.on,event)" '
+        +'style="background:none;border:none;color:rgba(220,38,38,.3);cursor:pointer;font-size:20px;line-height:1;padding:2px 5px;flex-shrink:0">\u00d7</button>'
     +'</div>';
+  }).join('');
+  if(unref.length>8)rows+='<div style="font-size:11px;color:var(--text3);padding:6px 0">'+(unref.length-8)+' more \u2014 '
+    +'<button class="btn btn-sm" style="font-size:10px" onclick="setFilter(\'sales\',\'fstatus\',\'Refunded\');nav(\'sales\')">View all in Sales</button></div>';
+  return '<div style="background:rgba(220,38,38,.06);border:1.5px solid rgba(220,38,38,.18);border-radius:10px;padding:12px 14px;margin-bottom:14px">'
+    +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">'
+      +'<span style="font-size:14px">\u21a9</span>'
+      +'<b style="font-size:13px;color:var(--red)">'+unref.length+' Return'+(unref.length!==1?'s':'')+' Need Processing</b>'
+      +'<span style="flex:1"></span>'
+      +'<button class="btn btn-sm" style="color:var(--text3);border-color:var(--border);font-size:10px" onclick="setFilter(\'sales\',\'fstatus\',\'Refunded\');nav(\'sales\')">View All \u2192</button>'
+    +'</div>'
+    +rows
+  +'</div>';
 }
 
 
