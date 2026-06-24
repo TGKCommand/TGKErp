@@ -1566,13 +1566,21 @@ function renderDashboard(){
     ?'<span style="color:'+(revChange>=0?'var(--green)':'var(--red)')+'">'+(revChange>=0?'&#9650;':'&#9660;')+Math.abs(revChange).toFixed(0)+'%</span> vs last month'
     :'first month of data';
   const thisMonthOrderCount=new Set(thisMonthSales.map(s=>s.order_number||s.id)).size;
-  // Unprocessed refunds (grouped by order)
-  const _rOrders={};
+  // Unprocessed refunds — grouped by order number.
+  // An order is shown only if it has at least one refunded line still without a return_status.
+  // This prevents split orders where some lines are already processed from re-appearing.
+  const _rMap={};
   S.sales.forEach(function(s){
-    if((s.financial_status==='refunded'||s.fulfillment_status==='Refunded'||s.financial_status==='partially_refunded')&&!s.return_status&&s.fulfillment_status!=='Cancelled')
-      _rOrders[s.order_number||s.id]=s;
+    if(s.fulfillment_status==='Cancelled')return;
+    var _isRef=(s.financial_status==='refunded'||s.fulfillment_status==='Refunded'||s.financial_status==='partially_refunded');
+    if(!_isRef)return;
+    var k=s.order_number||s.id;
+    if(!_rMap[k]){_rMap[k]={lead:s,hasUnprocessed:false};}
+    if(!s.return_status)_rMap[k].hasUnprocessed=true;
+    // prefer the lead line that has the most info
+    if(!_rMap[k].lead.customer_name&&s.customer_name)_rMap[k].lead=s;
   });
-  const _unref=Object.values(_rOrders);
+  const _unref=Object.values(_rMap).filter(function(o){return o.hasUnprocessed;}).map(function(o){return o.lead;});
   return `
   ${_buildWorkflowAlerts()}
   ${_unref.length>0?_buildRefundCard(_unref):''}
@@ -2617,7 +2625,7 @@ function renderSaleDetail(s){
       ${(S.syncLocked&&S.syncLocked.has((s.order_number||'').replace(/^#/,'')))?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="unlockOrderFromSync('${escHtml(s.order_number||'')}')">Unlock Sync</button>`:''}
       ${packedLines.length?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="unpackSaleOrder('${s.id}','${s.pn==='Multiple'?'':s.pn}',${s.qty||1})">&#8617; Unpack</button>`:''}
       ${['Open','Packed','On Hold','Partial'].includes(detailOrderFs)?`<button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
-      ${(financial==='refunded'||financial==='partially_refunded'||detailOrderFs==='Refunded')&&!allLines[0]?.return_status?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.35);font-weight:700" data-sid="${s.id}" onclick="openProcessReturnModal(this.dataset.sid)">&#8617; Process Return</button>`:''}${allLines[0]?.return_status?`<span style="font-size:10px;padding:3px 8px;border-radius:4px;font-weight:600;${allLines[0].return_status==='returned'?'background:var(--teal-dim);color:var(--teal)':'background:rgba(234,88,12,.12);color:var(--orange)'}">${allLines[0].return_status==='returned'?'&#10003; Restocked':'&#9888; Logged as Damaged'}</span><button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" data-oid="${s.id}" onclick="reverseReturn(this.dataset.oid)" title="Undo this return — reverses inventory and resets order status">&#8634; Reverse Return</button>`:''}
+      ${(financial==='refunded'||financial==='partially_refunded'||detailOrderFs==='Refunded')&&!allLines[0]?.return_status?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.35);font-weight:700" data-sid="${s.id}" onclick="openProcessReturnModal(this.dataset.sid)">&#8617; Process Return</button>`:''}${allLines[0]?.return_status?`<span style="font-size:10px;padding:3px 8px;border-radius:4px;font-weight:600;${allLines[0].return_status==='returned'?'background:var(--teal-dim);color:var(--teal)':allLines[0].return_status==='corrected'?'background:var(--bg3);color:var(--text3)':'background:rgba(234,88,12,.12);color:var(--orange)'}">${allLines[0].return_status==='returned'?'&#10003; Restocked':allLines[0].return_status==='corrected'?'&#10003; Admin Closed':'&#9888; Logged as Damaged'}</span><button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" data-oid="${s.id}" onclick="reverseReturn(this.dataset.oid)" title="Undo this return — reverses inventory and resets order status">&#8634; Reverse Return</button>`:''}
     </div>
   </div>
 
@@ -16122,44 +16130,86 @@ function renderPOBuilderTab(){
     );
 }
 
+function _prmUpdateFee(){
+  var sel=0;
+  document.querySelectorAll('#prm-overlay input[type=checkbox][data-lid]:checked:not(:disabled)').forEach(function(cb){sel+=parseFloat(cb.dataset.total)||0;});
+  window._prmSelTotal=sel;
+  var pct=parseFloat(document.getElementById('prm-fee-pct')?.value)||0;
+  var fee=sel*pct/100;var net=sel-fee;
+  var fa=document.getElementById('prm-fee-amt');var na=document.getElementById('prm-net-amt');var st=document.getElementById('prm-sel-total');
+  if(fa)fa.textContent='$'+fee.toFixed(2);
+  if(na)na.textContent='$'+net.toFixed(2);
+  if(st)st.textContent='$'+sel.toFixed(2);
+}
+
 function openProcessReturnModal(saleId){
   var lead=S.sales.find(function(s){return s.id===saleId;});
   if(!lead){toast('Order not found');return;}
   var orderNum=lead.order_number||'#'+saleId.slice(0,8);
+  // All lines for this order
   var allLines=(lead.order_number
     ?S.sales.filter(function(s){return s.order_number===lead.order_number&&s.pn;})
     :S.sales.filter(function(s){return s.id===saleId&&s.pn;}));
-  // Compute order total (MSRP x qty)
-  var orderTotal=allLines.reduce(function(t,l){return t+(l.msrp||0)*(l.qty||1);},0);
-  var defaultFee=25; // default restocking fee %
+  var defaultFee=25;
+
+  // Shopify confirmed refund items
+  var _shopifyRefunded=null;
+  try{if(lead.refunded_items)_shopifyRefunded=JSON.parse(lead.refunded_items);}catch(e){}
+  var _hasShopifyData=_shopifyRefunded&&_shopifyRefunded.length>0;
+
+  // Init global modal state
+  window._prmLines=allLines;
+  window._prmSaleId=saleId;
+  window._prmSel=new Set();
+  window._prmSelTotal=0;
+
+  allLines.forEach(function(l){
+    if(l.return_status)return; // already processed — don't pre-select
+    if(_hasShopifyData){
+      var sfItem=_shopifyRefunded.find(function(r){return r.sku&&r.sku.toUpperCase()===l.pn.toUpperCase();});
+      if(sfItem)window._prmSel.add(l.id);
+    }else{
+      window._prmSel.add(l.id); // select all unprocessed by default
+    }
+  });
 
   var old=document.getElementById('prm-overlay');if(old)old.remove();
   var ov=document.createElement('div');
   ov.id='prm-overlay';
   ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9000;display:flex;align-items:center;justify-content:center;padding:16px';
 
-  // Check if Shopify told us which items were returned
-  var _shopifyRefunded=null;
-  try{if(lead.refunded_items)_shopifyRefunded=JSON.parse(lead.refunded_items);}catch(e){}
-  var _hasShopifyData=_shopifyRefunded&&_shopifyRefunded.length>0;
+  // Build item rows with checkboxes
   var itemRows=allLines.filter(function(l){return l.pn;}).map(function(l){
     var asm=S.assemblies.find(function(a){return a.pn===l.pn;});
     var prt=S.parts.find(function(p){return p.pn===l.pn;});
     var desc=(asm?asm.description:prt?prt.description:'')||'';
     var lineTotal=(l.msrp||0)*(l.qty||1);
     var _sfItem=_shopifyRefunded&&_shopifyRefunded.find(function(r){return r.sku&&r.sku.toUpperCase()===l.pn.toUpperCase();});
-    var _sfQty=_sfItem?_sfItem.qty:null;
-    return '<div style="display:flex;align-items:center;gap:10px;padding:7px 12px;border-bottom:1px solid var(--border)">'
-      +'<span style="font-family:var(--mono);font-size:11px;color:var(--teal);min-width:130px">'+escHtml(l.pn)+'</span>'
+    var done=!!l.return_status;
+    var doneLabel='';
+    if(l.return_status==='returned')doneLabel='<span style="font-size:9px;background:var(--teal-dim);color:var(--teal);padding:1px 5px;border-radius:3px;font-weight:700">&#10003; Restocked</span>';
+    else if(l.return_status==='damaged')doneLabel='<span style="font-size:9px;background:rgba(234,88,12,.1);color:var(--orange);padding:1px 5px;border-radius:3px;font-weight:700">&#9888; Damaged</span>';
+    else if(l.return_status==='corrected')doneLabel='<span style="font-size:9px;background:var(--bg3);color:var(--text3);padding:1px 5px;border-radius:3px;font-weight:700">&#10003; Admin Closed</span>';
+    else if(l.return_status)doneLabel='<span style="font-size:9px;background:var(--bg3);color:var(--text3);padding:1px 5px;border-radius:3px">'+escHtml(l.return_status)+'</span>';
+    var checked=window._prmSel.has(l.id);
+    return '<div style="display:flex;align-items:center;gap:8px;padding:7px 12px;border-bottom:1px solid var(--border);'+(done?'opacity:.4':'')+'">'
+      +'<input type="checkbox" id="prm-cb-'+l.id+'" data-lid="'+l.id+'" data-total="'+lineTotal+'" '
+      +(done?'disabled':'onchange="window._prmSel[this.checked?\'add\':\'delete\'](this.dataset.lid);_prmUpdateFee()"')
+      +(checked?' checked':'')+' style="flex-shrink:0;accent-color:#2ABFAA;cursor:'+(done?'default':'pointer')+'">'
+      +'<span style="font-family:var(--mono);font-size:11px;color:var(--teal);min-width:120px">'+escHtml(l.pn)+'</span>'
       +'<span style="flex:1;font-size:12px;color:var(--text2)">'+escHtml(desc)+'</span>'
       +'<span style="font-size:11px;color:var(--text3)">\xd7'+(l.qty||1)+'</span>'
       +(lineTotal?'<span style="font-family:var(--mono);font-size:11px;font-weight:600">$'+lineTotal.toFixed(2)+'</span>':'')
-      +'<span style="font-size:9px;background:var(--bg3);padding:1px 5px;border-radius:3px;color:var(--text3)">'+(asm?'asm':'part')+'</span>'
-      +(_sfItem?'<span style="font-size:9px;background:var(--teal-dim);color:var(--teal);padding:1px 5px;border-radius:3px;font-weight:700" title="Shopify confirmed this item was returned">&#10003; Shopify</span>':'')
+      +(done?doneLabel:'')
+      +(!done&&_sfItem?'<span style="font-size:9px;background:var(--teal-dim);color:var(--teal);padding:1px 5px;border-radius:3px;font-weight:700" title="Shopify confirmed">&#10003; Shopify</span>':'')
       +'</div>';
   }).join('');
 
-  ov.innerHTML='<div style="background:var(--bg);border-radius:12px;max-width:540px;width:100%;max-height:90vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,.4)">'
+  // Selected total for fee calc (sum of pre-selected lines)
+  var selTotal=allLines.filter(function(l){return window._prmSel.has(l.id);}).reduce(function(t,l){return t+(l.msrp||0)*(l.qty||1);},0);
+  window._prmSelTotal=selTotal;
+
+  ov.innerHTML='<div style="background:var(--bg);border-radius:12px;max-width:560px;width:100%;max-height:90vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,.4)">'
     // Header
     +'<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">'
       +'<div style="font-size:20px">&#8617;</div>'
@@ -16169,33 +16219,36 @@ function openProcessReturnModal(saleId){
       +'</div>'
       +'<button onclick="document.getElementById(\'prm-overlay\').remove()" style="background:none;border:none;font-size:22px;cursor:pointer;color:var(--text3);line-height:1">\u2715</button>'
     +'</div>'
-    // Items
-    +(itemRows?'<div style="padding:10px 0 0">'
-    +(_hasShopifyData?'<div style="padding:4px 12px 6px;display:flex;align-items:center;gap:6px"><span style="font-size:10px;background:var(--teal-dim);color:var(--teal);padding:2px 8px;border-radius:4px;font-weight:700">&#10003; Shopify confirmed which items were returned</span></div>':'')
-    +'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text3);padding:0 12px 6px">Items Being Returned</div>'+itemRows
-      +(orderTotal?'<div style="padding:6px 12px 10px;display:flex;justify-content:flex-end;border-bottom:1px solid var(--border)">'
-        +'<span style="font-size:12px;color:var(--text2)">Order total: <b style="font-family:var(--mono)">$'+orderTotal.toFixed(2)+'</b></span></div>':'')
-      +'</div>':'')
-    // Restocking fee
-    +(orderTotal?'<div style="padding:12px 20px;background:var(--bg2);border-bottom:1px solid var(--border)">'
-      +'<div style="font-size:11px;font-weight:700;color:var(--text);margin-bottom:8px">Restocking Fee</div>'
+    // Items with checkboxes
+    +'<div style="padding:8px 0 0">'
+      +(_hasShopifyData?'<div style="padding:4px 12px 4px;display:flex;align-items:center;gap:6px"><span style="font-size:10px;background:var(--teal-dim);color:var(--teal);padding:2px 8px;border-radius:4px;font-weight:700">&#10003; Shopify confirmed items pre-selected</span></div>':'')
+      +'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text3);padding:4px 12px 6px">Select items being returned</div>'
+      +itemRows
+    +'</div>'
+    // Restocking fee (uses selected total, updates dynamically)
+    +'<div style="padding:12px 20px;background:var(--bg2);border-top:1px solid var(--border);border-bottom:1px solid var(--border)">'
+      +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'
+        +'<div style="font-size:11px;font-weight:700;color:var(--text)">Restocking Fee</div>'
+        +'<div style="font-size:11px;color:var(--text3)">Selected: <span id="prm-sel-total" style="font-family:var(--mono);font-weight:700;color:var(--text)">$'+selTotal.toFixed(2)+'</span></div>'
+      +'</div>'
       +'<div style="display:flex;align-items:center;gap:10px">'
         +'<input id="prm-fee-pct" type="number" min="0" max="100" step="1" value="'+defaultFee+'" '
           +'style="width:68px;font-size:16px;font-weight:700;font-family:var(--mono);text-align:center;padding:5px;background:var(--bg);border:1.5px solid var(--border);border-radius:6px;color:var(--text)" '
-          +'oninput="_updateRestockFee('+orderTotal+')">'
-        +'<span style="font-size:13px;color:var(--text2)">% of $'+orderTotal.toFixed(2)+'</span>'
+          +'oninput="_prmUpdateFee()">'
+        +'<span style="font-size:13px;color:var(--text2)">% restocking fee</span>'
         +'<span style="font-size:13px;color:var(--text3)">=</span>'
-        +'<span id="prm-fee-amt" style="font-size:15px;font-weight:700;font-family:var(--mono);color:var(--orange)">$'+(orderTotal*defaultFee/100).toFixed(2)+'</span>'
+        +'<span id="prm-fee-amt" style="font-size:15px;font-weight:700;font-family:var(--mono);color:var(--orange)">$'+(selTotal*defaultFee/100).toFixed(2)+'</span>'
       +'</div>'
       +'<div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:6px;border:1px solid var(--border)">'
         +'<span style="font-size:11px;color:var(--text3)">Net refund to customer:</span>'
-        +'<span id="prm-net-amt" style="font-size:14px;font-weight:700;font-family:var(--mono);color:var(--teal)">$'+(orderTotal*(1-defaultFee/100)).toFixed(2)+'</span>'
+        +'<span id="prm-net-amt" style="font-size:14px;font-weight:700;font-family:var(--mono);color:var(--teal)">$'+(selTotal*(1-defaultFee/100)).toFixed(2)+'</span>'
       +'</div>'
-    +'</div>':'')
+      +'<div style="font-size:10px;color:var(--text3);margin-top:5px">Restocking fee note added to return record. Adjust Shopify refund manually.</div>'
+    +'</div>'
     // Action buttons
     +'<div style="padding:16px 20px">'
       +'<div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:10px">What should happen to this inventory?</div>'
-      +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">'
+      +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">'
         +'<button data-action="returned" data-sid="'+saleId+'" onclick="processReturn(this.dataset.sid,this.dataset.action)" '
           +'style="padding:14px;border-radius:8px;border:2px solid rgba(13,148,136,.3);background:var(--teal-dim);color:var(--teal);font-weight:700;font-size:13px;cursor:pointer;text-align:center;line-height:1.4">'
           +'<div style="font-size:24px;margin-bottom:6px">&#128230;</div>Return to Stock'
@@ -16205,8 +16258,12 @@ function openProcessReturnModal(saleId){
           +'<div style="font-size:24px;margin-bottom:6px">&#9888;</div>Discard \u2014 Damaged'
           +'<div style="font-size:10px;font-weight:400;margin-top:6px;color:var(--text2);line-height:1.5">Damaged \u2014 log warranty, no restock</div></button>'
       +'</div>'
+      +'<button data-action="corrected" data-sid="'+saleId+'" onclick="processReturn(this.dataset.sid,this.dataset.action)" '
+        +'style="width:100%;padding:11px;border-radius:8px;border:1.5px solid var(--border2);background:var(--bg2);color:var(--text2);font-weight:600;font-size:12px;cursor:pointer;text-align:center;margin-bottom:12px">'
+        +'\u2714 Already Corrected \u2014 No Inventory Action'
+        +'<div style="font-size:10px;font-weight:400;margin-top:3px;color:var(--text3)">Inventory has already been adjusted manually \u2014 just close this return</div></button>'
       +'<div><label style="font-size:11px;font-weight:600;color:var(--text2);display:block;margin-bottom:4px">Notes <span style="font-weight:400;color:var(--text3)">(optional)</span></label>'
-        +'<textarea id="prm-notes" style="width:100%;height:56px;resize:vertical;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px;font-family:inherit;font-size:12px" placeholder="Condition details, damage description\u2026"></textarea>'
+        +'<textarea id="prm-notes" style="width:100%;height:52px;resize:vertical;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px;font-family:inherit;font-size:12px" placeholder="Condition details, reason\u2026"></textarea>'
       +'</div>'
     +'</div>'
   +'</div>';
@@ -16214,75 +16271,102 @@ function openProcessReturnModal(saleId){
   ov.addEventListener('click',function(e){if(e.target===ov)ov.remove();});
 }
 
-function _updateRestockFee(orderTotal){
-  var pct=parseFloat(document.getElementById('prm-fee-pct')?.value)||0;
-  var fee=orderTotal*pct/100;
-  var net=orderTotal-fee;
-  var fa=document.getElementById('prm-fee-amt');
-  var na=document.getElementById('prm-net-amt');
-  if(fa)fa.textContent='$'+fee.toFixed(2);
-  if(na)na.textContent='$'+net.toFixed(2);
-}
+
 
 async function processReturn(saleId,action){
   var notes=(document.getElementById('prm-notes')?.value||'').trim();
   var _feePct=parseFloat(document.getElementById('prm-fee-pct')?.value)||0;
-  var _allLines2=S.sales.filter(function(s){return (lead.order_number?s.order_number===lead.order_number:s.id===saleId)&&s.pn;});
-  var _orderTotal=_allLines2.reduce(function(t,l){return t+(l.msrp||0)*(l.qty||1);},0);
-  if(_feePct>0&&_orderTotal>0){
-    var _feeAmt=(_orderTotal*_feePct/100).toFixed(2);
-    var _netAmt=(_orderTotal-parseFloat(_feeAmt)).toFixed(2);
-    notes=(notes?notes+' | ':'')+'Restocking fee: '+_feePct+'% ($'+_feeAmt+') — Net refund: $'+_netAmt;
-  }
-  var lead=S.sales.find(function(s){return s.id===saleId;});
+
+  // Use stored modal state — lines and selection
+  var allLines=window._prmLines||[];
+  var selectedIds=window._prmSel||new Set();
+  var linesToProcess=allLines.filter(function(l){return selectedIds.has(l.id);});
+  if(!linesToProcess.length){toast('Select at least one item');return;}
+
+  var lead=S.sales.find(function(s){return s.id===(window._prmSaleId||saleId);});
   if(!lead){toast('Order not found');return;}
   var orderNum=lead.order_number||saleId;
-  var allLines=lead.order_number
-    ?S.sales.filter(function(s){return s.order_number===lead.order_number&&s.pn;})
-    :S.sales.filter(function(s){return s.id===saleId&&s.pn;});
-  // Disable buttons
+
+  // Add restocking fee to notes (skip for admin-close)
+  if(action!=='corrected'){
+    var selTotal=window._prmSelTotal||linesToProcess.reduce(function(t,l){return t+(l.msrp||0)*(l.qty||1);},0);
+    if(_feePct>0&&selTotal>0){
+      var _feeAmt=(selTotal*_feePct/100).toFixed(2);
+      var _netAmt=(selTotal-parseFloat(_feeAmt)).toFixed(2);
+      notes=(notes?notes+' | ':'')+'Restocking fee: '+_feePct+'% ($'+_feeAmt+') \u2014 Net refund: $'+_netAmt;
+    }
+  }
+
   document.querySelectorAll('#prm-overlay button[data-action]').forEach(function(b){b.disabled=true;});
   var errors=[],results=[];
-  for(var i=0;i<allLines.length;i++){
-    var line=allLines[i];var pn=line.pn;var qty=line.qty||1;
-    var asm=S.assemblies.find(function(a){return a.pn===pn;});
-    var prt=S.parts.find(function(p){return p.pn===pn;});
-    if(action==='returned'){
+
+  for(var i=0;i<linesToProcess.length;i++){
+    var line=linesToProcess[i];
+    var pn=line.pn;var qty=line.qty||1;
+
+    if(action==='corrected'){
+      // Admin close — mark processed, no inventory or warranty action
+      var rc=await db.from('sales').update({
+        return_status:'corrected',
+        return_reason:'Admin closed \u2014 inventory already corrected'+(notes?' \u2014 '+notes:''),
+        updated_at:new Date().toISOString()
+      }).eq('id',line.id);
+      if(!rc.error){S.sales=S.sales.map(function(s){return s.id===line.id?Object.assign({},s,{return_status:'corrected'}):s;});results.push(pn);}
+      else errors.push(pn+': '+rc.error.message);
+
+    }else if(action==='returned'){
+      var asm=S.assemblies.find(function(a){return a.pn===pn;});
+      var prt=S.parts.find(function(p){return p.pn===pn;});
+      var invOk=false;
       if(asm){
         var prev=asm.total_on_hand||0;var noh=prev+qty;
-        var r=await db.from('assemblies').update({total_on_hand:noh,updated_at:new Date().toISOString()}).eq('id',asm.id);
-        if(!r.error){S.assemblies=S.assemblies.map(function(a){return a.pn===pn?Object.assign({},a,{total_on_hand:noh}):a;});
-          await db.from('inv_corrections').insert({pn:pn,previous_qty:prev,new_qty:noh,adjustment:qty,reason:'Return to stock \u2014 order '+orderNum+(notes?' \u2014 '+notes:''),user_email:S.currentUser||null,source:'return'});
-          results.push('+'+qty+' '+pn);}
-        else errors.push(pn+': '+r.error.message);
-      } else if(prt){
+        var ra=await db.from('assemblies').update({total_on_hand:noh,updated_at:new Date().toISOString()}).eq('id',asm.id);
+        if(!ra.error){
+          S.assemblies=S.assemblies.map(function(a){return a.pn===pn?Object.assign({},a,{total_on_hand:noh}):a;});
+          await db.from('inv_corrections').insert({pn:pn,previous_qty:prev,new_qty:noh,adjustment:qty,
+            reason:'Return to stock \u2014 order '+orderNum+(notes?' \u2014 '+notes:''),
+            user_email:S.currentUser||null,source:'return'});
+          invOk=true;results.push('+'+qty+' '+pn);
+        }else errors.push(pn+': '+ra.error.message);
+      }else if(prt){
         var prev2=prt.total_unpckgd||0;var noh2=prev2+qty;
-        var r2=await db.from('parts').update({total_unpckgd:noh2,updated_at:new Date().toISOString()}).eq('id',prt.id);
-        if(!r2.error){S.parts=S.parts.map(function(p){return p.pn===pn?Object.assign({},p,{total_unpckgd:noh2}):p;});
-          await db.from('inv_corrections').insert({pn:pn,previous_qty:prev2,new_qty:noh2,adjustment:qty,reason:'Return to stock \u2014 order '+orderNum+(notes?' \u2014 '+notes:''),user_email:S.currentUser||null,source:'return'});
-          results.push('+'+qty+' '+pn);}
-        else errors.push(pn+': '+r2.error.message);
+        var rb=await db.from('parts').update({total_unpckgd:noh2,updated_at:new Date().toISOString()}).eq('id',prt.id);
+        if(!rb.error){
+          S.parts=S.parts.map(function(p){return p.pn===pn?Object.assign({},p,{total_unpckgd:noh2}):p;});
+          await db.from('inv_corrections').insert({pn:pn,previous_qty:prev2,new_qty:noh2,adjustment:qty,
+            reason:'Return to stock \u2014 order '+orderNum+(notes?' \u2014 '+notes:''),
+            user_email:S.currentUser||null,source:'return'});
+          invOk=true;results.push('+'+qty+' '+pn);
+        }else errors.push(pn+': '+rb.error.message);
       }
-    } else {
-      // Damaged — log warranty
-      var wres=await db.from('warranty_claims').insert({order_number:orderNum,pn:pn,qty:qty,
+      if(invOk||!asm&&!prt){
+        await db.from('sales').update({return_status:'returned',updated_at:new Date().toISOString()}).eq('id',line.id);
+        S.sales=S.sales.map(function(s){return s.id===line.id?Object.assign({},s,{return_status:'returned'}):s;});
+      }
+
+    }else{
+      // Damaged — log warranty claim
+      var wres=await db.from('warranty_claims').insert({
+        order_number:orderNum,pn:pn,qty:qty,
         customer_name:lead.customer_name||null,customer_email:lead.customer_email||null,
         issue:'Damaged return \u2014 discarded'+(notes?' \u2014 '+notes:''),
         resolution_type:'damaged_return',status:'Open',
-        created_at:new Date().toISOString()}).select().single();
-      if(wres.data){S.warrantyClaims=[wres.data,...(S.warrantyClaims||[])];results.push('Warranty: '+pn);}
-      else if(wres.error)errors.push(pn+': '+wres.error.message);
+        created_at:new Date().toISOString()
+      }).select().single();
+      if(wres.data){
+        S.warrantyClaims=[wres.data,...(S.warrantyClaims||[])];
+        await db.from('sales').update({return_status:'damaged',updated_at:new Date().toISOString()}).eq('id',line.id);
+        S.sales=S.sales.map(function(s){return s.id===line.id?Object.assign({},s,{return_status:'damaged'}):s;});
+        results.push('Warranty: '+pn);
+      }else if(wres.error)errors.push(pn+': '+wres.error.message);
     }
   }
-  // Mark all lines for this order as processed
-  if(!errors.length||results.length>0){
-    await db.from('sales').update({return_status:action,updated_at:new Date().toISOString()}).eq('order_number',orderNum);
-    S.sales=S.sales.map(function(s){return s.order_number===orderNum?Object.assign({},s,{return_status:action}):s;});
-  }
+
   document.getElementById('prm-overlay')?.remove();
   if(errors.length&&!results.length){toast('\u26a0 Failed: '+errors[0]);}
   else if(action==='returned'){toast('\u2713 Restocked: '+results.join(', '));}
-  else{toast('\u2713 '+results.length+' warranty claim'+(results.length!==1?'s':'')+' logged \u2014 check Customer Resolution');} 
+  else if(action==='corrected'){toast('\u2713 Admin closed \u2014 no inventory change: '+results.join(', '));}
+  else{toast('\u2713 '+results.length+' warranty claim'+(results.length!==1?'s':'')+' logged');}
   render();
 }
 
