@@ -16201,15 +16201,34 @@ function _parseFitCSV(text) {
   // Strip UTF-8 BOM if present (common in Excel CSV exports)
   if(text.charCodeAt(0)===0xFEFF)text=text.slice(1);
 
-  const lines=text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+  const lines=text.split(/\r?\n/).filter(l=>l.trim());
   if(lines.length<2)return{rows:[],error:'CSV needs at least a header and one data row'};
 
   // Auto-detect delimiter: tab > semicolon > comma
   const firstLine=lines[0];
   const delim=firstLine.includes('\t')?'\t':firstLine.includes(';')?';':',';
 
-  // Parse header — strip surrounding quotes, lowercase
-  const hdr=firstLine.split(delim).map(h=>h.trim().replace(/^["']|["']$/g,'').toLowerCase());
+  // RFC 4180-compliant CSV row parser -- handles quoted fields with embedded commas
+  function parseRow(line){
+    const cells=[];let field='';let inQ=false;let i=0;
+    while(i<line.length){
+      const ch=line[i];
+      if(inQ){
+        if(ch==='"'&&line[i+1]==='"'){field+='"';i+=2;}
+        else if(ch==='"'){inQ=false;i++;}
+        else{field+=ch;i++;}
+      }else{
+        if(ch==='"'){inQ=true;i++;}
+        else if(ch===delim){cells.push(field.trim());field='';i++;}
+        else{field+=ch;i++;}
+      }
+    }
+    cells.push(field.trim());
+    return cells;
+  }
+
+  // Parse header -- strip surrounding quotes, lowercase
+  const hdr=parseRow(firstLine).map(h=>h.replace(/^["']|["']$/g,'').toLowerCase().trim());
   const col=name=>{
     const aliases={
       pn:['part number','partnumber','part#','partno','sku','part_number','part no','part no.','pn','item number','item#','item no','product sku','product number'],
@@ -16218,8 +16237,9 @@ function _parseFitCSV(text) {
       year_to:['year to','yearto','year_to','to year','thru year','end year','year end'],
       make:['make','manufacturer','brand','vehicle make'],
       model:['model','vehicle model','car model'],
-      submodel:['submodel','sub model','sub-model','trim','submodel/trim','trim level','variant'],
-      notes:['notes','note','comments','comment','description','fitment notes'],
+      submodel:['submodel','sub model','sub-model','trim','submodel/trim','trim level','variant','chassis','chassis code','frame','frame code'],
+      engine:['engine','engine code','engine type','displacement'],
+      notes:['notes','note','comments','comment','fitment notes'],
     };
     const al=aliases[name]||[name];
     for(const a of al){const i=hdr.indexOf(a);if(i>=0)return i;}
@@ -16227,20 +16247,25 @@ function _parseFitCSV(text) {
   };
 
   const iPN=col('pn'),iYear=col('year'),iYF=col('year_from'),iYT=col('year_to');
-  const iMake=col('make'),iModel=col('model'),iSub=col('submodel'),iNotes=col('notes');
+  const iMake=col('make'),iModel=col('model'),iSub=col('submodel'),iEngine=col('engine'),iNotes=col('notes');
 
-  if(iPN<0)return{rows:[],error:'Could not find a Part Number column. Expected: "Part Number", "PartNumber", "SKU", "Part No", or "PN". Detected delimiter: '+(delim==='\t'?'TAB':delim===';'?'SEMICOLON':'COMMA')+'. Headers found: '+hdr.join(', ')};
-  if(iMake<0||iModel<0)return{rows:[],error:'Could not find Make and/or Model columns.'};
+  if(iPN<0)return{rows:[],error:'SKU/Part Number column not found. Detected delimiter: '+(delim==='\t'?'TAB':delim===';'?'SEMICOLON':'COMMA')+'. Headers found: '+hdr.join(', ')+'. Expected one of: sku, pn, part number, part no, item number.'};
+  if(iMake<0||iModel<0)return{rows:[],error:'Make and/or Model column not found. Headers found: '+hdr.join(', ')};
 
   const raw=[];
   for(let i=1;i<lines.length;i++){
-    const cells=lines[i].split(delim).map(c=>c.trim().replace(/^["']|["']$/g,''));
+    const cells=parseRow(lines[i]);
     const pn=(cells[iPN]||'').trim();
     if(!pn)continue;
     const make=(cells[iMake]||'').trim()||null;
     const model=(cells[iModel]||'').trim()||null;
-    const submodel=iSub>=0?(cells[iSub]||'').trim()||null:null;
-    const notes=iNotes>=0?(cells[iNotes]||'').trim()||null:null;
+    // Chassis -> submodel; Engine appended when both present
+    const rawSub=iSub>=0?(cells[iSub]||'').trim():'';
+    const rawEng=iEngine>=0?(cells[iEngine]||'').trim():'';
+    const submodel=rawSub||(rawEng||null);
+    const rawNotes=iNotes>=0?(cells[iNotes]||'').trim():'';
+    const engineSuffix=(rawEng&&rawSub)?rawEng:'';
+    const notes=(rawNotes&&engineSuffix?(rawNotes+' / '+engineSuffix):rawNotes||engineSuffix)||null;
 
     let yr=null,yf=null,yt=null;
     if(iYear>=0&&cells[iYear])yr=parseInt(cells[iYear])||null;
