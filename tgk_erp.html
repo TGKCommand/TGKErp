@@ -658,7 +658,7 @@ const S = {
   poCart:[], // [{pn,qty,unitCost}]
   poCartShipping:{}, // {vendorName: shippingCost}
   // Auth
-  currentUserId:null, currentUser:null, currentRole:null, currentFullName:null,
+  currentUserId:null, currentUser:null, currentRole:null, currentFullName:null, currentNavPerms:null,
   profiles:[],
   _shopifyImport:null,
   countMode:'home', // home|spot|walk|sheet
@@ -8945,10 +8945,12 @@ async function loadUserProfile(user){
       profile=np||{role,email:user.email,full_name:user.email.split('@')[0]};
       S.currentRole=profile.role||'admin';
       S.currentFullName=profile.full_name||user.email;
+      S.currentNavPerms=profile.nav_permissions||null;
       S._profilesTableMissing=false;
     } else {
       S.currentRole=profile.role||'admin';
       S.currentFullName=profile.full_name||user.email;
+      S.currentNavPerms=profile.nav_permissions||null;
       S._profilesTableMissing=false;
     }
   }catch(e){
@@ -8964,28 +8966,31 @@ function _updateAuthUI(){
   const rl=document.getElementById('sidebar-role-label');
   if(rl)rl.textContent=ROLE_LABELS[S.currentRole]||S.currentRole||'User';
   const em=document.getElementById('sidebar-email');if(em)em.textContent=S.currentUser||'';
-  const ROLE_NAV={
-    admin:null,
-    warehouse:['dashboard','lookup','parts','assemblies','boms','inventory','packqueue','cyclecounts','corrections','planning','purchases','sales','warranty','vendors','ai','reports'],
-    customer_service:['dashboard','lookup','sales','warranty','dealers','corrections','ai','reports'],
-    design:['dashboard','lookup','parts','assemblies','boms','pricelist','ai','reports']
-  };
+  const ALL_NAV=['dashboard','lookup','parts','assemblies','boms','inventory','packqueue','cyclecounts','corrections','planning','purchases','sales','warranty','vendors','dealers','pricelist','ai','reports'];
   const ADMIN_ONLY=['nav-users','nav-integrations','nav-import','nav-backups'];
   const role=S.currentRole||'warehouse';
-  const allowed=ROLE_NAV[role];
-  if(role==='admin'){
-    ADMIN_ONLY.forEach(id=>{const el=document.getElementById(id);if(el)el.style.display='';});
-    const as=document.getElementById('admin-section');if(as)as.style.display='';
+  const enforce=localStorage.getItem('tgk_enforce_perms')==='true';
+  if(role==='admin'||!enforce){
+    // Admin always sees everything. When enforcement is OFF, everyone sees everything.
+    ALL_NAV.forEach(v=>{const el=document.getElementById('nav-'+v);if(el)el.style.display='';});
+    ADMIN_ONLY.forEach(id=>{const el=document.getElementById(id);if(el)el.style.display=role==='admin'?'':'none';});
+    const as=document.getElementById('admin-section');if(as)as.style.display=role==='admin'?'':'none';
   } else {
+    // Enforcement ON: use per-user nav_permissions if set, else role defaults
+    const ROLE_NAV={
+      warehouse:['dashboard','lookup','parts','assemblies','boms','inventory','packqueue','cyclecounts','corrections','planning','purchases','sales','warranty','vendors','ai','reports'],
+      customer_service:['dashboard','lookup','sales','warranty','dealers','corrections','ai','reports'],
+      design:['dashboard','lookup','parts','assemblies','boms','pricelist','ai','reports']
+    };
+    const perms=S.currentNavPerms;
+    const roleAllowed=ROLE_NAV[role]||ALL_NAV;
     ADMIN_ONLY.forEach(id=>{const el=document.getElementById(id);if(el)el.style.display='none';});
     const as=document.getElementById('admin-section');if(as)as.style.display='none';
-    if(allowed){
-      const ALL_NAV=['dashboard','lookup','parts','assemblies','boms','inventory','packqueue','cyclecounts','corrections','planning','purchases','sales','warranty','vendors','dealers','pricelist','ai','reports'];
-      ALL_NAV.forEach(v=>{
-        const el=document.getElementById('nav-'+v);
-        if(el)el.style.display=allowed.includes(v)?'':'none';
-      });
-    }
+    ALL_NAV.forEach(v=>{
+      const el=document.getElementById('nav-'+v);if(!el)return;
+      const visible=(perms&&perms[v]!==undefined)?perms[v]:roleAllowed.includes(v);
+      el.style.display=visible?'':'none';
+    });
   }
   setTimeout(_chatInit, 800);
 }
@@ -9018,12 +9023,94 @@ async function doLogout(){
 }
 
 async function doForgotPassword(){
-  const emailEl=document.getElementById('login-email');
-  const email=(emailEl?.value||'').trim()||prompt('Enter your email:');
-  if(!email)return;
+  const gate=document.getElementById('auth-gate');
+  if(!gate)return;
+  const email=(document.getElementById('login-email')?.value||'').trim();
+  // Swap the panel to a dedicated forgot-password view
+  gate.innerHTML=`
+  <div style="width:100%;max-width:380px;padding:16px">
+    <div class="panel" style="padding:36px 32px" id="fp-panel">
+      <div style="text-align:center;margin-bottom:24px">
+        <div style="font-size:28px;margin-bottom:8px">🔑</div>
+        <div style="font-size:18px;font-weight:700;color:var(--text)">Reset your password</div>
+        <div style="font-size:12px;color:var(--text3);margin-top:6px">Enter your email and we'll send a reset link. Check your spam folder if it doesn't arrive within a minute.</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Email address</label>
+        <input type="email" id="fp-email" class="form-input" placeholder="you@tgkmotorsport.com" autocomplete="email" style="font-size:14px" onkeydown="if(event.key==='Enter')_submitForgotPassword()" value="${email.replace(/"/g,'&quot;')}">
+      </div>
+      <div id="fp-msg" style="min-height:18px;font-size:12px;margin-bottom:10px"></div>
+      <button id="fp-btn" class="btn btn-primary" style="width:100%;padding:10px;font-size:14px" onclick="_submitForgotPassword()">Send Reset Link</button>
+      <div style="text-align:center;margin-top:16px">
+        <button onclick="_showLoginPanel()" style="background:none;border:none;color:var(--text3);font-size:11px;cursor:pointer;text-decoration:underline">\u2190 Back to sign in</button>
+      </div>
+    </div>
+    <div style="text-align:center;margin-top:10px;font-size:10px;color:var(--text3)">TGK Command \u00b7 Access restricted</div>
+  </div>`;
+  setTimeout(()=>{
+    const el=document.getElementById('fp-email');
+    if(el){el.focus();if(email)el.setSelectionRange(email.length,email.length);}
+  },50);
+}
+
+async function _submitForgotPassword(){
+  const email=(document.getElementById('fp-email')?.value||'').trim();
+  const msgEl=document.getElementById('fp-msg');
+  const btn=document.getElementById('fp-btn');
+  if(!email){if(msgEl){msgEl.style.color='var(--red)';msgEl.textContent='Please enter your email address.';}return;}
+  if(btn){btn.disabled=true;btn.textContent='Sending\u2026';}
+  if(msgEl){msgEl.style.color='var(--text3)';msgEl.textContent='';}
   const{error}=await db.auth.resetPasswordForEmail(email,{redirectTo:window.location.origin+window.location.pathname});
-  const errEl=document.getElementById('login-error');
-  if(errEl)errEl.textContent=error?('Error: '+error.message):'Password reset email sent \u2014 check your inbox.';
+  if(error){
+    if(msgEl){msgEl.style.color='var(--red)';msgEl.textContent='Error: '+error.message;}
+    if(btn){btn.disabled=false;btn.textContent='Send Reset Link';}
+    return;
+  }
+  // Show success state
+  const panel=document.getElementById('fp-panel');
+  if(panel)panel.innerHTML=`
+    <div style="text-align:center;padding:12px 0">
+      <div style="font-size:44px;margin-bottom:16px">\u2709\ufe0f</div>
+      <div style="font-size:17px;font-weight:700;color:var(--text);margin-bottom:10px">Check your inbox</div>
+      <div style="font-size:13px;color:var(--text2);line-height:1.6;margin-bottom:6px">A password reset link has been sent to</div>
+      <div style="font-size:13px;font-weight:600;color:var(--teal);margin-bottom:16px">${email}</div>
+      <div style="font-size:11px;color:var(--text3);background:var(--bg3);border-radius:6px;padding:10px 14px;margin-bottom:20px;text-align:left;line-height:1.7">
+        \u2022 Check your spam folder if it doesn\u2019t arrive in 1-2 minutes<br>
+        \u2022 Click the link in the email to set your new password<br>
+        \u2022 The link expires after 1 hour
+      </div>
+      <button onclick="_showLoginPanel()" class="btn btn-teal" style="width:100%;padding:10px;font-size:13px">\u2190 Back to sign in</button>
+    </div>`;
+}
+
+function _showLoginPanel(){
+  const gate=document.getElementById('auth-gate');
+  if(!gate)return;
+  gate.innerHTML=`
+  <div style="width:100%;max-width:380px;padding:16px">
+    <div class="panel" style="padding:36px 32px">
+      <div style="text-align:center;margin-bottom:28px">
+        <div style="font-size:11px;font-weight:800;color:var(--teal);letter-spacing:.18em;text-transform:uppercase;margin-bottom:6px">TGK MOTORSPORT</div>
+        <div style="font-size:22px;font-weight:700;color:var(--text)">Command</div>
+        <div style="font-size:12px;color:var(--text3);margin-top:4px">Sign in to continue</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Email</label>
+        <input type="email" id="login-email" class="form-input" placeholder="you@tgkmotorsport.com" autocomplete="email" style="font-size:14px">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Password</label>
+        <input type="password" id="login-password" class="form-input" placeholder="Password" autocomplete="current-password" style="font-size:14px" onkeydown="if(event.key==='Enter')doLogin()">
+      </div>
+      <div id="login-error" style="color:var(--red);font-size:12px;min-height:18px;margin-bottom:10px"></div>
+      <button id="login-btn" class="btn btn-primary" style="width:100%;padding:10px;font-size:14px" onclick="doLogin()">Sign In</button>
+      <div style="text-align:center;margin-top:14px">
+        <button onclick="doForgotPassword()" style="background:none;border:none;color:var(--text3);font-size:11px;cursor:pointer;text-decoration:underline">Forgot password?</button>
+      </div>
+    </div>
+    <div style="text-align:center;margin-top:10px;font-size:10px;color:var(--text3)">TGK Command \u00b7 Access restricted</div>
+  </div>`;
+  setTimeout(()=>document.getElementById('login-email')?.focus(),50);
 }
 
 async function adminResetPassword(email){
@@ -9175,9 +9262,12 @@ function renderUsersSQLSetup(msg){
     +"  full_name TEXT DEFAULT '',\n"
     +"  role TEXT NOT NULL DEFAULT 'warehouse'\n"
     +"    CHECK (role IN ('admin','warehouse','customer_service','design')),\n"
+    +'  nav_permissions JSONB DEFAULT NULL,\n'
     +'  created_at TIMESTAMPTZ DEFAULT NOW(),\n'
     +'  updated_at TIMESTAMPTZ DEFAULT NOW()\n'
     +');\n'
+    +'-- Add nav_permissions column if upgrading existing install:\n'
+    +'ALTER TABLE profiles ADD COLUMN IF NOT EXISTS nav_permissions JSONB DEFAULT NULL;\n'
     +'ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;\n'
     +'CREATE POLICY \"own_profile\" ON profiles FOR SELECT USING (auth.uid()=id);\n'
     +'CREATE POLICY \"admin_all\"   ON profiles FOR ALL USING (\n'
@@ -9237,6 +9327,32 @@ function renderUsers(){
 
 
 
+  const enforce=localStorage.getItem('tgk_enforce_perms')==='true';
+
+  // Build permissions matrix rows
+  const matrixRows=S.profiles.map(p=>{
+    const perms=p.nav_permissions||{};
+    const roleDefaults=_ROLE_DEFAULTS[p.role]||_ROLE_DEFAULTS.warehouse;
+    const cells=_NAV_MODULES.map(m=>{
+      // If nav_permissions is null → use role default; else use stored value
+      const hasCustom=p.nav_permissions!==null&&p.nav_permissions!==undefined;
+      const val=hasCustom?(perms[m.id]!==false):(roleDefaults.includes(m.id));
+      const btn=`<button onclick="adminSetNavPerm('${p.id}','${m.id}',${!val})" title="${val?'Revoke':'Grant'} ${m.label}" style="width:28px;height:24px;border-radius:4px;border:none;cursor:pointer;font-size:12px;background:${val?(enforce?'var(--teal-dim)':'var(--bg4)'):'var(--bg3)'};color:${val?(enforce?'var(--teal)':'var(--text3)'):'var(--border2)'};transition:all .15s">${val?'✓':'—'}</button>`;
+      return `<td style="text-align:center;padding:2px 3px">${btn}</td>`;
+    }).join('');
+    const hasCustomPerms=p.nav_permissions!==null&&p.nav_permissions!==undefined;
+    return `<tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:6px 8px;font-size:11px;white-space:nowrap;font-weight:500;position:sticky;left:0;background:var(--bg2);z-index:1">${escHtml(p.full_name||p.email.split('@')[0])}<br><span style="font-size:9px;color:var(--text3)">${escHtml(p.email)}</span></td>
+      ${cells}
+      <td style="padding:2px 6px;white-space:nowrap;position:sticky;right:0;background:var(--bg2)">
+        <button class="action-btn" onclick="adminGrantAllPerms('${p.id}')" title="Grant all modules">All</button>
+        ${hasCustomPerms?`<button class="action-btn" onclick="adminResetPerms('${p.id}')" title="Reset to role defaults" style="margin-left:3px">Reset</button>`:''}
+      </td>
+    </tr>`;
+  }).join('');
+
+  const headerCells=_NAV_MODULES.map(m=>`<th style="text-align:center;padding:4px 3px;font-size:9px;font-weight:700;letter-spacing:.05em;white-space:nowrap;writing-mode:vertical-lr;transform:rotate(180deg);height:80px;color:var(--text3)">${m.label}</th>`).join('');
+
   return`
   <div class="kpi-grid kpi-grid-5">
     <div class="kpi"><div class="kpi-label">Total Users</div><div class="kpi-value">${S.profiles.length}</div></div>
@@ -9256,6 +9372,37 @@ function renderUsers(){
   </div>
   <div class="tbl-wrap"><table><thead class="sticky-header"><tr><th>Email</th><th>Name</th><th>Role</th><th>Joined</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table></div>
 
+  <div class="panel" style="padding:16px 18px;margin-top:4px">
+    <div class="panel-title" style="margin-bottom:12px">
+      <div class="panel-title-left">
+        <span>🔒 Permission Matrix</span>
+        <span style="font-size:10px;font-weight:400;color:var(--text3);margin-left:6px">Controls which modules each user can access</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:11px;color:${enforce?'var(--teal)':'var(--text3)'};font-weight:600">${enforce?'⚡ Enforcing':'○ Not enforced'}</span>
+        <button class="btn btn-sm ${enforce?'btn-teal':''}" onclick="adminToggleEnforce()" style="min-width:160px">
+          ${enforce?'✓ Enforcement ON — click to disable':'Enforcement OFF — click to enable'}
+        </button>
+      </div>
+    </div>
+    ${!enforce?`<div style="background:var(--yellow-dim);border:1px solid rgba(217,119,6,.2);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--yellow);margin-bottom:12px">
+      <b>Enforcement is OFF</b> — all users currently see every module regardless of settings below. Toggle enforcement on when you're ready to activate these restrictions.
+    </div>`:''}
+    <div style="overflow-x:auto;max-height:360px;overflow-y:auto">
+      <table style="border-collapse:collapse;min-width:100%">
+        <thead><tr style="border-bottom:2px solid var(--border)">
+          <th style="text-align:left;padding:4px 8px;font-size:11px;font-weight:600;position:sticky;left:0;background:var(--bg2);z-index:2;min-width:140px">User</th>
+          ${headerCells}
+          <th style="position:sticky;right:0;background:var(--bg2);z-index:2;padding:4px 6px;font-size:9px">Actions</th>
+        </tr></thead>
+        <tbody>${matrixRows}</tbody>
+      </table>
+    </div>
+    <div style="font-size:10px;color:var(--text3);margin-top:10px">
+      ✓ = has access &nbsp;·&nbsp; — = no access &nbsp;·&nbsp; <b>All</b> = grant everything &nbsp;·&nbsp; <b>Reset</b> = restore role defaults &nbsp;·&nbsp; Teal buttons indicate custom permissions are set
+    </div>
+  </div>
+
   <div class="panel" style="padding:14px 18px">
     <div class="panel-title"><span>Role Reference</span></div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;font-size:12px">
@@ -9265,6 +9412,64 @@ function renderUsers(){
       <div style="padding:12px;background:var(--bg3);border-radius:8px;border-left:3px solid var(--purple)"><div style="font-weight:700;color:var(--purple);margin-bottom:5px">Design</div><ul style="color:var(--text2);margin:0;padding-left:16px;line-height:1.9"><li>Parts Catalog, Assemblies, BOMs</li><li>Master Price List management</li><li>AI Assistant, Reports</li><li>No inventory or order access</li></ul></div>
     </div>
   </div>`;
+}
+
+// ============================================================
+// USER PERMISSION MANAGEMENT
+// ============================================================
+const _NAV_MODULES=[
+  {id:'dashboard',label:'Dashboard'},{id:'lookup',label:'Lookup'},
+  {id:'parts',label:'Parts'},{id:'assemblies',label:'Assemblies'},{id:'boms',label:'BOMs'},
+  {id:'inventory',label:'Inventory'},{id:'packqueue',label:'Production'},
+  {id:'cyclecounts',label:'Counts'},{id:'corrections',label:'Activity Log'},
+  {id:'planning',label:'Purchasing'},{id:'purchases',label:'POs'},
+  {id:'sales',label:'Sales'},{id:'warranty',label:'Resolution'},
+  {id:'vendors',label:'Vendors'},{id:'dealers',label:'Dealers'},
+  {id:'pricelist',label:'Price List'},{id:'ai',label:'AI'},
+  {id:'reports',label:'Reports'},{id:'integrations',label:'Integrations'},
+  {id:'import',label:'Import'},{id:'backups',label:'Backups'},
+];
+const _ROLE_DEFAULTS={
+  admin:_NAV_MODULES.map(m=>m.id),
+  warehouse:['dashboard','lookup','parts','assemblies','boms','inventory','packqueue','cyclecounts','corrections','planning','purchases','sales','warranty','vendors','ai','reports'],
+  customer_service:['dashboard','lookup','sales','warranty','dealers','corrections','ai','reports'],
+  design:['dashboard','lookup','parts','assemblies','boms','pricelist','ai','reports']
+};
+
+function adminToggleEnforce(){
+  const cur=localStorage.getItem('tgk_enforce_perms')==='true';
+  localStorage.setItem('tgk_enforce_perms', cur?'false':'true');
+  _updateAuthUI();
+  render();
+  logAction((cur?'Disabled':'Enabled')+' permission enforcement','profiles',null,null,null).catch(()=>{});
+}
+
+async function adminSetNavPerm(userId,mod,val){
+  const p=S.profiles.find(x=>x.id===userId);if(!p)return;
+  const perms={...(p.nav_permissions||{})};
+  perms[mod]=val;
+  const{error}=await db.from('profiles').update({nav_permissions:perms}).eq('id',userId);
+  if(error){toast('Error: '+error.message);return;}
+  p.nav_permissions=perms;
+  if(userId===S.currentUserId){S.currentNavPerms=perms;_updateAuthUI();}
+  render();
+}
+
+async function adminGrantAllPerms(userId){
+  const perms={};_NAV_MODULES.forEach(m=>perms[m.id]=true);
+  const{error}=await db.from('profiles').update({nav_permissions:perms}).eq('id',userId);
+  if(error){toast('Error: '+error.message);return;}
+  const p=S.profiles.find(x=>x.id===userId);if(p)p.nav_permissions=perms;
+  if(userId===S.currentUserId){S.currentNavPerms=perms;_updateAuthUI();}
+  toast('All access granted');render();
+}
+
+async function adminResetPerms(userId){
+  const{error}=await db.from('profiles').update({nav_permissions:null}).eq('id',userId);
+  if(error){toast('Error: '+error.message);return;}
+  const p=S.profiles.find(x=>x.id===userId);if(p)p.nav_permissions=null;
+  if(userId===S.currentUserId){S.currentNavPerms=null;_updateAuthUI();}
+  toast('Reset to role defaults');render();
 }
 
 // ============================================================
