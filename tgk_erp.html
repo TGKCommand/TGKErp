@@ -931,7 +931,7 @@ function normalizeAssemblies(rows){
 
 async function loadAll(){
   try{
-    const[parts,assemblies,sales,purchases,dealers,vendors,settings,bomItems,warrantyClaims,shipmentErrors,corrections,cycleCounts,poLinesAll,poTrackingAll,labelFilesResult,fitmentRows]=await Promise.all([
+    const[parts,assemblies,sales,purchases,dealers,vendors,settings,bomItems,warrantyClaims,shipmentErrors,corrections,cycleCounts,poLinesAll,poTrackingAll,labelFilesResult]=await Promise.all([
       db.from('parts').select('*').order('pn'),
       db.from('assemblies').select('*').order('pn'),
       db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000),
@@ -947,7 +947,6 @@ async function loadAll(){
       db.from('po_lines').select('*').order('po_id'),
       db.from('po_tracking').select('*').order('created_at'),
       db.from('part_files').select('*').eq('category','Label'),
-      (async()=>{try{return await db.from('fitments').select('*').order('make').order('model').order('year_from');}catch(e){return{data:[],error:null};}})(),
     ]);
     if(parts.error)throw parts.error;
     S.parts=parts.data||[];
@@ -976,7 +975,7 @@ async function loadAll(){
     (poLinesAll.data||[]).forEach(l=>{if(!S.poLines[l.po_id])S.poLines[l.po_id]=[];S.poLines[l.po_id].push(l);});
     S.poTracking={};
     (poTrackingAll.data||[]).forEach(t=>{if(!S.poTracking[t.po_id])S.poTracking[t.po_id]=[];S.poTracking[t.po_id].push(t);});
-    S.fitments=(fitmentRows?.data)||[];if(fitmentRows?.error&&fitmentRows.error.code!=='PGRST116')console.warn('[TGK] fitments:',fitmentRows.error.message);
+    S.fitments=null; // loaded on-demand when Fitments page opens
     if(labelFilesResult.error){console.warn('loadAll: part_files label query failed —',labelFilesResult.error.message,'— label buttons will load on demand');}
     else{S.labelFiles={};(labelFilesResult.data||[]).forEach(function(lf){if(!S.labelFiles[lf.entity_pn])S.labelFiles[lf.entity_pn]=[];S.labelFiles[lf.entity_pn].push(lf);});console.log('[TGK] Label files loaded:',Object.keys(S.labelFiles).length,'SKUs:',Object.keys(S.labelFiles).join(', '));}
     // Seed liveActivity from recent data on load (so feed is non-empty on first open)
@@ -7191,6 +7190,59 @@ async function deleteSale(id){
   if(item) pushUndo('delete','sales',item,null,'Delete sale: '+item.pn+' #'+item.order_number);
   S.sales=S.sales.filter(s=>s.id!==id);
   toast('Sale deleted');render();
+}
+
+// ============================================================
+// DEALER PORTAL — activated via ?dealer=UUID
+// ============================================================
+async function startDealerPortal(dealerId){
+  ['tgk-loader','auth-gate','tgk-app'].forEach(id=>{
+    const el=document.getElementById(id);if(el)el.style.display='none';
+  });
+  const wrap=document.createElement('div');
+  wrap.id='dealer-portal';
+  wrap.style.cssText='position:fixed;inset:0;overflow-y:auto;background:#f3f4f6;font-family:"DM Sans",sans-serif;color:#1a1c1e;';
+  wrap.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:12px"><div style="width:32px;height:32px;border:3px solid #e5e7eb;border-top-color:#0D9488;border-radius:50%;animation:spin 0.8s linear infinite"></div><div style="color:#9ca3af;font-size:13px">Loading price list\u2026</div></div>';
+  document.body.appendChild(wrap);
+  try{
+    const{data:dealer,error:dErr}=await db.from('dealers').select('*').eq('id',dealerId).maybeSingle();
+    if(dErr||!dealer){wrap.innerHTML=dealerPortalError('This price list link is invalid or has been removed.');return;}
+    if(dealer.status!=='Active'){wrap.innerHTML=dealerPortalError('This price list is not currently active. Contact TGK Motorsport.');return;}
+
+    const[prodResult,storeResult,fitResult]=await Promise.all([
+      db.from('assemblies')
+        .select('pn,new_sku,use_new_sku,description,category,msrp,image_url,ship_us,ship_ca,ship_intl,sales_price,pl_notes,product_url')
+        .eq('is_subassembly',false).eq('discontinued',false).gt('msrp',0).neq('pl_active',false)
+        .order('category').order('pn'),
+      db.from('settings').select('value').eq('key','portal_store_url').maybeSingle(),
+      db.from('fitments').select('*').order('make').order('model').order('year_from').then(r=>r,()=>({data:[],error:null}))
+    ]);
+    const products=prodResult.data||[];
+    const storeUrl=(storeResult.data?.value||'https://tgkmotorsport.com').replace(/\/$/,'');
+    const portalFitments=fitResult?.data||[];
+    if(S.fitments===null)S.fitments=portalFitments;
+
+    const _dph=buildDealerPortalHTML(dealer,products,storeUrl,portalFitments);
+    window._dealerPortalHTML=_dph;
+    wrap.innerHTML=_dph;
+    attachDealerPortalSearch();
+    logDealerVisit(dealer).catch(e=>console.warn('[TGK] dealer visit log failed:',e?.message||e));
+
+    db.channel('dealer-portal-prices')
+      .on('postgres_changes',{event:'UPDATE',schema:'public',table:'assemblies'},payload=>{
+        const row=document.querySelector(`tr[data-dpn="${payload.new.pn}"]`);
+        if(!row||!(payload.new.msrp>0))return;
+        const disc=dealer.discount_pct||0.2;
+        const dp=payload.new.msrp*(1-disc);
+        const msrpEl=row.querySelector('.dp-msrp');const priceEl=row.querySelector('.dp-price');const saveEl=row.querySelector('.dp-save');
+        if(msrpEl)msrpEl.textContent='$'+payload.new.msrp.toFixed(2);
+        if(priceEl)priceEl.textContent='$'+dp.toFixed(2);
+        if(saveEl)saveEl.textContent='-$'+(payload.new.msrp-dp).toFixed(2);
+        row.classList.add('dp-flash');setTimeout(()=>row.classList.remove('dp-flash'),1500);
+      }).subscribe();
+  }catch(e){
+    wrap.innerHTML=dealerPortalError('Could not load price list: '+e.message);
+  }
 }
 
 // ============================================================
@@ -15574,7 +15626,24 @@ window._aomAddAll=function(){
 // FITMENT GUIDE
 // ============================================================
 
+async function loadFitments(){
+  if(S.fitments!==null)return; // already loaded
+  try{
+    const{data,error}=await db.from('fitments').select('*').order('make').order('model').order('year_from');
+    S.fitments=data||[];
+    if(error&&error.code!=='PGRST116')console.warn('[TGK] fitments:',error.message);
+  }catch(e){
+    S.fitments=[];
+    console.warn('[TGK] fitments load failed:',e.message);
+  }
+}
+
 function renderFitments() {
+  // Trigger lazy load — re-render once data arrives
+  if(S.fitments===null){
+    loadFitments().then(()=>render());
+    return '<div class="section-empty" style="margin-top:60px">Loading fitment data…</div>';
+  }
   const tab = S.fitmentTab || 'guide';
   const guideHtml = tab === 'guide' ? renderFitmentsGuide() : '';
   const manageHtml = tab === 'manage' ? renderFitmentsManage() : '';
