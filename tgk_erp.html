@@ -7109,7 +7109,151 @@ async function deleteSale(id){
 }
 
 // ============================================================
-// DEALER PORTAL — read-only price list, activated via ?dealer=UUID
+// PROSPECT PRICELIST — read-only multi-tier list, activated via ?prospect=1
+// ============================================================
+async function startProspectPortal(){
+  ['tgk-loader','auth-gate','tgk-app'].forEach(id=>{
+    const el=document.getElementById(id);if(el)el.style.display='none';
+  });
+  const wrap=document.createElement('div');
+  wrap.id='dealer-portal';
+  wrap.style.cssText='position:fixed;inset:0;overflow-y:auto;background:#f3f4f6;font-family:"DM Sans",sans-serif;color:#1a1c1e;';
+  wrap.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:12px"><div style="width:32px;height:32px;border:3px solid #e5e7eb;border-top-color:#0D9488;border-radius:50%;animation:spin 0.8s linear infinite"></div><div style="color:#9ca3af;font-size:13px">Loading price list\u2026</div></div>';
+  document.body.appendChild(wrap);
+  try{
+    const[prodResult,settingsResult]=await Promise.all([
+      db.from('assemblies')
+        .select('pn,new_sku,use_new_sku,description,category,msrp,image_url,ship_us,ship_ca,ship_intl,sales_price,pl_notes')
+        .eq('is_subassembly',false).eq('discontinued',false).gt('msrp',0).neq('pl_active',false)
+        .order('category').order('pn'),
+      db.from('settings').select('key,value').in('key',['pricing_tiers','portal_store_url'])
+    ]);
+    const products=prodResult.data||[];
+    const settingsRows=settingsResult.data||[];
+    const storeUrl=((settingsRows.find(r=>r.key==='portal_store_url')||{}).value||'https://tgkmotorsport.com').replace(/\/$/,'');
+    const tiers=(settingsRows.find(r=>r.key==='pricing_tiers')||{}).value||DEFAULT_PRICING_TIERS;
+    const html=buildProspectPortalHTML(tiers,products,storeUrl);
+    window._dealerPortalHTML=html;
+    wrap.innerHTML=html;
+    attachDealerPortalSearch();
+  }catch(e){
+    wrap.innerHTML=dealerPortalError('Could not load prospect pricelist: '+e.message);
+  }
+}
+
+function buildProspectPortalHTML(tiers,products,storeUrl){
+  const now=new Date().toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'});
+  const logoSrc=document.querySelector('.logo-img')?document.querySelector('.logo-img').src:'';
+  const activeTiers=(tiers||[]).filter(t=>t&&t.pct!=null);
+
+  const catMap={};
+  products.forEach(p=>{const c=p.category||'Other';if(!catMap[c])catMap[c]=[];catMap[c].push(p);});
+  const cats=Object.keys(catMap).sort();
+
+  // Tier header cells
+  const tierHeaders=activeTiers.map(t=>`<th style="text-align:right;padding:8px 12px;color:#0d9488;font-weight:800;white-space:nowrap">${escHtml(t.name)}<br><span style="font-size:10px;font-weight:400;color:#6b7280">${t.pct}% off MSRP</span></th>`).join('');
+  const tierColspan=7+activeTiers.length;
+
+  const sections=cats.map(cat=>{
+    const rows=catMap[cat].map(p=>{
+      const sku=(p.use_new_sku&&p.new_sku)?p.new_sku:p.pn;
+      const sp=p.sales_price!=null?parseFloat(p.sales_price):null;
+      const searchStr=(sku+' '+p.pn+' '+(p.description||'')+' '+cat).toLowerCase();
+
+      const tierCells=activeTiers.map(t=>{
+        const dp=sp!=null?sp:p.msrp*(1-(t.pct/100));
+        const isSale=sp!=null;
+        return `<td style="text-align:right;font-weight:700;font-size:12px;padding:9px 12px;color:${isSale?'#dc2626':'#0d9488'};white-space:nowrap">$${dp.toFixed(2)}${isSale?' <span style="background:#dc2626;color:#fff;border-radius:3px;padding:1px 4px;font-size:9px">SALE</span>':''}</td>`;
+      }).join('');
+
+      const su=p.ship_us||'FREE';const sc=p.ship_ca||'$25.00';const si=p.ship_intl||'--';
+      return `<tr data-dpn="${escHtml(sku)}" data-search="${escHtml(searchStr)}" style="border-bottom:1px solid #f0f0f0">`
+        +`<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:9px 12px;white-space:nowrap">${escHtml(sku)}</td>`
+        +`<td style="font-size:12px;padding:9px 12px">${escHtml(p.description||'')}</td>`
+        +`<td style="text-align:right;font-size:12px;padding:9px 12px;white-space:nowrap;color:#374151">$${p.msrp.toFixed(2)}</td>`
+        +tierCells
+        +`<td style="text-align:center;font-size:11px;padding:9px 12px;color:#6b7280">${escHtml(su)}</td>`
+        +`<td style="text-align:center;font-size:11px;padding:9px 12px;color:#6b7280">${escHtml(sc)}</td>`
+        +`<td style="text-align:center;font-size:11px;padding:9px 12px;color:#6b7280">${escHtml(si)}</td>`
+        +`<td style="font-size:11px;color:#9ca3af;padding:9px 12px;font-style:italic">${escHtml(p.pl_notes||'')}</td>`
+        +'</tr>';
+    }).join('');
+    const tierSubHeaders=activeTiers.map(t=>`<th style="text-align:right;padding:8px 12px;font-size:10px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap">${escHtml(t.name)}</th>`).join('');
+    return `<div class="dp-section" style="margin-bottom:32px">`
+      +`<div class="dp-cat-heading">${escHtml(cat)}</div>`
+      +`<table style="width:100%;border-collapse:collapse">`
+      +`<thead><tr style="background:#f9fafb;border-bottom:1px solid #e5e7eb">`
+      +`<th style="text-align:left;padding:8px 12px;font-size:10px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em">SKU</th>`
+      +`<th style="text-align:left;padding:8px 12px;font-size:10px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em">Description</th>`
+      +`<th style="text-align:right;padding:8px 12px;font-size:10px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em">MSRP</th>`
+      +tierSubHeaders
+      +`<th style="text-align:center;padding:8px 12px;font-size:10px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em">US Ship</th>`
+      +`<th style="text-align:center;padding:8px 12px;font-size:10px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em">Canada</th>`
+      +`<th style="text-align:center;padding:8px 12px;font-size:10px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em">Intl</th>`
+      +`<th style="text-align:left;padding:8px 12px;font-size:10px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em">Notes</th>`
+      +`</tr></thead><tbody>${rows}</tbody></table></div>`;
+  }).join('');
+
+  // Tier summary pills for header
+  const tierPills=activeTiers.map(t=>`<span style="background:#f0fdf4;border:1px solid #0d9488;color:#065f46;font-size:11px;font-weight:700;padding:4px 12px;border-radius:20px;white-space:nowrap">${escHtml(t.name)}: ${t.pct}% off MSRP</span>`).join('');
+
+  return '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+    +'<meta name="viewport" content="width=device-width,initial-scale=1">'
+    +'<title>TGK Motorsport \u2014 Authorized Dealer Program</title>'
+    +'<style>'
+    +'*{box-sizing:border-box}'
+    +'body{font-family:"DM Sans",Arial,sans-serif;margin:0;padding:24px 20px;background:#f3f4f6;color:#111}'
+    +'.dp-wrap{max-width:1200px;margin:0 auto;background:#fff;border-radius:10px;padding:32px 36px;box-shadow:0 2px 12px rgba(0,0,0,.08)}'
+    +'.dp-header{display:flex;align-items:flex-start;gap:20px;padding-bottom:20px;border-bottom:3px solid #0d9488;margin-bottom:24px}'
+    +'.dp-cat-heading{font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#374151;padding:10px 0 6px;border-bottom:2px solid #0d9488;margin-bottom:0}'
+    +'table{width:100%;border-collapse:collapse}'
+    +'tbody tr:hover td{background:#f0fdf4}'
+    +'.dp-search{width:100%;max-width:340px;padding:8px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:12px;outline:none}'
+    +'.dp-search:focus{border-color:#0d9488}'
+    +'.dp-flash td{animation:dpf .8s}'
+    +'@keyframes dpf{0%{background:#d1fae5}100%{background:transparent}}'
+    +'@keyframes spin{to{transform:rotate(360deg)}}'
+    +'.dp-footer{margin-top:32px;padding:20px 24px;background:#f9fafb;border-radius:8px;border:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}'
+    +'@media(max-width:768px){.dp-wrap{padding:16px 14px;border-radius:0}body{padding:0}}'
+    +'@media print{.no-print{display:none!important}body{background:#fff;padding:0}.dp-wrap{box-shadow:none;padding:16px;border-radius:0}}'
+    +'</style>'
+    +'</head><body><div class="dp-wrap">'
+    +'<div class="dp-header">'
+    +(logoSrc?'<img src="'+logoSrc+'" style="height:56px;width:auto" alt="TGK Motorsport">':'<div style="font-size:24px;font-weight:900;color:#0d9488">TGK MOTORSPORT</div>')
+    +'<div style="flex:1">'
+    +'<div style="font-size:22px;font-weight:800;color:#111;margin-bottom:4px">Authorized Dealer Program</div>'
+    +'<div style="font-size:12px;color:#6b7280;margin-bottom:10px">Wholesale pricing schedule &bull; '+now+'</div>'
+    +'<div style="display:flex;gap:8px;flex-wrap:wrap">'+tierPills+'</div>'
+    +'</div>'
+    +'<div style="display:flex;gap:8px;align-items:flex-start">'
+    +'<button class="no-print" onclick="printDealerPortal()" style="padding:9px 18px;background:#0d9488;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap">\uD83D\uDCC4 Print / PDF</button>'
+    +'</div>'
+    +'</div>'
+    +'<div class="no-print" style="margin:0 0 18px;display:flex;align-items:center;gap:10px">'
+    +'<div style="position:relative;flex:1;max-width:360px">'
+    +'<span style="position:absolute;left:11px;top:50%;transform:translateY(-50%);color:#9ca3af;font-size:14px;pointer-events:none">&#9906;</span>'
+    +'<input id="dp-search-input" class="dp-search" style="padding-left:34px" type="search" placeholder="Search SKU or description\u2026" oninput="dealerPortalFilter(this.value)" autocomplete="off">'
+    +'</div>'
+    +'<span id="dp-result-count" style="font-size:11px;color:#9ca3af"></span>'
+    +'<button onclick="document.getElementById(\'dp-search-input\').value=\'\';dealerPortalFilter(\'\')" style="font-size:11px;color:#6b7280;background:none;border:1px solid #d1d5db;border-radius:5px;padding:5px 10px;cursor:pointer">Clear</button>'
+    +'</div>'
+    +sections
+    +'<div id="dp-empty" style="display:none;text-align:center;padding:48px 20px;color:#9ca3af">'
+    +'<div style="font-size:32px;margin-bottom:10px">&#128269;</div>'
+    +'<div style="font-size:14px;font-weight:600;margin-bottom:4px">No results</div>'
+    +'<div style="font-size:12px">Try a different SKU or keyword</div>'
+    +'</div>'
+    +'<div class="dp-footer">'
+    +'<div>'
+    +'<div style="font-size:14px;font-weight:700;color:#111;margin-bottom:4px">Interested in becoming an authorized TGK dealer?</div>'
+    +'<div style="font-size:12px;color:#6b7280">Contact us to discuss your application and find the right tier for your business.</div>'
+    +'</div>'
+    +'<a href="'+storeUrl+'" style="padding:10px 20px;background:#0d9488;color:#fff;border-radius:6px;font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap">Visit TGK Motorsport &#8599;</a>'
+    +'</div>'
+    +'</div></body></html>';
+}
+
+
 // No auth required. Uses the same Supabase anon key.
 // SQL required: ALTER TABLE dealers DISABLE ROW LEVEL SECURITY;
 // ============================================================
@@ -15498,6 +15642,23 @@ function renderPriceList(){
     +'<button class="btn btn-sm btn-teal" onclick="publishPriceListNow()" title="Push current prices to all dealer portals">&#8593; Publish to Dealers</button>'
     +'<button class="btn btn-sm" onclick="printPriceList()">Print</button>'
     +'</div></div>'
+    // ── Prospect pricelist panel ──
+    +(function(){
+      var prospectUrl=window.location.origin+window.location.pathname+'?prospect=1';
+      var tierPills=(S.pricingTiers||[]).map(function(t){return '<span style="background:var(--teal-dim);color:var(--teal);border:1px solid rgba(13,148,136,.25);font-size:10px;font-weight:700;padding:2px 8px;border-radius:12px;white-space:nowrap">'+escHtml(t.name)+' — '+t.pct+'% off</span>';}).join(' ');
+      return '<div style="background:var(--bg2);border:1px solid rgba(13,148,136,.25);border-radius:8px;padding:12px 16px;margin-bottom:10px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">'
+        +'<div style="flex:1;min-width:200px">'
+        +'<div style="font-size:12px;font-weight:700;color:var(--text);margin-bottom:3px">🔗 Prospect Pricelist</div>'
+        +'<div style="font-size:11px;color:var(--text3);margin-bottom:6px">Send to dealers considering joining your network — shows all tiers, no login required.</div>'
+        +(tierPills?'<div style="display:flex;gap:5px;flex-wrap:wrap">'+tierPills+'</div>':'<span style="font-size:10px;color:var(--yellow)">No tiers defined — add them in Dealers → Pricing Tiers</span>')
+        +'</div>'
+        +'<div style="display:flex;gap:6px;align-items:center;flex-shrink:0">'
+        +'<code style="font-size:10px;color:var(--teal);background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:3px 8px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(prospectUrl)+'</code>'
+        +'<button class="btn btn-sm btn-teal" onclick="navigator.clipboard.writeText(\''+escHtml(prospectUrl)+'\').then(function(){toast(\'Link copied\')})">🔗 Copy</button>'
+        +'<a href="'+escHtml(prospectUrl)+'" target="_blank" class="btn btn-sm" style="text-decoration:none">👁 Preview</a>'
+        +'</div>'
+        +'</div>';
+    })()
     +'<div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:9px 16px;margin-bottom:10px;display:flex;gap:16px;flex-wrap:wrap;align-items:center">'
     +'<span style="font-size:11px"><strong>TGK MOTORSPORT</strong> -- Authorized Dealer Pricing</span>'
     +'<span style="font-size:11px;color:var(--teal);font-weight:700">Standard Tier -- 10% off MSRP</span>'
@@ -15570,6 +15731,9 @@ function printPriceList(){
     // ── Dealer portal: bypass auth for ?dealer= URLs ──
     const _dealerParam=new URLSearchParams(window.location.search).get('dealer');
     if(_dealerParam){startDealerPortal(_dealerParam);return;}
+    // ── Prospect pricelist: bypass auth for ?prospect= URLs ──
+    const _prospectParam=new URLSearchParams(window.location.search).get('prospect');
+    if(_prospectParam){startProspectPortal();return;}
     checkAuthAndConnect();
   }
 
