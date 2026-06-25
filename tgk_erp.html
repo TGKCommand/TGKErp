@@ -1987,8 +1987,8 @@ function renderBOMs(){
         const accentMap={'bomtag-sub':'var(--orange)','bomtag-hw':'var(--blue)','bomtag-hwp':'var(--purple)','bomtag-sup':'var(--green)','bomtag-comp':'var(--text3)','bomtag-part':'var(--teal)','bomtag-pack':'#9333ea'};
         const uc=lineUnitCost(item);
         const total=lineCost(item);
-        const _p=S.parts.find(x=>x.pn===item.child_pn);
-        const hasTier=activeTierNum(_p,(item.qty||1))>0;
+        const _p=_findPart(item.child_pn);
+        const hasTier=activeTierNum(_p,item.qty||1)>0;
         return `<div class="bom-row rowlink" 
           draggable="true"
           data-bom-id="${item.id}"
@@ -10836,15 +10836,16 @@ function assemblyDossier(pn){
         <th>Bin</th>
       </tr></thead><tbody>
       ${b.checks.map(c=>{
-        const _p=S.parts.find(_x=>_x.pn===c.pn);
-        const _uc=c.isSub?bomCostOf(c.pn,0):(_p?costForQty(_p,c.need):0);
+        const _p=_findPart(c.pn);
+        const _isSub=c.isSub||(!_p&&!!_findAsm2(c.pn));
+        const _uc=_isSub?bomCostOf(c.pn,0):(_p?costForQty(_p,c.need):(c.unit_cost||0));
         const _ext=_uc*c.need;
-        const _hasTier=activeTierNum(_p,c.need)>0;
-        return `<tr style="cursor:pointer" onclick="lookupGo('${S.assemblies.find(a=>a.pn===c.pn)?'assembly':'part'}','${c.pn}')">
-          <td class="pn" style="white-space:nowrap">${c.pn}<br>${bomTag(c.pn,c.isSub?'assembly':'part')}</td>
+        const _tnum=_p?activeTierNum(_p,c.need):0;
+        return `<tr style="cursor:pointer" onclick="lookupGo('${_findAsm2(c.pn)?'assembly':'part'}','${c.pn}')">
+          <td class="pn" style="white-space:nowrap">${c.pn}<br>${bomTag(c.pn,_isSub?'assembly':'part')}</td>
           <td style="font-size:11px;color:var(--text2);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(c.desc||'')}</td>
           <td class="money-neutral" style="text-align:right">${c.need}</td>
-          <td class="money-cost" style="text-align:right;white-space:nowrap">${fc(_uc)}${_hasTier?('<span title="Tier '+activeTierNum(_p,c.need)+' active" style="font-size:9px;font-weight:700;color:var(--teal);background:var(--teal-dim);border-radius:2px;padding:0 3px;margin-left:2px">T'+activeTierNum(_p,c.need)+'</span>'):''}</td>
+          <td class="money-cost" style="text-align:right;white-space:nowrap">${fc(_uc)}${_tnum>0?('<span title="Tier '+_tnum+' active" style="font-size:9px;font-weight:700;color:var(--teal);background:var(--teal-dim);border-radius:2px;padding:0 3px;margin-left:2px">T'+_tnum+'</span>'):''}</td>
           <td class="money-cost" style="text-align:right;font-weight:700">${fc(_ext)}</td>
           <td class="money" style="color:${c.ok?'var(--green)':'var(--red)'};font-weight:700;text-align:right">${c.avail}</td>
           <td style="font-size:10px;font-family:var(--mono);color:var(--text3)">${c.loc||'—'}</td>
@@ -10852,7 +10853,7 @@ function assemblyDossier(pn){
       <tr style="background:var(--bg2);border-top:2px solid var(--border)">
         <td colspan="3" style="padding:7px 8px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Total BOM Cost</td>
         <td></td>
-        <td class="money-cost" style="text-align:right;font-size:14px;font-weight:700;padding:7px 8px">${fc(b.checks.reduce((t,c)=>{const _p=S.parts.find(_x=>_x.pn===c.pn);const _uc=c.isSub?bomCostOf(c.pn,0):(_p?costForQty(_p,c.need):0);return t+_uc*c.need;},0))}</td>
+        <td class="money-cost" style="text-align:right;font-size:14px;font-weight:700;padding:7px 8px">${fc(b.checks.reduce((t,c)=>{const _p=_findPart(c.pn);const _isSub=c.isSub||(!_p&&!!_findAsm2(c.pn));const _uc=_isSub?bomCostOf(c.pn,0):(_p?costForQty(_p,c.need):(c.unit_cost||0));return t+_uc*c.need;},0))}</td>
         <td colspan="2"></td>
       </tr>
       </tbody></table>`}
@@ -11365,37 +11366,92 @@ function calcForecast(pn) {
 const HW_CATS=['Bolts/Washers/Nuts','Orings','Fittings','Heims & Sphericals','Suspension Hardware','Hardware'];
 const SUPPLY_CATS=['Shipping','Bulk Pieces'];
 const PACK_CATS=['Box','Boxes','Packaging','Packing','Carton','Cartons','Label','Labels'];
+// ── Part/assembly lookup helpers ─────────────────────────────────────────────
+
+// Parse price_breaks whether stored as JSONB array or accidentally as JSON string
+function _getBreaks(p){
+  if(!p)return[];
+  let b=p.price_breaks;
+  if(!b)return[];
+  if(typeof b==='string'){try{b=JSON.parse(b);}catch(e){return[];}}
+  return Array.isArray(b)?b:[];
+}
+
+// Robust part finder: tries exact pn, then new_sku alias, then case-insensitive trim
+function _findPart(childPn){
+  if(!childPn)return null;
+  const raw=String(childPn);
+  const clean=raw.trim().toUpperCase();
+  // 1. Exact match
+  let p=S.parts.find(x=>x.pn===raw);if(p)return p;
+  // 2. Trimmed exact
+  p=S.parts.find(x=>x.pn===clean);if(p)return p;
+  // 3. Case-insensitive
+  p=S.parts.find(x=>(x.pn||'').toUpperCase()===clean);if(p)return p;
+  return null;
+}
+
+// Robust assembly finder: tries pn, then new_sku, then case-insensitive
+function _findAsm2(childPn){
+  if(!childPn)return null;
+  const raw=String(childPn);
+  const clean=raw.trim().toUpperCase();
+  let a=S.assemblies.find(x=>x.pn===raw);if(a)return a;
+  a=S.assemblies.find(x=>x.pn===clean);if(a)return a;
+  a=S.assemblies.find(x=>(x.pn||'').toUpperCase()===clean);if(a)return a;
+  // Also check new_sku
+  a=S.assemblies.find(x=>x.use_new_sku&&x.new_sku&&(x.new_sku===raw||(x.new_sku||'').toUpperCase()===clean));if(a)return a;
+  return null;
+}
+
+// Resolve child_pn to internal pn for S.boms lookup (handles new_sku redirect)
+function _resolveAsmPn(childPn){
+  if(!childPn)return childPn;
+  if(S.boms[childPn]&&S.boms[childPn].length)return childPn; // direct hit
+  const a=_findAsm2(childPn);
+  return a?a.pn:childPn;
+}
+
+// True item type: 'assembly' if it's actually an assembly in S.assemblies,
+// 'part' if it's a part in S.parts, else use stored item_type
+function _resolveItemType(item){
+  const stored=item.item_type||'part';
+  if(isAsmBOMItem(stored))return'assembly';
+  // Double-check: if stored as 'part' but it's actually an assembly, treat as assembly
+  if(!isAsmBOMItem(stored)&&_findAsm2(item.child_pn)&&!_findPart(item.child_pn))return'assembly';
+  return'part';
+}
+
 function bomCostOf(pn, depth){
-  // True rolled-up cost of an assembly from its BOM (recursive through subassemblies)
   if((depth||0)>6)return 0;
-  const items=S.boms[pn]||[];
+  const resolvedPn=_resolveAsmPn(pn);
+  const items=S.boms[resolvedPn]||[];
+  if(!items.length)return 0;
   let t=0;
   for(const i of items){
-    if(i.item_type==='assembly'||i.item_type==='subassembly'){
+    const itype=_resolveItemType(i);
+    if(itype==='assembly'){
       const subCost=bomCostOf(i.child_pn,(depth||0)+1);
-      // If sub-assembly has no BOM of its own, fall back to stored unit_cost on this line
       t+=(subCost||(i.unit_cost||0))*(i.qty||1);
     } else {
-      const p=S.parts.find(x=>x.pn===i.child_pn);
-      // Use current tier price; fall back to stored unit_cost if part not in catalog
+      const p=_findPart(i.child_pn);
+      // Always use current tier price at BOM qty; fall back to stored unit_cost only if part not found
       t+=(p?costForQty(p,i.qty||1):(i.unit_cost||0))*(i.qty||1);
     }
   }
   return t;
 }
 function lineCost(item){
-  // Assembly/subassembly: roll up recursively
-  if(isAsmBOMItem(item.item_type))return bomCostOf(item.child_pn,0)*(item.qty||1);
-  // Part in catalog: always use current tier price at BOM qty (ignores stored unit_cost)
-  const p=S.parts.find(x=>x.pn===item.child_pn);
+  const itype=_resolveItemType(item);
+  if(itype==='assembly')return bomCostOf(item.child_pn,0)*(item.qty||1);
+  const p=_findPart(item.child_pn);
   if(p)return costForQty(p,item.qty||1)*(item.qty||1);
-  // Not in catalog: fall back to stored value
   return (item.unit_cost||0)*(item.qty||1);
 }
 function lineUnitCost(item){
-  // Per-unit cost for display — uses tier price
-  if(isAsmBOMItem(item.item_type))return bomCostOf(item.child_pn,0);
-  const p=S.parts.find(x=>x.pn===item.child_pn);
+  const itype=_resolveItemType(item);
+  if(itype==='assembly')return bomCostOf(item.child_pn,0);
+  const p=_findPart(item.child_pn);
   if(p)return costForQty(p,item.qty||1);
   return item.unit_cost||0;
 }
@@ -11462,21 +11518,21 @@ function pnOpt(pn){const d=pnLabel(pn);return`<option value="${escHtml(pn)}"${d?
 function pnOptDisc(pn){const d=pnLabel(pn);return`<option value="${escHtml(pn)}" label="${escHtml(pn+(d?' — '+d:'')+' (discontinued)')}">`;} 
 
 function costForQty(p, qty){
-  const breaks=Array.isArray(p.price_breaks)?p.price_breaks:[];
+  const breaks=_getBreaks(p);
   let cost=p.unit_cost||0, bestQty=0;
   for(const b of breaks){
     const bQty=Number(b?.qty)||0;
     const bPrice=Number(b?.price)||0;
-    if(bQty>0 && bPrice>0 && qty>=bQty && bQty>bestQty){bestQty=bQty;cost=bPrice;}
+    if(bQty>0 && bPrice>0 && Number(qty)>=bQty && bQty>bestQty){bestQty=bQty;cost=bPrice;}
   }
   return cost;
 }
-// Returns which 1-based tier number is active for a part at a given qty (0 = base price)
+// Returns which 1-based tier number is active for a part at a given qty (0 = base price, no break)
 function activeTierNum(p, qty){
-  const breaks=Array.isArray(p?.price_breaks)?p.price_breaks:[];
+  const breaks=_getBreaks(p);
   const sorted=breaks.filter(b=>Number(b?.qty)>0&&Number(b?.price)>0).sort((a,b)=>Number(a.qty)-Number(b.qty));
   let tier=0;
-  for(let i=0;i<sorted.length;i++){if(qty>=Number(sorted[i].qty))tier=i+1;}
+  for(let i=0;i<sorted.length;i++){if(Number(qty)>=Number(sorted[i].qty))tier=i+1;}
   return tier;
 }
 
