@@ -180,6 +180,11 @@ select.form-input{cursor:pointer}
 .bom-row{padding:8px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;font-size:12px}
 .bom-row:last-child{border-bottom:none}
 .bom-row:hover{background:var(--bg3)}
+.bom-drag-handle{cursor:grab;color:var(--text3);font-size:14px;padding:0 2px;flex-shrink:0;user-select:none;opacity:.5}
+.bom-drag-handle:hover{opacity:1;color:var(--teal)}
+.bom-row.bom-dragging{opacity:.35;background:var(--bg3)}
+.bom-row.bom-drop-above{box-shadow:inset 0 2px 0 var(--teal)}
+.bom-row.bom-drop-below{box-shadow:inset 0 -2px 0 var(--teal)}
 .type-accent{width:2px;height:28px;border-radius:2px;flex-shrink:0}
 
 /* ── ALERT ROWS ── */
@@ -1983,7 +1988,15 @@ function renderBOMs(){
         const total=lineCost(item);
         const _p=S.parts.find(x=>x.pn===item.child_pn);
         const hasTier=_p&&Array.isArray(_p.price_breaks)&&_p.price_breaks.some(b=>b.qty>0&&b.price>0&&(item.qty||1)>=b.qty);
-        return `<div class="bom-row rowlink" onclick="rowClick(event,function(){lookupGo('${S.assemblies.find(a=>a.pn===item.child_pn)?'assembly':'part'}','${item.child_pn}')})">
+        return `<div class="bom-row rowlink" 
+          draggable="true"
+          data-bom-id="${item.id}"
+          ondragstart="bomDragStart(this,'${item.id}','${sel}',event)"
+          ondragend="bomDragEnd(this)"
+          ondragover="bomDragOver(this,'${item.id}',event)"
+          ondrop="bomDrop(this,'${item.id}','${sel}',event)"
+          onclick="rowClick(event,function(){lookupGo('${S.assemblies.find(a=>a.pn===item.child_pn)?'assembly':'part'}','${item.child_pn}')})">
+          <div class="bom-drag-handle" title="Drag to reorder" onclick="event.stopPropagation()">&#8942;</div>
           <div class="type-accent" style="background:${accentMap[bb.cls]}"></div>
           <div style="flex:1;min-width:0">
             <span class="pn" style="color:var(--text)">${item.child_pn}</span>
@@ -7735,6 +7748,64 @@ async function deleteDealer(id){
   S.dealers=S.dealers.filter(d=>d.id!==id);
   toast('Dealer deleted');render();
 }
+// ── BOM drag-and-drop reordering ─────────────────────────────────────────────
+var _bomDragId=null,_bomDragPn=null;
+
+window.bomDragStart=function(el,id,pn){
+  _bomDragId=id;_bomDragPn=pn;
+  el.classList.add('bom-dragging');
+  event.dataTransfer.effectAllowed='move';
+  event.dataTransfer.setData('text/plain',id);
+};
+
+window.bomDragEnd=function(el){
+  el.classList.remove('bom-dragging');
+  document.querySelectorAll('.bom-row').forEach(r=>{r.classList.remove('bom-drop-above');r.classList.remove('bom-drop-below');});
+};
+
+window.bomDragOver=function(el,id,ev){
+  if(!_bomDragId||_bomDragId===id)return;
+  ev.preventDefault();ev.dataTransfer.dropEffect='move';
+  document.querySelectorAll('.bom-row').forEach(r=>{r.classList.remove('bom-drop-above');r.classList.remove('bom-drop-below');});
+  const rect=el.getBoundingClientRect();
+  const mid=rect.top+rect.height/2;
+  el.classList.add(ev.clientY<mid?'bom-drop-above':'bom-drop-below');
+};
+
+window.bomDrop=async function(el,targetId,pn,ev){
+  ev.preventDefault();
+  document.querySelectorAll('.bom-row').forEach(r=>{r.classList.remove('bom-drop-above');r.classList.remove('bom-drop-below');});
+  const dragId=_bomDragId;
+  if(!dragId||dragId===targetId){_bomDragId=null;return;}
+
+  const items=[...(S.boms[pn]||[])];
+  const fromIdx=items.findIndex(i=>i.id===dragId);
+  const toIdx=items.findIndex(i=>i.id===targetId);
+  if(fromIdx<0||toIdx<0){_bomDragId=null;return;}
+
+  // Determine insert position: above or below target
+  const rect=el.getBoundingClientRect();
+  const insertBefore=ev.clientY<rect.top+rect.height/2;
+  const [moved]=items.splice(fromIdx,1);
+  let insertAt=items.findIndex(i=>i.id===targetId);
+  if(!insertBefore)insertAt+=1;
+  items.splice(insertAt,0,moved);
+
+  // Assign sort_order 10, 20, 30…
+  const updated=items.map((item,idx)=>({...item,sort_order:(idx+1)*10}));
+  S.boms[pn]=updated;
+  _bomDragId=null;
+  render();
+
+  // Persist to DB — update all rows for this assembly
+  try{
+    await Promise.all(updated.map(item=>
+      db.from('bom_items').update({sort_order:item.sort_order}).eq('id',item.id)
+    ));
+    toast('\u2713 BOM order saved');
+  }catch(e){toast('Order saved locally — DB update failed: '+e.message);}
+};
+
 async function delBOMItem(id,parentPn){
   const item=S.boms[parentPn]?.find(i=>i.id===id);
   const{error}=await db.from('bom_items').delete().eq('id',id);
@@ -9275,9 +9346,9 @@ function _updateAuthUI(){
   } else {
     // Enforcement ON: use per-user nav_permissions if set, else role defaults
     const ROLE_NAV={
-      warehouse:['dashboard','lookup','parts','assemblies','boms','inventory','packqueue','cyclecounts','corrections','planning','purchases','sales','warranty','vendors','ai','reports'],
+      warehouse:['dashboard','lookup','parts','assemblies','boms','fitments','inventory','packqueue','cyclecounts','corrections','planning','purchases','sales','warranty','vendors','ai','reports'],
       customer_service:['dashboard','lookup','sales','warranty','dealers','corrections','ai','reports'],
-      design:['dashboard','lookup','parts','assemblies','boms','pricelist','ai','reports']
+      design:['dashboard','lookup','parts','assemblies','boms','fitments','pricelist','ai','reports']
     };
     const perms=S.currentNavPerms;
     const roleAllowed=ROLE_NAV[role]||ALL_NAV;
