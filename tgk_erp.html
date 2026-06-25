@@ -1590,7 +1590,31 @@ function renderDashboard(){
   const partialCount=countGroupedStatus('Partial');
   const preorderCount=countGroupedStatus('Pre-order');
   // Stale: grouped open orders where the lead line's sale_date is older than 60 days
-  const staleOpenNums=new Set(S.sales.filter(s=>!isInternal(s.order_number)&&(!s.fulfillment_status||s.fulfillment_status==='Open')&&s.sale_date&&s.sale_date<daysAgo(60)).map(s=>s.order_number||('__noid__'+s.id)));
+  // staleOpen: grouped orders with effective 'Open' status older than 60 days
+  // Must use the same grouping logic as the sales view — not raw line status
+  const staleOpenNums=(function(){
+    const byOrd={};
+    S.sales.forEach(function(s){
+      if(isInternal(s.order_number))return;
+      const k=s.order_number||('__noid__'+s.id);
+      if(!byOrd[k])byOrd[k]={lines:[],date:s.sale_date};
+      byOrd[k].lines.push(s);
+      if(s.sale_date&&(!byOrd[k].date||s.sale_date<byOrd[k].date))byOrd[k].date=s.sale_date;
+    });
+    const nums=new Set();
+    Object.entries(byOrd).forEach(function(e){
+      const k=e[0],grp=e[1];
+      if(!grp.date||grp.date>=daysAgo(60))return;
+      // effective status — same logic as groupSales
+      const pending=grp.lines.filter(function(l){return!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open');});
+      if(pending.length===0)return;
+      const shipped=grp.lines.filter(function(l){return l.fulfillment_status==='Shipped'||l.fulfillment_status==='Delivered';});
+      const allOnHold=pending.every(function(l){return l.fulfillment_status==='On Hold';});
+      const eff=allOnHold?'On Hold':shipped.length>0?'Partial':'Open';
+      if(eff==='Open')nums.add(k);
+    });
+    return nums;
+  })();
   const staleOpen=staleOpenNums.size;
   const freshOpen=Math.max(0,openOrders-staleOpen);
   // Fulfillment queue widget still uses raw lines (needs individual IDs for Pack/Ship buttons)
@@ -17847,14 +17871,34 @@ function _buildWorkflowAlerts() {
     alerts.push({ level: 'red', icon: '\u26a0', text: zeroAsms.length + ' assembl' + (zeroAsms.length > 1 ? 'ies' : 'y') + ' at zero stock: ' + zeroAsms.slice(0, 3).map(function(a) { return a.pn; }).join(', ') + (zeroAsms.length > 3 ? '\u2026' : ''), nav: "nav('assemblies')", lbl: 'Assemblies' });
   }
 
-  // Open orders 14-60 days old (not already caught by 60-day stale alert)
+  // Unfulfilled orders 14-60 days old — group by order number, use effective grouped status
+  // so multi-SKU orders where some lines are shipped (Partial) are counted correctly
   var d14 = daysAgo(14);
-  var stale14 = new Set(S.sales.filter(function(s) {
-    return !isInternal(s.order_number) && (s.fulfillment_status === 'Open' || !s.fulfillment_status)
-      && s.sale_date && s.sale_date < d14 && s.sale_date >= daysAgo(60);
-  }).map(function(s) { return s.order_number || s.id; }));
-  if (stale14.size) {
-    alerts.push({ level: 'yellow', icon: '\ud83d\udd52', text: stale14.size + ' open order' + (stale14.size > 1 ? 's' : '') + ' unfulfilled for 14+ days', nav: "setFilter('sales','fstatus','Open');nav('sales')", lbl: 'View Orders' });
+  var d60 = daysAgo(60);
+  var rank14 = {'Shipped':5,'Delivered':4,'Packed':3,'On Hold':2,'Partial':2,'Open':1,'Cancelled':0,'Refunded':0};
+  var byOrder14 = {};
+  S.sales.forEach(function(s) {
+    if (isInternal(s.order_number)) return;
+    var key = s.order_number || ('__noid__' + s.id);
+    if (!byOrder14[key]) byOrder14[key] = { lines: [], date: s.sale_date };
+    byOrder14[key].lines.push(s);
+    // Use earliest sale_date for the order
+    if (s.sale_date && (!byOrder14[key].date || s.sale_date < byOrder14[key].date)) byOrder14[key].date = s.sale_date;
+  });
+  var stale14Count = 0;
+  Object.values(byOrder14).forEach(function(grp) {
+    var d = grp.date;
+    if (!d || d >= d14 || d < d60) return; // not in 14-60 day window
+    var lines = grp.lines;
+    var shipped = lines.filter(function(l) { return l.fulfillment_status === 'Shipped' || l.fulfillment_status === 'Delivered'; });
+    var pending = lines.filter(function(l) { return !['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status || 'Open'); });
+    if (pending.length === 0) return; // fully shipped/cancelled — not unfulfilled
+    var allOnHold = pending.every(function(l) { return l.fulfillment_status === 'On Hold'; });
+    if (allOnHold) return; // on hold is intentional, not a workflow problem
+    stale14Count++;
+  });
+  if (stale14Count > 0) {
+    alerts.push({ level: 'yellow', icon: '\ud83d\udd52', text: stale14Count + ' unfulfilled order' + (stale14Count > 1 ? 's' : '') + ' 14+ days old (Open or Partial)', nav: "setFilter('sales','fstatus','Open|Partial');nav('sales')", lbl: 'View Orders' });
   }
 
   // Parts with open orders but zero stock (backorder risk)
