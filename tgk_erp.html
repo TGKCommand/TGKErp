@@ -9658,6 +9658,7 @@ function renderUsersSQLSetup(msg){
     +'  created_at TIMESTAMPTZ DEFAULT NOW()\n'
     +');\n'
     +'CREATE INDEX IF NOT EXISTS fitments_pn_idx ON fitments(pn);\n'
+    +'ALTER TABLE fitments DISABLE ROW LEVEL SECURITY;\n'
     +'ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;\n'
     +'CREATE POLICY \"own_profile\" ON profiles FOR SELECT USING (auth.uid()=id);\n'
     +'CREATE POLICY \"admin_all\"   ON profiles FOR ALL USING (\n'
@@ -16344,8 +16345,32 @@ window.previewFitmentCSV=function(){
 window.importFitmentCSV=async function(mode){
   const text=document.getElementById('fit-csv-input')?.value||'';
   const{rows,error}=_parseFitCSV(text);
-  if(error){toast('Error: '+error);return;}
+  if(error){toast('Parse error: '+error,6000);return;}
   if(!rows.length){toast('No rows to import');return;}
+
+  // Pre-check: verify the table exists and is writable before doing anything
+  const{error:chkErr}=await db.from('fitments').select('id').limit(1);
+  if(chkErr){
+    const isRLS=chkErr.code==='42501'||chkErr.message?.includes('permission')||chkErr.message?.includes('policy')||chkErr.code==='PGRST301';
+    const isMissing=chkErr.message?.includes('relation')||chkErr.message?.includes('does not exist');
+    const prev=document.getElementById('fit-csv-preview');
+    const sqlFix=isMissing
+      ?'CREATE TABLE IF NOT EXISTS fitments (\n  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,\n  pn TEXT NOT NULL,\n  year_from INTEGER, year_to INTEGER,\n  make TEXT, model TEXT, submodel TEXT, notes TEXT,\n  created_at TIMESTAMPTZ DEFAULT NOW()\n);\nCREATE INDEX IF NOT EXISTS fitments_pn_idx ON fitments(pn);\nALTER TABLE fitments DISABLE ROW LEVEL SECURITY;'
+      :'ALTER TABLE fitments DISABLE ROW LEVEL SECURITY;';
+    if(prev){
+      prev.innerHTML=`<div style="padding:10px 12px;background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.25);border-radius:6px;font-size:11px;color:var(--red)">
+        <b>&#9888; ${isMissing?'Fitments table not created yet':'Permission denied (Row Level Security blocking inserts)'}</b><br>
+        <span style="color:var(--text2)">Run this SQL in Supabase → SQL Editor, then try again:</span>
+        <pre id="fit-rls-sql" style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:8px;font-size:10px;margin:8px 0;color:var(--text2);white-space:pre;overflow-x:auto">${escHtml(sqlFix)}</pre>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-teal btn-sm" onclick="navigator.clipboard.writeText(document.getElementById('fit-rls-sql').textContent).then(()=>toast('SQL copied'))">Copy SQL</button>
+          <a href="https://supabase.com/dashboard/project/piamamighqiielfztgic/sql" target="_blank" class="btn btn-sm">Open SQL Editor &#8599;</a>
+        </div>
+        <div style="margin-top:6px;color:var(--text3)">Error: ${escHtml(chkErr.message)}</div>
+      </div>`;
+    }
+    return;
+  }
 
   const pns=[...new Set(rows.map(r=>r.pn))];
   const modeLabel=mode==='replace'?'replace ALL existing fitments for these '+pns.length+' SKU(s)':'add '+rows.length+' row(s)';
@@ -16365,7 +16390,12 @@ window.importFitmentCSV=async function(mode){
   for(let i=0;i<rows.length;i+=BATCH){
     const batch=rows.slice(i,i+BATCH);
     const{error:ie}=await db.from('fitments').insert(batch);
-    if(ie){toast('Import error: '+ie.message);return;}
+    if(ie){
+      const msg=(ie.code==='42501'||ie.message?.includes('policy'))
+        ?'Permission denied — run: ALTER TABLE fitments DISABLE ROW LEVEL SECURITY; in Supabase SQL Editor'
+        :'Import error: '+ie.message;
+      toast(msg,8000);return;
+    }
     inserted+=batch.length;
   }
 
