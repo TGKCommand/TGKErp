@@ -1808,8 +1808,8 @@ function renderParts(){
       <td><div class="stock-bar-wrap"><div class="stock-bar"><div class="stock-fill" style="width:${pct}%;background:${col}"></div></div><span class="wk-label" style="color:${col}">${w!==null?w+'w':'N/A'}</span></div></td>
       <td class="txt-muted">${p.lead_time_weeks||1}w</td>
       <td style="display:flex;gap:4px">
+        <button class="btn btn-teal btn-sm" onclick="openPartOrderModal('${p.pn}')" title="Order this part">Order</button>
         <button class="action-btn" onclick='openModal("editPart",${JSON.stringify(p)})'>Edit</button>
-        ${w!==null&&w<(p.lead_time_weeks+2)?`<button class="action-btn" style="color:var(--orange);border-color:rgba(224,123,40,.3)" onclick='openModal("addPO",{item:"${p.pn}",desc:${JSON.stringify(p.description||'')},vendor:"${p.vendor||''}",qty:${Math.ceil((p.avg_sales_wk||1)*12)},unitCost:${p.unit_cost||0}})'>Order</button>`:''}
         <button class="action-btn" style="color:var(--red);border-color:rgba(220,38,38,.25)" onclick="deletePart('${p.pn}','${p.id}')">&#10005;</button>
       </td>
     </tr>`);
@@ -1882,6 +1882,7 @@ function renderAssemblies(){
     <td class="money-neutral" title="auto from sales">${asmAvgWk(a)>0?asmAvgWk(a).toFixed(2)+'/wk':'-'}</td>
     <td>${statusPill(liveStatus(a))}</td>
     <td style="display:flex;gap:4px">
+      ${S.boms[a.pn]?`<button class="btn btn-teal btn-sm" onclick="openAsmOrderModal('${a.pn}')" title="Order parts to build this assembly">Order Parts</button>`:''}
       ${S.boms[a.pn]?`<button class="action-btn" onclick="S.selBOM='${a.pn}';nav('boms')">BOM</button>`:''}
       <button class="action-btn" onclick='openModal("editAsm",${JSON.stringify(a)})'>Edit</button>
       <button class="action-btn" style="color:var(--red);border-color:rgba(220,38,38,.25)" onclick="deleteAsm('${a.pn}','${a.id}')">✕</button>
@@ -2264,8 +2265,15 @@ function renderPurchases(){
     return{pn:'Multiple',desc:lines.length+' items',qty:totalQty,unitCostHtml:'—',extended:ext,tooltip:tip};
   }
 
-  let list=S.purchases;
+  let list=[...S.purchases];
   const sf=S.filters.po||{};
+  const _poSF=sf.sort||'date', _poSD=sf.dir||'desc';
+  list.sort((a,b)=>{
+    if(_poSF==='date'){const da=a.order_date||'',db=b.order_date||'';return _poSD==='desc'?db.localeCompare(da):da.localeCompare(db);}
+    if(_poSF==='vendor'){return _poSD==='desc'?(b.vendor||'').localeCompare(a.vendor||''):(a.vendor||'').localeCompare(b.vendor||'');}
+    if(_poSF==='value'){return _poSD==='desc'?poExtended(b)-poExtended(a):poExtended(a)-poExtended(b);}
+    return 0;
+  });
   const q=(sf.search||S.searchQ||'').toLowerCase();
   if(q){
     list=list.filter(p=>{
@@ -2329,7 +2337,12 @@ function renderPurchases(){
     <button class="btn btn-primary btn-sm" onclick="nav('pobuilder')">+ New PO</button>
   </div>
   <div class="tbl-wrap">
-  <table data-tid="purchases"><thead><tr><th>Date</th><th>Vendor</th><th>Part #</th><th>Description</th><th>Qty</th><th>Extended</th><th>Status & Tracking</th><th></th></tr></thead><tbody>
+  <table data-tid="purchases"><thead><tr>
+  <th style="cursor:pointer;white-space:nowrap;user-select:none" onclick="(()=>{var d=S.filters.po&&S.filters.po.sort==='date'&&S.filters.po.dir==='asc'?'desc':'asc';setFilter('po','sort','date');setFilter('po','dir',d)})()">Date ${_poSF==='date'?(_poSD==='asc'?'&uarr;':'&darr;'):'&darr;'}</th>
+  <th style="cursor:pointer;user-select:none" onclick="(()=>{var d=S.filters.po&&S.filters.po.sort==='vendor'&&S.filters.po.dir==='asc'?'desc':'asc';setFilter('po','sort','vendor');setFilter('po','dir',d)})()">Vendor ${_poSF==='vendor'?(_poSD==='asc'?'&uarr;':'&darr;'):''}</th>
+  <th>Part #</th><th>Description</th><th>Qty</th>
+  <th style="cursor:pointer;user-select:none" onclick="(()=>{var d=S.filters.po&&S.filters.po.sort==='value'&&S.filters.po.dir==='asc'?'desc':'asc';setFilter('po','sort','value');setFilter('po','dir',d)})()">Value ${_poSF==='value'?(_poSD==='asc'?'&uarr;':'&darr;'):''}</th>
+  <th>Status &amp; Tracking</th><th></th></tr></thead><tbody>
   ${list.map(p=>{
     const d=poDisplayData(p);
     const isMulti=d.pn==='Multiple';
@@ -7123,7 +7136,7 @@ async function startProspectPortal(){
   try{
     const[prodResult,settingsResult]=await Promise.all([
       db.from('assemblies')
-        .select('pn,new_sku,use_new_sku,description,category,msrp,image_url,ship_us,ship_ca,ship_intl,sales_price,pl_notes')
+        .select('pn,new_sku,use_new_sku,description,category,msrp,image_url,ship_us,ship_ca,ship_intl,sales_price,pl_notes,product_url')
         .eq('is_subassembly',false).eq('discontinued',false).gt('msrp',0).neq('pl_active',false)
         .order('category').order('pn'),
       db.from('settings').select('key,value').in('key',['pricing_tiers','portal_store_url'])
@@ -7168,7 +7181,10 @@ function buildProspectPortalHTML(tiers,products,storeUrl){
 
       const su=p.ship_us||'FREE';const sc=p.ship_ca||'$25.00';const si=p.ship_intl||'--';
       return `<tr data-dpn="${escHtml(sku)}" data-search="${escHtml(searchStr)}" style="border-bottom:1px solid #f0f0f0">`
-        +`<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:9px 12px;white-space:nowrap">${escHtml(sku)}</td>`
+        +(p.product_url
+          ?`<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:9px 12px;white-space:nowrap"><a href="${escHtml(p.product_url)}" target="_blank" style="color:#0d9488;text-decoration:none;border-bottom:1px dashed rgba(13,148,136,.4)" title="View product page">${escHtml(sku)}&thinsp;&#8599;</a></td>`
+          :`<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:9px 12px;white-space:nowrap">${escHtml(sku)}</td>`
+        )
         +`<td style="font-size:12px;padding:9px 12px">${escHtml(p.description||'')}</td>`
         +`<td style="text-align:right;font-size:12px;padding:9px 12px;white-space:nowrap;color:#374151">$${p.msrp.toFixed(2)}</td>`
         +tierCells
@@ -7286,7 +7302,7 @@ async function startDealerPortal(dealerId){
     // Fetch finished goods with an MSRP set, plus store URL setting in parallel
     const[prodResult,storeResult]=await Promise.all([
       db.from('assemblies')
-        .select('pn,new_sku,use_new_sku,description,category,msrp,image_url,ship_us,ship_ca,ship_intl,sales_price,pl_notes')
+        .select('pn,new_sku,use_new_sku,description,category,msrp,image_url,ship_us,ship_ca,ship_intl,sales_price,pl_notes,product_url')
         .eq('is_subassembly',false)
         .eq('discontinued',false)
         .gt('msrp',0)
@@ -7360,7 +7376,10 @@ function buildDealerPortalHTML(dealer,products,storeUrl){
       var su=p.ship_us||'FREE';var sc2=p.ship_ca||'$25.00';var si=p.ship_intl||'--';
       var searchStr=(sku+' '+p.pn+' '+(p.description||'')+' '+cat).toLowerCase();
       return '<tr data-dpn="'+escHtml(sku)+'" data-search="'+escHtml(searchStr)+'" style="border-bottom:1px solid #e5e7eb">'
-        +'<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:5px 8px">'+escHtml(sku)+'</td>'
+        +(p.product_url
+          ?'<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:5px 8px"><a href="'+escHtml(p.product_url)+'" target="_blank" style="color:#0d9488;text-decoration:none;border-bottom:1px dashed rgba(13,148,136,.4)" title="View product page">'+escHtml(sku)+'&thinsp;&#8599;</a></td>'
+          :'<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:5px 8px">'+escHtml(sku)+'</td>'
+        )
         +'<td style="font-size:11px;padding:5px 8px">'+escHtml(p.description||'')+'</td>'
         +'<td style="text-align:right;font-size:11px;padding:5px 8px">$'+p.msrp.toFixed(2)+'</td>'
         +'<td style="text-align:right;font-weight:700;font-size:11px;padding:5px 8px;color:'+(isSale?'#dc2626':'#0d9488')+'">$'+dp.toFixed(2)+(isSale?' <span style="background:#dc2626;color:#fff;border-radius:3px;padding:1px 4px;font-size:9px">SALE</span>':'')+'</td>'
@@ -11438,41 +11457,13 @@ function renderPlanning() {
         }
       </td>
       <td><span class="pill ${statusCls}" title="Reorder point: ${rp}${onOrder>0?' · '+onOrder+' on open PO':''}">${status}</span></td>
-      <td onclick="event.stopPropagation()" style="padding:4px 8px;min-width:180px;vertical-align:middle">
-        ${(()=>{
-          const _tiers=Array.isArray(p.price_breaks)&&p.price_breaks.length?p.price_breaks:[];
-          const _slMax=Math.max(orderQty*4,_tiers.length?Math.ceil(_tiers[_tiers.length-1].qty*1.5):50,moq*3||50,50);
-          const _inCart=S.poCart&&S.poCart.some(function(c){return c.pn===p.pn;});
-          const _slId='sl-'+p.id, _niId='ni-'+p.id;
-          const _tierChips=_tiers.map(function(t){
-            return '<button style="font-size:9px;padding:2px 6px;background:var(--bg3);border:1px solid var(--border);'
-              +'border-radius:3px;cursor:pointer;color:var(--teal);font-family:var(--mono);white-space:nowrap;line-height:1.5"'
-              +' onclick="document.getElementById(\''+_niId+'\').value='+t.qty
-              +';var s=document.getElementById(\''+_slId+'\');if(s)s.value='+t.qty+'">&#8805;'+t.qty
-              +' <span style="color:var(--text3)">$'+t.price.toFixed(2)+'</span>'
-              +'</button>';
-          }).join('');
-          return '<div style="display:flex;flex-direction:column;gap:4px">'
-            +(alreadyCovered?'<div style="font-size:9px;color:var(--teal);font-weight:600">&#10003; PO open &mdash; optional top-up only</div>':'')
-            +(sq===0&&!alreadyCovered&&moq>0?'<div style="font-size:9px;color:var(--text3)">Stock OK &mdash; min order if needed: '+moq+'</div>':'')
-            +'<div style="display:flex;align-items:stretch">'
-            +'<input type="number" id="'+_niId+'" min="1" value="'+orderQty+'"'
-            +' style="width:58px;font-size:14px;font-weight:700;font-family:var(--mono);text-align:center;'
-            +'padding:4px 3px;background:var(--bg3);border:1.5px solid var(--border);border-right:none;'
-            +'border-radius:5px 0 0 5px;color:var(--text);line-height:1"'
-            +' oninput="var s=document.getElementById(\''+_slId+'\');if(s)s.value=this.value">'
-            +'<button class="'+(_inCart?'btn btn-teal':'btn btn-primary')+'"'
-            +' data-pn="'+escHtml(p.pn)+'" data-ni="'+_niId+'"'
-            +' style="border-radius:0 5px 5px 0;padding:4px 12px;font-size:14px;font-weight:700;border-left:none"'
-            +' onclick="event.stopPropagation();var ni=document.getElementById(this.dataset.ni);addToCart(this.dataset.pn,ni?ni.value:1);renderCartPanel()">'
-            +(_inCart?'&#10003;':'+')+'</button>'
-            +'</div>'
-            +(_tiers.length?'<div style="display:flex;gap:2px;flex-wrap:wrap">'+_tierChips+'</div>':'')
-            +'<input type="range" id="'+_slId+'" min="0" max="'+_slMax+'" step="1" value="'+orderQty+'"'
-            +' style="width:100%;accent-color:var(--teal);height:3px;cursor:pointer;border-radius:2px"'
-            +' oninput="var n=document.getElementById(\''+_niId+'\');if(n)n.value=this.value">'
-            +'</div>';
-        })()}
+      <td onclick="event.stopPropagation()" style="padding:4px 8px;vertical-align:middle;white-space:nowrap">
+        ${alreadyCovered
+          ? `<span style="font-size:11px;color:var(--teal);font-weight:700">&#10003; Covered</span><div style="font-size:9px;color:var(--text3)">${onOrder} inbound</div>`
+          : orderQty>0
+            ? `<button class="btn btn-primary btn-sm" onclick="event.stopPropagation();openPartOrderModal('${p.pn}')" title="Order ${orderQty} × ${p.pn}">Order ${orderQty}</button>`
+            : `<button class="btn btn-sm" onclick="event.stopPropagation();openPartOrderModal('${p.pn}')" style="color:var(--text3)">Order</button>`
+        }
       </td>
     </tr>`;
   })(p));
@@ -15165,6 +15156,227 @@ function exportTable(table) {
   a.download='tgk_'+table+'_'+new Date().toISOString().slice(0,10)+'.csv';a.click();
   toast('Exported '+data.length+' rows');
 }
+
+
+// ============================================================
+// PART ORDER MODAL
+// ============================================================
+function openPartOrderModal(pn){
+  const p=S.parts.find(x=>x.pn===pn);
+  if(!p){toast('Part not found');return;}
+  const sq=Math.max(calcSuggestedQty(p),p.moq||0)||1;
+  const breaks=(Array.isArray(p.price_breaks)?p.price_breaks:[]).filter(b=>b&&b.qty>0&&b.price>0).sort((a,b)=>a.qty-b.qty);
+  const oh=p.total_unpckgd||0;
+  const rp=calcReorderPoint(p);
+  const onOrder=openOrderedQty(pn);
+
+  const breaksRows=[{qty:1,price:p.unit_cost||0,label:'Base'},...breaks].map((b,i)=>{
+    const pct=i>0?Math.round((1-b.price/(p.unit_cost||1))*100):0;
+    return `<div style="display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid var(--border);font-size:12px">
+      <span style="color:var(--text3);min-width:72px">${b.qty===1?'Base':'Buy '+b.qty+'+'}</span>
+      <span style="font-family:var(--mono);color:var(--text);flex:1;font-weight:600">${fc(b.price,4)} <span style="font-size:10px;font-weight:400;color:var(--text3)">per unit</span></span>
+      ${i>0?`<span style="font-size:10px;background:var(--green-dim);color:var(--green);padding:1px 6px;border-radius:10px;font-weight:700">Save ${pct}%</span>`:''}
+    </div>`;
+  }).join('');
+
+  const ov=document.createElement('div');
+  ov.id='_part-order-ov';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:center;justify-content:center;padding:20px';
+  ov.onclick=e=>{if(e.target===ov)ov.remove();};
+  ov.innerHTML=`<div class="modal" style="width:480px;max-width:96vw">
+    <div class="modal-header">
+      <div>
+        <span style="font-family:var(--mono);font-size:16px;font-weight:700;color:var(--teal)">${escHtml(pn)}</span>
+        <span style="font-size:12px;color:var(--text3);margin-left:8px">${escHtml(p.description||'')}</span>
+      </div>
+      <button onclick="document.getElementById('_part-order-ov').remove()" style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--text3);line-height:1">&times;</button>
+    </div>
+    <div style="padding:16px 20px">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:14px">
+        <div style="background:var(--bg3);border-radius:6px;padding:8px;text-align:center">
+          <div style="font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">On Hand</div>
+          <div style="font-size:20px;font-weight:700;color:${oh<=rp?'var(--red)':'var(--text)'}">${oh}</div>
+        </div>
+        <div style="background:var(--bg3);border-radius:6px;padding:8px;text-align:center">
+          <div style="font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">On Order</div>
+          <div style="font-size:20px;font-weight:700;color:var(--teal)">${onOrder}</div>
+        </div>
+        <div style="background:var(--bg3);border-radius:6px;padding:8px;text-align:center">
+          <div style="font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">Vendor</div>
+          <div style="font-size:11px;font-weight:600;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(p.vendor||'—')}</div>
+        </div>
+      </div>
+      ${breaks.length?`<div style="background:var(--bg3);border-radius:6px;padding:10px 12px;margin-bottom:14px">
+        <div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text3);margin-bottom:6px">Price Breaks</div>
+        ${breaksRows}
+      </div>`:''}
+      <div style="margin-bottom:12px">
+        <label style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.07em;display:block;margin-bottom:6px">Order Quantity</label>
+        <div style="display:flex;align-items:center;gap:12px">
+          <input type="number" id="pom-qty" min="1" value="${sq}" style="width:100px;font-size:22px;font-weight:700;text-align:center;padding:8px 10px;border:2px solid var(--border2);border-radius:6px;background:var(--bg);color:var(--text)" oninput="_pomUpdate()">
+          <div id="pom-price" style="font-size:13px;color:var(--teal);font-weight:700;flex:1"></div>
+        </div>
+        ${p.moq>1?`<div style="font-size:10px;color:var(--text3);margin-top:4px">Minimum order: ${p.moq}</div>`:''}
+        ${sq>0?`<button onclick="document.getElementById('pom-qty').value=${sq};_pomUpdate()" style="margin-top:5px;background:none;border:none;font-size:10px;color:var(--teal);cursor:pointer;padding:0;text-decoration:underline">Use suggested: ${sq}</button>`:''}
+      </div>
+      <div id="pom-hint" style="min-height:18px;font-size:11px;color:var(--yellow);margin-bottom:12px"></div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn" onclick="document.getElementById('_part-order-ov').remove()">Cancel</button>
+        <button class="btn btn-primary" id="pom-add-btn" onclick="_pomAdd()">+ Add to PO Cart</button>
+      </div>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  window._pomPn=pn;
+  setTimeout(()=>{_pomUpdate();document.getElementById('pom-qty')?.focus();document.getElementById('pom-qty')?.select();},50);
+}
+window._pomUpdate=function(){
+  const el=document.getElementById('pom-qty');const pe=document.getElementById('pom-price');const he=document.getElementById('pom-hint');
+  if(!el||!pe)return;
+  const qty=parseInt(el.value)||1;
+  const p=S.parts.find(x=>x.pn===window._pomPn);if(!p)return;
+  const cost=costForQty(p,qty);
+  pe.innerHTML=`${fc(cost,4)} ea &nbsp;=&nbsp; <strong style="font-size:17px">${fc(qty*cost)}</strong>`;
+  if(he)he.textContent=nextBreakHint(p,qty)?'💡 '+nextBreakHint(p,qty):'';
+};
+window._pomAdd=function(){
+  const qty=parseInt(document.getElementById('pom-qty')?.value)||1;
+  addToCart(window._pomPn,qty);
+  document.getElementById('_part-order-ov')?.remove();
+  toast(qty+'\u00d7 '+window._pomPn+' added to PO Cart \u2014 open Purchasing \u2192 PO Builder to review');
+};
+
+// ============================================================
+// ASSEMBLY BOM ORDER MODAL
+// ============================================================
+function openAsmOrderModal(pn){
+  const asm=S.assemblies.find(a=>a.pn===pn);
+  if(!asm){toast('Assembly not found');return;}
+  const bom=S.boms[pn]||[];
+  if(!bom.length){toast('No BOM for '+pn+' \u2014 add components in Bill of Materials first');return;}
+  const ov=document.createElement('div');
+  ov.id='_asm-order-ov';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
+  ov.onclick=e=>{if(e.target===ov)ov.remove();};
+  ov.innerHTML=`<div class="modal" style="width:820px;max-width:96vw;margin:auto">
+    <div class="modal-header">
+      <div>
+        <span style="font-size:14px;font-weight:700;color:var(--teal)">${escHtml(pn)}</span>
+        <span style="font-size:12px;color:var(--text3);margin-left:8px">${escHtml(asm.description||'')}</span>
+      </div>
+      <button onclick="document.getElementById('_asm-order-ov').remove()" style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--text3)">&times;</button>
+    </div>
+    <div style="padding:16px 20px">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:12px 14px;background:var(--bg3);border-radius:8px">
+        <label style="font-size:12px;font-weight:700;color:var(--text);white-space:nowrap">How many finished goods to build?</label>
+        <input type="number" id="aom-qty" min="1" value="1" style="width:80px;font-size:18px;font-weight:700;text-align:center;padding:6px 8px;border:2px solid var(--teal);border-radius:6px;background:var(--bg);color:var(--text)" oninput="_aomRefresh()">
+        <span style="font-size:12px;color:var(--text3)">units of <strong>${escHtml(pn)}</strong></span>
+      </div>
+      <div id="aom-table"></div>
+      <div id="aom-footer" style="margin-top:14px;display:flex;align-items:center;gap:10px;justify-content:space-between;flex-wrap:wrap">
+        <div id="aom-total" style="font-size:13px;font-weight:700;color:var(--text3)"></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="document.getElementById('_asm-order-ov').remove()">Cancel</button>
+          <button class="btn btn-primary" id="aom-add-btn" onclick="_aomAddAll()">+ Add All to PO Cart</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  window._aomPn=pn;
+  setTimeout(()=>{_aomRefresh();document.getElementById('aom-qty')?.focus();document.getElementById('aom-qty')?.select();},50);
+}
+window._aomRefresh=function(){
+  const buildQty=parseInt(document.getElementById('aom-qty')?.value)||1;
+  const pn=window._aomPn;
+  const bom=S.boms[pn]||[];
+  const pm={};S.parts.forEach(p=>pm[p.pn]=p);
+  const am={};S.assemblies.forEach(a=>am[a.pn]=a);
+
+  let totalCost=0,toOrderCount=0;
+  const rows=bom.map((item,idx)=>{
+    const need=Math.ceil((item.qty||1)*buildQty);
+    const isSub=item.item_type==='assembly'||item.item_type==='subassembly';
+    const src=isSub?am[item.child_pn]:pm[item.child_pn];
+    const oh=src?(isSub?(src.total_on_hand||0):(src.total_unpckgd||0)):0;
+    const toOrder=Math.max(0,need-oh);
+    const p=pm[item.child_pn];
+    const breaks=p&&Array.isArray(p.price_breaks)?p.price_breaks.filter(b=>b.qty>0&&b.price>0).sort((a,b)=>a.qty-b.qty):[];
+    const unitCost=p?costForQty(p,toOrder||1):0;
+    const lineCost=toOrder*unitCost;
+    if(toOrder>0){totalCost+=lineCost;toOrderCount++;}
+
+    // Find next better tier
+    const nextBreak=breaks.find(b=>b.qty>toOrder);
+    const tierHint=nextBreak&&toOrder>0?`<div style="font-size:9px;color:var(--yellow);margin-top:2px">💡 Buy ${nextBreak.qty} for ${fc(nextBreak.price,4)}/ea</div>`:'';
+
+    const rowBg=toOrder>0?'background:rgba(234,88,12,.04)':'';
+    return `<tr style="${rowBg};border-bottom:1px solid var(--border)" data-idx="${idx}">
+      <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--teal);padding:6px 8px">${escHtml(item.child_pn)}</td>
+      <td style="font-size:11px;color:var(--text2);padding:6px 8px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(src?.description||'')}</td>
+      <td style="text-align:center;font-size:12px;font-weight:600;padding:6px 8px">${item.qty||1} ea</td>
+      <td style="text-align:center;font-weight:700;font-size:13px;padding:6px 8px">${need}</td>
+      <td style="text-align:center;padding:6px 8px;color:${oh>=need?'var(--green)':'var(--red)'};font-weight:700">${oh}</td>
+      <td style="text-align:center;padding:6px 8px">
+        ${toOrder>0
+          ?`<span style="font-weight:700;font-size:14px;color:var(--orange)">${toOrder}</span>`
+          :`<span style="color:var(--teal);font-size:12px">&#10003; covered</span>`}
+      </td>
+      <td style="padding:6px 8px;min-width:140px">
+        ${toOrder>0&&p
+          ?`<div style="font-size:11px;font-weight:600;color:var(--teal)">${fc(unitCost,4)}/ea</div>
+            <div style="font-size:11px;color:var(--text2);font-weight:700">${fc(lineCost)} total</div>
+            ${tierHint}`
+          :toOrder===0?'<span style="color:var(--text3);font-size:11px">\u2014</span>':'<span style="font-size:10px;color:var(--yellow)">No price set</span>'}
+      </td>
+      <td style="padding:6px 8px;text-align:center">
+        <input type="checkbox" id="aom-cb-${idx}" ${toOrder>0?'checked':''} ${toOrder===0?'disabled':''} style="width:16px;height:16px;cursor:${toOrder>0?'pointer':'default'}">
+      </td>
+    </tr>`;
+  }).join('');
+
+  const tbl=document.getElementById('aom-table');
+  if(tbl)tbl.innerHTML=`<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">
+    <thead><tr style="background:var(--bg3);border-bottom:2px solid var(--border)">
+      <th style="padding:6px 8px;text-align:left">Part #</th>
+      <th style="padding:6px 8px;text-align:left">Description</th>
+      <th style="padding:6px 8px;text-align:center">Per Unit</th>
+      <th style="padding:6px 8px;text-align:center">Need</th>
+      <th style="padding:6px 8px;text-align:center">On Hand</th>
+      <th style="padding:6px 8px;text-align:center">To Order</th>
+      <th style="padding:6px 8px;text-align:left">Price</th>
+      <th style="padding:6px 8px;text-align:center;width:40px">Add</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+
+  const totEl=document.getElementById('aom-total');
+  if(totEl)totEl.innerHTML=toOrderCount>0
+    ?`Estimated cost: <span style="color:var(--orange);font-size:16px">${fc(totalCost)}</span> across ${toOrderCount} part${toOrderCount!==1?'s':''}`
+    :'<span style="color:var(--teal)">\u2713 All components covered by current stock</span>';
+
+  window._aomBom=bom;
+};
+window._aomAddAll=function(){
+  const buildQty=parseInt(document.getElementById('aom-qty')?.value)||1;
+  const bom=window._aomBom||[];
+  const pm={};S.parts.forEach(p=>pm[p.pn]=p);
+  const am={};S.assemblies.forEach(a=>am[a.pn]=a);
+  let added=0;
+  bom.forEach((item,idx)=>{
+    const cb=document.getElementById('aom-cb-'+idx);
+    if(!cb||!cb.checked)return;
+    const isSub=item.item_type==='assembly'||item.item_type==='subassembly';
+    const src=isSub?am[item.child_pn]:pm[item.child_pn];
+    const oh=src?(isSub?(src.total_on_hand||0):(src.total_unpckgd||0)):0;
+    const need=Math.ceil((item.qty||1)*buildQty);
+    const toOrder=Math.max(0,need-oh);
+    if(toOrder>0){addToCart(item.child_pn,toOrder);added++;}
+  });
+  document.getElementById('_asm-order-ov')?.remove();
+  if(added>0)toast(added+' part'+(added!==1?'s':'')+' added to PO Cart \u2014 open Purchasing \u2192 PO Builder to review');
+  else toast('Nothing to order \u2014 all components are covered');
+};
 
 // ============================================================
 // REPORT CHARTS (Chart.js)
