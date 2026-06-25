@@ -14595,7 +14595,7 @@ function renderShipmentErrors(){
   ${list.length===0?'<tr><td colspan="10" class="section-empty">No shipment errors logged</td></tr>':list.map(e=>{
     const wrongItem=e.error_type!=='missing_item'&&e.actual_pn&&e.actual_pn!==e.expected_pn;
     const wrongQty=e.error_type!=='missing_item'&&e.actual_qty!==e.expected_qty;
-    const canShip=['reship_correct','send_additional'].includes(e.resolution)&&!e.ss_order_id&&e.status!=='Resolved';
+    const canShip=e.status!=='Resolved'&&!e.ss_order_id;
     const seTrackUrl=e.tracking_number?trackingUrl(e.carrier||'',e.tracking_number):'';
     const seCarrier=carrierLabel(e.carrier||'');    return `<tr>
       <td style="font-size:10px;color:var(--text3);font-family:var(--mono)">${new Date(e.created_at).toLocaleDateString()}</td>
@@ -14885,57 +14885,228 @@ async function checkResolutionTracking(){
   }
 }
 
+
+// ── Shipment Error — Ship Missing Components (assembly/BOM picker) ─────────────
+// State: items user has added to the ship list
+// Initialized fresh each time the modal opens
+
 function shipShipmentError(id){
   const e=(S.shipmentErrors||[]).find(function(x){return x.id===id;});
   if(!e){toast('Record not found');return;}
+  S.seShipItems=[];
+
+  // Pre-fill address from sales order if available
+  const salesLines=S.sales.filter(function(s){return s.order_number===e.order_number;});
+  const saleAddr=salesLines.length?salesLines[0]:null;
+  const preName=saleAddr?.customer_name||e.customer_name||'';
+  const preAddr1=saleAddr?.shipping_address1||'';
+  const preAddr2=saleAddr?.shipping_address2||'';
+  const preCity=saleAddr?.shipping_city||'';
+  const preState=saleAddr?.shipping_province||'';
+  const preZip=saleAddr?.shipping_zip||'';
+  const preCountry=saleAddr?.shipping_country||'US';
+  const preEmail=saleAddr?.customer_email||e.customer_email||'';
+
+  const asm=S.assemblies.find(function(a){return a.pn===e.expected_pn;});
   const overlay=document.createElement('div');
   overlay.id='se-ship-overlay';
-  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto';
-  overlay.innerHTML='<div class="modal" style="width:520px;max-width:96vw">'
-    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">'
-      +'<div><div style="font-size:15px;font-weight:700;color:var(--text)">🚚 Ship Correction</div>'
-      +'<div style="font-size:11px;color:var(--text3);margin-top:2px">'+escHtml(e.order_number||'')+' · '+escHtml(e.expected_pn||'')+' ×'+(e.expected_qty||1)+'</div></div>'
-      +'<button onclick="document.getElementById(\'se-ship-overlay\').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">×</button>'
-    +'</div>'
-    +'<div style="padding:10px 12px;background:var(--teal-dim);border-radius:6px;border:1px solid rgba(13,148,136,.2);font-size:11px;color:var(--text2);margin-bottom:14px">'
-      +'<b>Correction item:</b> '+escHtml(e.expected_pn||'')+' ×'+(e.expected_qty||1)
-      +'&nbsp;·&nbsp; <b>Customer:</b> '+escHtml(e.customer_name||'—')
-    +'</div>'
-    +'<div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Ship-to Address</div>'
-    +'<div class="form-row"><div class="form-group"><label class="form-label">Name</label><input id="se-ship-name" class="form-input" value="'+escHtml(e.customer_name||'')+'"></div></div>'
-    +'<div class="form-row"><div class="form-group"><label class="form-label">Address Line 1</label><input id="se-ship-addr1" class="form-input" placeholder="123 Main St"></div></div>'
-    +'<div class="form-row"><div class="form-group"><label class="form-label">Address Line 2 (optional)</label><input id="se-ship-addr2" class="form-input" placeholder="Apt, Suite…"></div></div>'
-    +'<div class="form-row cols-2">'
-      +'<div class="form-group"><label class="form-label">City</label><input id="se-ship-city" class="form-input" placeholder="City"></div>'
-      +'<div class="form-group"><label class="form-label">State</label><input id="se-ship-state" class="form-input" placeholder="CA"></div>'
-    +'</div>'
-    +'<div class="form-row cols-2">'
-      +'<div class="form-group"><label class="form-label">ZIP</label><input id="se-ship-zip" class="form-input" placeholder="90210"></div>'
-      +'<div class="form-group"><label class="form-label">Country</label><input id="se-ship-country" class="form-input" value="US"></div>'
-    +'</div>'
-    +'<div id="se-ship-status" style="display:none;padding:10px;border-radius:6px;font-size:11px;margin-top:8px"></div>'
-    +'<div class="modal-footer">'
-      +'<button class="btn" onclick="document.getElementById(\'se-ship-overlay\').remove()">Cancel</button>'
-      +'<button id="se-ship-submit" class="btn btn-teal" onclick="confirmShipShipmentError(\''+id+'\')">🚚 Create ShipStation Order</button>'
-    +'</div>'
-  +'</div>';
+  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
+  overlay.innerHTML=
+    '<div class="modal" style="width:560px;max-width:96vw;margin:auto">'+
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">'+
+      '<div>'+
+        '<div style="font-size:15px;font-weight:700;color:var(--text)">&#128666; Ship Missing Components</div>'+
+        '<div style="font-size:11px;color:var(--text3);margin-top:2px">'+escHtml(e.order_number||'')+(e.customer_name?' &middot; '+escHtml(e.customer_name):'')+'</div>'+
+      '</div>'+
+      '<button onclick="document.getElementById(\'se-ship-overlay\').remove()" style="background:transparent;border:none;color:var(--text3);font-size:22px;cursor:pointer;line-height:1">&times;</button>'+
+    '</div>'+
+    // Error summary
+    '<div style="padding:10px 12px;background:var(--bg3);border-radius:6px;border:1px solid var(--border);font-size:11px;color:var(--text2);margin-bottom:14px">'+
+      '<b>Expected:</b> '+escHtml(e.expected_pn||'—')+' &times;'+(e.expected_qty||1)+(e.error_type?' &nbsp;&middot;&nbsp; <b>Error:</b> '+(e.error_type||'').replace(/_/g,' '):'')+
+    '</div>'+
+    // Assembly / Part picker
+    '<div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Assembly or Part to Ship</div>'+
+    '<div style="position:relative;margin-bottom:8px">'+
+      '<input id="se-asm-input" class="form-input" placeholder="Search assemblies or type a part #&hellip;" autocomplete="off"'+
+        ' oninput="seAsmFilter(this.value)" onfocus="seAsmOpen(this)" onkeydown="seAsmKey(event)" style="padding-right:28px">'+
+      '<span style="position:absolute;right:8px;top:50%;transform:translateY(-50%);color:var(--text3);pointer-events:none;font-size:12px">&#9660;</span>'+
+      '<div id="se-asm-dd" style="display:none;position:absolute;top:calc(100%+4px);left:0;right:0;background:var(--bg2);border:1px solid var(--border2);border-radius:8px;max-height:200px;overflow-y:auto;z-index:300;box-shadow:0 8px 24px rgba(0,0,0,.25)"></div>'+
+    '</div>'+
+    '<div id="se-bom-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px"></div>'+
+    // Items list
+    '<div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Items to Ship</div>'+
+    '<div id="se-ship-items" style="min-height:36px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:14px;font-size:12px">'+
+      '<div style="color:var(--text3);font-size:11px;padding:4px 0">Use the chips above to add items &mdash; you can add multiple</div>'+
+    '</div>'+
+    // Address
+    '<div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Ship-to Address</div>'+
+    '<div class="form-row"><div class="form-group"><label class="form-label">Name</label>'+
+      '<input id="se-ship-name" class="form-input" value="'+escHtml(preName)+'"></div></div>'+
+    '<div class="form-row"><div class="form-group"><label class="form-label">Address</label>'+
+      '<input id="se-ship-addr1" class="form-input" value="'+escHtml(preAddr1)+'" placeholder="Street address">'+
+      '<input id="se-ship-addr2" class="form-input" value="'+escHtml(preAddr2)+'" placeholder="Apt, Suite&hellip; (optional)" style="margin-top:5px"></div></div>'+
+    '<div class="form-row cols-3">'+
+      '<div class="form-group"><label class="form-label">City</label><input id="se-ship-city" class="form-input" value="'+escHtml(preCity)+'"></div>'+
+      '<div class="form-group"><label class="form-label">State</label><input id="se-ship-state" class="form-input" value="'+escHtml(preState)+'"></div>'+
+      '<div class="form-group"><label class="form-label">ZIP</label><input id="se-ship-zip" class="form-input" value="'+escHtml(preZip)+'"></div>'+
+    '</div>'+
+    '<div class="form-row cols-2" style="margin-bottom:14px">'+
+      '<div class="form-group"><label class="form-label">Country</label><input id="se-ship-country" class="form-input" value="'+escHtml(preCountry)+'"></div>'+
+      '<div class="form-group"><label class="form-label">Email (optional)</label><input id="se-ship-email" class="form-input" value="'+escHtml(preEmail)+'"></div>'+
+    '</div>'+
+    '<div id="se-ship-status" style="display:none;padding:10px;border-radius:6px;font-size:11px;margin-bottom:10px"></div>'+
+    '<div class="modal-footer">'+
+      '<button class="btn" onclick="document.getElementById(\'se-ship-overlay\').remove()">Cancel</button>'+
+      '<button id="se-ship-submit" class="btn btn-teal" onclick="confirmShipShipmentError(\''+id+'\')">&#128666; Create ShipStation Order</button>'+
+    '</div>'+
+    '</div>';
   document.body.appendChild(overlay);
+
+  // Pre-populate with the expected_pn
+  if(e.expected_pn) seAsmPick(e.expected_pn, e.expected_qty||1);
+  setTimeout(function(){document.getElementById('se-asm-input')?.focus();},80);
+}
+
+function seAsmFilter(q){
+  const dd=document.getElementById('se-asm-dd');if(!dd)return;
+  const ql=q.toLowerCase();
+  const matches=S.assemblies.filter(function(a){return !a.discontinued&&(a.pn.toLowerCase().includes(ql)||(a.description||'').toLowerCase().includes(ql));}).slice(0,12);
+  if(!matches.length){dd.style.display='none';return;}
+  dd.innerHTML=matches.map(function(a){
+    return '<div class="_se-asm-opt" onclick="seAsmPick(\''+escHtml(a.pn)+'\')" style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border)" onmouseenter="this.style.background=\'var(--bg3)\'" onmouseleave="this.style.background=\'transparent\'">'+
+      '<span style="font-family:var(--mono);font-size:11px;color:var(--teal)">'+escHtml(a.pn)+'</span>'+
+      '<span style="font-size:11px;color:var(--text2);margin-left:8px">'+escHtml(a.description||'')+'</span>'+
+    '</div>';
+  }).join('');
+  dd.style.display='block';
+}
+function seAsmOpen(inp){
+  seAsmFilter(inp.value);
+  const dd=document.getElementById('se-asm-dd');if(dd&&dd.children.length)dd.style.display='block';
+  setTimeout(function(){
+    function outside(e){const wrap=inp.parentNode;if(!wrap||!wrap.contains(e.target)){const dd=document.getElementById('se-asm-dd');if(dd)dd.style.display='none';document.removeEventListener('click',outside);}}
+    document.addEventListener('click',outside);
+  },0);
+}
+function seAsmKey(e){
+  const dd=document.getElementById('se-asm-dd');if(!dd||dd.style.display==='none')return;
+  const opts=Array.from(dd.querySelectorAll('._se-asm-opt'));
+  const cur=dd.querySelector('._se-asm-opt[data-active]');
+  if(e.key==='ArrowDown'){e.preventDefault();const next=cur?opts[opts.indexOf(cur)+1]||opts[0]:opts[0];opts.forEach(function(o){delete o.dataset.active;o.style.background='transparent';});if(next){next.dataset.active='1';next.style.background='var(--bg3)';}}
+  else if(e.key==='ArrowUp'){e.preventDefault();const prev=cur?opts[opts.indexOf(cur)-1]||opts[opts.length-1]:opts[opts.length-1];opts.forEach(function(o){delete o.dataset.active;o.style.background='transparent';});if(prev){prev.dataset.active='1';prev.style.background='var(--bg3)';}}
+  else if(e.key==='Enter'){e.preventDefault();const act=dd.querySelector('._se-asm-opt[data-active]')||opts[0];if(act)act.click();}
+  else if(e.key==='Escape'){dd.style.display='none';}
+}
+
+function seAsmPick(pn, defaultQty){
+  const dd=document.getElementById('se-asm-dd');if(dd)dd.style.display='none';
+  const inp=document.getElementById('se-asm-input');
+  const asm=S.assemblies.find(function(a){return a.pn===pn;});
+  const part=asm?null:S.parts.find(function(p){return p.pn===pn;});
+  const desc=(asm||part)?.description||'';
+  if(inp)inp.value=pn+(desc?' \u2014 '+desc:'');
+
+  const chips=document.getElementById('se-bom-chips');
+  if(!chips)return;
+
+  const bomItems=S.boms[pn]||[];
+  const isAsm=!!asm;
+  const qty=defaultQty||1;
+
+  let html='<div style="font-size:10px;color:var(--text3);margin-bottom:4px;width:100%">Quick-add:</div>';
+  if(isAsm){
+    html+='<button type="button" class="filter-chip" style="background:var(--teal-dim);color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="seAddItem(\''+escHtml(pn)+'\','+qty+',\'assembly\',\''+escHtml(desc)+'\')">+ Entire Assembly &times;'+qty+'</button>';
+    if(bomItems.length){
+      html+=bomItems.map(function(b){
+        const cp=S.parts.find(function(p){return p.pn===b.child_pn;})||S.assemblies.find(function(a){return a.pn===b.child_pn;});
+        const cdesc=cp?.description||'';
+        const ctype=S.assemblies.find(function(a){return a.pn===b.child_pn;})?'assembly':'part';
+        return '<button type="button" class="filter-chip" onclick="seAddItem(\''+escHtml(b.child_pn)+'\','+b.qty+',\''+ctype+'\',\''+escHtml(cdesc)+'\')" title="'+escHtml(cdesc)+' (&times;'+b.qty+' per assembly)">'+
+          escHtml(b.child_pn)+'<span style="font-size:9px;color:var(--text3);margin-left:3px">&times;'+b.qty+'</span></button>';
+      }).join('');
+    } else {
+      html+='<span style="font-size:10px;color:var(--text3)">No BOM on file \u2014 only whole assembly available</span>';
+    }
+  } else if(part){
+    html+='<button type="button" class="filter-chip" style="background:var(--teal-dim);color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="seAddItem(\''+escHtml(pn)+'\','+qty+',\'part\',\''+escHtml(desc)+'\')">+ '+escHtml(pn)+' &times;'+qty+'</button>';
+  } else {
+    html+='<span style="font-size:10px;color:var(--text3)">Not found in catalog \u2014 you can still add it manually</span>';
+    html+='<button type="button" class="filter-chip" onclick="seAddItem(\''+escHtml(pn)+'\','+qty+',\'part\',\'\')">+ Add '+escHtml(pn)+'</button>';
+  }
+  chips.innerHTML=html;
+}
+
+function seAddItem(pn, qty, type, description){
+  if(!S.seShipItems)S.seShipItems=[];
+  if(S.seShipItems.some(function(i){return i.pn===pn;})){toast(pn+' already in list \u2014 adjust the qty below');return;}
+  S.seShipItems.push({idx:Date.now(),pn:pn,qty:qty||1,type:type||'part',description:description||''});
+  seRenderItems();
+}
+function seRemoveItem(idx){
+  S.seShipItems=(S.seShipItems||[]).filter(function(i){return i.idx!==idx;});
+  seRenderItems();
+}
+function seUpdateItemQty(idx,v){
+  const q=Math.max(1,parseInt(v)||1);
+  S.seShipItems=(S.seShipItems||[]).map(function(i){return i.idx===idx?{...i,qty:q}:i;});
+}
+window.seRemoveItem=seRemoveItem;
+window.seUpdateItemQty=seUpdateItemQty;
+window.seAsmOpen=seAsmOpen;
+window.seAsmFilter=seAsmFilter;
+window.seAsmKey=seAsmKey;
+window.seAsmPick=seAsmPick;
+window.seAddItem=seAddItem;
+
+function seRenderItems(){
+  const wrap=document.getElementById('se-ship-items');
+  if(!wrap)return;
+  const items=S.seShipItems||[];
+  if(!items.length){
+    wrap.innerHTML='<div style="color:var(--text3);font-size:11px;padding:4px 0">Use the chips above to add items</div>';
+    return;
+  }
+  wrap.innerHTML=items.map(function(item){
+    const pill=item.type==='assembly'?'<span class="pill pill-teal" style="font-size:9px">Assembly</span>':'<span class="pill pill-muted" style="font-size:9px">Part</span>';
+    return '<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)">'+
+      '<span style="font-family:var(--mono);font-size:12px;color:var(--teal);flex-shrink:0">'+escHtml(item.pn)+'</span>'+
+      pill+
+      '<span style="flex:1;font-size:11px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(item.description)+'</span>'+
+      '<label style="font-size:10px;color:var(--text3);flex-shrink:0">Qty</label>'+
+      '<input type="number" min="1" value="'+item.qty+'" style="width:54px;padding:3px 6px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;font-family:var(--mono)" oninput="seUpdateItemQty('+item.idx+',this.value)">'+
+      '<button style="background:transparent;border:none;color:var(--text3);cursor:pointer;font-size:16px;line-height:1;padding:2px" onclick="seRemoveItem('+item.idx+')">&times;</button>'+
+    '</div>';
+  }).join('');
 }
 
 async function confirmShipShipmentError(id){
   const e=(S.shipmentErrors||[]).find(function(x){return x.id===id;});
   if(!e){toast('Record not found');return;}
+  const items=S.seShipItems||[];
+  if(!items.length){toast('Add at least one item to ship');return;}
   const name=(document.getElementById('se-ship-name')?.value||'').trim();
   const addr1=(document.getElementById('se-ship-addr1')?.value||'').trim();
   const city=(document.getElementById('se-ship-city')?.value||'').trim();
   const zip=(document.getElementById('se-ship-zip')?.value||'').trim();
-  if(!addr1||!city||!zip){toast('Address, city and ZIP required');return;}
-  const shipTo={name:name,street1:addr1,street2:(document.getElementById('se-ship-addr2')?.value||'').trim(),city:city,state:(document.getElementById('se-ship-state')?.value||'').trim(),postal_code:zip,country:(document.getElementById('se-ship-country')?.value||'US').trim()};
+  if(!addr1||!city||!zip){toast('Address, city and ZIP are required');return;}
+  const shipTo={
+    name:name,
+    street1:addr1,
+    street2:(document.getElementById('se-ship-addr2')?.value||'').trim(),
+    city:city,
+    state:(document.getElementById('se-ship-state')?.value||'').trim(),
+    postal_code:zip,
+    country:(document.getElementById('se-ship-country')?.value||'US').trim()
+  };
   const statusEl=document.getElementById('se-ship-status');
   const submitBtn=document.getElementById('se-ship-submit');
-  if(statusEl){statusEl.style.display='block';statusEl.style.background='var(--bg3)';statusEl.style.color='var(--text2)';statusEl.textContent='Creating order in ShipStation…';}
-  if(submitBtn){submitBtn.disabled=true;submitBtn.textContent='Creating…';}
+  if(statusEl){statusEl.style.display='block';statusEl.style.background='var(--bg3)';statusEl.style.color='var(--text2)';statusEl.textContent='\u29d0 Creating order in ShipStation\u2026';}
+  if(submitBtn){submitBtn.disabled=true;submitBtn.textContent='Creating\u2026';}
+
   try{
+    const ssItems=items.map(function(item,i){
+      return{lineItemKey:String(i+1),sku:item.pn,name:item.description||item.pn,quantity:item.qty||1,unitPrice:0};
+    });
     const resp=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -14943,62 +15114,63 @@ async function confirmShipShipmentError(id){
         action:'create_order',
         orderNumber:'SHError_'+(e.order_number||id),
         customerName:e.customer_name||name,
-        customerEmail:e.customer_email||'',
-        pn:e.expected_pn,
-        description:e.expected_pn,
-        qty:e.expected_qty||1,
+        customerEmail:(document.getElementById('se-ship-email')?.value||e.customer_email||'').trim(),
+        pn:items[0].pn,
+        description:items[0].description||items[0].pn,
+        qty:items[0].qty||1,
+        ssItems:ssItems,
         shipTo:shipTo,
-        internalNotes:'Shipment error correction — Original order '+(e.order_number||'N/A')+' — '+(e.error_type||'').replace(/_/g,' ')
+        internalNotes:'Shipment error correction ('+items.length+' item'+(items.length!==1?'s':'')+') \u2014 Original order '+(e.order_number||'N/A')+' \u2014 '+(e.error_type||'').replace(/_/g,' ')
       })
     });
     const rawText=await resp.text();
     let json;
     try{json=JSON.parse(rawText);}catch(_){
-      if(statusEl){
-        statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';
-        statusEl.innerHTML='<b>✗ HTTP '+resp.status+' — Non-JSON response</b><br><br>'
-          +'<div style="font-size:10px;color:var(--text3);margin-bottom:4px">Raw response from edge function:</div>'
-          +'<pre style="font-size:9px;white-space:pre-wrap;background:var(--bg2);padding:6px;border-radius:4px;border:1px solid var(--border);max-height:120px;overflow-y:auto">'+escHtml(rawText.slice(0,600))+'</pre>'
-          +'<div style="font-size:10px;color:var(--text3);margin-top:6px">Common fixes: redeploy <b>shipstation-ship</b> from Setup Guide · check SS_KEY/SS_SECRET secrets are set</div>';
-      }
-      if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
+      if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.innerHTML='<b>\u2717 HTTP '+resp.status+' \u2014 Non-JSON response from edge function</b><br><pre style="font-size:9px;margin-top:6px;white-space:pre-wrap;background:var(--bg2);padding:6px;border-radius:4px;border:1px solid var(--border);max-height:100px;overflow-y:auto">'+escHtml(rawText.slice(0,400))+'</pre>';}
+      if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='\u{1F69A} Create ShipStation Order';}
       return;
     }
     if(!resp.ok||json.error){
-      if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='Error: '+(json.error||'HTTP '+resp.status);}
-      if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
+      if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='\u2717 '+(json.error||'HTTP '+resp.status);}
+      if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='\u{1F69A} Create ShipStation Order';}
       return;
     }
     const ssOrderId=json.orderId||json.orderNumber||'(created)';
 
-    // Deduct inventory for the correction item being sent
-    const corrPn=e.expected_pn;
-    const corrQty=e.expected_qty||1;
-    const corrAsm=S.assemblies.find(function(x){return x.pn===corrPn;});
-    const corrPrt=corrAsm?null:S.parts.find(function(x){return x.pn===corrPn;});
-    if(corrAsm){
-      const newOh=(corrAsm.total_on_hand||0)-corrQty;
-      await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',corrAsm.id);
-      S.assemblies=S.assemblies.map(function(x){return x.pn===corrPn?{...x,total_on_hand:newOh}:x;});
-      await db.from('inv_corrections').insert({pn:corrPn,previous_qty:corrAsm.total_on_hand||0,new_qty:newOh,adjustment:-corrQty,reason:'Shipment error correction shipped (SS#'+ssOrderId+') — order '+(e.order_number||id),user_email:S.currentUser||null,source:'shipment'});
-    } else if(corrPrt){
-      const newQty=(corrPrt.total_unpckgd||0)-corrQty;
-      await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',corrPrt.id);
-      S.parts=S.parts.map(function(x){return x.pn===corrPn?{...x,total_unpckgd:newQty}:x;});
-      await db.from('inv_corrections').insert({pn:corrPn,previous_qty:corrPrt.total_unpckgd||0,new_qty:newQty,adjustment:-corrQty,reason:'Shipment error correction shipped (SS#'+ssOrderId+') — order '+(e.order_number||id),user_email:S.currentUser||null,source:'shipment'});
+    // Deduct inventory for each shipped item
+    for(const item of items){
+      const qty=item.qty||1;
+      if(item.type==='assembly'){
+        const a=S.assemblies.find(function(x){return x.pn===item.pn;});
+        if(a){
+          const newOh=(a.total_on_hand||0)-qty;
+          await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',a.id);
+          S.assemblies=S.assemblies.map(function(x){return x.pn===item.pn?{...x,total_on_hand:newOh}:x;});
+          await db.from('inv_corrections').insert({pn:item.pn,previous_qty:a.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Shipment error correction shipped (SS#'+ssOrderId+')',user_email:S.currentUser||null,source:'shipment'});
+        }
+      } else {
+        const p=S.parts.find(function(x){return x.pn===item.pn;});
+        if(p){
+          const newQty=(p.total_unpckgd||0)-qty;
+          await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
+          S.parts=S.parts.map(function(x){return x.pn===item.pn?{...x,total_unpckgd:newQty}:x;});
+          await db.from('inv_corrections').insert({pn:item.pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:-qty,reason:'Shipment error correction part shipped (SS#'+ssOrderId+')',user_email:S.currentUser||null,source:'shipment'});
+        }
+      }
     }
 
-    const{error:dbErr}=await db.from('shipment_errors').update({ss_order_id:String(ssOrderId),status:'Reshipping'}).eq('id',id);
-    if(!dbErr)S.shipmentErrors=(S.shipmentErrors||[]).map(function(x){return x.id===id?{...x,ss_order_id:String(ssOrderId),status:'Reshipping'}:x;});
+    // Update SE record
+    const{error:dbErr}=await db.from('shipment_errors').update({ss_order_id:String(ssOrderId),status:'Reshipping',shipping_details:shipTo}).eq('id',id);
+    if(!dbErr){S.shipmentErrors=S.shipmentErrors.map(function(x){return x.id===id?{...x,ss_order_id:String(ssOrderId),status:'Reshipping',shipping_details:shipTo}:x;});}
     document.getElementById('se-ship-overlay')?.remove();
-    const deducted=corrAsm||corrPrt;
-    toast('ShipStation correction order created — SS#'+ssOrderId+(deducted?' · inventory updated for '+corrPn:'')+'. Tracking auto-syncs when shipped.',6000);
-    updateBadge();render();
-  }catch(err){
-    if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='Network error: '+err.message;}
-    if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='🚚 Create ShipStation Order';}
+    toast('\u2713 ShipStation order created \u2014 SS#'+ssOrderId+'. Inventory updated for '+items.length+' item'+(items.length!==1?'s':''),5000);
+    render();
+  } catch(err){
+    if(statusEl){statusEl.style.background='rgba(220,38,38,.1)';statusEl.style.color='var(--red)';statusEl.textContent='\u2717 Network error: '+err.message;}
+    if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='\u{1F69A} Create ShipStation Order';}
   }
 }
+
 
 function shipWarrantyReplacement(id){
   const w=S.warrantyClaims.find(x=>x.id===id);
