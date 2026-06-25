@@ -2673,6 +2673,7 @@ function renderSales(){
     <span style="width:1px;height:18px;background:var(--border2);margin:0 2px;flex-shrink:0"></span>
     <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="ssOrderAudit()" title="Find ShipStation orders missing from ERP">📦 SS Audit</button>
     <button class="btn btn-sm" style="color:var(--text3)" onclick="diagHolds()" title="Diagnose hold sync issues">🔍 Diagnose</button>
+    <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.2)" onclick="diagOrderSync()" title="Full sync diagnostic — test credentials, edge function, and Shopify API">🩺 Sync Diag</button>
     <button class="btn btn-sm" style="color:var(--text3)" onclick="testShopifyWebhook()" title="Ping the Shopify order webhook edge function to verify it is reachable">🔌 Test Webhook</button>
     <button class="btn btn-sm" style="color:var(--text3)" title="Remove duplicate order lines, preserve tracking" onclick="dedupeOrders()">🧽 Dedupe</button>
   </div>
@@ -4461,6 +4462,103 @@ function fnPill(v){
   if(v===true)return '<span style="color:var(--green);font-weight:700">✓ LIVE</span>';
   if(v===false)return '<span style="color:var(--red);font-weight:700">✕ not responding</span>';
   return '<span style="color:var(--text3)">unknown — click Check</span>';
+}
+
+
+async function diagOrderSync(){
+  // Opens a modal showing each step of the Shopify→ERP chain
+  const ov=document.createElement('div');
+  ov.id='diag-ov';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2001;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
+  ov.innerHTML='<div id="diag-box" style="background:var(--bg2);border:1px solid var(--border2);border-radius:10px;width:min(560px,95vw);margin:auto;padding:24px;box-shadow:0 16px 48px rgba(0,0,0,.25)">'
+    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">'
+    +'<div style="font-size:15px;font-weight:700;color:var(--text)">🔍 Order Sync Diagnostics</div>'
+    +'<button onclick="document.getElementById(&quot;diag-ov&quot;).remove()" style="background:none;border:none;font-size:20px;cursor:pointer;color:var(--text3)">×</button>'
+    +'</div>'
+    +'<div id="diag-log" style="font-size:12px;line-height:2;color:var(--text2)">Running checks…</div>'
+    +'</div>';
+  document.body.appendChild(ov);
+  ov.onclick=e=>{if(e.target===ov)ov.remove();};
+
+  var log=document.getElementById('diag-log');
+  function line(icon,msg,color){
+    var d=document.createElement('div');
+    d.innerHTML='<span style="margin-right:6px">'+icon+'</span>'
+      +'<span style="color:'+(color||'var(--text2)')+'">'+msg+'</span>';
+    log.appendChild(d);
+  }
+
+  log.innerHTML='';
+
+  // 1. Credentials
+  var store=(S.shopify?.store||'').trim();
+  var key=(S.shopify?.key||'').trim();
+  line(store?'✅':'❌','Shopify store: '+(store||'NOT SET'),store?'var(--green)':'var(--red)');
+  line(key?'✅':'❌','Admin API key: '+(key?key.slice(0,8)+'… (saved)':'NOT SET'),key?'var(--green)':'var(--red)');
+  if(!store||!key){
+    line('ℹ️','Go to Integrations → Shopify to enter credentials','var(--orange)');
+    return;
+  }
+
+  // 2. Realtime connection
+  var rtOk=typeof _rtStatus!=='undefined'&&_rtStatus==='SUBSCRIBED';
+  line(rtOk?'✅':'⚠️','Realtime subscription: '+(_rtStatus||'unknown'),rtOk?'var(--green)':'var(--orange)');
+
+  // 3. Ping edge function
+  line('⏳','Pinging shopify-orders edge function…','var(--text3)');
+  try{
+    var pr=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+      body:JSON.stringify({ping:true})
+    });
+    var pt=await pr.text();
+    var pok=pr.ok&&(pt.includes('pong')||pt.includes('ok'));
+    log.lastChild.remove();
+    line(pok?'✅':'❌','Edge function: HTTP '+pr.status+' '+(pok?'(responding)':'— '+pt.slice(0,80)),pok?'var(--green)':'var(--red)');
+    if(!pok){line('ℹ️','Run: supabase functions deploy shopify-orders','var(--orange)');return;}
+  }catch(ex){
+    log.lastChild.remove();
+    line('❌','Edge function unreachable: '+ex.message,'var(--red)');
+    line('ℹ️','The edge function may not be deployed','var(--orange)');
+    return;
+  }
+
+  // 4. Try a live Shopify API call via edge function
+  line('⏳','Fetching 1 recent order from Shopify…','var(--text3)');
+  try{
+    var since=new Date(Date.now()-7*24*60*60*1000).toISOString();
+    var sr=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+      body:JSON.stringify({action:'sync',store:store,key:key,since:since,page_info:''})
+    });
+    var sj=await sr.json().catch(()=>({}));
+    log.lastChild.remove();
+    if(!sr.ok||sj.error){
+      var em=sj.error||('HTTP '+sr.status);
+      line('❌','Shopify API error: '+em,'var(--red)');
+      if(em.includes('401')||em.includes('Unauthorized'))
+        line('ℹ️','Your Admin API token is invalid or revoked. Generate a new one in Shopify → Apps → Develop Apps','var(--orange)');
+      else if(em.includes('403'))
+        line('ℹ️','Token lacks read_orders permission. Edit the app in Shopify → Apps → Develop Apps → API credentials','var(--orange)');
+      return;
+    }
+    var ords=sj.orders||[];
+    line('✅','Shopify API: '+ords.length+' order'+(ords.length!==1?'s':'')+' returned (last 7 days)','var(--green)');
+    line('ℹ️',ords.length===0
+      ?'No orders in last 7 days — try placing a test order in Shopify'
+      :'Shopify API is working. If orders still do not appear, check webhook registration: Shopify Admin → Settings → Notifications → Webhooks','var(--text3)');
+
+    // 5. Webhook URL
+    var wUrl=SUPA_URL+'/functions/v1/shopify-orders';
+    line('ℹ️','Required webhook URL: '+wUrl,'var(--teal)');
+    line('ℹ️','Events needed: orders/create · orders/cancelled · orders/updated','var(--text3)');
+    line('ℹ️','Register at: Shopify Admin → Settings → Notifications → Webhooks','var(--text3)');
+  }catch(ex2){
+    log.lastChild.remove();
+    line('❌','Error calling Shopify via edge function: '+ex2.message,'var(--red)');
+  }
 }
 
 async function testShopifyWebhook(){
@@ -6605,7 +6703,26 @@ async function syncOrdersNow(){
   const store=(S.shopify?.store||'').trim();
   const key=(S.shopify?.key||'').trim();
   if(!store||!key){
-    toast('⚠ Shopify credentials not saved — go to Integrations to configure');
+    // Show a prominent modal instead of a 2.5s toast that's easy to miss
+    const ov=document.createElement('div');
+    ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;display:flex;align-items:center;justify-content:center;padding:20px';
+    ov.innerHTML=`<div style="background:var(--bg2);border:1px solid var(--border2);border-radius:10px;width:min(480px,95vw);padding:24px;box-shadow:0 16px 48px rgba(0,0,0,.25)">
+      <div style="font-size:15px;font-weight:700;color:var(--orange);margin-bottom:10px">⚠ Shopify Not Configured</div>
+      <div style="font-size:13px;color:var(--text2);margin-bottom:16px;line-height:1.6">
+        Shopify store URL and API key are not saved.<br>
+        Go to <strong>Settings → Integrations → Shopify</strong>, enter your store URL and Admin API token, then hit Save.
+      </div>
+      <div style="font-size:11px;color:var(--text3);background:var(--bg3);border-radius:6px;padding:10px;margin-bottom:16px">
+        Admin API token starts with <code>shpat_</code><br>
+        Get it from: Shopify Admin → Apps → Develop Apps → API credentials
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn btn-sm" onclick="this.closest('div[style*=fixed]').remove()">Close</button>
+        <button class="btn btn-primary btn-sm" onclick="this.closest('div[style*=fixed]').remove();nav('integrations')">Go to Integrations →</button>
+      </div>
+    </div>`;
+    document.body.appendChild(ov);
+    ov.onclick=e=>{if(e.target===ov)ov.remove();};
     return;
   }
 
@@ -6772,14 +6889,14 @@ async function syncOrdersNow(){
 
   await refreshSales();render();
 
-  if(newCount===0&&updatedCount===0){
-    toast('✓ Sync done — all orders are up to date (90 days)');
-    return;
-  }
-  if(newCount===0){
-    toast(`✓ Sync done — ${updatedCount} status update${updatedCount!==1?'s':''}, no new orders`);
-    return;
-  }
+  const syncMsg=newCount>0
+    ?`✓ Synced: ${newCount} new order${newCount!==1?'s':''}, ${updatedCount} update${updatedCount!==1?'s':''}`
+    :updatedCount>0
+      ?`✓ Sync done — ${updatedCount} status update${updatedCount!==1?'s':''}, no new orders`
+      :'✓ Sync done — all orders are up to date (90 days)';
+  toast(syncMsg, 5000);
+  if(newCount===0&&updatedCount===0) return;
+  if(newCount===0) return;
 
   if(syncConflicts.length>0){
     const cov=document.createElement('div');cov.id='sync-conflict-overlay';
