@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -4107,12 +4108,14 @@ async function submitVendor(editId){
     if(error){toast('Error: '+error.message);return;}
     S.vendors=(S.vendors||[]).map(v=>v.id===editId?{...v,...payload}:v);
     document.getElementById('vendor-overlay')?.remove();
+    logAction('Vendor updated: '+(payload.name||''),'vendors',null,null,payload).catch(()=>{});
     toast('Vendor updated');render();
   } else {
     const{data,error}=await db.from('vendors').insert(payload).select().single();
     if(error){toast('Error: '+error.message);return;}
     S.vendors=[...(S.vendors||[]),data].sort((a,b)=>(a.name||'').localeCompare(b.name||''));
     document.getElementById('vendor-overlay')?.remove();
+    logAction('Vendor added: '+(payload.name||data?.name||''),'vendors',null,null,payload).catch(()=>{});
     toast('Vendor added');render();
   }
 }
@@ -5491,7 +5494,7 @@ Deno.serve(async (req) => {
     if (action === 'invite') {
       const { email, role } = body
       if (!email || !role) return new Response(JSON.stringify({ error: 'email and role are required' }), { status: 400, headers: CORS })
-      if (!['admin', 'super_user'].includes(role)) return new Response(JSON.stringify({ error: 'Invalid role' }), { status: 400, headers: CORS })
+      if (!['admin', 'warehouse', 'customer_service', 'design'].includes(role)) return new Response(JSON.stringify({ error: 'Invalid role' }), { status: 400, headers: CORS })
 
       const { redirectTo } = body
       // generateLink creates the invite without sending email (avoids Supabase SMTP rate limits).
@@ -8937,7 +8940,7 @@ async function loadUserProfile(user){
     } else if(!profile){
       // Logged-in user has no profile row — create one
       const{data:any}=await db.from('profiles').select('id').limit(1).maybeSingle();
-      const role=!any?'admin':'super_user';
+      const role=!any?'admin':'warehouse';
       const{data:np}=await db.from('profiles').insert({id:user.id,email:user.email,full_name:user.email.split('@')[0],role}).select().single();
       profile=np||{role,email:user.email,full_name:user.email.split('@')[0]};
       S.currentRole=profile.role||'admin';
@@ -8957,13 +8960,33 @@ async function loadUserProfile(user){
 
 function _updateAuthUI(){
   const su=document.getElementById('sidebar-user');if(su)su.style.display='';
-  const rl=document.getElementById('sidebar-role-label');if(rl)rl.textContent=S.currentRole==='admin'?'⚑ Administrator':'Super User';
+  const ROLE_LABELS={admin:'⚑ Administrator',warehouse:'Warehouse',customer_service:'Customer Service',design:'Design'};
+  const rl=document.getElementById('sidebar-role-label');
+  if(rl)rl.textContent=ROLE_LABELS[S.currentRole]||S.currentRole||'User';
   const em=document.getElementById('sidebar-email');if(em)em.textContent=S.currentUser||'';
-  if(S.currentRole==='admin'){
-    const un=document.getElementById('nav-users');if(un)un.style.display='';
+  const ROLE_NAV={
+    admin:null,
+    warehouse:['dashboard','lookup','parts','assemblies','boms','inventory','packqueue','cyclecounts','corrections','planning','purchases','sales','warranty','vendors','ai','reports'],
+    customer_service:['dashboard','lookup','sales','warranty','dealers','corrections','ai','reports'],
+    design:['dashboard','lookup','parts','assemblies','boms','pricelist','ai','reports']
+  };
+  const ADMIN_ONLY=['nav-users','nav-integrations','nav-import','nav-backups'];
+  const role=S.currentRole||'warehouse';
+  const allowed=ROLE_NAV[role];
+  if(role==='admin'){
+    ADMIN_ONLY.forEach(id=>{const el=document.getElementById(id);if(el)el.style.display='';});
     const as=document.getElementById('admin-section');if(as)as.style.display='';
+  } else {
+    ADMIN_ONLY.forEach(id=>{const el=document.getElementById(id);if(el)el.style.display='none';});
+    const as=document.getElementById('admin-section');if(as)as.style.display='none';
+    if(allowed){
+      const ALL_NAV=['dashboard','lookup','parts','assemblies','boms','inventory','packqueue','cyclecounts','corrections','planning','purchases','sales','warranty','vendors','dealers','pricelist','ai','reports'];
+      ALL_NAV.forEach(v=>{
+        const el=document.getElementById('nav-'+v);
+        if(el)el.style.display=allowed.includes(v)?'':'none';
+      });
+    }
   }
-  // Init team chat after profile is ready
   setTimeout(_chatInit, 800);
 }
 
@@ -9031,7 +9054,9 @@ function showInviteUserModal(){
       <div class="form-group" style="margin-top:10px">
         <label class="form-label">Role</label>
         <select id="invite-role" class="form-input">
-          <option value="super_user">Super User</option>
+          <option value="warehouse">Warehouse</option>
+          <option value="customer_service">Customer Service</option>
+          <option value="design">Design</option>
           <option value="admin">Admin</option>
         </select>
       </div>
@@ -9047,7 +9072,7 @@ function showInviteUserModal(){
 
 async function adminInviteUser(){
   const email=(document.getElementById('invite-email')?.value||'').trim();
-  const role=document.getElementById('invite-role')?.value||'super_user';
+  const role=document.getElementById('invite-role')?.value||'warehouse';
   const errEl=document.getElementById('invite-error');
   if(errEl)errEl.style.display='none';
   if(!email){if(errEl){errEl.textContent='Email is required.';errEl.style.display='';}return;}
@@ -9148,8 +9173,8 @@ function renderUsersSQLSetup(msg){
     +'  id UUID REFERENCES auth.users(id) ON DELETE CASCADE PRIMARY KEY,\n'
     +'  email TEXT NOT NULL,\n'
     +"  full_name TEXT DEFAULT '',\n"
-    +"  role TEXT NOT NULL DEFAULT 'super_user'\n"
-    +"    CHECK (role IN ('admin','super_user')),\n"
+    +"  role TEXT NOT NULL DEFAULT 'warehouse'\n"
+    +"    CHECK (role IN ('admin','warehouse','customer_service','design')),\n"
     +'  created_at TIMESTAMPTZ DEFAULT NOW(),\n'
     +'  updated_at TIMESTAMPTZ DEFAULT NOW()\n'
     +');\n'
@@ -9193,7 +9218,7 @@ function renderUsers(){
   <div style="font-size:13px;color:var(--text2);margin-bottom:16px">${S._profilesError?'Error: '+S._profilesError:'The profiles table is empty or not yet created. Run the setup SQL below, then refresh.'}</div>
   <button class="btn btn-teal btn-sm" onclick="S._profilesLoaded=false;S._profilesError=null;loadProfiles()">\u21ba Retry</button>
   </div>`;}
-  const roleColors={admin:'var(--teal)',super_user:'var(--orange)'};
+  const roleColors={admin:'var(--teal)',warehouse:'var(--orange)',customer_service:'var(--blue)',design:'var(--purple)'};
   const rows=S.profiles.map(p=>{
     const isSelf=p.id===S.currentUserId;
     const delBtn=isSelf?'':`<button class="action-btn" style="color:var(--red);border-color:var(--red)" onclick="adminDeleteUser('${p.id}')">&#10005; Remove</button>`;
@@ -9202,7 +9227,9 @@ function renderUsers(){
     <td style="font-size:12px;color:var(--text2)">${p.full_name||'\u2014'}</td>
     <td><select class="form-input" style="width:auto;padding:4px 8px;font-size:11px" ${isSelf?'disabled title="Cannot change your own role"':''} onchange="adminSetRole('${p.id}',this.value,'${p.email.replace(/'/g,"\\'")}')">
       <option value="admin" ${p.role==='admin'?'selected':''}>&#9873; Admin</option>
-      <option value="super_user" ${p.role==='super_user'?'selected':''}>Super User</option>
+      <option value="warehouse" ${p.role==='warehouse'?'selected':''}>Warehouse</option>
+      <option value="customer_service" ${p.role==='customer_service'?'selected':''}>Customer Service</option>
+      <option value="design" ${p.role==='design'?'selected':''}>Design</option>
     </select>${isSelf?' <span style="font-size:10px;color:var(--text3)">(you)</span>':''}</td>
     <td style="font-size:11px;color:var(--text3)">${p.created_at?new Date(p.created_at).toLocaleDateString():''}</td>
     <td style="display:flex;gap:6px;align-items:center"><button class="action-btn" onclick="adminResetPassword('${p.email.replace(/'/g,"\\'")}')">&#8635; Reset PW</button>${delBtn}</td>
@@ -9211,11 +9238,12 @@ function renderUsers(){
 
 
   return`
-  <div class="kpi-grid kpi-grid-4">
+  <div class="kpi-grid kpi-grid-5">
     <div class="kpi"><div class="kpi-label">Total Users</div><div class="kpi-value">${S.profiles.length}</div></div>
     <div class="kpi kpi-teal"><div class="kpi-label">Admins</div><div class="kpi-value">${S.profiles.filter(p=>p.role==='admin').length}</div></div>
-    <div class="kpi kpi-orange"><div class="kpi-label">Super Users</div><div class="kpi-value">${S.profiles.filter(p=>p.role==='super_user').length}</div></div>
-    <div class="kpi"><div class="kpi-label">Your Role</div><div class="kpi-value" style="font-size:15px">${S.currentRole==='admin'?'Admin':'Super User'}</div></div>
+    <div class="kpi kpi-orange"><div class="kpi-label">Warehouse</div><div class="kpi-value">${S.profiles.filter(p=>p.role==='warehouse').length}</div></div>
+    <div class="kpi"><div class="kpi-label">CS / Design</div><div class="kpi-value">${S.profiles.filter(p=>p.role==='customer_service'||p.role==='design').length}</div></div>
+    <div class="kpi"><div class="kpi-label">Your Role</div><div class="kpi-value" style="font-size:13px">${{admin:'Admin',warehouse:'Warehouse',customer_service:'CS',design:'Design'}[S.currentRole]||S.currentRole}</div></div>
   </div>
   <div class="panel" style="padding:12px 18px;margin-bottom:0">
     <div style="display:flex;align-items:center;gap:10px">
@@ -9231,8 +9259,10 @@ function renderUsers(){
   <div class="panel" style="padding:14px 18px">
     <div class="panel-title"><span>Role Reference</span></div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;font-size:12px">
-      <div style="padding:12px;background:var(--bg3);border-radius:8px;border-left:3px solid var(--teal)"><div style="font-weight:700;color:var(--teal);margin-bottom:5px">\u2691 Admin</div><ul style="color:var(--text2);margin:0;padding-left:16px;line-height:1.9"><li>Full access to all modules</li><li>Manage users &amp; roles</li><li>Send password resets</li><li>Full audit log access</li></ul></div>
-      <div style="padding:12px;background:var(--bg3);border-radius:8px;border-left:3px solid var(--orange)"><div style="font-weight:700;color:var(--orange);margin-bottom:5px">Super User</div><ul style="color:var(--text2);margin:0;padding-left:16px;line-height:1.9"><li>Full access to all modules</li><li>No user management access</li><li>Cannot change roles</li><li>Cannot reset passwords</li></ul></div>
+      <div style="padding:12px;background:var(--bg3);border-radius:8px;border-left:3px solid var(--teal)"><div style="font-weight:700;color:var(--teal);margin-bottom:5px">\u2691 Admin</div><ul style="color:var(--text2);margin:0;padding-left:16px;line-height:1.9"><li>Full access to all modules</li><li>Manage users &amp; roles, reset passwords</li><li>Integrations, Import, Backups</li><li>Full audit log access</li></ul></div>
+      <div style="padding:12px;background:var(--bg3);border-radius:8px;border-left:3px solid var(--orange)"><div style="font-weight:700;color:var(--orange);margin-bottom:5px">Warehouse</div><ul style="color:var(--text2);margin:0;padding-left:16px;line-height:1.9"><li>Inventory, Production, Cycle Counts</li><li>Purchase Orders, Sales (view)</li><li>Parts, Assemblies, BOMs, Vendors</li><li>Activity Log, Reports, AI</li></ul></div>
+      <div style="padding:12px;background:var(--bg3);border-radius:8px;border-left:3px solid var(--blue)"><div style="font-weight:700;color:var(--blue);margin-bottom:5px">Customer Service</div><ul style="color:var(--text2);margin:0;padding-left:16px;line-height:1.9"><li>Sales Orders, Warranty &amp; Resolution</li><li>Dealers, Activity Log</li><li>AI Assistant, Reports</li><li>No inventory or purchasing access</li></ul></div>
+      <div style="padding:12px;background:var(--bg3);border-radius:8px;border-left:3px solid var(--purple)"><div style="font-weight:700;color:var(--purple);margin-bottom:5px">Design</div><ul style="color:var(--text2);margin:0;padding-left:16px;line-height:1.9"><li>Parts Catalog, Assemblies, BOMs</li><li>Master Price List management</li><li>AI Assistant, Reports</li><li>No inventory or order access</li></ul></div>
     </div>
   </div>`;
 }
@@ -9555,6 +9585,10 @@ function renderReports(){
   const hasRows=rows&&rows.data&&rows.data.length>0;
   const previewData=hasRows?rows.data.slice(0,50):[];
   const cols=hasRows?rows.cols:[];
+  const CHARTABLE=["sales_by_month","sales_by_sku","sales_by_customer","sales_by_dealer","inv_valuation","inv_velocity","po_by_vendor"];
+  const canChart=CHARTABLE.includes(def.id)&&hasRows;
+  if(canChart&&S.rptState.chartView)window._rptChartDef={id:def.id,data:rows.data,cols:rows.cols};
+  else if(!canChart)S.rptState.chartView=false;
 
   return `<div style="display:grid;grid-template-columns:260px 1fr;gap:18px;min-height:500px;align-items:start">
     <div style="overflow-y:auto;max-height:calc(100vh - 100px);padding-right:4px;position:sticky;top:0">${selectorHtml}</div>
@@ -9570,6 +9604,7 @@ function renderReports(){
           ${hasRows?`<div style="font-size:11px;color:var(--text3)">${rows.data.length.toLocaleString()} rows</div>`:''}
           <button class="btn btn-teal" onclick="runExport('csv','${def.id}','${dr}','${customFrom}','${customTo}')">⬇ CSV</button>
           <button class="btn btn-primary" onclick="runExport('xlsx','${def.id}','${dr}','${customFrom}','${customTo}')">⬇ Excel</button>
+          ${canChart?`<button class="btn ${S.rptState.chartView?'btn-teal':''}" onclick="(()=>{S.rptState={...S.rptState,chartView:!S.rptState.chartView,preview:null};render()})()" title="Toggle chart view">${S.rptState.chartView?'\uD83D\uDCC3 Table':'\uD83D\uDCCA Chart'}</button>`:''}
         </div>
         ${hasDates?`<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
           <span style="font-size:11px;color:var(--text3)">Range:</span>
@@ -9582,7 +9617,7 @@ function renderReports(){
       </div>
 
       <!-- Preview table -->
-      ${!hasRows?`<div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:48px;text-align:center;color:var(--text3)">No data for this report with the current filters</div>`:`
+      ${!hasRows?`<div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:48px;text-align:center;color:var(--text3)">No data for this report with the current filters</div>`:canChart&&S.rptState.chartView?`<div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:24px"><canvas id="rpt-chart-canvas" style="max-height:460px;width:100%"></canvas></div>` :`
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden">
         <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
           <span style="font-size:11px;color:var(--text3)">Preview — first ${Math.min(50,rows.data.length)} of ${rows.data.length.toLocaleString()} rows</span>
@@ -11693,6 +11728,7 @@ async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
     S.purchases = S.purchases.map(p=>p.id===poId?{...p,status:'Received'}:p);
   }
   pushUndoMulti('Receive '+qty+'× '+pn+' on PO',undoOps);
+  logAction('PO received: '+qty+' x '+pn,'purchases',pn,null,{qty,poId}).catch(()=>{});
   updateBadge();
   render();
 }
@@ -11748,6 +11784,7 @@ async function receiveAllLines(poId) {
     const remaining = (line.qty_ordered||0)-(line.qty_received||0);
     if(remaining>0) await checkInLineQuick(line.id, poId, line.pn, line.qty_ordered, line.qty_received||0, remaining);
   }
+  logAction('PO all lines received on PO '+poId,'purchases',null,null,{poId}).catch(()=>{});
   toast('All lines received');
 }
 
@@ -13354,11 +13391,14 @@ function renderAuditLog(){
   const sSort=(val,label)=>{const arr=sortField===val?(sortDir==='desc'?'↓':'↑'):'';return`<button class="filter-chip ${sortField===val?'on-teal':''}" onclick="(()=>{const d=S.filters.auditlog?.sort==='${val}'&&(S.filters.auditlog?.dir||'desc')==='desc'?'asc':'desc';setFilter('auditlog','sort','${val}');setFilter('auditlog','dir',d)})()">${label}${arr?' '+arr:''}</button>`;};
 
   const rows=list.map(a=>{
-    const roleColor=a.user_role==='admin'?'var(--teal)':'var(--orange)';
+    const _rc={admin:'var(--teal)',warehouse:'var(--orange)',customer_service:'var(--blue)',design:'var(--purple)'};
+    const roleColor=_rc[a.user_role]||'var(--text3)';
+    const _rbg={admin:'rgba(13,148,136,.12)',warehouse:'rgba(234,88,12,.1)',customer_service:'rgba(37,99,235,.1)',design:'rgba(124,58,237,.1)'};
+    const roleBg=_rbg[a.user_role]||'rgba(107,114,128,.1)';
     const dt=a.created_at?new Date(a.created_at):null;
     return `<tr>
       <td style="font-size:10px;color:var(--text3);font-family:var(--mono);white-space:nowrap;min-width:100px">${dt?timeAgo(a.created_at):'—'}<br><span style="font-size:8px">${dt?dt.toLocaleString():''}</span></td>
-      <td><div style="font-size:12px;color:var(--text);font-weight:500">${escHtml(a.user_email||'—')}</div><span style="font-size:9px;color:${roleColor};background:${a.user_role==='admin'?'rgba(13,148,136,.12)':'rgba(234,88,12,.1)'};border-radius:3px;padding:1px 5px">${a.user_role||''}</span></td>
+      <td><div style="font-size:12px;color:var(--text);font-weight:500">${escHtml(a.user_email||'—')}</div><span style="font-size:9px;color:${roleColor};background:${roleBg};border-radius:3px;padding:1px 5px">${a.user_role||''}</span></td>
       <td style="font-size:12px;color:var(--text2);max-width:300px">${escHtml(a.summary||'')}</td>
       <td style="font-size:11px;font-family:var(--mono);color:var(--teal)">${a.entity_pn?escHtml(a.entity_pn):'—'}</td>
       <td style="font-size:10px;color:var(--text3)">${escHtml(a.entity_type||'—')}</td>
@@ -13374,7 +13414,9 @@ function renderAuditLog(){
     <select class="form-input" style="width:auto;padding:6px 10px;font-size:11px" onchange="setFilter('auditlog','role',this.value)">
       <option value="">All Roles</option>
       <option value="admin" ${sf.role==='admin'?'selected':''}>Admin</option>
-      <option value="super_user" ${sf.role==='super_user'?'selected':''}>Super User</option>
+      <option value="warehouse" ${sf.role==='warehouse'?'selected':''}>Warehouse</option>
+      <option value="customer_service" ${sf.role==='customer_service'?'selected':''}>Customer Service</option>
+      <option value="design" ${sf.role==='design'?'selected':''}>Design</option>
     </select>
     <input type="date" class="form-input" style="width:auto;padding:6px 10px;font-size:11px" value="${sf.from||''}" title="From date" onchange="setFilter('auditlog','from',this.value)">
     <input type="date" class="form-input" style="width:auto;padding:6px 10px;font-size:11px" value="${sf.to||''}" title="To date" onchange="setFilter('auditlog','to',this.value)">
@@ -14776,6 +14818,70 @@ function exportTable(table) {
 }
 
 // ============================================================
+// REPORT CHARTS (Chart.js)
+// ============================================================
+function _initReportChart(){
+  const canvas=document.getElementById('rpt-chart-canvas');
+  if(!canvas||!window._rptChartDef)return;
+  if(window._rptChartInst){try{window._rptChartInst.destroy();}catch(e){}window._rptChartInst=null;}
+  const{id,data}=window._rptChartDef;
+  const TEAL='rgba(13,148,136,0.85)',ORANGE='rgba(234,88,12,0.85)',BLUE='rgba(37,99,235,0.85)',PURPLE='rgba(124,58,237,0.85)',GREEN='rgba(22,163,74,0.85)';
+  const PAL=[TEAL,ORANGE,BLUE,PURPLE,GREEN,'rgba(217,119,6,0.85)','rgba(220,38,38,0.85)'];
+  const n=v=>typeof v==='number'?v:0;
+  const gridCol='rgba(0,0,0,0.06)',txtCol='#6b7280';
+  const baseOpts={responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>' '+ctx.dataset.label+': '+(n(ctx.raw)).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:2})}}},
+    scales:{x:{grid:{color:gridCol},ticks:{color:txtCol,maxTicksLimit:16,font:{size:11}}},y:{grid:{color:gridCol},ticks:{color:txtCol,font:{size:11}}}}};
+  let cfg=null;
+  if(id==='sales_by_month'){
+    const d=data.slice(0,36);
+    cfg={type:'line',data:{labels:d.map(r=>r['Month']),datasets:[
+      {label:'Revenue ($)',data:d.map(r=>n(r['Revenue ($)'])),borderColor:TEAL,backgroundColor:'rgba(13,148,136,0.1)',fill:true,tension:0.35,pointRadius:4,pointBackgroundColor:TEAL},
+      {label:'Orders',data:d.map(r=>n(r['Order Count'])),borderColor:ORANGE,backgroundColor:'rgba(234,88,12,0)',fill:false,tension:0.35,pointRadius:3,yAxisID:'y2'}]},
+    options:{...baseOpts,plugins:{...baseOpts.plugins,legend:{display:true,position:'top',labels:{color:txtCol,boxWidth:12,font:{size:11}}}},
+      scales:{...baseOpts.scales,y:{...baseOpts.scales.y,title:{display:true,text:'Revenue ($)',color:txtCol,font:{size:11}}},
+      y2:{position:'right',grid:{display:false},ticks:{color:txtCol,font:{size:11}},title:{display:true,text:'Orders',color:txtCol,font:{size:11}}}}}};
+  } else if(id==='sales_by_sku'){
+    const d=data.slice(0,20);
+    cfg={type:'bar',data:{labels:d.map(r=>r['SKU']),datasets:[
+      {label:'Revenue ($)',data:d.map(r=>n(r['Revenue ($)'])),backgroundColor:d.map((_,i)=>PAL[i%PAL.length])},
+      {label:'Units Sold',data:d.map(r=>n(r['Units Sold'])),backgroundColor:'rgba(107,114,128,0.25)',yAxisID:'y2'}]},
+    options:{...baseOpts,plugins:{...baseOpts.plugins,legend:{display:true,position:'top',labels:{color:txtCol,boxWidth:12,font:{size:11}}}},
+      scales:{...baseOpts.scales,y:{...baseOpts.scales.y,title:{display:true,text:'Revenue ($)',color:txtCol}},
+      y2:{position:'right',grid:{display:false},ticks:{color:txtCol},title:{display:true,text:'Units',color:txtCol}}}}};
+  } else if(id==='sales_by_customer'){
+    const d=data.slice(0,15);
+    cfg={type:'bar',data:{labels:d.map(r=>{const s=String(r['Customer']||'');return s.length>22?s.slice(0,20)+'...':s;}),
+      datasets:[{label:'Revenue ($)',data:d.map(r=>n(r['Revenue ($)'])),backgroundColor:d.map((_,i)=>PAL[i%PAL.length])}]},
+    options:{...baseOpts,indexAxis:'y'}};
+  } else if(id==='inv_valuation'){
+    const d=data.filter(r=>r['Part #']!=='— TOTAL —').slice(0,20);
+    cfg={type:'bar',data:{labels:d.map(r=>r['Part #']),
+      datasets:[{label:'Total Value ($)',data:d.map(r=>n(r['Total Value ($)'])),backgroundColor:d.map((_,i)=>PAL[i%PAL.length])}]},
+    options:{...baseOpts,indexAxis:'y'}};
+  } else if(id==='inv_velocity'){
+    const d=data.slice(0,18);
+    cfg={type:'bar',data:{labels:d.map(r=>r['Part #']),datasets:[
+      {label:'Avg/Wk (12w)',data:d.map(r=>n(r['Avg/Wk (12w)'])),backgroundColor:TEAL},
+      {label:'Avg/Wk (4w)',data:d.map(r=>n(r['Avg/Wk (4w)'])),backgroundColor:ORANGE}]},
+    options:{...baseOpts,plugins:{...baseOpts.plugins,legend:{display:true,position:'top',labels:{color:txtCol,boxWidth:12,font:{size:11}}}}}};
+  } else if(id==='po_by_vendor'){
+    const d=data.slice(0,15);
+    cfg={type:'bar',data:{labels:d.map(r=>r['Vendor']),
+      datasets:[{label:'Total Spend ($)',data:d.map(r=>n(r['Total Spend ($)'])),backgroundColor:d.map((_,i)=>PAL[i%PAL.length])}]},
+    options:{...baseOpts,indexAxis:'y'}};
+  } else if(id==='sales_by_dealer'){
+    const d=data.slice(0,20);
+    const lKey=d[0]?Object.keys(d[0]).find(k=>k.toLowerCase().includes('revenue')||k.toLowerCase().includes('spend')):'Revenue ($)';
+    cfg={type:'bar',data:{labels:d.map(r=>r['Dealer']||r['Dealer Code']||r['Customer']||''),
+      datasets:[{label:lKey||'Amount',data:d.map(r=>n(r[lKey])),backgroundColor:d.map((_,i)=>PAL[i%PAL.length])}]},
+    options:{...baseOpts}};
+  }
+  if(!cfg)return;
+  try{canvas.height=420;window._rptChartInst=new Chart(canvas,cfg);}catch(e){console.warn('Chart error:',e);}
+}
+
+// ============================================================
 // RENDER
 // ============================================================
 let _renderPending=false;
@@ -14797,6 +14903,7 @@ function render(){
   }
   $('content').innerHTML=(views[S.view]||renderDashboard)();
   requestAnimationFrame(initResizableTables);
+  if(S.view==='reports'&&S.rptState?.chartView)requestAnimationFrame(_initReportChart);
   if(fkey){
     let el=null;
     if(fkey.startsWith('id:'))el=document.getElementById(fkey.slice(3));
