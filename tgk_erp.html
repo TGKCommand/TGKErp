@@ -500,6 +500,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
     <button class="nav-item" id="nav-parts" onclick="nav('parts')"><span class="nav-dot"></span>Parts Catalog</button>
     <button class="nav-item" id="nav-assemblies" onclick="nav('assemblies')"><span class="nav-dot"></span>Assemblies</button>
     <button class="nav-item" id="nav-boms" onclick="nav('boms')"><span class="nav-dot"></span>Bill of Materials</button>
+    <button class="nav-item" id="nav-fitments" onclick="nav('fitments')"><span class="nav-dot"></span>Fitment Guide</button>
 
     <div class="sidebar-section">Operations</div>
     <button class="nav-item" id="nav-inventory" onclick="nav('inventory')"><span class="nav-dot"></span>Inventory</button>
@@ -930,7 +931,7 @@ function normalizeAssemblies(rows){
 
 async function loadAll(){
   try{
-    const[parts,assemblies,sales,purchases,dealers,vendors,settings,bomItems,warrantyClaims,shipmentErrors,corrections,cycleCounts,poLinesAll,poTrackingAll,labelFilesResult]=await Promise.all([
+    const[parts,assemblies,sales,purchases,dealers,vendors,settings,bomItems,warrantyClaims,shipmentErrors,corrections,cycleCounts,poLinesAll,poTrackingAll,labelFilesResult,fitmentRows]=await Promise.all([
       db.from('parts').select('*').order('pn'),
       db.from('assemblies').select('*').order('pn'),
       db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000),
@@ -946,6 +947,7 @@ async function loadAll(){
       db.from('po_lines').select('*').order('po_id'),
       db.from('po_tracking').select('*').order('created_at'),
       db.from('part_files').select('*').eq('category','Label'),
+      db.from('fitments').select('*').order('make').order('model').order('year_from').catch(()=>({data:[],error:null})),
     ]);
     if(parts.error)throw parts.error;
     S.parts=parts.data||[];
@@ -974,6 +976,7 @@ async function loadAll(){
     (poLinesAll.data||[]).forEach(l=>{if(!S.poLines[l.po_id])S.poLines[l.po_id]=[];S.poLines[l.po_id].push(l);});
     S.poTracking={};
     (poTrackingAll.data||[]).forEach(t=>{if(!S.poTracking[t.po_id])S.poTracking[t.po_id]=[];S.poTracking[t.po_id].push(t);});
+    S.fitments=fitmentRows?.data||[];
     if(labelFilesResult.error){console.warn('loadAll: part_files label query failed —',labelFilesResult.error.message,'— label buttons will load on demand');}
     else{S.labelFiles={};(labelFilesResult.data||[]).forEach(function(lf){if(!S.labelFiles[lf.entity_pn])S.labelFiles[lf.entity_pn]=[];S.labelFiles[lf.entity_pn].push(lf);});console.log('[TGK] Label files loaded:',Object.keys(S.labelFiles).length,'SKUs:',Object.keys(S.labelFiles).join(', '));}
     // Seed liveActivity from recent data on load (so feed is non-empty on first open)
@@ -7275,6 +7278,68 @@ function buildProspectPortalHTML(tiers,products,storeUrl){
   // Tier summary pills for header
   const tierPills=activeTiers.map(t=>`<span style="background:#f0fdf4;border:1px solid #0d9488;color:#065f46;font-size:11px;font-weight:700;padding:4px 12px;border-radius:20px;white-space:nowrap">${escHtml(t.name)}: ${t.pct}% off MSRP</span>`).join('');
 
+
+  // Build fitment guide HTML for this dealer
+  var byPnF={};
+  fitments.forEach(function(f){if(!byPnF[f.pn])byPnF[f.pn]=[];byPnF[f.pn].push(f);});
+  var fitProducts=products.filter(function(p){return byPnF[p.pn];});
+  var fitMakes=[...new Set(fitments.map(function(f){return f.make||'';}).filter(Boolean))].sort();
+
+  var fitCards=fitProducts.map(function(p){
+    var sku=(p.use_new_sku&&p.new_sku)?p.new_sku:p.pn;
+    var sp=p.sales_price!=null?parseFloat(p.sales_price):null;
+    var dp=sp!=null?sp:p.msrp*(1-disc);
+    var fits=byPnF[p.pn]||[];
+    var modelGroups={};
+    fits.forEach(function(f){
+      var key=(f.make||'?')+'|'+(f.model||'?');
+      if(!modelGroups[key])modelGroups[key]={make:f.make,model:f.model,rows:[]};
+      modelGroups[key].rows.push(f);
+    });
+    var appRows=Object.values(modelGroups).sort(function(a,b){return(a.make+a.model).localeCompare(b.make+b.model);}).map(function(g){
+      var years=g.rows.sort(function(a,b){return(a.year_from||0)-(b.year_from||0);}).map(function(f){
+        var yLabel=(!f.year_from)?'All Years':f.year_from===f.year_to||!f.year_to?String(f.year_from):f.year_from+'\u2013'+f.year_to;
+        var sub=f.submodel&&f.submodel.toLowerCase()!=='base'&&f.submodel.toLowerCase()!=='all'?' ('+f.submodel+')':'';
+        return yLabel+sub;
+      }).join(', ');
+      return '<tr><td style="padding:3px 8px;font-size:11px;font-weight:600;white-space:nowrap">'+escHtml(g.make||'')+'</td><td style="padding:3px 8px;font-size:11px">'+escHtml(g.model||'')+'</td><td style="padding:3px 8px;font-size:11px;color:#4b5563">'+escHtml(years)+'</td></tr>';
+    }).join('');
+    var searchStr=(sku+' '+p.pn+' '+(p.description||'')+' '+fits.map(function(f){return(f.make||'')+' '+(f.model||'');}).join(' ')).toLowerCase();
+    return '<div class="dp-fit-card" data-fit-search="'+escHtml(searchStr)+'" style="border:1px solid #e5e7eb;border-radius:8px;padding:14px 16px;margin-bottom:12px">'
+      +'<div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:10px;flex-wrap:wrap">'
+        +'<div style="flex:1;min-width:180px">'
+          +(p.product_url?'<a href="'+escHtml(p.product_url)+'" target="_blank" style="font-family:monospace;font-size:14px;font-weight:700;color:#0d9488;text-decoration:none">'+escHtml(sku)+'&thinsp;&#8599;</a>':'<span style="font-family:monospace;font-size:14px;font-weight:700;color:#0d9488">'+escHtml(sku)+'</span>')
+          +'<div style="font-size:12px;color:#374151;margin-top:3px">'+escHtml(p.description||'')+'</div>'
+          +'<div style="font-size:10px;color:#9ca3af;margin-top:3px">'+fits.length+' application'+(fits.length!==1?'s':'')+' &middot; '+fitMakes.filter(function(m){return fits.some(function(f){return f.make===m;});}).join(', ')+'</div>'
+        +'</div>'
+        +'<div style="text-align:right;flex-shrink:0">'
+          +'<div style="font-size:9px;color:#9ca3af;text-transform:uppercase;letter-spacing:.07em;margin-bottom:2px">Your price</div>'
+          +'<div style="font-size:18px;font-weight:700;color:#d97706">$'+dp.toFixed(2)+'</div>'
+          +'<div style="font-size:10px;color:#9ca3af">MSRP $'+p.msrp.toFixed(2)+'</div>'
+        +'</div>'
+      +'</div>'
+      +'<table style="width:100%;border-collapse:collapse;background:#f9fafb;border-radius:6px;overflow:hidden"><thead>'
+      +'<tr style="font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:#9ca3af;background:#f3f4f6">'
+      +'<th style="padding:4px 8px;text-align:left;font-weight:700">Make</th>'
+      +'<th style="padding:4px 8px;text-align:left;font-weight:700">Model</th>'
+      +'<th style="padding:4px 8px;text-align:left;font-weight:700">Year(s)</th>'
+      +'</tr></thead><tbody>'+appRows+'</tbody></table>'
+    +'</div>';
+  }).join('');
+
+  var fitGuideSection=fitProducts.length===0?'<div style="text-align:center;padding:48px 20px;color:#9ca3af"><div style="font-size:32px;margin-bottom:10px">&#128268;</div><div style="font-size:14px;font-weight:600">No fitment data available yet</div></div>'
+    :'<div style="margin-bottom:16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+      +'<div style="position:relative;flex:1;max-width:360px">'
+      +'<span style="position:absolute;left:11px;top:50%;transform:translateY(-50%);color:#9ca3af;font-size:14px;pointer-events:none">&#9906;</span>'
+      +'<input id="dp-fit-search" type="search" placeholder="Search part # or vehicle\u2026" style="width:100%;padding:8px 12px 8px 34px;border:1px solid #d1d5db;border-radius:6px;font-size:12px;outline:none" oninput="dpFilterFit(this.value)">'
+      +'</div>'
+      +'<select id="dp-fit-make" style="padding:7px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:12px" onchange="dpFilterFit(document.getElementById(\'dp-fit-search\').value)">'
+      +'<option value="">All Makes</option>'
+      +fitMakes.map(function(m){return'<option value="'+escHtml(m)+'">'+escHtml(m)+'</option>';}).join('')
+      +'</select>'
+      +'<span id="dp-fit-count" style="font-size:11px;color:#9ca3af">'+fitProducts.length+' parts</span>'
+    +'</div>'+fitCards;
+
   return '<!DOCTYPE html><html><head><meta charset="UTF-8">'
     +'<meta name="viewport" content="width=device-width,initial-scale=1">'
     +'<title>TGK Motorsport \u2014 Authorized Dealer Program</title>'
@@ -7307,206 +7372,18 @@ function buildProspectPortalHTML(tiers,products,storeUrl){
     +'<button class="no-print" onclick="printDealerPortal()" style="padding:9px 18px;background:#0d9488;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap">\uD83D\uDCC4 Print / PDF</button>'
     +'</div>'
     +'</div>'
-    +'<div class="no-print" style="margin:0 0 18px;display:flex;align-items:center;gap:10px">'
-    +'<div style="position:relative;flex:1;max-width:360px">'
-    +'<span style="position:absolute;left:11px;top:50%;transform:translateY(-50%);color:#9ca3af;font-size:14px;pointer-events:none">&#9906;</span>'
-    +'<input id="dp-search-input" class="dp-search" style="padding-left:34px" type="search" placeholder="Search SKU or description\u2026" oninput="dealerPortalFilter(this.value)" autocomplete="off">'
+    +'<div id="dp-tabs" class="no-print" style="display:flex;gap:0;margin-bottom:16px;border-bottom:2px solid #e5e7eb">'
+    +'<button id="dp-tab-p" data-tab="prices" onclick="dpTab(this)" style="padding:9px 22px;font-size:12px;font-weight:700;background:none;border:none;cursor:pointer;border-bottom:3px solid #0d9488;color:#0d9488;margin-bottom:-2px">&#128230; Price List</button>'
+    +(fitProducts.length>0?'<button id="dp-tab-f" data-tab="fitments" onclick="dpTab(this)" style="padding:9px 22px;font-size:12px;font-weight:700;background:none;border:none;cursor:pointer;border-bottom:3px solid transparent;color:#9ca3af;margin-bottom:-2px">&#128268; Fitment Guide ('+fitProducts.length+')</button>':'')
     +'</div>'
-    +'<span id="dp-result-count" style="font-size:11px;color:#9ca3af"></span>'
-    +'<button onclick="document.getElementById(\'dp-search-input\').value=\'\';dealerPortalFilter(\'\')" style="font-size:11px;color:#6b7280;background:none;border:1px solid #d1d5db;border-radius:5px;padding:5px 10px;cursor:pointer">Clear</button>'
-    +'</div>'
-    +sections
-    +'<div id="dp-empty" style="display:none;text-align:center;padding:48px 20px;color:#9ca3af">'
-    +'<div style="font-size:32px;margin-bottom:10px">&#128269;</div>'
-    +'<div style="font-size:14px;font-weight:600;margin-bottom:4px">No results</div>'
-    +'<div style="font-size:12px">Try a different SKU or keyword</div>'
-    +'</div>'
-    +'<div class="dp-footer">'
-    +'<div>'
-    +'<div style="font-size:14px;font-weight:700;color:#111;margin-bottom:4px">Interested in becoming an authorized TGK dealer?</div>'
-    +'<div style="font-size:12px;color:#6b7280">Contact us to discuss your application and find the right tier for your business.</div>'
-    +'</div>'
-    +'<a href="'+storeUrl+'" style="padding:10px 20px;background:#0d9488;color:#fff;border-radius:6px;font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap">Visit TGK Motorsport &#8599;</a>'
-    +'</div>'
-    +'</div></body></html>';
-}
-
-
-// No auth required. Uses the same Supabase anon key.
-// SQL required: ALTER TABLE dealers DISABLE ROW LEVEL SECURITY;
-// ============================================================
-async function startDealerPortal(dealerId){
-  // Hide everything — this page becomes the price list
-  ['tgk-loader','auth-gate','tgk-app'].forEach(id=>{
-    const el=document.getElementById(id);
-    if(el)el.style.display='none';
-  });
-
-  // Mount a full-page container
-  const wrap=document.createElement('div');
-  wrap.id='dealer-portal';
-  wrap.style.cssText='position:fixed;inset:0;overflow-y:auto;background:#f5f6f7;font-family:"DM Sans",sans-serif;color:#1a1c1e;';
-  wrap.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:12px"><div style="width:32px;height:32px;border:3px solid #e5e7eb;border-top-color:#0D9488;border-radius:50%;animation:spin 0.8s linear infinite"></div><div style="color:#9ca3af;font-size:13px">Loading price list…</div></div>';
-  document.body.appendChild(wrap);
-
-  try{
-    // Fetch dealer record (anon key, RLS must be disabled on dealers table)
-    const{data:dealer,error:dErr}=await db.from('dealers').select('*').eq('id',dealerId).maybeSingle();
-    if(dErr||!dealer){
-      wrap.innerHTML=dealerPortalError('This price list link is invalid or has been removed.');
-      return;
-    }
-    if(dealer.status!=='Active'){
-      wrap.innerHTML=dealerPortalError('This price list is not currently active. Contact TGK Motorsport.');
-      return;
-    }
-
-    // Fetch finished goods with an MSRP set, plus store URL setting in parallel
-    const[prodResult,storeResult]=await Promise.all([
-      db.from('assemblies')
-        .select('pn,new_sku,use_new_sku,description,category,msrp,image_url,ship_us,ship_ca,ship_intl,sales_price,pl_notes,product_url')
-        .eq('is_subassembly',false)
-        .eq('discontinued',false)
-        .gt('msrp',0)
-        .neq('pl_active',false)
-        .order('category')
-        .order('pn'),
-      db.from('settings').select('value').eq('key','portal_store_url').maybeSingle()
-    ]);
-    const products=prodResult.data||[];
-    const storeUrl=(storeResult.data?.value||'https://tgkmotorsport.com').replace(/\/$/, '');
-
-    const _dph=buildDealerPortalHTML(dealer,products,storeUrl);window._dealerPortalHTML=_dph;wrap.innerHTML=_dph;
-    attachDealerPortalSearch();
-
-
-    // Log this visit (fire-and-forget, don't block render)
-    logDealerVisit(dealer).catch(e=>console.warn('[TGK] dealer visit log failed:',e?.message||e));
-
-    // Live updates — patch prices in place when MSRP changes in ERP
-    db.channel('dealer-portal-prices')
-      .on('postgres_changes',{event:'UPDATE',schema:'public',table:'assemblies'},payload=>{
-        const row=document.querySelector(`tr[data-dpn="${payload.new.pn}"]`);
-        if(!row||!(payload.new.msrp>0))return;
-        const disc=dealer.discount_pct||0.2;
-        const dp=payload.new.msrp*(1-disc);
-        row.querySelector('.dp-msrp').textContent='$'+payload.new.msrp.toFixed(2);
-        row.querySelector('.dp-price').textContent='$'+dp.toFixed(2);
-        row.querySelector('.dp-save').textContent='-$'+(payload.new.msrp-dp).toFixed(2);
-        row.classList.add('dp-flash');
-        setTimeout(()=>row.classList.remove('dp-flash'),1500);
-        const ts=document.getElementById('dp-ts');
-        if(ts)ts.textContent='Updated '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-      })
-      .subscribe();
-  }catch(e){
-    wrap.innerHTML=dealerPortalError('Could not load price list: '+e.message);
-  }
-}
-
-function printDealerPortal(){
-  var html=window._dealerPortalHTML;
-  if(!html){window.print();return;}
-  var pw=window.open('','_blank','width=1000,height=700');
-  if(!pw){window.print();return;}
-  pw.document.open();
-  pw.document.write(html);
-  pw.document.close();
-  pw.focus();
-  pw.addEventListener('load',function(){
-    setTimeout(function(){pw.print();},400);
-  });
-  setTimeout(function(){if(pw.document.readyState==='complete')pw.print();},800);
-}
-function buildDealerPortalHTML(dealer,products,storeUrl){
-  var disc=dealer.discount_pct||0.2;
-  var tier=Math.round(disc*100)+'% off MSRP';
-  var now=new Date().toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'});
-  var logoSrc=document.querySelector('.logo-img')?document.querySelector('.logo-img').src:'';
-  var dname=escHtml(dealer.name||'Dealer');
-
-  var catMap={};
-  products.forEach(function(p){var c=p.category||'Other';if(!catMap[c])catMap[c]=[];catMap[c].push(p);});
-  var cats=Object.keys(catMap).sort();
-
-  var sections=cats.map(function(cat){
-    var rows=catMap[cat].map(function(p){
-      var sku=(p.use_new_sku&&p.new_sku)?p.new_sku:p.pn;
-      var sp=p.sales_price!=null?parseFloat(p.sales_price):null;
-      var dp=sp!=null?sp:p.msrp*(1-disc);
-      var isSale=sp!=null;
-      var su=p.ship_us||'FREE';var sc2=p.ship_ca||'$25.00';var si=p.ship_intl||'--';
-      var searchStr=(sku+' '+p.pn+' '+(p.description||'')+' '+cat).toLowerCase();
-      return '<tr data-dpn="'+escHtml(sku)+'" data-search="'+escHtml(searchStr)+'" style="border-bottom:1px solid #e5e7eb">'
-        +(p.product_url
-          ?'<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:5px 8px"><a href="'+escHtml(p.product_url)+'" target="_blank" style="color:#0d9488;text-decoration:none;border-bottom:1px dashed rgba(13,148,136,.4)" title="View product page">'+escHtml(sku)+'&thinsp;&#8599;</a></td>'
-          :'<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:5px 8px">'+escHtml(sku)+'</td>'
-        )
-        +'<td style="font-size:11px;padding:5px 8px">'+escHtml(p.description||'')+'</td>'
-        +'<td style="text-align:right;font-size:11px;padding:5px 8px">$'+p.msrp.toFixed(2)+'</td>'
-        +'<td style="text-align:right;font-weight:700;font-size:11px;padding:5px 8px;color:'+(isSale?'#dc2626':'#0d9488')+'">$'+dp.toFixed(2)+(isSale?' <span style="background:#dc2626;color:#fff;border-radius:3px;padding:1px 4px;font-size:9px">SALE</span>':'')+'</td>'
-        +'<td style="text-align:right;font-size:10px;color:#6b7280;padding:5px 8px">$'+(p.msrp-dp).toFixed(2)+'</td>'
-        +'<td style="text-align:center;font-size:11px;padding:5px 8px">'+escHtml(su)+'</td>'
-        +'<td style="text-align:center;font-size:11px;padding:5px 8px">'+escHtml(sc2)+'</td>'
-        +'<td style="text-align:center;font-size:11px;padding:5px 8px">'+escHtml(si)+'</td>'
-        +'<td style="font-size:10px;color:#6b7280;padding:5px 8px;font-style:italic">'+escHtml(p.pl_notes||'')+'</td>'
-        +'</tr>';
-    }).join('');
-    return '<div class="dp-section" style="margin-bottom:28px">'
-      +'<div class="dp-cat-heading">'+escHtml(cat)+'</div>'
-      +'<table style="width:100%;border-collapse:collapse">'
-      +'<thead><tr style="font-size:10px;color:#6b7280;background:#f9fafb">'
-      +'<th style="text-align:left;padding:4px 8px">SKU</th><th style="text-align:left;padding:4px 8px">Description</th>'
-      +'<th style="text-align:right;padding:4px 8px">MSRP</th><th style="text-align:right;padding:4px 8px">Dealer Price</th>'
-      +'<th style="text-align:right;padding:4px 8px">Savings</th>'
-      +'<th style="text-align:center;padding:4px 8px">US Ship</th><th style="text-align:center;padding:4px 8px">Canada</th>'
-      +'<th style="text-align:center;padding:4px 8px">Intl</th><th style="text-align:left;padding:4px 8px">Notes</th>'
-      +'</tr></thead><tbody>'+rows+'</tbody></table></div>';
-  }).join('');
-
-  return '<!DOCTYPE html><html><head><meta charset="UTF-8">'
-    +'<meta name="viewport" content="width=device-width,initial-scale=1">'
-    +'<title>TGK Motorsport - '+dname+' Price List</title>'
-    +'<style>'
-    +'*{box-sizing:border-box}'
-    +'body{font-family:"DM Sans",Arial,sans-serif;margin:0;padding:24px 20px;background:#f3f4f6;color:#111}'
-    +'.dp-wrap{max-width:1100px;margin:0 auto;background:#fff;border-radius:10px;padding:32px 36px;box-shadow:0 2px 12px rgba(0,0,0,.08)}'
-    +'.dp-header{display:flex;align-items:flex-start;gap:20px;padding-bottom:20px;border-bottom:3px solid #0d9488;margin-bottom:24px}'
-    +'.dp-cat-heading{font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#374151;padding:8px 0 5px;border-bottom:2px solid #0d9488;margin-bottom:0}'
-    +'table{width:100%;border-collapse:collapse;margin-bottom:24px}'
-    +'thead th{background:#f9fafb;font-size:10px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;padding:8px 12px;white-space:nowrap}'
-    +'tbody td{padding:9px 12px;font-size:12px;border-bottom:1px solid #f0f0f0;vertical-align:middle}'
-    +'tbody tr:last-child td{border-bottom:none}'
-    +'tbody tr:hover td{background:#f0fdf4}'
-    +'.dp-search{width:100%;max-width:320px;padding:8px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:12px;margin-bottom:16px;outline:none}'
-    +'.dp-search:focus{border-color:#0d9488}'
-    +'.dp-flash td{animation:dpf .8s}'
-    +'@keyframes dpf{0%{background:#d1fae5}100%{background:transparent}}'
-    +'@keyframes spin{to{transform:rotate(360deg)}}'
-    +'@media(max-width:768px){.dp-wrap{padding:16px 14px;border-radius:0}body{padding:0}thead th,tbody td{padding:6px 8px;font-size:11px}}'
-    +'@media print{.no-print{display:none!important}body{background:#fff;padding:0}.dp-wrap{box-shadow:none;padding:0;border-radius:0}thead th{background:#eee}}'
-    +'</style>'
-    +'</head><body><div class="dp-wrap">'
-    +'<div class="dp-header">'
-    +(logoSrc?'<img src="'+logoSrc+'" style="height:52px;width:auto" alt="TGK Motorsport">':'<div style="font-size:24px;font-weight:900;color:#0d9488;letter-spacing:-.5px">TGK MOTORSPORT</div>')
-    +'<div style="flex:1"><div style="font-size:20px;font-weight:800;color:#111;margin-bottom:4px">Authorized Dealer Price List</div>'
-    +'<div style="font-size:12px;color:#6b7280">'+dname+' &bull; '+now+'</div>'
-    +'<div style="margin-top:6px;display:flex;gap:8px;align-items:center">'
-    +'<span style="background:#f0fdf4;border:1px solid #0d9488;color:#065f46;font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px">'+tier+'</span>'
-    +'<span style="background:#fef2f2;border:1px solid #dc2626;color:#dc2626;font-size:10px;font-weight:700;padding:3px 10px;border-radius:20px">CONFIDENTIAL</span>'
-    +'</div></div>'
-    +'<div style="display:flex;gap:8px;align-items:flex-start">'
-    +'<span id="dp-ts" style="font-size:10px;color:#9ca3af;align-self:flex-end"></span>'
-    +'<button class="no-print" onclick="printDealerPortal()" style="padding:9px 18px;background:#0d9488;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap">&#128438; Print / PDF</button>'
-    +'</div>'
-    +'</div>'
+    +'<div id="dp-prices-section">'
     +'<div class="no-print" style="margin:0 0 18px;display:flex;align-items:center;gap:10px">'
     +'<div style="position:relative;flex:1;max-width:360px">'
     +'<span style="position:absolute;left:11px;top:50%;transform:translateY(-50%);color:#9ca3af;font-size:14px;pointer-events:none">&#9906;</span>'
     +'<input id="dp-search-input" class="dp-search" style="padding-left:34px" type="search" placeholder="Search SKU or description…" oninput="dealerPortalFilter(this.value)" autocomplete="off">'
     +'</div>'
     +'<span id="dp-result-count" style="font-size:11px;color:#9ca3af"></span>'
-    +'<button onclick="document.getElementById(\"dp-search-input\").value=\"\";dealerPortalFilter(\"\")" style="font-size:11px;color:#6b7280;background:none;border:1px solid #d1d5db;border-radius:5px;padding:5px 10px;cursor:pointer">Clear</button>'
+    +'<button onclick="document.getElementById(&quot;dp-search-input&quot;).value=&quot;&quot;;dealerPortalFilter(&quot;&quot;)" style="font-size:11px;color:#6b7280;background:none;border:1px solid #d1d5db;border-radius:5px;padding:5px 10px;cursor:pointer">Clear</button>'
     +'</div>'
     +sections
     +'<div id="dp-empty" style="display:none;text-align:center;padding:48px 20px;color:#9ca3af">'
@@ -7514,9 +7391,39 @@ function buildDealerPortalHTML(dealer,products,storeUrl){
     +'<div style="font-size:14px;font-weight:600;margin-bottom:4px">No results</div>'
     +'<div style="font-size:12px">Try a different SKU or keyword</div>'
     +'</div>'
+    +'</div>'
+    +(fitProducts.length>0?'<div id="dp-fitments-section" style="display:none">'+fitGuideSection+'</div>':'')
     +'<div style="margin-top:28px;padding-top:14px;border-top:1px solid #e5e7eb;font-size:10px;color:#9ca3af;text-align:center">'
     +'Confidential &mdash; '+dname+' only &mdash; Prices subject to change &mdash; &copy; TGK Motorsport '+new Date().getFullYear()
-    +'</div></div></body></html>';
+    +'</div></div>'
+    +'<script>'
+    +'function dpTab(btn){'
+      +'var t=btn.dataset.tab;'
+      +'var ps=document.getElementById("dp-prices-section");'
+      +'var fs=document.getElementById("dp-fitments-section");'
+      +'if(ps)ps.style.display=t==="prices"?"":"none";'
+      +'if(fs)fs.style.display=t==="fitments"?"":"none";'
+      +'document.querySelectorAll("[data-tab]").forEach(function(b){'
+        +'var on=b.dataset.tab===t;'
+        +'b.style.borderBottomColor=on?"#0d9488":"transparent";'
+        +'b.style.color=on?"#0d9488":"#9ca3af";'
+      +'});'
+    +'}'
+    +'function dpFilterFit(q){'
+      +'var makeEl=document.getElementById("dp-fit-make");'
+      +'var make=makeEl?makeEl.value:"";'
+      +'var cards=document.querySelectorAll(".dp-fit-card");'
+      +'var shown=0;'
+      +'cards.forEach(function(c){'
+        +'var s=c.dataset.fitSearch||"";'
+        +'var show=(!q||s.includes(q.toLowerCase()))&&(!make||s.includes(make.toLowerCase()));'
+        +'c.style.display=show?"":"none";'
+        +'if(show)shown++;'
+      +'});'
+      +'var cnt=document.getElementById("dp-fit-count");if(cnt)cnt.textContent=shown+" part"+(shown!==1?"s":"");'
+    +'}'
+    +('<'+'/'+'script>')
+    +'</body></html>';
 }
 
 
@@ -9243,7 +9150,7 @@ function _updateAuthUI(){
   const rl=document.getElementById('sidebar-role-label');
   if(rl)rl.textContent=ROLE_LABELS[S.currentRole]||S.currentRole||'User';
   const em=document.getElementById('sidebar-email');if(em)em.textContent=S.currentUser||'';
-  const ALL_NAV=['dashboard','lookup','parts','assemblies','boms','inventory','packqueue','cyclecounts','corrections','planning','purchases','sales','warranty','vendors','dealers','pricelist','ai','reports'];
+  const ALL_NAV=['dashboard','lookup','parts','assemblies','boms','fitments','inventory','packqueue','cyclecounts','corrections','planning','purchases','sales','warranty','vendors','dealers','pricelist','ai','reports'];
   const ADMIN_ONLY=['nav-users','nav-integrations','nav-import','nav-backups'];
   const role=S.currentRole||'warehouse';
   const enforce=localStorage.getItem('tgk_enforce_perms')==='true';
@@ -9548,6 +9455,19 @@ function renderUsersSQLSetup(msg){
     +'\n-- Dev pipeline columns (run once on existing installs):\n'
     +'ALTER TABLE assemblies ADD COLUMN IF NOT EXISTS stage TEXT DEFAULT NULL;\n'
     +'ALTER TABLE assemblies ADD COLUMN IF NOT EXISTS cc_project TEXT DEFAULT NULL;\n'
+    +'\n-- Fitment guide (run once):\n'
+    +'CREATE TABLE IF NOT EXISTS fitments (\n'
+    +'  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,\n'
+    +'  pn TEXT NOT NULL,\n'
+    +'  year_from INTEGER,\n'
+    +'  year_to INTEGER,\n'
+    +'  make TEXT,\n'
+    +'  model TEXT,\n'
+    +'  submodel TEXT,\n'
+    +'  notes TEXT,\n'
+    +'  created_at TIMESTAMPTZ DEFAULT NOW()\n'
+    +');\n'
+    +'CREATE INDEX IF NOT EXISTS fitments_pn_idx ON fitments(pn);\n'
     +'ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;\n'
     +'CREATE POLICY \"own_profile\" ON profiles FOR SELECT USING (auth.uid()=id);\n'
     +'CREATE POLICY \"admin_all\"   ON profiles FOR ALL USING (\n'
@@ -15592,6 +15512,386 @@ window._aomAddAll=function(){
   else toast('Nothing checked to order');
 };
 
+
+// ============================================================
+// FITMENT GUIDE
+// ============================================================
+
+function renderFitments() {
+  const tab = S.fitmentTab || 'guide';
+  const guideHtml = tab === 'guide' ? renderFitmentsGuide() : '';
+  const manageHtml = tab === 'manage' ? renderFitmentsManage() : '';
+  return `
+  <div class="tabs-row" style="margin-bottom:0">
+    <div class="tab ${tab==='guide'?'active':''}" onclick="S.fitmentTab='guide';render()">&#128218; Dealer Guide</div>
+    <div class="tab ${tab==='manage'?'active':''}" onclick="S.fitmentTab='manage';render()">&#128221; Manage &amp; Import</div>
+  </div>
+  ${tab==='guide'?guideHtml:manageHtml}`;
+}
+
+function _fitYearLabel(f) {
+  if(!f.year_from)return'All Years';
+  if(f.year_from===f.year_to||!f.year_to)return String(f.year_from);
+  return f.year_from+'\u2013'+f.year_to;
+}
+
+function renderFitmentsGuide() {
+  const sf=S.filters.fitments||{};
+  const q=(sf.search||'').toLowerCase();
+  const makeFilter=sf.make||'';
+
+  // Group fitments by pn
+  const byPn={};
+  S.fitments.forEach(f=>{
+    if(!byPn[f.pn])byPn[f.pn]=[];
+    byPn[f.pn].push(f);
+  });
+
+  const makes=[...new Set(S.fitments.map(f=>f.make||'').filter(Boolean))].sort();
+
+  // Build part list — only assemblies/parts that have fitment data
+  let asmList=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&byPn[a.pn]);
+  if(q)asmList=asmList.filter(a=>a.pn.toLowerCase().includes(q)||(a.description||'').toLowerCase().includes(q)||
+    (byPn[a.pn]||[]).some(f=>(f.make||'').toLowerCase().includes(q)||(f.model||'').toLowerCase().includes(q)));
+  if(makeFilter)asmList=asmList.filter(a=>(byPn[a.pn]||[]).some(f=>f.make===makeFilter));
+  asmList.sort((a,b)=>a.pn.localeCompare(b.pn));
+
+  const totalApps=S.fitments.length;
+  const totalPns=Object.keys(byPn).length;
+
+  const cards=asmList.map(a=>{
+    const fitments=(byPn[a.pn]||[]);
+    const fMakes=[...new Set(fitments.map(f=>f.make||'').filter(Boolean))].sort();
+    const t1Price=(a.msrp||0)*(1-(S.pricingTiers?.[0]?.discount||0.2));
+
+    // Group fitments by make > model > year ranges
+    const modelGroups={};
+    fitments.forEach(f=>{
+      const key=(f.make||'?')+'|'+(f.model||'?');
+      if(!modelGroups[key])modelGroups[key]={make:f.make,model:f.model,rows:[]};
+      modelGroups[key].rows.push(f);
+    });
+
+    const appRows=Object.values(modelGroups).sort((a,b)=>(a.make+a.model).localeCompare(b.make+b.model)).map(g=>{
+      const yearSubs=g.rows.sort((a,b)=>(a.year_from||0)-(b.year_from||0)).map(f=>{
+        const sub=f.submodel&&f.submodel.toLowerCase()!=='base'&&f.submodel.toLowerCase()!=='all'?` <span style="font-size:9px;color:var(--text3);font-style:italic">${escHtml(f.submodel)}</span>`:'';
+        const note=f.notes?` <span style="font-size:9px;color:var(--text3)">— ${escHtml(f.notes)}</span>`:'';
+        return `<span style="display:inline-block;background:var(--bg3);border-radius:3px;padding:1px 6px;margin:1px;font-size:10px;font-family:var(--mono)">${_fitYearLabel(f)}${sub}${note}</span>`;
+      }).join('');
+      return `<tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:4px 8px;font-size:11px;font-weight:600;color:var(--text);white-space:nowrap">${escHtml(g.make||'')}</td>
+        <td style="padding:4px 8px;font-size:11px;color:var(--text2)">${escHtml(g.model||'')}</td>
+        <td style="padding:4px 8px">${yearSubs}</td>
+      </tr>`;
+    }).join('');
+
+    return `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:10px">
+      <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:10px;flex-wrap:wrap">
+        <div style="flex:1;min-width:200px">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px">
+            <span style="font-family:var(--mono);font-size:13px;font-weight:700;color:var(--teal)">${escHtml(a.pn)}</span>
+            ${a.category?`<span class="bomtag ${catBomClass(a.category)}">${escHtml(a.category)}</span>`:''}
+          </div>
+          <div style="font-size:12px;color:var(--text2)">${escHtml(a.description||'')}</div>
+          <div style="font-size:11px;color:var(--text3);margin-top:4px">${fitments.length} application${fitments.length!==1?'s':''} &middot; ${fMakes.join(', ')}</div>
+        </div>
+        <div style="text-align:right;flex-shrink:0">
+          <div style="font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:.07em;margin-bottom:2px">Dealer Price (T1)</div>
+          <div style="font-size:18px;font-weight:700;color:var(--orange)">${fc(t1Price)}</div>
+          <div style="font-size:10px;color:var(--text3)">MSRP ${fc(a.msrp||0)}</div>
+          ${a.product_url?`<a href="${escHtml(a.product_url)}" target="_blank" style="font-size:10px;color:var(--teal);text-decoration:none;display:block;margin-top:4px">View Product &#8599;</a>`:''}
+        </div>
+      </div>
+      <div style="overflow-x:auto">
+        <table style="width:100%;border-collapse:collapse;font-size:11px">
+          <thead><tr style="background:var(--bg3)">
+            <th style="padding:4px 8px;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--text3);font-weight:700;white-space:nowrap">Make</th>
+            <th style="padding:4px 8px;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--text3);font-weight:700">Model</th>
+            <th style="padding:4px 8px;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--text3);font-weight:700">Year(s)</th>
+          </tr></thead>
+          <tbody>${appRows}</tbody>
+        </table>
+      </div>
+    </div>`;
+  }).join('');
+
+  return `
+  <div style="display:flex;align-items:center;gap:8px;padding:10px 0 8px;flex-wrap:wrap">
+    <div class="search-wrap" style="flex:1;min-width:180px"><span class="search-icon">&#8981;</span>
+      <input placeholder="Search part # or vehicle…" value="${sf.search||''}" oninput="setFilter('fitments','search',this.value)">
+    </div>
+    <select class="form-input" style="width:160px" onchange="setFilter('fitments','make',this.value)">
+      <option value="">All Makes</option>
+      ${makes.map(m=>`<option value="${escHtml(m)}" ${makeFilter===m?'selected':''}>${escHtml(m)}</option>`).join('')}
+    </select>
+    <span style="font-size:11px;color:var(--text3)">${asmList.length} part${asmList.length!==1?'s':''} &middot; ${totalApps} applications</span>
+    <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="printFitmentGuide()">&#128438; Print Guide</button>
+  </div>
+  ${asmList.length===0?`<div class="section-empty" style="margin-top:40px">${totalPns===0?'No fitment data yet &mdash; go to Manage &amp; Import to add data.':'No results match your search.'}</div>`:cards}`;
+}
+
+function renderFitmentsManage() {
+  const makes=[...new Set(S.fitments.map(f=>f.make||'').filter(Boolean))].sort();
+  const byPn={};S.fitments.forEach(f=>{if(!byPn[f.pn])byPn[f.pn]=[];byPn[f.pn].push(f);});
+  const pns=Object.keys(byPn).sort();
+  const sf=S.filters.fitmentsM||{};
+
+  let rows=[...S.fitments];
+  if(sf.search){const q=sf.search.toLowerCase();rows=rows.filter(f=>f.pn.toLowerCase().includes(q)||(f.make||'').toLowerCase().includes(q)||(f.model||'').toLowerCase().includes(q));}
+  if(sf.make)rows=rows.filter(f=>f.make===sf.make);
+
+  return `
+  <!-- Import panel -->
+  <div class="panel" style="padding:16px 18px;margin-bottom:14px">
+    <div style="font-size:13px;font-weight:700;color:var(--text);margin-bottom:4px">&#128221; Import from Convermax CSV</div>
+    <div style="font-size:11px;color:var(--text3);margin-bottom:12px">
+      Paste your Convermax export below. Expected columns (any order, header required):
+      <strong>Part Number</strong> or <strong>PartNumber</strong> &middot;
+      <strong>Year</strong> (single) or <strong>Year From</strong> + <strong>Year To</strong> (range) &middot;
+      <strong>Make</strong> &middot; <strong>Model</strong> &middot;
+      <strong>SubModel</strong> or <strong>Submodel</strong> (optional) &middot;
+      <strong>Notes</strong> (optional)
+    </div>
+    <textarea id="fit-csv-input" class="form-input" rows="6" style="width:100%;font-family:var(--mono);font-size:11px;resize:vertical" placeholder="Paste CSV here… (include header row)"></textarea>
+    <div id="fit-csv-preview" style="margin-top:8px;font-size:11px;color:var(--text3);min-height:18px"></div>
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+      <button class="btn btn-sm" onclick="previewFitmentCSV()">&#128269; Preview</button>
+      <button class="btn btn-primary btn-sm" onclick="importFitmentCSV('add')">&#8853; Add to Existing</button>
+      <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="importFitmentCSV('replace')">&#8635; Replace All &amp; Re-import</button>
+    </div>
+  </div>
+
+  <!-- Table -->
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+    <div class="search-wrap" style="flex:1;min-width:160px"><span class="search-icon">&#8981;</span>
+      <input placeholder="Filter by PN or vehicle…" value="${sf.search||''}" oninput="setFilter('fitmentsM','search',this.value)">
+    </div>
+    <select class="form-input" style="width:150px" onchange="setFilter('fitmentsM','make',this.value)">
+      <option value="">All Makes</option>
+      ${makes.map(m=>`<option value="${escHtml(m)}" ${sf.make===m?'selected':''}>${escHtml(m)}</option>`).join('')}
+    </select>
+    <span style="font-size:11px;color:var(--text3)">${rows.length} rows &middot; ${pns.length} SKUs</span>
+    <button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.25)" onclick="deleteAllFitments()">&#128465; Delete All</button>
+  </div>
+  <div class="tbl-wrap"><table style="font-size:12px"><thead><tr>
+    <th>Part #</th><th>Make</th><th>Model</th><th>Year</th><th>Submodel</th><th>Notes</th><th></th>
+  </tr></thead><tbody>
+  ${rows.slice(0,500).map(f=>`<tr>
+    <td class="pn">${escHtml(f.pn)}</td>
+    <td>${escHtml(f.make||'')}</td>
+    <td>${escHtml(f.model||'')}</td>
+    <td class="money-neutral">${_fitYearLabel(f)}</td>
+    <td style="color:var(--text3)">${escHtml(f.submodel||'')}</td>
+    <td style="color:var(--text3);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(f.notes||'')}</td>
+    <td><button class="action-btn del" onclick="deleteFitment('${f.id}')">&#10005;</button></td>
+  </tr>`).join('')}
+  ${rows.length>500?`<tr><td colspan="7" style="text-align:center;padding:10px;color:var(--text3)">Showing 500 of ${rows.length} rows — use search to filter</td></tr>`:''}
+  </tbody></table></div>`;
+}
+
+// ── CSV parsing & import ─────────────────────────────────────────────────────
+
+function _parseFitCSV(text) {
+  const lines=text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+  if(lines.length<2)return{rows:[],error:'CSV needs at least a header and one data row'};
+
+  // Parse header — flexible column matching
+  const hdr=lines[0].split(',').map(h=>h.trim().replace(/^"|"$/g,'').toLowerCase());
+  const col=name=>{
+    const aliases={
+      pn:['part number','partnumber','part#','partno','sku','part_number'],
+      year:['year'],
+      year_from:['year from','yearfrom','year_from','from year'],
+      year_to:['year to','yearto','year_to','to year','thru year'],
+      make:['make','manufacturer'],
+      model:['model','vehicle model'],
+      submodel:['submodel','sub model','sub-model','trim','submodel/trim'],
+      notes:['notes','note','comments'],
+    };
+    const al=aliases[name]||[name];
+    for(const a of al){const i=hdr.indexOf(a);if(i>=0)return i;}
+    return -1;
+  };
+
+  const iPN=col('pn'),iYear=col('year'),iYF=col('year_from'),iYT=col('year_to');
+  const iMake=col('make'),iModel=col('model'),iSub=col('submodel'),iNotes=col('notes');
+
+  if(iPN<0)return{rows:[],error:'Could not find a Part Number column. Expected: "Part Number", "PartNumber", or "SKU"'};
+  if(iMake<0||iModel<0)return{rows:[],error:'Could not find Make and/or Model columns.'};
+
+  const raw=[];
+  for(let i=1;i<lines.length;i++){
+    const cells=lines[i].split(',').map(c=>c.trim().replace(/^"|"$/g,''));
+    const pn=(cells[iPN]||'').trim();
+    if(!pn)continue;
+    const make=(cells[iMake]||'').trim()||null;
+    const model=(cells[iModel]||'').trim()||null;
+    const submodel=iSub>=0?(cells[iSub]||'').trim()||null:null;
+    const notes=iNotes>=0?(cells[iNotes]||'').trim()||null:null;
+
+    let yr=null,yf=null,yt=null;
+    if(iYear>=0&&cells[iYear])yr=parseInt(cells[iYear])||null;
+    if(iYF>=0&&cells[iYF])yf=parseInt(cells[iYF])||null;
+    if(iYT>=0&&cells[iYT])yt=parseInt(cells[iYT])||null;
+
+    const year_from=yr||yf||null;
+    const year_to=yr||yt||year_from;
+    raw.push({pn,year_from,year_to,make,model,submodel,notes});
+  }
+
+  // Consolidate consecutive years for same pn+make+model+submodel
+  const groups={};
+  raw.forEach(r=>{
+    const key=[r.pn,r.make||'',r.model||'',r.submodel||'',r.notes||''].join('\x00');
+    if(!groups[key])groups[key]={pn:r.pn,make:r.make,model:r.model,submodel:r.submodel,notes:r.notes,years:[]};
+    if(r.year_from!==null){
+      for(let y=r.year_from;y<=(r.year_to||r.year_from);y++)groups[key].years.push(y);
+    } else {
+      groups[key].years.push(null);
+    }
+  });
+
+  const rows=[];
+  Object.values(groups).forEach(g=>{
+    if(g.years.includes(null)||!g.years.length){
+      rows.push({pn:g.pn,year_from:null,year_to:null,make:g.make,model:g.model,submodel:g.submodel,notes:g.notes});
+      return;
+    }
+    const sorted=[...new Set(g.years)].sort((a,b)=>a-b);
+    let rs=sorted[0],re=sorted[0];
+    for(let i=1;i<=sorted.length;i++){
+      if(i<sorted.length&&sorted[i]===re+1){re=sorted[i];}
+      else{
+        rows.push({pn:g.pn,year_from:rs,year_to:re,make:g.make,model:g.model,submodel:g.submodel,notes:g.notes});
+        if(i<sorted.length){rs=sorted[i];re=sorted[i];}
+      }
+    }
+  });
+  return{rows,error:null};
+}
+
+window.previewFitmentCSV=function(){
+  const text=document.getElementById('fit-csv-input')?.value||'';
+  const{rows,error}=_parseFitCSV(text);
+  const el=document.getElementById('fit-csv-preview');
+  if(!el)return;
+  if(error){el.innerHTML=`<span style="color:var(--red)">&#9888; ${escHtml(error)}</span>`;return;}
+  const pns=[...new Set(rows.map(r=>r.pn))];
+  el.innerHTML=`<span style="color:var(--teal)">&#10003; ${rows.length} application row${rows.length!==1?'s':''} parsed &mdash; ${pns.length} unique SKU${pns.length!==1?'s':''}: ${pns.slice(0,6).map(escHtml).join(', ')}${pns.length>6?' \u2026':''}</span>`;
+};
+
+window.importFitmentCSV=async function(mode){
+  const text=document.getElementById('fit-csv-input')?.value||'';
+  const{rows,error}=_parseFitCSV(text);
+  if(error){toast('Error: '+error);return;}
+  if(!rows.length){toast('No rows to import');return;}
+
+  const pns=[...new Set(rows.map(r=>r.pn))];
+  const modeLabel=mode==='replace'?'replace ALL existing fitments for these '+pns.length+' SKU(s)':'add '+rows.length+' row(s)';
+  if(!confirm('Import: '+modeLabel+'?\n\n'+pns.slice(0,8).join(', ')+(pns.length>8?' … and '+(pns.length-8)+' more':'')))return;
+
+  toast('Importing\u2026');
+  if(mode==='replace'){
+    // Delete existing fitments for these PNs
+    for(const pn of pns){
+      await db.from('fitments').delete().eq('pn',pn);
+    }
+  }
+
+  // Insert in batches of 200
+  const BATCH=200;
+  let inserted=0;
+  for(let i=0;i<rows.length;i+=BATCH){
+    const batch=rows.slice(i,i+BATCH);
+    const{error:ie}=await db.from('fitments').insert(batch);
+    if(ie){toast('Import error: '+ie.message);return;}
+    inserted+=batch.length;
+  }
+
+  // Reload fitments
+  const{data}=await db.from('fitments').select('*').order('make').order('model').order('year_from');
+  S.fitments=data||[];
+  document.getElementById('fit-csv-input').value='';
+  const prev=document.getElementById('fit-csv-preview');if(prev)prev.textContent='';
+  toast('\u2713 Imported '+inserted+' fitment row'+(inserted!==1?'s':'')+' for '+pns.length+' SKU'+(pns.length!==1?'s':''));
+  render();
+};
+
+window.deleteFitment=async function(id){
+  if(!confirm('Delete this fitment row?'))return;
+  const{error}=await db.from('fitments').delete().eq('id',id);
+  if(error){toast('Error: '+error.message);return;}
+  S.fitments=S.fitments.filter(f=>f.id!==id);
+  render();
+};
+
+window.deleteAllFitments=async function(){
+  if(!confirm('Delete ALL fitment data?\n\nThis cannot be undone.'))return;
+  const{error}=await db.from('fitments').delete().neq('id','00000000-0000-0000-0000-000000000000');
+  if(error){toast('Error: '+error.message);return;}
+  S.fitments=[];
+  toast('All fitment data deleted');
+  render();
+};
+
+// ── Print fitment guide ──────────────────────────────────────────────────────
+window.printFitmentGuide=function(){
+  const sf=S.filters.fitments||{};
+  const q=(sf.search||'').toLowerCase();
+  const makeFilter=sf.make||'';
+  const byPn={};S.fitments.forEach(f=>{if(!byPn[f.pn])byPn[f.pn]=[];byPn[f.pn].push(f);});
+  let asmList=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&byPn[a.pn]);
+  if(q)asmList=asmList.filter(a=>a.pn.toLowerCase().includes(q)||(a.description||'').toLowerCase().includes(q)||(byPn[a.pn]||[]).some(f=>(f.make||'').toLowerCase().includes(q)||(f.model||'').toLowerCase().includes(q)));
+  if(makeFilter)asmList=asmList.filter(a=>(byPn[a.pn]||[]).some(f=>f.make===makeFilter));
+  asmList.sort((a,b)=>a.pn.localeCompare(b.pn));
+
+  const t1Disc=S.pricingTiers?.[0]?.discount||0.2;
+
+  const sections=asmList.map(a=>{
+    const fits=(byPn[a.pn]||[]);
+    const modelGroups={};
+    fits.forEach(f=>{
+      const key=(f.make||'?')+'|'+(f.model||'?');
+      if(!modelGroups[key])modelGroups[key]={make:f.make,model:f.model,rows:[]};
+      modelGroups[key].rows.push(f);
+    });
+    const tableRows=Object.values(modelGroups).sort((a,b)=>(a.make+a.model).localeCompare(b.make+b.model)).map(g=>{
+      const years=g.rows.sort((a,b)=>(a.year_from||0)-(b.year_from||0)).map(f=>{
+        const s=f.submodel&&f.submodel.toLowerCase()!=='base'&&f.submodel.toLowerCase()!=='all'?' ('+f.submodel+')':'';
+        return _fitYearLabel(f)+s;
+      }).join(', ');
+      return `<tr><td>${g.make}</td><td>${g.model}</td><td>${years}</td></tr>`;
+    }).join('');
+    const t1=fc((a.msrp||0)*(1-t1Disc));
+    return `<div class="part-section"><div class="part-header"><span class="pn">${a.pn}</span><span class="desc">${a.description||''}</span><span class="price">Dealer: ${t1} &nbsp;&middot;&nbsp; MSRP: ${fc(a.msrp||0)}</span></div><table><thead><tr><th>Make</th><th>Model</th><th>Year(s)</th></tr></thead><tbody>${tableRows}</tbody></table></div>`;
+  }).join('');
+
+  const w=window.open('','_blank');
+  w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>TGK Motorsport Fitment Guide</title><style>
+    *{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,sans-serif;color:#111;padding:20px}
+    h1{font-size:20px;font-weight:700;margin-bottom:4px}
+    .meta{font-size:11px;color:#6b7280;margin-bottom:20px}
+    .part-section{margin-bottom:20px;page-break-inside:avoid;border-bottom:1px solid #e5e7eb;padding-bottom:16px}
+    .part-header{display:flex;align-items:baseline;gap:12px;margin-bottom:8px;flex-wrap:wrap}
+    .pn{font-family:monospace;font-size:14px;font-weight:700;color:#0d9488}
+    .desc{font-size:13px;color:#374151;flex:1}
+    .price{font-size:11px;color:#6b7280;white-space:nowrap}
+    table{width:100%;border-collapse:collapse;font-size:11px}
+    th{background:#f3f4f6;padding:4px 8px;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:#6b7280}
+    td{padding:3px 8px;border-bottom:1px solid #f9fafb}
+    @media print{button{display:none}}
+  </style></head><body>
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px">
+      <div><h1>TGK Motorsport &mdash; Fitment Guide</h1>
+      <div class="meta">${asmList.length} part${asmList.length!==1?'s':''} &middot; ${S.fitments.length} application${S.fitments.length!==1?'s':''} &middot; Generated ${new Date().toLocaleDateString()}</div></div>
+      <button onclick="window.print()" style="padding:6px 16px;background:#0d9488;color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer">Print / PDF</button>
+    </div>
+    ${sections}
+  </body></html>`);
+  w.document.close();
+};
+
+
 // ============================================================
 // REPORT CHARTS (Chart.js)
 // ============================================================
@@ -15667,7 +15967,7 @@ function scheduleRender(){
 }
 function render(){
   // Hide loader on first render  if(_sh)_sh.style.display='flex';}
-  const views={dashboard:renderDashboard,users:renderUsers,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder,reports:renderReports,pricelist:renderPriceList};
+  const views={dashboard:renderDashboard,users:renderUsers,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,fitments:renderFitments,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder,reports:renderReports,pricelist:renderPriceList};
   if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length)computeDemand();
   // Preserve focused input + caret across re-render
   const active=document.activeElement;
