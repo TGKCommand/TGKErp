@@ -7266,7 +7266,7 @@ async function startDealerPortal(dealerId){
         .eq('is_subassembly',false).eq('discontinued',false).gt('msrp',0).neq('pl_active',false)
         .order('category').order('pn'),
       db.from('settings').select('value').eq('key','portal_store_url').maybeSingle(),
-      db.from('fitments').select('*').order('make').order('model').order('year_from').then(r=>r,()=>({data:[],error:null}))
+      fetchAll((f,t)=>db.from('fitments').select('*').order('make').order('model').order('year_from').range(f,t)).then(data=>({data,error:null}),()=>({data:[],error:null}))
     ]);
     const products=prodResult.data||[];
     const storeUrl=(storeResult.data?.value||'https://tgkmotorsport.com').replace(/\/$/,'');
@@ -16331,9 +16331,9 @@ window._aomAddAll=function(){
 async function loadFitments(){
   if(S.fitments!==null)return; // already loaded
   try{
-    const{data,error}=await db.from('fitments').select('*').order('make').order('model').order('year_from');
+    // fetchAll paginates past Supabase's 1000-row REST cap
+    const data=await fetchAll((f,t)=>db.from('fitments').select('*').order('make').order('model').order('year_from').range(f,t));
     S.fitments=data||[];
-    if(error&&error.code!=='PGRST116')console.warn('[TGK] fitments:',error.message);
   }catch(e){
     S.fitments=[];
     console.warn('[TGK] fitments load failed:',e.message);
@@ -16637,7 +16637,7 @@ window.previewFitmentCSV=function(){
   if(!el)return;
   if(error){el.innerHTML=`<span style="color:var(--red)">&#9888; ${escHtml(error)}</span>`;return;}
   const pns=[...new Set(rows.map(r=>r.pn))];
-  el.innerHTML=`<span style="color:var(--teal)">&#10003; ${rows.length} application row${rows.length!==1?'s':''} parsed &mdash; ${pns.length} unique SKU${pns.length!==1?'s':''}: ${pns.slice(0,6).map(escHtml).join(', ')}${pns.length>6?' \u2026':''}</span>`;
+  el.innerHTML=`<span style="color:var(--teal)">&#10003; ${rows.length} row${rows.length!==1?'s':''} ready to insert &mdash; ${pns.length} unique SKU${pns.length!==1?'s':''}: ${pns.slice(0,6).map(escHtml).join(', ')}${pns.length>6?' …':''}</span><div style="font-size:10px;color:var(--text3);margin-top:3px">Years consolidated where consecutive. Click Import to proceed.</div>`;
 };
 
 window.importFitmentCSV=async function(mode){
@@ -16668,27 +16668,37 @@ window.importFitmentCSV=async function(mode){
   const modeLabel=mode==='replace'?'replace ALL existing fitments for these '+pns.length+' SKU(s)':'add '+rows.length+' row(s)';
   if(!confirm('Import: '+modeLabel+'?\n\n'+pns.slice(0,8).join(', ')+(pns.length>8?' … and '+(pns.length-8)+' more':'')))return;
 
-  toast('Importing\u2026');
+  toast('Importing…');
   if(mode==='replace'){
-    // Delete existing fitments for these PNs
+    // Delete existing fitments for these PNs in batches to avoid URL length limits
     for(const pn of pns){
-      await db.from('fitments').delete().eq('pn',pn);
+      const{error:de}=await db.from('fitments').delete().eq('pn',pn);
+      if(de)console.warn('[TGK] fitment delete error for',pn,de.message);
     }
   }
 
-  // Insert in batches of 200
-  const BATCH=200;
+  // Insert in batches of 100 (conservative — avoids payload size limits on large rows)
+  const BATCH=100;
   let inserted=0;
+  let batchErrors=0;
   for(let i=0;i<rows.length;i+=BATCH){
     const batch=rows.slice(i,i+BATCH);
     const{error:ie}=await db.from('fitments').insert(batch);
-    if(ie){toast('Import error: '+ie.message);return;}
-    inserted+=batch.length;
+    if(ie){
+      console.error('[TGK] fitment insert error batch '+(i/BATCH+1),ie.message);
+      batchErrors++;
+      toast('⚠ Batch '+(i/BATCH+1)+' error: '+ie.message,5000);
+      // Continue trying remaining batches rather than stopping
+    } else {
+      inserted+=batch.length;
+    }
+    // Progress update every 5 batches
+    if((i/BATCH)%5===0)toast('Importing… '+inserted+' / '+rows.length+' rows');
   }
 
-  // Reload fitments
-  const{data}=await db.from('fitments').select('*').order('make').order('model').order('year_from');
-  S.fitments=data||[];
+  // Reload fitments — fetchAll paginates past the 1000-row REST cap
+  const reloadedFits=await fetchAll((f,t)=>db.from('fitments').select('*').order('make').order('model').order('year_from').range(f,t));
+  S.fitments=reloadedFits||[];
   document.getElementById('fit-csv-input').value='';
   const prev=document.getElementById('fit-csv-preview');if(prev)prev.textContent='';
   toast('\u2713 Imported '+inserted+' fitment row'+(inserted!==1?'s':'')+' for '+pns.length+' SKU'+(pns.length!==1?'s':''));
