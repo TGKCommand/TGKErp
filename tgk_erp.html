@@ -4936,7 +4936,20 @@ Deno.serve(async (req) => {
   }
 
   // Shopify webhook handling
-  const topic = req.headers.get('x-shopify-topic') || ''
+  // x-shopify-topic header is sometimes stripped by Cloudflare before reaching Deno.
+  // Fall back to detecting the payload type from the body structure.
+  let topic = req.headers.get('x-shopify-topic')
+    || req.headers.get('X-Shopify-Topic')
+    || ''
+  // If topic still missing, infer from body
+  if (!topic) {
+    if (body.line_items && body.id && body.order_number) {
+      // Has cancel_reason set = cancelled, otherwise create/update
+      topic = body.cancelled_at ? 'orders/cancelled' : 'orders/create'
+    } else if (body.cancel_reason !== undefined) {
+      topic = 'orders/cancelled'
+    }
+  }
   if (!topic) return new Response('ok', { headers: CORS })
 
   try {
@@ -8409,11 +8422,17 @@ async function saveShopify(){
   const clientId=($('sh-client-id')?.value||'').trim();
   if(!store){toast('Enter your store URL');return;}
   Object.assign(S.shopify,{store,key,webhook,clientId,connected:!!(store&&key)});
-  await db.from('settings').upsert({key:'shopify',value:S.shopify},{onConflict:'key'});
+  const{error:se}=await db.from('settings').upsert({key:'shopify',value:S.shopify},{onConflict:'key'});
+  if(se){
+    toast('\u26a0 Save FAILED: '+se.message+' — run: ALTER TABLE settings DISABLE ROW LEVEL SECURITY; in Supabase SQL Editor',10000);
+    console.error('[TGK] saveShopify failed:',se);
+    return;
+  }
   const bkTpl=(document.getElementById('sh-backorder-template')?.value||'backorder').trim();
   S.settings.shopify_backorder_template=bkTpl||'backorder';
   await db.from('settings').upsert({key:'shopify_backorder_template',value:bkTpl||'backorder'},{onConflict:'key'});
-  toast('Shopify credentials saved');render();
+  S.settings.shopify=S.shopify;
+  toast('\u2713 Shopify credentials saved to database');render();
 }
 
 // ── SHOPIFY OAUTH FLOW ────────────────────────────────────────────────────
