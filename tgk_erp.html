@@ -947,7 +947,7 @@ async function loadAll(){
       db.from('po_lines').select('*').order('po_id'),
       db.from('po_tracking').select('*').order('created_at'),
       db.from('part_files').select('*').eq('category','Label'),
-      db.from('fitments').select('*').order('make').order('model').order('year_from').catch(()=>({data:[],error:null})),
+      Promise.resolve(db.from('fitments').select('*').order('make').order('model').order('year_from')).catch(()=>({data:[],error:null})),
     ]);
     if(parts.error)throw parts.error;
     S.parts=parts.data||[];
@@ -1988,7 +1988,14 @@ function renderBOMs(){
           </div>
           ${bomTag(item.child_pn,item.item_type)}<span style="width:6px"></span>
           <span class="money-neutral" style="min-width:28px;text-align:right">×${item.qty}</span>
-          <span class="money-cost" style="min-width:58px;text-align:right">${fc(lineCost(item))}</span>
+          ${(()=>{
+            const uc=lineUnitCost(item);
+            const total=lineCost(item);
+            const p=S.parts.find(x=>x.pn===item.child_pn);
+            const hasTier=p&&Array.isArray(p.price_breaks)&&p.price_breaks.some(b=>b.qty>0&&b.price>0&&(item.qty||1)>=b.qty);
+            return `<span class="money-cost" style="min-width:80px;text-align:right;white-space:nowrap">${fc(uc,4)}/ea${hasTier?'<span title="Tier price active" style="font-size:8px;color:var(--teal);background:var(--teal-dim);border-radius:2px;padding:0 3px;margin-left:3px">T</span>':''}</span>
+          <span class="money-neutral" style="font-size:10px;min-width:60px;text-align:right;color:var(--text3)">${fc(total)}</span>`;
+          })()}
           <button class="action-btn del" style="margin-left:8px" onclick="delBOMItem('${item.id}','${sel}')">×</button>
         </div>`;}).join('')}
       <div style="padding:10px 18px;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
@@ -2037,7 +2044,7 @@ function renderBOMs(){
         </div>
       </div>
       <div class="form-row cols-2">
-        <div class="form-group"><label class="form-label">Child Part #</label><input id="bom-child" class="form-input" placeholder="PN" list="bom-child-list" autocomplete="off" oninput="bomChildLookup()"><datalist id="bom-child-list">${[...S.parts.filter(p=>!p.discontinued).map(p=>p.pn),...S.assemblies.filter(a=>!a.discontinued).map(a=>a.pn)].sort().map(pn=>pnOpt(pn)).join('')}${[...S.parts.filter(p=>p.discontinued).map(p=>p.pn),...S.assemblies.filter(a=>a.discontinued).map(a=>a.pn)].sort().map(pn=>pnOptDisc(pn)).join('')}</datalist></div>
+        <div class="form-group"><label class="form-label">Child Part #</label><input id="bom-child" class="form-input" placeholder="PN" list="bom-child-list" autocomplete="off" oninput="bomChildLookup()" onchange="bomChildFill()" onkeydown="if(event.key==='Enter'){event.preventDefault();bomChildFill();document.getElementById('bom-qty')?.focus();}"><datalist id="bom-child-list">${[...S.parts.filter(p=>!p.discontinued).map(p=>p.pn),...S.assemblies.filter(a=>!a.discontinued).map(a=>a.pn)].sort().map(pn=>pnOpt(pn)).join('')}${[...S.parts.filter(p=>p.discontinued).map(p=>p.pn),...S.assemblies.filter(a=>a.discontinued).map(a=>a.pn)].sort().map(pn=>pnOptDisc(pn)).join('')}</datalist></div>
         <div class="form-group"><label class="form-label">Qty</label><input id="bom-qty" class="form-input" type="number" min="0.001" step="0.001" value="1"></div>
       </div>
       <div class="form-row cols-2">
@@ -2067,7 +2074,7 @@ function printBOM(pn){
       +'<td style="padding:4px 8px;font-size:12px">'+escHtml(p2?p2.description||'':'')+'</td>'
       +'<td style="padding:4px 8px;font-size:10px;color:#6b7280;text-transform:capitalize">'+escHtml(item.item_type||'part')+'</td>'
       +'<td style="padding:4px 8px;text-align:right">'+item.qty+'</td>'
-      +'<td style="padding:4px 8px;text-align:right;font-family:monospace">$'+((item.unit_cost||0).toFixed(4))+'</td>'
+      +'<td style="padding:4px 8px;text-align:right;font-family:monospace">$'+lineUnitCost(item).toFixed(4)+'</td>'
       +'<td style="padding:4px 8px;text-align:right;font-family:monospace;font-weight:700">$'+lineCost(item).toFixed(4)+'</td>'
       +'<td style="padding:4px 8px;font-size:10px;color:#6b7280">'+escHtml((S.parts.find(function(p){return p.pn===item.child_pn;})||{}).location||'')+'</td>'
       +'</tr>';
@@ -7686,35 +7693,54 @@ async function delBOMItem(id,parentPn){
   toast('BOM item removed');render();
 }
 function bomChildLookup(){
+  // oninput: hint only — do NOT fill type or cost while still typing
+  const el=document.getElementById('bom-child');
+  const hint=document.getElementById('bom-child-desc');
+  if(!el)return;
+  const pn=(el.value||'').trim().toUpperCase();
+  if(!pn){if(hint)hint.textContent='';return;}
+  const part=S.parts.find(p=>p.pn===pn);
+  const asm=findAsm(pn);
+  if(part){
+    const qty=parseFloat(document.getElementById('bom-qty')?.value)||1;
+    const tierCost=costForQty(part,qty);
+    const hasTier=tierCost<(part.unit_cost||0);
+    if(hint)hint.textContent=escHtml(part.description||'')+(part.vendor?' · '+part.vendor:'')+(hasTier?' — Tier: '+fc(tierCost,4)+'/ea':'');
+  }else if(asm){
+    if(hint)hint.textContent=escHtml(asm.description||'')+' — Assembly';
+  }else{
+    if(hint)hint.textContent=pn.length>2?'⚠ Not found in catalog':'';
+  }
+}
+
+function bomChildFill(){
+  // onchange or Enter: fill type and cost from catalog
   const el=document.getElementById('bom-child');
   const hint=document.getElementById('bom-child-desc');
   const typeEl=document.getElementById('bom-type');
   const costEl=document.getElementById('bom-cost');
   if(!el)return;
   const pn=(el.value||'').trim().toUpperCase();
-  if(!pn){if(hint)hint.textContent='';return;}
+  if(!pn)return;
+  el.value=pn;
   const qty=parseFloat(document.getElementById('bom-qty')?.value)||1;
   const part=S.parts.find(p=>p.pn===pn);
   const asm=findAsm(pn);
   if(part){
-    if(hint)hint.textContent=escHtml(part.description||'')+(part.vendor?' · '+escHtml(part.vendor):'');
+    const tierCost=costForQty(part,qty);
+    const hasTier=tierCost<(part.unit_cost||0);
+    if(hint)hint.textContent=escHtml(part.description||'')+(part.vendor?' · '+part.vendor:'')+(hasTier?' — Tier: '+fc(tierCost,4)+'/ea':'');
     if(typeEl)typeEl.value='part';
-    if(costEl&&(parseFloat(costEl.value)||0)===0){
-      const tierCost=costForQty(part,qty);
-      costEl.value=tierCost.toFixed(4);
-      const base=part.unit_cost||0;
-      if(tierCost<base) hint.textContent+=' — '+fc(tierCost,4)+'/ea at qty '+qty+' (tier price)';
-    }
+    if(costEl)costEl.value=tierCost.toFixed(4);
   }else if(asm){
     if(hint)hint.textContent=escHtml(asm.description||'')+' — Assembly';
     if(typeEl)typeEl.value='assembly';
     const asmCost=bomCostOf(asm.pn,0);
-    if(costEl&&(parseFloat(costEl.value)||0)===0&&asmCost>0)costEl.value=asmCost.toFixed(4);
+    if(costEl&&asmCost>0)costEl.value=asmCost.toFixed(4);
   }else{
-    if(hint)hint.textContent=pn.length>2?'⚠ Not found in catalog':'';
+    if(hint&&pn.length>2)hint.textContent='⚠ Not found in catalog';
   }
 }
-
 async function saveBOMItem(){
   const parent=$('bom-parent').value,child=$('bom-child').value.trim();
   const qty=parseFloat($('bom-qty').value)||1,type=$('bom-type').value;
@@ -7961,7 +7987,7 @@ function openModal(type,data){
       <div id="m-bom-existing">${existingRows}</div>
       <div id="m-bom-pending"></div>
       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px;padding:8px 10px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)">
-        <input id="m-bom-pn" class="form-input" placeholder="Part # or SKU" style="flex:2;min-width:90px" list="m-bom-pn-list" autocomplete="off" oninput="bomPnLookup()" onkeydown="if(event.key==='Enter'){event.preventDefault();modalAddBOMRow();}">
+        <input id="m-bom-pn" class="form-input" placeholder="Part # or SKU" style="flex:2;min-width:90px" list="m-bom-pn-list" autocomplete="off" oninput="bomPnLookup()" onchange="bomPnFill()" onkeydown="if(event.key==='Enter'){event.preventDefault();bomPnFill();modalAddBOMRow();}">
         <datalist id="m-bom-pn-list">${allPNs.map(function(pn){return pnOpt(pn);}).join('')}${discPNs.map(function(pn){return pnOptDisc(pn);}).join('')}</datalist>
         <input id="m-bom-qty" type="number" min="0.001" step="0.001" value="1" class="form-input" style="width:65px" oninput="bomPnLookup()">
         <input id="m-bom-cost" type="number" min="0" step="0.0001" placeholder="Cost" title="Unit cost override (optional — leave blank to use catalog price)" class="form-input" style="width:80px">
@@ -8905,30 +8931,51 @@ function updatePriceBreak(idx,field,val){
 window.updatePriceBreak=updatePriceBreak;
 
 function bomPnLookup(){
+  // oninput: show hint only — do NOT fill type or cost yet
   const el=document.getElementById('m-bom-pn');
   if(!el)return;
   const pn=(el.value||'').trim().toUpperCase();
   const hint=document.getElementById('m-bom-desc-hint');
+  if(!pn){if(hint)hint.textContent='';return;}
+  const part=S.parts.find(p=>p.pn===pn);
+  const asm=S.assemblies.find(a=>a.pn===pn);
+  if(part){
+    const qty=parseFloat(document.getElementById('m-bom-qty')?.value)||1;
+    const tierCost=costForQty(part,qty);
+    const hasTier=tierCost<(part.unit_cost||0);
+    if(hint)hint.textContent='Part: '+(part.description||'')+(part.vendor?' · '+part.vendor:'')+(hasTier?' — Tier price: '+fc(tierCost,4)+'/ea':'');
+  }else if(asm){
+    if(hint)hint.textContent='Assembly: '+(asm.description||'');
+  }else{
+    if(hint)hint.textContent=pn.length>2?'⚠ Not found in catalog':'';
+  }
+}
+function bomPnFill(){
+  // onchange or Enter: fill type and cost from catalog
+  const el=document.getElementById('m-bom-pn');
+  if(!el)return;
+  const pn=(el.value||'').trim().toUpperCase();
+  if(!pn)return;
+  el.value=pn; // normalize case
   const typeEl=document.getElementById('m-bom-type');
   const costEl=document.getElementById('m-bom-cost');
-  if(!pn){if(hint)hint.textContent='';return;}
+  const hint=document.getElementById('m-bom-desc-hint');
   const qty=parseFloat(document.getElementById('m-bom-qty')?.value)||1;
   const part=S.parts.find(p=>p.pn===pn);
   const asm=S.assemblies.find(a=>a.pn===pn);
   if(part){
     const tierCost=costForQty(part,qty);
-    const base=part.unit_cost||0;
-    const tierNote=tierCost<base?' — '+fc(tierCost,4)+'/ea at qty '+qty+' (tier price)':'';
-    if(hint)hint.textContent='Part: '+(part.description||'')+(part.vendor?' · '+part.vendor:'')+tierNote;
-    if(typeEl&&typeEl.value!=='part')typeEl.value='part';
-    if(costEl&&!costEl.value)costEl.value=tierCost.toFixed(4);
+    const hasTier=tierCost<(part.unit_cost||0);
+    if(hint)hint.innerHTML='Part: '+(part.description||'')+(part.vendor?' · '+part.vendor:'')+(hasTier?' <span style="color:var(--teal);font-weight:700">Tier: '+fc(tierCost,4)+'/ea</span>':'');
+    if(typeEl)typeEl.value='part';
+    if(costEl)costEl.value=tierCost.toFixed(4);
   }else if(asm){
     if(hint)hint.textContent='Assembly: '+(asm.description||'');
     if(typeEl)typeEl.value='assembly';
     const asmCost=bomCostOf(asm.pn,0);
-    if(costEl&&!costEl.value&&asmCost>0)costEl.value=asmCost.toFixed(4);
+    if(costEl&&asmCost>0)costEl.value=asmCost.toFixed(4);
   }else{
-    if(hint)hint.textContent='⚠ Not found in catalog';
+    if(hint)hint.textContent='⚠ Not found in catalog — check the part number';
   }
 }
 
@@ -11168,10 +11215,20 @@ function bomCostOf(pn, depth){
   return t;
 }
 function lineCost(item){
-  if((item.unit_cost||0)>0)return item.unit_cost*(item.qty||1);
+  // Assembly/subassembly: roll up recursively
   if(isAsmBOMItem(item.item_type))return bomCostOf(item.child_pn,0)*(item.qty||1);
+  // Part in catalog: always use current tier price at BOM qty (ignores stored unit_cost)
   const p=S.parts.find(x=>x.pn===item.child_pn);
-  return (p?(p.unit_cost||0):0)*(item.qty||1);
+  if(p)return costForQty(p,item.qty||1)*(item.qty||1);
+  // Not in catalog: fall back to stored value
+  return (item.unit_cost||0)*(item.qty||1);
+}
+function lineUnitCost(item){
+  // Per-unit cost for display — uses tier price
+  if(isAsmBOMItem(item.item_type))return bomCostOf(item.child_pn,0);
+  const p=S.parts.find(x=>x.pn===item.child_pn);
+  if(p)return costForQty(p,item.qty||1);
+  return item.unit_cost||0;
 }
 
 // Hardware Pack check: TGK-P + digits (TGK-P01…TGK-P100). TGK-PCV etc. are NOT packs.
@@ -12553,7 +12610,7 @@ function printAssemblyBOMs(rootPn){
         +escHtml(item.child_pn)+'</td><td>'+escHtml(p2?p2.description||'':'')+'</td>'
         +'<td style="color:#6b7280;font-size:10px">'+escHtml(item.item_type||'part')+'</td>'
         +'<td style="text-align:right">'+item.qty+'</td>'
-        +'<td style="text-align:right;font-family:monospace">$'+(item.unit_cost||0).toFixed(4)+'</td>'
+        +'<td style="text-align:right;font-family:monospace">$'+lineUnitCost(item).toFixed(4)+'</td>'
         +'<td style="text-align:right;font-family:monospace;font-weight:700">$'+lineCost(item).toFixed(4)+'</td>'
         +'<td style="font-size:10px;color:#6b7280">'+escHtml((S.parts.find(function(p){return p.pn===item.child_pn;})||{}).location||'')+'</td></tr>';
     }).join('');
@@ -12594,7 +12651,7 @@ function printAllBOMs(){
     const margin=msrp?(profit/msrp*100):null;
     const trows=items.map((item,idx)=>{
       const p2=S.parts.find(p=>p.pn===item.child_pn)||S.assemblies.find(a=>a.pn===item.child_pn);
-      return '<tr><td>'+(idx+1)+'</td><td style="font-family:monospace;color:#0891b2">'+escHtml(item.child_pn)+'</td><td>'+escHtml(p2?.description||'')+'</td><td style="color:#6b7280;font-size:10px">'+escHtml(item.item_type||'part')+'</td><td style="text-align:right">'+item.qty+'</td><td style="text-align:right;font-family:monospace">$'+(item.unit_cost||0).toFixed(4)+'</td><td style="text-align:right;font-family:monospace;font-weight:700">$'+lineCost(item).toFixed(4)+'</td><td style="font-size:10px;color:#6b7280">'+escHtml((S.parts.find(p=>p.pn===item.child_pn)||{}).location||'')+'</td></tr>';
+      return '<tr><td>'+(idx+1)+'</td><td style="font-family:monospace;color:#0891b2">'+escHtml(item.child_pn)+'</td><td>'+escHtml(p2?.description||'')+'</td><td style="color:#6b7280;font-size:10px">'+escHtml(item.item_type||'part')+'</td><td style="text-align:right">'+item.qty+'</td><td style="text-align:right;font-family:monospace">$'+lineUnitCost(item).toFixed(4)+'</td><td style="text-align:right;font-family:monospace;font-weight:700">$'+lineCost(item).toFixed(4)+'</td><td style="font-size:10px;color:#6b7280">'+escHtml((S.parts.find(p=>p.pn===item.child_pn)||{}).location||'')+'</td></tr>';
     }).join('');
     sections+='<div class="bom-section"><div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px"><div><h2 style="font-size:14px;font-weight:700;margin:0">'+escHtml(pn)+'</h2><p style="font-size:11px;color:#6b7280;margin:2px 0 0">'+escHtml(asm?.description||'')+'</p></div><div style="font-size:11px;text-align:right;color:#374151">'+(msrp?'MSRP: $'+msrp.toFixed(2)+' | ':'')+'BOM Cost: $'+totalCost.toFixed(4)+(margin!==null?' | Margin: '+margin.toFixed(0)+'%':'')+'</div></div><table><thead><tr><th>#</th><th>Part #</th><th>Description</th><th>Type</th><th style="text-align:right">Qty</th><th style="text-align:right">Unit Cost</th><th style="text-align:right">Ext Cost</th><th>Bin</th></tr></thead><tbody>'+trows+'</tbody></table></div>';
   }
