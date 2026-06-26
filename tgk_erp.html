@@ -633,7 +633,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v1.6';
+const TGK_ERP_VERSION = 'v1.7';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -4622,7 +4622,7 @@ supabase login
 supabase link --project-ref piamamighqiielfztgic</pre>
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">2 — Shopify order webhook (handles new orders, cancellations, refunds)</div>
-    <div style="font-size:11px;color:var(--text3);margin:4px 0 6px">Create <span class="pn">supabase/functions/shopify-orders/index.ts</span> and paste:</div>
+    <div style="font-size:11px;color:var(--text3);margin:4px 0 6px;display:flex;align-items:center;gap:8px">Create <span class="pn">supabase/functions/shopify-orders/index.ts</span> and paste:<button class="btn btn-sm" style="margin-left:auto;font-size:10px" onclick="var pre=this.closest('div').nextElementSibling;navigator.clipboard.writeText(pre.textContent).then(()=>{this.textContent='✓ Copied';setTimeout(()=>this.textContent='Copy',2000)})">Copy</button></div>
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto;max-height:280px">import { createClient } from 'npm:@supabase/supabase-js@2'
 const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
 const CORS = {
@@ -4692,26 +4692,39 @@ Deno.serve(async (req) => {
     const varData = await varRes.json()
     const candidateIds: number[] = [...new Set((varData.variants || []).map((v: any) => v.product_id).filter(Boolean))]
     if (!candidateIds.length) return new Response(JSON.stringify({error:'No Shopify product found for SKU: ' + sku}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
-    // Step 2: verify each candidate product actually exists — skip ghost/deleted products
+    // Step 2: verify each candidate actually has this SKU as a variant (not just that the product exists)
     let productId: number | null = null
     for (const cid of candidateIds) {
-      const checkRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + cid + '.json?fields=id', {headers: shopHeaders})
-      if (checkRes.ok) { productId = cid; break }
-      console.warn('[shopify update_template] product', cid, 'returned', checkRes.status, '— skipping (ghost/deleted)')
+      const checkRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + cid + '.json?fields=id,variants', {headers: shopHeaders})
+      if (!checkRes.ok) { console.warn('[shopify update_template] product', cid, 'returned', checkRes.status, '— skipping'); continue }
+      const checkData = await checkRes.json()
+      const variants = checkData.product?.variants || []
+      const skuMatch = variants.find((v: any) => (v.sku || '').trim().toUpperCase() === sku.toUpperCase())
+      if (skuMatch) { productId = cid; console.log('[shopify update_template] confirmed SKU', sku, 'on product', cid); break }
+      console.warn('[shopify update_template] product', cid, 'exists but SKU', sku, 'not found on it — likely wrong/archived product, skipping')
     }
-    // Step 3: if all candidates were ghosts, fall back to product search by SKU via title/variant search
+    // Step 3: if no candidate had the SKU, search all products
     if (!productId) {
-      console.warn('[shopify update_template] all variant product_ids were ghosts for SKU', sku, '— trying product search fallback')
-      const searchRes = await fetch('https://' + store + '/admin/api/2024-01/products.json?limit=10&fields=id,variants', {headers: shopHeaders})
-      if (searchRes.ok) {
+      console.warn('[shopify update_template] SKU', sku, 'not confirmed on any candidate — searching all products')
+      let searchPage = ''
+      outer: for (let attempt = 0; attempt < 5; attempt++) {
+        const searchUrl = searchPage
+          ? 'https://' + store + '/admin/api/2024-01/products.json?limit=250&page_info=' + searchPage + '&fields=id,variants'
+          : 'https://' + store + '/admin/api/2024-01/products.json?limit=250&fields=id,variants'
+        const searchRes = await fetch(searchUrl, {headers: shopHeaders})
+        if (!searchRes.ok) break
         const searchData = await searchRes.json()
         for (const p of (searchData.products || [])) {
           const match = (p.variants || []).find((v: any) => (v.sku || '').trim().toUpperCase() === sku.toUpperCase())
-          if (match) { productId = p.id; break }
+          if (match) { productId = p.id; console.log('[shopify update_template] found SKU', sku, 'via full search on product', p.id); break outer }
         }
+        const link = searchRes.headers.get('link') || ''
+        const next = link.match(/page_info=([^&>"]+)[^>]*rel="next"/)
+        if (!next) break
+        searchPage = next[1]
       }
     }
-    if (!productId) return new Response(JSON.stringify({error:'No live Shopify product found for SKU: ' + sku + ' (all candidate product IDs were deleted/ghost)'}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
+    if (!productId) return new Response(JSON.stringify({error:'No live Shopify product found for SKU: ' + sku}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
     const putRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + productId + '.json', {
       method: 'PUT',
       headers: {...shopHeaders, 'Content-Type': 'application/json'},
@@ -4883,7 +4896,7 @@ Deno.serve(async (req) => {
 })</pre>
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">3 — ShipStation ship webhook (split shipments, tracking, on-hold)</div>
-    <div style="font-size:11px;color:var(--text3);margin:4px 0 6px">Replace <span class="pn">supabase/functions/shipstation-ship/index.ts</span> with:</div>
+    <div style="font-size:11px;color:var(--text3);margin:4px 0 6px;display:flex;align-items:center;gap:8px">Replace <span class="pn">supabase/functions/shipstation-ship/index.ts</span> with:<button class="btn btn-sm" style="margin-left:auto;font-size:10px" onclick="var pre=this.closest('div').nextElementSibling;navigator.clipboard.writeText(pre.textContent).then(()=>{this.textContent='✓ Copied';setTimeout(()=>this.textContent='Copy',2000)})">Copy</button></div>
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto;max-height:280px">import { createClient } from 'npm:@supabase/supabase-js@2'
 const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
 const CORS = {
@@ -4963,11 +4976,14 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise<void> {
     if (!candidateIds.length) { console.warn('[SS->Shopify] no product for SKU', pn); return }
     let productId: number | null = null
     for (const cid of candidateIds) {
-      const checkRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + cid + '.json?fields=id', { headers: { 'X-Shopify-Access-Token': key } })
-      if (checkRes.ok) { productId = cid; break }
-      console.warn('[SS->Shopify] product', cid, 'is ghost/deleted — skipping')
+      const checkRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + cid + '.json?fields=id,variants', { headers: { 'X-Shopify-Access-Token': key } })
+      if (!checkRes.ok) { console.warn('[SS->Shopify] product', cid, 'returned', checkRes.status, '— skipping'); continue }
+      const checkData = await checkRes.json()
+      const skuMatch = (checkData.product?.variants || []).find((v: any) => (v.sku || '').trim().toUpperCase() === pn.toUpperCase())
+      if (skuMatch) { productId = cid; break }
+      console.warn('[SS->Shopify] product', cid, 'exists but SKU', pn, 'not on it — skipping')
     }
-    if (!productId) { console.warn('[SS->Shopify] all candidate products were ghosts for SKU', pn); return }
+    if (!productId) { console.warn('[SS->Shopify] could not confirm product for SKU', pn); return }
     const putRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + productId + '.json', {
       method: 'PUT',
       headers: { 'X-Shopify-Access-Token': key, 'Content-Type': 'application/json' },
