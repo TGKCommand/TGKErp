@@ -568,6 +568,10 @@ td[class*=money]{font-variant-numeric:tabular-nums}
         <div class="sync-sub" id="sync-sub">piamamighqiielfztgic</div>
       </div>
     </div>
+    <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v1.1</span>
+      <span style="font-size:9px;color:var(--text3)" id="erp-build-date">2026-06-26</span>
+    </div>
   </div>
 </div>
 
@@ -629,7 +633,14 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
+const TGK_ERP_VERSION = 'v1.4';
+const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
+// Stamp version badge once DOM is ready
+document.addEventListener('DOMContentLoaded',function(){
+  var vb=document.getElementById('erp-version-badge');if(vb)vb.textContent=TGK_ERP_VERSION;
+  var bd=document.getElementById('erp-build-date');if(bd)bd.textContent=TGK_ERP_BUILD_DATE;
+});
 
 // ============================================================
 // ============================================================
@@ -1283,7 +1294,23 @@ function trackingUrl(carrier, tracking){
 }
 function syncShopifyTemplate(pn,newOh){
   if(!pn||!S.shopify||!S.shopify.store||!S.shopify.key)return;
-  const template=newOh<=0?(S.settings.shopify_backorder_template||'backorder'):'';
+  if(S.settings.shopify_backorder_sync_enabled===false){console.log('[Shopify template] sync disabled — skipped for',pn);return;}
+  // Only flag backorder if BOTH finished-good stock is zero AND BOM components
+  // cannot cover a build. If we can assemble the item, it is not truly out of stock.
+  var isBackorder=false;
+  if(newOh<=0){
+    var b=buildability(pn);
+    if(b.hasBOM){
+      // Has a BOM: backorder only if zero buildable units from components
+      isBackorder=(b.maxBuild<=0);
+    }else{
+      // No BOM defined: cannot verify buildability -- flag as backorder to be safe
+      isBackorder=true;
+      console.warn('[Shopify backorder] '+pn+' has no BOM -- flagging as backorder (cannot verify buildability)');
+    }
+  }
+  const template=isBackorder?(S.settings.shopify_backorder_template||'backorder'):'';
+  console.log('[Shopify template] '+pn+': newOh='+newOh+' -> template='+(template||'(revert to normal)'));
   fetch(SUPA_URL+'/functions/v1/shopify-orders',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
@@ -3261,6 +3288,7 @@ async function submitReturnV2(orderNum){
         await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
         S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
         await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newOh,adjustment:qty2,reason:'Return — '+reason+' (order '+orderNum+')',user_email:S.currentUser||null,source:'return'});
+        syncShopifyTemplate(pn,newOh);
         results.push('+'+qty2+' '+pn);
       } else if(prt){
         const prev=prt.total_unpckgd||0;const newOh=prev+qty2;
@@ -4421,6 +4449,19 @@ function renderIntegrations(){
       <input id="sh-backorder-template" class="form-input" value="${S.settings.shopify_backorder_template||'backorder'}" placeholder="backorder" style="max-width:200px">
       <div style="font-size:10px;color:var(--text3);margin-top:3px">When a finished good hits 0 stock, ERP switches its Shopify page to <code>product.{suffix}.liquid</code> and reverts when stock returns. Requires <b>write_products</b> scope.</div>
     </div>
+    <div class="form-group" style="margin-top:2px">
+      <label style="display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none">
+        <div style="position:relative;width:36px;height:20px;flex-shrink:0">
+          <input type="checkbox" id="sh-backorder-sync-enabled" ${S.settings.shopify_backorder_sync_enabled!==false?'checked':''} style="opacity:0;position:absolute;width:0;height:0" onchange="document.getElementById('sh-toggle-track').style.background=this.checked?'var(--teal)':'var(--bg5)'">
+          <div id="sh-toggle-track" style="position:absolute;inset:0;border-radius:10px;background:${S.settings.shopify_backorder_sync_enabled!==false?'var(--teal)':'var(--bg5)'};border:1px solid var(--border2);transition:background .2s;cursor:pointer" onclick="var cb=document.getElementById('sh-backorder-sync-enabled');cb.checked=!cb.checked;cb.dispatchEvent(new Event('change'))"></div>
+          <div style="position:absolute;top:2px;left:${S.settings.shopify_backorder_sync_enabled!==false?'18':'2'}px;width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.2);transition:left .2s;pointer-events:none" id="sh-toggle-knob"></div>
+        </div>
+        <div>
+          <div style="font-size:12px;font-weight:600;color:var(--text)">Auto-sync backorder status to Shopify</div>
+          <div style="font-size:10px;color:var(--text3);margin-top:1px">When off, shipping via ShipStation or the ERP will never change Shopify templates. Use to pause sync without removing credentials.</div>
+        </div>
+      </label>
+    </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <button class="btn btn-primary" onclick="saveShopify()">Save Credentials</button>
       <button class="btn btn-teal" onclick="startShopifyOAuth()" title="Opens Shopify OAuth to automatically get your access token">🔗 Connect via OAuth</button>
@@ -4848,6 +4889,66 @@ function ssAuth(): string {
   const k = Deno.env.get('SS_KEY') || '', s = Deno.env.get('SS_SECRET') || ''
   return btoa(k + ':' + s)
 }
+// ── Shopify backorder sync helper (BOM-aware) ──────────────────────────────
+async function bomMaxBuild(pn: string): Promise<{ hasBOM: boolean, maxBuild: number }> {
+  const { data: bom } = await db.from('bom_items').select('child_pn,qty,item_type').eq('parent_pn', pn)
+  if (!bom?.length) return { hasBOM: false, maxBuild: 0 }
+  let maxBuild = Infinity
+  for (const item of bom) {
+    const need = Number(item.qty) || 1
+    const isSub = item.item_type === 'assembly' || item.item_type === 'subassembly'
+    let avail = 0
+    if (isSub) {
+      const { data: rows } = await db.from('assemblies').select('total_on_hand').eq('pn', item.child_pn).limit(1)
+      avail = Number(rows?.[0]?.total_on_hand) || 0
+    } else {
+      const { data: rows } = await db.from('parts').select('total_unpckgd').eq('pn', item.child_pn).limit(1)
+      avail = Number(rows?.[0]?.total_unpckgd) || 0
+    }
+    const fromThis = need > 0 ? Math.floor(avail / need) : Infinity
+    if (fromThis < maxBuild) maxBuild = fromThis
+  }
+  return { hasBOM: true, maxBuild: maxBuild === Infinity ? 0 : Math.max(0, maxBuild) }
+}
+async function syncShopifyBackorder(pn: string, newOh: number): Promise<void> {
+  // Check the ERP toggle before doing anything
+  const { data: toggleRow } = await db.from('settings').select('value').eq('key', 'shopify_backorder_sync_enabled').limit(1)
+  const syncEnabled = toggleRow?.[0]?.value
+  if (syncEnabled === false || syncEnabled === 'false') {
+    console.log('[SS->Shopify] sync disabled via ERP toggle — skipped for', pn)
+    return
+  }
+  const store = (Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
+  const key = Deno.env.get('SHOPIFY_KEY') || ''
+  if (!store || !key) return
+  let template = ''
+  if (newOh <= 0) {
+    const { hasBOM, maxBuild } = await bomMaxBuild(pn)
+    const isBackorder = !hasBOM || maxBuild <= 0
+    if (isBackorder) {
+      template = Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder'
+    }
+    console.log('[SS->Shopify]', pn, 'newOh='+newOh, 'hasBOM='+hasBOM, 'maxBuild='+maxBuild, '->', template || '(revert)')
+  }
+  try {
+    const varRes = await fetch('https://' + store + '/admin/api/2024-01/variants.json?sku=' + encodeURIComponent(pn) + '&fields=product_id', {
+      headers: { 'X-Shopify-Access-Token': key }
+    })
+    if (!varRes.ok) { console.warn('[SS->Shopify] variant lookup failed', pn, varRes.status); return }
+    const varData = await varRes.json()
+    const productId = varData.variants?.[0]?.product_id
+    if (!productId) { console.warn('[SS->Shopify] no product for SKU', pn); return }
+    const putRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + productId + '.json', {
+      method: 'PUT',
+      headers: { 'X-Shopify-Access-Token': key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product: { id: productId, template_suffix: template } })
+    })
+    console.log('[SS->Shopify] template set', pn, '->', template || '(normal)', 'HTTP', putRes.status)
+  } catch (e) {
+    console.warn('[SS->Shopify] error for', pn, e)
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
   const body = await req.json().catch(() => ({})) as any
@@ -5345,6 +5446,8 @@ Deno.serve(async (req) => {
         await db.from('assemblies').update({ total_on_hand: newOh, updated_at: new Date().toISOString() }).eq('id', asm.id)
         await db.from('inv_corrections').insert({ pn, previous_qty: prev, new_qty: newOh, adjustment: -lineQty, reason: 'Shipped via ShipStation ' + resolvedOrderNum + ' ' + tracking, source: 'shipment' })
         console.log('[SS] Deducted', lineQty, 'of', pn, 'on', resolvedOrderNum, '| on_hand:', prev, '->', newOh)
+        // Sync Shopify backorder template: only flag as backorder if BOM components also cannot cover a build
+        await syncShopifyBackorder(pn, newOh)
       }
     }
   }
@@ -8008,6 +8111,7 @@ async function recordPack(pn,asmId){
     const oh=(asm.total_on_hand||0)+1;
     await db.from('assemblies').update({total_on_hand:oh,total_assembled:(asm.total_assembled||0)+1,updated_at:new Date().toISOString()}).eq('id',asm.id);
     S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:oh}:a);
+    syncShopifyTemplate(pn,oh);
   }
   toast(`Packed 1 × ${pn}`);render();
   var _lf3=(S.labelFiles&&S.labelFiles[pn])||[];if(_lf3.length)showLabelPrintPrompt(pn,1,_lf3);else checkAndPromptLabel(pn,1);
@@ -8026,6 +8130,9 @@ async function saveShopify(){
   const bkTpl=(document.getElementById('sh-backorder-template')?.value||'backorder').trim();
   S.settings.shopify_backorder_template=bkTpl||'backorder';
   await db.from('settings').upsert({key:'shopify_backorder_template',value:bkTpl||'backorder'},{onConflict:'key'});
+  const bkEnabled=document.getElementById('sh-backorder-sync-enabled')?.checked!==false;
+  S.settings.shopify_backorder_sync_enabled=bkEnabled;
+  await db.from('settings').upsert({key:'shopify_backorder_sync_enabled',value:bkEnabled},{onConflict:'key'});
   S.settings.shopify=S.shopify;
   toast('\u2713 Shopify credentials saved to database');render();
 }
@@ -12759,6 +12866,7 @@ async function submitCustomPackList(){
     S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh,total_assembled:newAssembled}:a);
     await db.from('pack_log').insert({pn,qty,pack_date:new Date().toISOString(),type:'pack',notes:'Custom pack list: '+qty+'x '+pn});
     await db.from('inv_corrections').insert({pn,previous_qty:asm.total_on_hand||0,new_qty:newOh,adjustment:qty,reason:'Custom Pack List',user_email:S.currentUser||null,source:'pack'});
+    syncShopifyTemplate(pn,newOh);
     packed++;
   }
   pushUndoMulti('Custom Pack List ('+packed+' SKU'+(packed!==1?'s':'')+')',allUndo);
@@ -13334,6 +13442,7 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
 
   pushUndoMulti((isUnpack?'Unpack':'Pack')+' '+qty+'×'+pn+' (incl. components)',undoOps);
   updateBadge();
+  syncShopifyTemplate(pn,newOh);
   toast((isUnpack?'Unpacked':'Packed')+' '+qty+'× '+pn);
   render();
   if(!isUnpack){var _lf=(S.labelFiles&&S.labelFiles[pn])||[];if(_lf.length)showLabelPrintPrompt(pn,qty,_lf);else checkAndPromptLabel(pn,qty);}
@@ -13603,6 +13712,7 @@ async function applySpotCount(){
     await db.from('assemblies').update({total_on_hand:newQty,updated_at:new Date().toISOString()}).eq('id',a.id);
     S.assemblies=S.assemblies.map(x=>x.pn===a.pn?{...x,total_on_hand:newQty}:x);
     await db.from('inv_corrections').insert({pn:a.pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason:reason+' (assembly)',user_email:S.currentUser||null,source:'spot_count'});
+    syncShopifyTemplate(a.pn,newQty);
     toast(a.pn+': '+prev+' → '+newQty);
   }
   document.getElementById('spot-pn').value='';
@@ -13734,6 +13844,7 @@ async function applyWalkCount(){
       if(error){errors++;continue;}
       S.assemblies=S.assemblies.map(x=>x.pn===item.pn?{...x,total_on_hand:item.counted}:x);
       await db.from('inv_corrections').insert({pn:item.pn,previous_qty:item.exp,new_qty:item.counted,adjustment:item.counted-item.exp,reason:'Walk Count',user_email:S.currentUser||null,source:'walk_count'});
+      syncShopifyTemplate(item.pn,item.counted);
     } else {
       const p=S.parts.find(x=>x.pn===item.pn);
       if(!p){errors++;continue;}
@@ -13950,6 +14061,7 @@ async function applyCountCorrections(countId) {
       S.assemblies=S.assemblies.map(a=>a.pn===line.pn?{...a,total_on_hand:newQty}:a);
       await db.from('inv_corrections').insert({pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count (finished/sub — components untouched)'+(line.notes?' — '+line.notes:''),user_email:S.currentUser||null,source:'cycle_count',reference_id:countId});
       S.corrections=[{pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count',source:'cycle_count',created_at:new Date().toISOString()},...S.corrections];
+      syncShopifyTemplate(line.pn,newQty);
     } else {
       const part=S.parts.find(p=>p.pn===line.pn);
       if(!part){_corrErrors++;continue;}
