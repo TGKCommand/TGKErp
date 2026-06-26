@@ -633,7 +633,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v1.8';
+const TGK_ERP_VERSION = 'v1.9';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -4685,49 +4685,29 @@ Deno.serve(async (req) => {
     const sku = (body.pn || '').trim()
     const templateSuffix = body.template || ''
     if (!store || !key || !sku) return new Response(JSON.stringify({error:'Missing store, key or pn'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
-    const shopHeaders = {'X-Shopify-Access-Token': key}
-    // Step 1: look up all variants with this SKU (may return multiple / stale product_ids)
-    const varRes = await fetch('https://' + store + '/admin/api/2024-01/variants.json?sku=' + encodeURIComponent(sku) + '&fields=product_id,id,sku&limit=250', {headers: shopHeaders})
-    if (!varRes.ok) return new Response(JSON.stringify({error:'Variant lookup failed: ' + varRes.status}), {status:varRes.status, headers:{...CORS,'Content-Type':'application/json'}})
-    const varData = await varRes.json()
-    const candidateIds: number[] = [...new Set((varData.variants || []).map((v: any) => v.product_id).filter(Boolean))]
-    if (!candidateIds.length) return new Response(JSON.stringify({error:'No Shopify product found for SKU: ' + sku}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
-    // Step 2: verify each candidate actually has this SKU as a variant (not just that the product exists)
-    let productId: number | null = null
-    for (const cid of candidateIds) {
-      const checkRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + cid + '.json?fields=id,variants', {headers: shopHeaders})
-      if (!checkRes.ok) { console.warn('[shopify update_template] product', cid, 'returned', checkRes.status, '— skipping'); continue }
-      const checkData = await checkRes.json()
-      const variants = checkData.product?.variants || []
-      const skuMatch = variants.find((v: any) => (v.sku || '').trim().toUpperCase() === sku.toUpperCase())
-      if (skuMatch) { productId = cid; console.log('[shopify update_template] confirmed SKU', sku, 'on product', cid); break }
-      console.warn('[shopify update_template] product', cid, 'exists but SKU', sku, 'not found on it — likely wrong/archived product, skipping')
+    const shopHeaders = {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'}
+    // Use GraphQL to find product by SKU — more reliable than REST variants endpoint
+    const safeSku = sku.replace(/"/g, '')
+    const gqlQuery = '{ productVariants(first: 10, query: "sku:' + safeSku + '") { edges { node { id sku product { id legacyResourceId title } } } } }'
+    const gqlRes = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {
+      method: 'POST',
+      headers: shopHeaders,
+      body: JSON.stringify({ query: gqlQuery })
+    })
+    if (!gqlRes.ok) return new Response(JSON.stringify({error:'GraphQL request failed: ' + gqlRes.status}), {status:gqlRes.status, headers:{...CORS,'Content-Type':'application/json'}})
+    const gqlData = await gqlRes.json()
+    console.log('[shopify update_template] GraphQL result for SKU', sku, ':', JSON.stringify(gqlData?.data?.productVariants?.edges?.map((e:any)=>({sku:e.node.sku,productId:e.node.product?.legacyResourceId}))))
+    const edges = gqlData?.data?.productVariants?.edges || []
+    // Find the edge where SKU matches exactly
+    const match = edges.find((e: any) => (e.node.sku || '').trim().toUpperCase() === sku.toUpperCase())
+    if (!match) {
+      console.warn('[shopify update_template] GraphQL found no exact SKU match for', sku, '— edges:', JSON.stringify(edges.map((e:any)=>e.node.sku)))
+      return new Response(JSON.stringify({error:'No Shopify product found for SKU: ' + sku, debug: edges.map((e:any)=>({sku:e.node.sku,productId:e.node.product?.legacyResourceId}))}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
     }
-    // Step 3: if no candidate had the SKU, search all products
-    if (!productId) {
-      console.warn('[shopify update_template] SKU', sku, 'not confirmed on any candidate — searching all products')
-      let searchPage = ''
-      outer: for (let attempt = 0; attempt < 5; attempt++) {
-        const searchUrl = searchPage
-          ? 'https://' + store + '/admin/api/2024-01/products.json?limit=250&page_info=' + searchPage + '&fields=id,variants,status'
-          : 'https://' + store + '/admin/api/2024-01/products.json?limit=250&status=any&fields=id,variants,status'
-        const searchRes = await fetch(searchUrl, {headers: shopHeaders})
-        if (!searchRes.ok) break
-        const searchData = await searchRes.json()
-        for (const p of (searchData.products || [])) {
-          const match = (p.variants || []).find((v: any) => (v.sku || '').trim().toUpperCase() === sku.toUpperCase())
-          if (match) { productId = p.id; console.log('[shopify update_template] found SKU', sku, 'via full search on product', p.id); break outer }
-        }
-        const link = searchRes.headers.get('link') || ''
-        const next = link.match(/page_info=([^&>"]+)[^>]*rel="next"/)
-        if (!next) break
-        searchPage = next[1]
-      }
-    }
-    if (!productId) return new Response(JSON.stringify({error:'No live Shopify product found for SKU: ' + sku}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
+    const productId = match.node.product.legacyResourceId
     const putRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + productId + '.json', {
       method: 'PUT',
-      headers: {...shopHeaders, 'Content-Type': 'application/json'},
+      headers: shopHeaders,
       body: JSON.stringify({product: {id: productId, template_suffix: templateSuffix}})
     })
     if (!putRes.ok) return new Response(JSON.stringify({error:'Product update failed: ' + putRes.status}), {status:putRes.status, headers:{...CORS,'Content-Type':'application/json'}})
