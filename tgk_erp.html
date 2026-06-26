@@ -532,8 +532,8 @@ td[class*=money]{font-variant-numeric:tabular-nums}
     <button class="nav-item" id="nav-sales" onclick="nav('sales')"><span class="nav-dot"></span>Sales Orders<span class="nav-badge" id="sales-badge" style="display:none">0</span></button>
     <button class="nav-item" id="nav-warranty" onclick="navResolution('claims')"><span class="nav-dot"></span>Customer Resolution<span class="nav-badge" id="warranty-badge" style="display:none">0</span></button>
     <div class="sub-nav" id="sub-nav-resolution">
-      <button class="nav-sub-item" id="subnav-claims" onclick="navResolution('claims')">⚑ Warranty</button>
-      <button class="nav-sub-item" id="subnav-errors" onclick="navResolution('errors')">📦 Shipment Errors</button>
+      <button class="nav-sub-item" id="subnav-claims" onclick="navResolution('claims')">Warranty</button>
+      <button class="nav-sub-item" id="subnav-errors" onclick="navResolution('errors')">Shipment Errors</button>
     </div>
 
     <div class="sidebar-section">Contacts</div>
@@ -1099,6 +1099,18 @@ function setupRealtime(){
         setTimeout(()=>{toast('Reconnecting to live sync…');setupRealtime();},5000);
       }
     });
+}
+
+// Ping realtime every 90 seconds — reconnect if dropped or stale
+let _rtHealthTimer=null;
+function startRealtimeHealthCheck(){
+  if(_rtHealthTimer)clearInterval(_rtHealthTimer);
+  _rtHealthTimer=setInterval(function(){
+    if(_rtStatus!=='SUBSCRIBED'){
+      console.warn('[TGK] Realtime not subscribed ('+_rtStatus+') — reconnecting');
+      setupRealtime();
+    }
+  },90000);
 }
 
 // ============================================================
@@ -6485,25 +6497,84 @@ async function syncOrdersNow(){
   if(newCount===0) return;
 
   if(syncConflicts.length>0){
-    const cov=document.createElement('div');cov.id='sync-conflict-overlay';
+    const cov=document.createElement('div');
+    cov.id='sync-conflict-overlay';
     cov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1060;display:flex;align-items:center;justify-content:center;padding:20px';
-    cov.innerHTML='<div style="background:var(--bg2);border:1px solid var(--border2);border-radius:10px;width:min(580px,95vw);max-height:85vh;overflow-y:auto;padding:20px;box-shadow:0 16px 48px rgba(0,0,0,.2)">'
-      +'<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px"><div style="flex:1"><div style="font-size:14px;font-weight:700;color:var(--orange)">Sync Conflicts — '+syncConflicts.length+' Order'+(syncConflicts.length!==1?'s':'')+'</div><div style="font-size:11px;color:var(--text3);margin-top:2px">Shopify has a different SKU than what is in ERP. Choose per order:</div></div><button onclick="document.getElementById(\'sync-conflict-overlay\').remove();render()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;padding:0">×</button></div>'
-      +'<div style="font-size:11px;color:var(--text3);background:var(--bg3);border-radius:6px;padding:8px 12px;margin-bottom:12px"><b>Lock ERP</b> — keep ERP version, lock order from all future Shopify syncs<br><b>Accept Shopify</b> — add Shopify SKU as an additional line</div>'
-      +syncConflicts.map(function(cf){
-        const oq=JSON.stringify(cf.orderNum).replace(/\\/g,'\\\\').replace(/'/g,"\\'");
-        const pq=JSON.stringify(cf.shopifyPn).replace(/\\/g,'\\\\').replace(/'/g,"\\'");
-        return '<div style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:var(--bg3);border-radius:6px;border:1px solid var(--border);margin-bottom:6px">'
-          +'<div style="flex:1"><div style="font-size:11px;font-weight:700;font-family:var(--mono)">'+escHtml(cf.orderNum)+'</div><div style="font-size:10px;color:var(--text3);margin-top:1px">Shopify: <b style="color:var(--orange)">'+escHtml(cf.shopifyPn)+'</b> × '+cf.qty+'</div></div>'
-          +'<button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3);flex-shrink:0" onclick="(async function(b){b.disabled=true;await lockOrderFromSync('+oq+');b.closest(\'div\').style.opacity=\'.4\';b.textContent=\'Locked\';}).call(this,this)">Lock ERP</button>'
-          +'<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3);flex-shrink:0" onclick="(async function(b){b.disabled=true;b.textContent=\'Adding...\';const r=await db.from(\'sales\').insert({order_number:'+oq+',pn:'+pq+',qty:'+cf.qty+',fulfillment_status:\''+cf.fs+'\',source:\'Shopify Sync\',sale_date:\''+cf.date+'\' }).select().single();if(r.data){S.sales=[r.data,...S.sales];b.closest(\'div\').style.opacity=\'.4\';b.textContent=\'Added\';}else b.textContent=\'Error\';}).call(this,this)">Accept Shopify</button>'
-          +'</div>';
-      }).join('')
-      +'<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">'
-        +'<button class="btn btn-sm" onclick="(async function(){for(const on of syncConflicts)await lockOrderFromSync(on.orderNum);document.getElementById(\'sync-conflict-overlay\').remove();toast(\'All \'+syncConflicts.length+\' conflicts locked\');render();})()">Lock All ERP</button>'
-        +'<button class="btn" onclick="document.getElementById(\'sync-conflict-overlay\').remove();render()">Done</button>'
-      +'</div>'
-    +'</div>';
+    // Build modal with DOM — avoids quote-escaping bugs with order numbers/SKUs
+    const box=document.createElement('div');
+    box.style.cssText='background:var(--bg2);border:1px solid var(--border2);border-radius:10px;width:min(580px,95vw);max-height:85vh;overflow-y:auto;padding:20px;box-shadow:0 16px 48px rgba(0,0,0,.2)';
+    // Header
+    const hdr=document.createElement('div');
+    hdr.style.cssText='display:flex;align-items:center;gap:10px;margin-bottom:12px';
+    hdr.innerHTML='<div style="flex:1"><div style="font-size:14px;font-weight:700;color:var(--orange)">Sync Conflicts — '+syncConflicts.length+' Order'+(syncConflicts.length!==1?'s':'')+'</div><div style="font-size:11px;color:var(--text3);margin-top:2px">Shopify has a different SKU than what is in ERP. Choose per order:</div></div>';
+    const xBtn=document.createElement('button');
+    xBtn.style.cssText='background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;padding:0';
+    xBtn.textContent='×';
+    xBtn.onclick=function(){cov.remove();render();};
+    hdr.appendChild(xBtn);
+    box.appendChild(hdr);
+    // Legend
+    const leg=document.createElement('div');
+    leg.style.cssText='font-size:11px;color:var(--text3);background:var(--bg3);border-radius:6px;padding:8px 12px;margin-bottom:12px';
+    leg.innerHTML='<b>Lock ERP</b> — keep ERP version, lock order from all future Shopify syncs<br><b>Accept Shopify</b> — add Shopify SKU as an additional line';
+    box.appendChild(leg);
+    // Conflict rows
+    syncConflicts.forEach(function(cf){
+      const row=document.createElement('div');
+      row.style.cssText='display:flex;align-items:center;gap:8px;padding:8px 10px;background:var(--bg3);border-radius:6px;border:1px solid var(--border);margin-bottom:6px';
+      const info=document.createElement('div');
+      info.style.cssText='flex:1';
+      info.innerHTML='<div style="font-size:11px;font-weight:700;font-family:var(--mono)">'+escHtml(cf.orderNum)+'</div>'
+        +'<div style="font-size:10px;color:var(--text3);margin-top:1px">Shopify: <b style="color:var(--orange)">'+escHtml(cf.shopifyPn)+'</b> × '+cf.qty+'</div>';
+      row.appendChild(info);
+      // Lock ERP button
+      const lockBtn=document.createElement('button');
+      lockBtn.className='btn btn-sm';
+      lockBtn.style.cssText='color:var(--teal);border-color:rgba(13,148,136,.3);flex-shrink:0';
+      lockBtn.textContent='Lock ERP';
+      lockBtn.onclick=(function(orderNum,btn){return async function(){
+        btn.disabled=true;
+        await lockOrderFromSync(orderNum);
+        btn.closest('div').style.opacity='.4';
+        btn.textContent='Locked';
+      };})(cf.orderNum,lockBtn);
+      row.appendChild(lockBtn);
+      // Accept Shopify button
+      const acceptBtn=document.createElement('button');
+      acceptBtn.className='btn btn-sm';
+      acceptBtn.style.cssText='color:var(--orange);border-color:rgba(234,88,12,.3);flex-shrink:0';
+      acceptBtn.textContent='Accept Shopify';
+      acceptBtn.onclick=(function(orderNum,pn,qty,fs,date,btn){return async function(){
+        btn.disabled=true;btn.textContent='Adding...';
+        const r=await db.from('sales').insert({
+          order_number:orderNum,pn:pn,qty:qty,
+          fulfillment_status:fs,financial_status:'pending',
+          source:'Shopify Sync',sale_date:date
+        }).select().single();
+        if(r.data){S.sales=[r.data,...S.sales];btn.closest('div').style.opacity='.4';btn.textContent='Added';}
+        else{btn.textContent='Error';btn.disabled=false;}
+      };})(cf.orderNum,cf.shopifyPn,cf.qty,cf.fs,cf.date,acceptBtn);
+      row.appendChild(acceptBtn);
+      box.appendChild(row);
+    });
+    // Footer
+    const ftr=document.createElement('div');
+    ftr.style.cssText='display:flex;justify-content:flex-end;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)';
+    const lockAllBtn=document.createElement('button');
+    lockAllBtn.className='btn btn-sm';
+    lockAllBtn.textContent='Lock All ERP';
+    lockAllBtn.onclick=async function(){
+      lockAllBtn.disabled=true;
+      for(const on of syncConflicts)await lockOrderFromSync(on.orderNum);
+      cov.remove();toast('All '+syncConflicts.length+' conflicts locked');render();
+    };
+    const doneBtn=document.createElement('button');
+    doneBtn.className='btn';
+    doneBtn.textContent='Done';
+    doneBtn.onclick=function(){cov.remove();render();};
+    ftr.appendChild(lockAllBtn);ftr.appendChild(doneBtn);
+    box.appendChild(ftr);
+    cov.appendChild(box);
     document.body.appendChild(cov);
   }
 
@@ -16917,7 +16988,7 @@ function printPriceList(){
         if(loader)loader.style.display='none';
         if(app)app.style.display='';
         try{computeDemand();}catch(e){console.error('computeDemand:',e);}
-        try{setupRealtime();}catch(e){console.error('setupRealtime:',e);}
+        try{setupRealtime();startRealtimeHealthCheck();}catch(e){console.error('setupRealtime:',e);}
         try{loadBackups();}catch(e){console.error('loadBackups:',e);}
         try{startAutoBackup();}catch(e){console.error('startAutoBackup:',e);}
         try{startAutoRefresh();}catch(e){console.error('startAutoRefresh:',e);}
