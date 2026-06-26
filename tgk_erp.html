@@ -633,7 +633,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v1.9';
+const TGK_ERP_VERSION = 'v2.0';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -1311,10 +1311,17 @@ function syncShopifyTemplate(pn,newOh){
   }
   const template=isBackorder?(S.settings.shopify_backorder_template||'backorder'):'';
   console.log('[Shopify template] '+pn+': newOh='+newOh+' -> template='+(template||'(revert to normal)'));
+  // Calculate restock date (only sent when going to backorder)
+  var restockDate='';
+  if(isBackorder){
+    var restockDays=parseInt(S.settings.shopify_restock_days)||30;
+    restockDate=new Date(Date.now()+restockDays*86400000).toISOString().slice(0,10);
+    console.log('[Shopify backorder] '+pn+': restock_date='+restockDate+' ('+restockDays+' days)');
+  }
   fetch(SUPA_URL+'/functions/v1/shopify-orders',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({action:'update_template',store:S.shopify.store,key:S.shopify.key,pn,template})
+    body:JSON.stringify({action:'update_template',store:S.shopify.store,key:S.shopify.key,pn,template,restock_date:restockDate})
   }).then(function(r){
     if(!r.ok)r.json().then(function(e){console.warn('[Shopify template]',pn,e.error||r.status);});
   }).catch(function(){});
@@ -4447,7 +4454,15 @@ function renderIntegrations(){
     <div class="form-group" style="margin-top:4px">
       <label class="form-label">Backorder Template Suffix</label>
       <input id="sh-backorder-template" class="form-input" value="${S.settings.shopify_backorder_template||'backorder'}" placeholder="backorder" style="max-width:200px">
-      <div style="font-size:10px;color:var(--text3);margin-top:3px">When a finished good hits 0 stock, ERP switches its Shopify page to <code>product.{suffix}.liquid</code> and reverts when stock returns. Requires <b>write_products</b> scope.</div>
+      <div style="font-size:10px;color:var(--text3);margin-top:3px">When a finished good hits 0 stock, ERP switches its Shopify page to <code>product.{suffix}.liquid</code> and reverts when stock returns. Requires <b>write_products</b> and <b>write_metafields</b> scope.</div>
+    </div>
+    <div class="form-group" style="margin-top:4px">
+      <label class="form-label">Default Restock Days</label>
+      <div style="display:flex;align-items:center;gap:8px">
+        <input id="sh-restock-days" class="form-input" type="number" min="1" max="365" value="${S.settings.shopify_restock_days||30}" style="max-width:100px">
+        <span style="font-size:11px;color:var(--text3)">days from today — written to <code>custom.restock_date</code> metafield when product goes on backorder</span>
+      </div>
+      <div style="font-size:10px;color:var(--text3);margin-top:3px">In your theme: <code>{{ product.metafields.custom.restock_date.value }}</code></div>
     </div>
     <div class="form-group" style="margin-top:2px">
       <label style="display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none">
@@ -4712,7 +4727,26 @@ Deno.serve(async (req) => {
     })
     if (!putRes.ok) return new Response(JSON.stringify({error:'Product update failed: ' + putRes.status}), {status:putRes.status, headers:{...CORS,'Content-Type':'application/json'}})
     console.log('[shopify update_template] set', sku, 'product', productId, 'template_suffix ->', templateSuffix || '(default)')
-    return new Response(JSON.stringify({success: true, productId, template_suffix: templateSuffix}), {headers:{...CORS,'Content-Type':'application/json'}})
+    // Write restock_date metafield if going to backorder
+    const restockDate = body.restock_date || ''
+    if (templateSuffix && restockDate) {
+      try {
+        const gid = 'gid://shopify/Product/' + productId
+        const metaMutation = 'mutation { metafieldsSet(metafields: [{ownerId: "' + gid + '", namespace: "custom", key: "restock_date", value: "' + restockDate + '", type: "single_line_text_field"}]) { metafields { id key value } userErrors { field message } } }'
+        const metaRes = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {
+          method: 'POST',
+          headers: shopHeaders,
+          body: JSON.stringify({ query: metaMutation })
+        })
+        const metaData = await metaRes.json()
+        const metaErrors = metaData?.data?.metafieldsSet?.userErrors || []
+        if (metaErrors.length) console.warn('[shopify update_template] metafield errors:', JSON.stringify(metaErrors))
+        else console.log('[shopify update_template] restock_date metafield set to', restockDate, 'for product', productId)
+      } catch (e) {
+        console.warn('[shopify update_template] metafield write failed:', e)
+      }
+    }
+    return new Response(JSON.stringify({success: true, productId, template_suffix: templateSuffix, restock_date: restockDate||null}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
   if (body.action === 'sync_images' || body.action === 'sync_images_page') {
     const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
@@ -4938,14 +4972,19 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise<void> {
   const key = Deno.env.get('SHOPIFY_KEY') || ''
   if (!store || !key) return
   let template = ''
+  let ssRestock = ''
   if (newOh <= 0) {
     const { hasBOM, maxBuild } = await bomMaxBuild(pn)
     const isBackorder = !hasBOM || maxBuild <= 0
     if (isBackorder) {
       template = Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder'
+      const { data: rdRow } = await db.from('settings').select('value').eq('key', 'shopify_restock_days').limit(1)
+      const rdDays = Number(rdRow?.[0]?.value) || 30
+      ssRestock = new Date(Date.now() + rdDays * 86400000).toISOString().slice(0, 10)
     }
-    console.log('[SS->Shopify]', pn, 'newOh='+newOh, 'hasBOM='+hasBOM, 'maxBuild='+maxBuild, '->', template || '(revert)')
+    console.log('[SS->Shopify]', pn, 'newOh='+newOh, 'hasBOM='+hasBOM, 'maxBuild='+maxBuild, '->', template || '(revert)', ssRestock ? 'restock:'+ssRestock : '')
   }
+  const body: any = { restock_date: ssRestock }
   try {
     const varRes = await fetch('https://' + store + '/admin/api/2024-01/variants.json?sku=' + encodeURIComponent(pn) + '&fields=product_id,id,sku', {
       headers: { 'X-Shopify-Access-Token': key }
@@ -4970,6 +5009,19 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise<void> {
       body: JSON.stringify({ product: { id: productId, template_suffix: template } })
     })
     console.log('[SS->Shopify] template set', pn, '->', template || '(normal)', 'HTTP', putRes.status)
+    // Write restock_date metafield if going to backorder
+    const ssRestockDate = body.restock_date || ''
+    if (template && ssRestockDate) {
+      try {
+        const ssGid = 'gid://shopify/Product/' + productId
+        const ssMutation = 'mutation { metafieldsSet(metafields: [{ownerId: "' + ssGid + '", namespace: "custom", key: "restock_date", value: "' + ssRestockDate + '", type: "single_line_text_field"}]) { metafields { id } userErrors { field message } } }'
+        await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {
+          method: 'POST', headers: { 'X-Shopify-Access-Token': key, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: ssMutation })
+        })
+        console.log('[SS->Shopify] restock_date metafield set to', ssRestockDate)
+      } catch (e) { console.warn('[SS->Shopify] metafield write failed:', e) }
+    }
   } catch (e) {
     console.warn('[SS->Shopify] error for', pn, e)
   }
@@ -8159,6 +8211,9 @@ async function saveShopify(){
   const bkEnabled=document.getElementById('sh-backorder-sync-enabled')?.checked!==false;
   S.settings.shopify_backorder_sync_enabled=bkEnabled;
   await db.from('settings').upsert({key:'shopify_backorder_sync_enabled',value:bkEnabled},{onConflict:'key'});
+  const restockDays=parseInt(document.getElementById('sh-restock-days')?.value)||30;
+  S.settings.shopify_restock_days=restockDays;
+  await db.from('settings').upsert({key:'shopify_restock_days',value:restockDays},{onConflict:'key'});
   S.settings.shopify=S.shopify;
   toast('\u2713 Shopify credentials saved to database');render();
 }
