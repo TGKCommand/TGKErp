@@ -633,7 +633,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v1.5';
+const TGK_ERP_VERSION = 'v1.6';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -4685,17 +4685,40 @@ Deno.serve(async (req) => {
     const sku = (body.pn || '').trim()
     const templateSuffix = body.template || ''
     if (!store || !key || !sku) return new Response(JSON.stringify({error:'Missing store, key or pn'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
-    const varRes = await fetch('https://' + store + '/admin/api/2024-01/variants.json?sku=' + encodeURIComponent(sku) + '&fields=product_id', {headers:{'X-Shopify-Access-Token': key}})
+    const shopHeaders = {'X-Shopify-Access-Token': key}
+    // Step 1: look up all variants with this SKU (may return multiple / stale product_ids)
+    const varRes = await fetch('https://' + store + '/admin/api/2024-01/variants.json?sku=' + encodeURIComponent(sku) + '&fields=product_id,id,sku', {headers: shopHeaders})
     if (!varRes.ok) return new Response(JSON.stringify({error:'Variant lookup failed: ' + varRes.status}), {status:varRes.status, headers:{...CORS,'Content-Type':'application/json'}})
     const varData = await varRes.json()
-    const productId = varData.variants?.[0]?.product_id
-    if (!productId) return new Response(JSON.stringify({error:'No Shopify product found for SKU: ' + sku}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
+    const candidateIds: number[] = [...new Set((varData.variants || []).map((v: any) => v.product_id).filter(Boolean))]
+    if (!candidateIds.length) return new Response(JSON.stringify({error:'No Shopify product found for SKU: ' + sku}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
+    // Step 2: verify each candidate product actually exists — skip ghost/deleted products
+    let productId: number | null = null
+    for (const cid of candidateIds) {
+      const checkRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + cid + '.json?fields=id', {headers: shopHeaders})
+      if (checkRes.ok) { productId = cid; break }
+      console.warn('[shopify update_template] product', cid, 'returned', checkRes.status, '— skipping (ghost/deleted)')
+    }
+    // Step 3: if all candidates were ghosts, fall back to product search by SKU via title/variant search
+    if (!productId) {
+      console.warn('[shopify update_template] all variant product_ids were ghosts for SKU', sku, '— trying product search fallback')
+      const searchRes = await fetch('https://' + store + '/admin/api/2024-01/products.json?limit=10&fields=id,variants', {headers: shopHeaders})
+      if (searchRes.ok) {
+        const searchData = await searchRes.json()
+        for (const p of (searchData.products || [])) {
+          const match = (p.variants || []).find((v: any) => (v.sku || '').trim().toUpperCase() === sku.toUpperCase())
+          if (match) { productId = p.id; break }
+        }
+      }
+    }
+    if (!productId) return new Response(JSON.stringify({error:'No live Shopify product found for SKU: ' + sku + ' (all candidate product IDs were deleted/ghost)'}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
     const putRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + productId + '.json', {
       method: 'PUT',
-      headers: {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'},
+      headers: {...shopHeaders, 'Content-Type': 'application/json'},
       body: JSON.stringify({product: {id: productId, template_suffix: templateSuffix}})
     })
     if (!putRes.ok) return new Response(JSON.stringify({error:'Product update failed: ' + putRes.status}), {status:putRes.status, headers:{...CORS,'Content-Type':'application/json'}})
+    console.log('[shopify update_template] set', sku, 'product', productId, 'template_suffix ->', templateSuffix || '(default)')
     return new Response(JSON.stringify({success: true, productId, template_suffix: templateSuffix}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
   if (body.action === 'sync_images' || body.action === 'sync_images_page') {
@@ -4931,13 +4954,20 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise<void> {
     console.log('[SS->Shopify]', pn, 'newOh='+newOh, 'hasBOM='+hasBOM, 'maxBuild='+maxBuild, '->', template || '(revert)')
   }
   try {
-    const varRes = await fetch('https://' + store + '/admin/api/2024-01/variants.json?sku=' + encodeURIComponent(pn) + '&fields=product_id', {
+    const varRes = await fetch('https://' + store + '/admin/api/2024-01/variants.json?sku=' + encodeURIComponent(pn) + '&fields=product_id,id,sku', {
       headers: { 'X-Shopify-Access-Token': key }
     })
     if (!varRes.ok) { console.warn('[SS->Shopify] variant lookup failed', pn, varRes.status); return }
     const varData = await varRes.json()
-    const productId = varData.variants?.[0]?.product_id
-    if (!productId) { console.warn('[SS->Shopify] no product for SKU', pn); return }
+    const candidateIds: number[] = [...new Set((varData.variants || []).map((v: any) => v.product_id).filter(Boolean))]
+    if (!candidateIds.length) { console.warn('[SS->Shopify] no product for SKU', pn); return }
+    let productId: number | null = null
+    for (const cid of candidateIds) {
+      const checkRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + cid + '.json?fields=id', { headers: { 'X-Shopify-Access-Token': key } })
+      if (checkRes.ok) { productId = cid; break }
+      console.warn('[SS->Shopify] product', cid, 'is ghost/deleted — skipping')
+    }
+    if (!productId) { console.warn('[SS->Shopify] all candidate products were ghosts for SKU', pn); return }
     const putRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + productId + '.json', {
       method: 'PUT',
       headers: { 'X-Shopify-Access-Token': key, 'Content-Type': 'application/json' },
