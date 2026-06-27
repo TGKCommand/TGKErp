@@ -263,11 +263,11 @@ const S={
   tab:'home',detail:null,detailId:null,  // detail: null|'part'|'count'
   tasksTab:'counts',orderFilter:'open',
   orderExp:null,poExp:null,
-  partSearch:'',partCat:'',
-  chatUnread:0,
+  partSearch:'',partCat:'',partsMode:'parts',asmSearch:'',
+  chatUnread:0,dataReady:false,
   // data
   sales:[],assemblies:[],parts:[],purchases:[],cycleCounts:[],chatMessages:[],
-  partCats:[],
+  boms:{},partCorr:{},partCats:[],
   loaded:{},countVals:{},
   // nav stack
   nav:[],
@@ -312,7 +312,7 @@ function updateHdr(){
   $('hdr-back').style.display=back?'flex':'none';
   $('hdr-home').style.display=(back&&S.tab!=='home')?'block':'none';
   const titles={home:'TGK Mobile',orders:'Orders',parts:'Parts',tasks:'Tasks',chat:'Team Chat'};
-  const detailTitles={part:'Part Detail',count:'Cycle Count'};
+  const detailTitles={part:'Part Detail',count:'Cycle Count',order:'Order Detail',asm:'Assembly BOM'};
   $('hdr-title').textContent=S.detail?detailTitles[S.detail]:(titles[S.tab]||'TGK Mobile');
 }
 function syncNav(){
@@ -336,7 +336,8 @@ async function onLogin(sess){
   S.name=sess.user.user_metadata?.name||sess.user.email.split('@')[0];
   $('hdr-user').textContent=S.name;
   $('login').style.display='none';$('app').style.display='flex';
-  await loadData('home');
+  $('view').innerHTML=spin();
+  await loadAll();
   render();setupRT();
 }
 async function doLogin(){
@@ -352,39 +353,36 @@ async function doLogin(){
 async function doLogout(){if(!confirm('Sign out?'))return;if(_rt)db.removeChannel(_rt);await db.auth.signOut();}
 
 // ── DATA ─────────────────────────────────────────────────────────────────
-async function loadData(tab){
-  if(S.loaded[tab])return;S.loaded[tab]=true;
+async function loadAll(){
+  // Load everything at once on login — no per-tab flag races
   try{
-    if(tab==='home'||tab==='orders'){
-      if(!S.loaded._sales){
-        const{data}=await db.from('sales').select('id,order_number,pn,fulfillment_status,qty,customer_name,sale_date,tracking_number,carrier,shipped_at').order('created_at',{ascending:false}).limit(800);
-        S.sales=data||[];S.loaded._sales=true;
-      }
-      if(!S.loaded._asms){
-        const{data}=await db.from('assemblies').select('pn,description,total_on_hand,new_sku,use_new_sku,discontinued,stage').order('pn');
-        S.assemblies=(data||[]).filter(a=>!a.discontinued&&a.stage!=='discontinued');S.loaded._asms=true;
-      }
-    }
-    if(tab==='parts'||tab==='tasks'){
-      if(!S.loaded._parts){
-        const{data}=await db.from('parts').select('pn,description,category,vendor,total_unpckgd,unit_cost,location,min_qty,max_qty,new_sku,avg_sales_wk').order('pn');
-        S.parts=data||[];
-        S.partCats=[...new Set(S.parts.map(p=>p.category||'').filter(Boolean))].sort();
-        S.loaded._parts=true;
-      }
-    }
-    if(tab==='tasks'){
-      const[pos,cts]=await Promise.all([
-        db.from('purchases').select('*').not('status','in','("Received","Cancelled")').order('order_date',{ascending:false}),
-        db.from('cycle_counts').select('*').eq('status','Open').order('created_at',{ascending:false})
-      ]);
-      S.purchases=pos.data||[];S.cycleCounts=cts.data||[];
-    }
-    if(tab==='chat'){
-      const{data}=await db.from('chat_messages').select('*').order('created_at',{ascending:false}).limit(80);
-      S.chatMessages=(data||[]).reverse();S.chatUnread=0;updChatBadge();
-    }
-  }catch(e){console.error('[TGK]',e);}
+    const[sales,asms,parts,pos,cts,chat,bomRows]=await Promise.all([
+      db.from('sales').select('id,order_number,pn,fulfillment_status,qty,customer_name,sale_date,tracking_number,carrier,shipped_at').order('created_at',{ascending:false}).limit(800),
+      db.from('assemblies').select('pn,description,total_on_hand,new_sku,use_new_sku,discontinued,stage').order('pn'),
+      db.from('parts').select('pn,description,category,vendor,total_unpckgd,unit_cost,location,min_qty,max_qty,new_sku,avg_sales_wk').order('pn'),
+      db.from('purchases').select('*').not('status','in','("Received","Cancelled")').order('order_date',{ascending:false}),
+      db.from('cycle_counts').select('*').eq('status','Open').order('created_at',{ascending:false}),
+      db.from('chat_messages').select('*').order('created_at',{ascending:false}).limit(80),
+      db.from('bom_items').select('parent_pn,child_pn,qty,item_type,sort_order')
+    ]);
+    S.sales=sales.data||[];
+    S.assemblies=(asms.data||[]).filter(a=>!a.discontinued&&a.stage!=='discontinued');
+    S.parts=parts.data||[];
+    S.partCats=[...new Set(S.parts.map(p=>p.category||'').filter(Boolean))].sort();
+    S.purchases=pos.data||[];
+    S.cycleCounts=cts.data||[];
+    S.chatMessages=(chat.data||[]).reverse();
+    S.boms={};
+    (bomRows.data||[]).forEach(i=>{if(!S.boms[i.parent_pn])S.boms[i.parent_pn]=[];S.boms[i.parent_pn].push(i);});
+    S.dataReady=true;
+  }catch(e){console.error('[TGK load]',e);toast('Connection error — check network');}
+}
+async function loadData(tab){
+  // Stub kept for realtime refresh paths
+  if(tab==='chat'){
+    const{data}=await db.from('chat_messages').select('*').order('created_at',{ascending:false}).limit(80);
+    S.chatMessages=(data||[]).reverse();S.chatUnread=0;updChatBadge();
+  }
 }
 
 // ── REALTIME ─────────────────────────────────────────────────────────────
@@ -396,8 +394,7 @@ function setupRT(){
       else{S.chatUnread++;updChatBadge();}
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'sales'},()=>{
-      S.loaded._sales=false;
-      if(S.tab==='home'||S.tab==='orders')loadData(S.tab).then(render);
+      db.from('sales').select('id,order_number,pn,fulfillment_status,qty,customer_name,sale_date,tracking_number,carrier,shipped_at').order('created_at',{ascending:false}).limit(800).then(({data})=>{if(data){S.sales=data;if(S.tab==='home'||S.tab==='orders')render();}});
     })
     .subscribe();
 }
@@ -412,9 +409,7 @@ async function setTab(tab){
   S.tab=tab;S.detail=null;S.detailId=null;S.nav=[];
   S.orderExp=null;S.poExp=null;
   syncNav();updateHdr();
-  if(!S.loaded[tab])$('view').innerHTML=spin();
-  await loadData(tab);
-  if(tab==='chat'){S.chatUnread=0;updChatBadge();}
+  if(tab==='chat'){await loadData(tab);S.chatUnread=0;updChatBadge();}
   render();$('view').scrollTo(0,0);
   if(tab==='chat')chatScroll();
 }
@@ -424,6 +419,8 @@ function render(){
   updateHdr();
   if(S.detail==='part'){$('view').innerHTML=renderPartDetail();return;}
   if(S.detail==='count'){$('view').innerHTML=renderCountDetail();return;}
+  if(S.detail==='order'){$('view').innerHTML=renderOrderDetail();return;}
+  if(S.detail==='asm'){$('view').innerHTML=renderAsmDetail();return;}
   switch(S.tab){
     case 'home':  $('view').innerHTML=renderHome();break;
     case 'orders':$('view').innerHTML=renderOrders();break;
@@ -506,10 +503,10 @@ function orderCard(o){
       ${st!==null?`<div style="font-weight:700;color:${ok?'var(--green)':'var(--red)'}">${st} in stock</div>`:'<div style="font-size:12px;color:var(--t3)">Drop-ship</div>'}
     </div>`;
   }).join('');
-  const acts=o.fs==='Open'?`<button class="btn btn-p btn-sm" onclick="event.stopPropagation();markPacked(${JSON.stringify(o.k)})">Mark Packed</button>`:
-    o.fs==='Packed'?`<button class="btn btn-o btn-sm" onclick="event.stopPropagation();shipForm(${JSON.stringify(o.k)})">🚚 Ship</button>`:'';
+  const acts=o.fs==='Open'?`<button class="btn btn-p btn-sm" onclick="event.stopPropagation();markPacked('${esc(o.k)}')">Mark Packed</button>`:
+    o.fs==='Packed'?`<button class="btn btn-o btn-sm" onclick="event.stopPropagation();shipForm('${esc(o.k)}')">🚚 Ship</button>`:'';
   return`<div class="card ${exp?'exp':''}">
-    <div class="c-hd" onclick="window._togOrd(${JSON.stringify(o.k)})">
+    <div class="c-hd" onclick="openOrder('${esc(o.k)}','${esc(o.orderNum)}','${esc(o.customer)}')">
       <div style="flex:1;min-width:0">
         <div style="display:flex;align-items:center;gap:7px;margin-bottom:3px">
           <span style="font-weight:700;font-family:var(--mono);font-size:14px">${esc(o.orderNum)}</span>
@@ -520,8 +517,12 @@ function orderCard(o){
       <span class="pill ${pc}" style="flex-shrink:0">${o.fs}</span>
       <span class="chev">▼</span>
     </div>
-    ${exp?`<div class="c-body">${lines}${acts?`<div style="margin-top:12px">${acts}</div>`:''}</div>`:''}
+    <div style="padding:0 14px 12px;display:flex;gap:8px;align-items:center">
+      <div style="flex:1;font-size:12px;color:var(--t3)">${o.lines.map(l=>esc(l.pn)).join('  ·  ').slice(0,60)}</div>
+      <span style="font-size:12px;color:var(--teal);font-weight:600">Details ›</span>
+    </div>
   </div>`;
+
 }
 
 window._togOrd=function(k){S.orderExp=S.orderExp===k?null:k;render();};
@@ -553,32 +554,43 @@ async function markShipped(k,tr,cr){
 
 // ── PARTS ─────────────────────────────────────────────────────────────────
 function renderParts(){
+  const ph=S.partsMode==='assemblies'?'Search assembly name or SKU…':'Search part #, description, vendor…';
+  const sv=S.partsMode==='assemblies'?S.asmSearch:S.partSearch;
   return`
-  <div class="pg">Parts</div>
-  <div class="srch-w">
-    <span class="srch-ico">⌕</span>
-    <input class="inp" id="p-srch" placeholder="Search part #, description, vendor…"
-      value="${esc(S.partSearch)}" oninput="onPSrch(this.value)" autocomplete="off" autocorrect="off" spellcheck="false">
-  </div>
-  <div class="chips" id="p-cats">
+  <div class="pg">Parts &amp; Assemblies</div>
+  <div class="chips">
+    <div class="chip ${S.partsMode==='parts'?'on':''}" onclick="setPartsMode('parts')">🔩 Parts</div>
+    <div class="chip ${S.partsMode==='assemblies'?'on':''}" onclick="setPartsMode('assemblies')">🏗 Assemblies</div>
+    ${S.partsMode==='parts'?`<div style="width:1px;background:var(--br);margin:0 2px;flex-shrink:0"></div>
     <div class="chip ${!S.partCat?'on':''}" onclick="onPCat('')">All</div>
-    ${S.partCats.map(c=>`<div class="chip ${S.partCat===c?'on':''}" onclick="onPCat(${JSON.stringify(c)})">${esc(c)}</div>`).join('')}
+    ${S.partCats.map(c=>`<div class="chip ${S.partCat===c?'on':''}" onclick="onPCat('${esc(c)}')">${esc(c)}</div>`).join('')}`:''}
   </div>
-  <div id="p-res">${buildParts()}</div>`;
+  <div class="srch-w" style="padding-top:4px">
+    <span class="srch-ico">⌕</span>
+    <input class="inp" id="p-srch" placeholder="${ph}"
+      value="${esc(sv)}" oninput="onPSrch(this.value)" autocomplete="off" autocorrect="off" spellcheck="false">
+  </div>
+  <div id="p-res">${buildResults()}</div>`;
+}
+function setPartsMode(m){S.partsMode=m;S.partSearch='';S.asmSearch='';S.partCat='';render();}
+function buildResults(){return S.partsMode==='assemblies'?buildAsms():buildParts();}
+function onPSrch(v){
+  if(S.partsMode==='assemblies')S.asmSearch=v;else S.partSearch=v;
+  const r=$('p-res');if(r)r.innerHTML=buildResults();
 }
 
-function onPSrch(v){S.partSearch=v;const r=$('p-res');if(r)r.innerHTML=buildParts();}
 function onPCat(c){S.partCat=c;const r=$('p-res');if(r)r.innerHTML=buildParts();}
 
 function buildParts(){
+  if(!S.dataReady)return spin();
   const q=S.partSearch.toLowerCase().trim();
   let list=S.parts;
   if(q)list=list.filter(p=>p.pn.toLowerCase().includes(q)||(p.description||'').toLowerCase().includes(q)||(p.vendor||'').toLowerCase().includes(q));
   if(S.partCat)list=list.filter(p=>(p.category||'')==S.partCat);
-  if(!list.length)return`<div class="empty"><div class="ei">${q||S.partCat?'🔍':'🔩'}</div><div class="et">${q||S.partCat?'No parts found':'Loading…'}</div><div class="es">${q||S.partCat?'Try a different search':'Parts will appear here once loaded'}</div></div>`;
+  if(!list.length)return`<div class="empty"><div class="ei">${q||S.partCat?'🔍':'🔩'}</div><div class="et">${q||S.partCat?'No parts found':'No parts'}</div><div class="es">${q||S.partCat?'Try a different search':'No parts in catalog'}</div></div>`;
   const rows=list.slice(0,80).map(p=>{
     const oh=p.total_unpckgd||0;const low=oh<=(p.min_qty||0)&&(p.min_qty||0)>0;
-    return`<div class="pt-row" onclick="openPart(${JSON.stringify(p.pn)})">
+    return`<div class="pt-row" onclick="openPart('${esc(p.pn)}')">
       <div style="flex:1;min-width:0">
         <div style="font-family:var(--mono);font-size:13px;color:var(--teal);font-weight:600">${esc(p.pn)}</div>
         <div style="font-size:12px;color:var(--t2);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.description||'—')}</div>
@@ -594,10 +606,7 @@ function buildParts(){
   return`<div class="lst" style="margin-bottom:8px">${rows}</div>${list.length>80?`<div style="text-align:center;padding:10px;font-size:12px;color:var(--t3)">Showing 80 of ${list.length} — refine search</div>`:''}`;
 }
 
-function openPart(pn){
-  saveNav();S.detail='part';S.detailId=pn;
-  render();$('view').scrollTo(0,0);
-}
+// openPart defined above with history fetch
 
 function renderPartDetail(){
   const p=fP(S.detailId);
@@ -632,8 +641,41 @@ function renderPartDetail(){
       </select>
     </div>
     <div><label class="lbl">Notes (optional)</label><input class="inp" id="adj-n" placeholder="Add notes…" autocomplete="off"></div>
-    <button class="btn btn-p btn-w" onclick="doAdj(${JSON.stringify(p.pn)},${oh})">Save Adjustment</button>
-  </div>`;
+    <button class="btn btn-p btn-w" onclick="doAdj('${esc(p.pn)}',${oh})">Save Adjustment</button>
+  </div>
+  ${(()=>{
+    // Where used
+    const used=Object.entries(S.boms).filter(([par,items])=>items.some(i=>i.child_pn===p.pn)).map(([par])=>par);
+    if(!used.length)return'';
+    return`<div class="sec-hd">Used In (${used.length} assembl${used.length!==1?'ies':'y'})</div>
+    <div class="lst" style="margin-bottom:12px">${used.map(asmPn=>{
+      const a=S.assemblies.find(x=>x.pn===asmPn);
+      const oh2=a?(a.total_on_hand||0):0;
+      return`<div class="li" onclick="openAsm('${esc(asmPn)}')">
+        <div style="flex:1;min-width:0"><div class="li-t" style="font-family:var(--mono);color:var(--teal)">${esc(asmPn)}</div><div class="li-s">${esc(a?.description||'')}</div></div>
+        <div style="font-size:15px;font-weight:700;color:${oh2<=0?'var(--red)':'var(--tx)'}; margin-right:8px">${fmt(oh2)}</div>
+        <span class="arr">›</span>
+      </div>`;
+    }).join('')}</div>`;
+  })()}
+  ${(()=>{
+    const hist=S.partCorr[p.pn];
+    if(!hist)return`<div style="padding:8px 16px 16px;font-size:12px;color:var(--t3)">Loading correction history…</div>`;
+    if(!hist.length)return`<div class="sec-hd">Correction History</div><div class="empty" style="padding:18px"><div class="es">No corrections recorded</div></div>`;
+    return`<div class="sec-hd">Correction History</div>
+    <div class="lst" style="margin-bottom:24px">${hist.map(c=>{
+      const adj=c.adjustment||0;
+      return`<div style="display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--br)">
+        <div style="font-size:16px;font-weight:700;color:${adj>0?'var(--green)':'var(--red)'};min-width:44px;text-align:center">${adj>0?'+':''}${adj}</div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:13px;font-weight:600">${esc(c.reason||'Adjustment')}</div>
+          <div style="font-size:11px;color:var(--t3);margin-top:1px">${esc((c.user_email||'').split('@')[0])} &middot; ${ago(c.created_at)}</div>
+        </div>
+        <div style="text-align:right;font-size:11px;color:var(--t3)">${fmt(c.previous_qty||0)} → ${fmt(c.new_qty||0)}</div>
+      </div>`;
+    }).join('')}</div>`;
+  })()}
+`;
 }
 
 function adjD(d,id,orig){const el=$(id);if(el)el.value=Math.max(0,(parseInt(el.value)||orig)+d);}
@@ -643,7 +685,7 @@ async function doAdj(pn,prev){
   const notes=$('adj-n')?.value||'';
   const adj=nq-prev;
   if(adj===0){toast('No change');return;}
-  if(!confirm(`${pn}: ${prev} → ${nq} (${adj>0?'+':''}${adj}). Save?`))return;
+  if(!confirm(pn+': '+prev+' to '+nq+' ('+(adj>0?'+':'')+adj+'). Save?'))return;
   try{
     const now=new Date().toISOString();
     await db.from('parts').update({total_unpckgd:nq,updated_at:now}).eq('pn',pn);
@@ -651,6 +693,152 @@ async function doAdj(pn,prev){
     const pt=S.parts.find(p=>p.pn===pn);if(pt)pt.total_unpckgd=nq;
     toast('✓ Inventory updated');goBack();
   }catch(e){toast('Error: '+e.message);}
+}
+
+
+// ── ASSEMBLY LOOKUP ───────────────────────────────────────────────────────
+function buildAsms(){
+  if(!S.dataReady)return spin();
+  const q=S.asmSearch.toLowerCase().trim();
+  let list=S.assemblies;
+  if(q)list=list.filter(a=>a.pn.toLowerCase().includes(q)||(a.description||'').toLowerCase().includes(q));
+  if(!list.length)return`<div class="empty"><div class="ei">🏗</div><div class="et">${q?'No assemblies found':'All Assemblies'}</div><div class="es">${q?'Try a different search':'Search by SKU or description'}</div></div>`;
+  const rows=list.slice(0,60).map(a=>{
+    const bom=S.boms[a.pn]||[];
+    const oh=a.total_on_hand||0;
+    return`<div class="pt-row" onclick="openAsm('${esc(a.pn)}')">
+      <div style="flex:1;min-width:0">
+        <div style="font-family:var(--mono);font-size:13px;color:var(--teal);font-weight:600">${esc(a.pn)}</div>
+        <div style="font-size:12px;color:var(--t2);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.description||'—')}</div>
+        <div style="font-size:11px;color:var(--t3);margin-top:1px">${bom.length} BOM line${bom.length!==1?'s':''}</div>
+      </div>
+      <div style="text-align:right;flex-shrink:0;margin:0 10px">
+        <div style="font-size:22px;font-weight:700;color:${oh<=0?'var(--red)':'var(--tx)'};line-height:1">${fmt(oh)}</div>
+        <div style="font-size:10px;color:var(--t3)">on hand</div>
+      </div>
+      <span class="arr">›</span>
+    </div>`;
+  }).join('');
+  return`<div class="lst" style="margin-bottom:8px">${rows}</div>${list.length>60?`<div style="text-align:center;padding:10px;font-size:12px;color:var(--t3)">Showing 60 of ${list.length} — refine search</div>`:''}`;
+}
+
+function openAsm(pn){saveNav();S.detail='asm';S.detailId=pn;render();$('view').scrollTo(0,0);}
+
+function renderAsmDetail(){
+  const a=S.assemblies.find(x=>x.pn===S.detailId);
+  if(!a)return`<div class="empty"><div class="et">Assembly not found</div></div>`;
+  const oh=a.total_on_hand||0;
+  const bom=S.boms[a.pn]||[];
+  // Calculate can-build
+  let canBuild=Infinity;
+  bom.forEach(i=>{
+    if(i.item_type!=='part'&&i.item_type!=='assembly'&&i.item_type!=='subassembly')return;
+    const p=fP(i.child_pn);if(!p)return;
+    const avail=Math.max(0,p.total_unpckgd||0);
+    const builds=i.qty>0?Math.floor(avail/i.qty):Infinity;
+    canBuild=Math.min(canBuild,builds);
+  });
+  if(!isFinite(canBuild)||bom.length===0)canBuild=0;
+  const bomRows=bom.map(i=>{
+    const p=fP(i.child_pn);
+    const a2=S.assemblies.find(x=>x.pn===i.child_pn);
+    const oh2=p?(p.total_unpckgd||0):a2?(a2.total_on_hand||0):null;
+    const need=i.qty||1;
+    const ok=oh2===null||oh2>=need;
+    const isSub=i.item_type==='assembly'||i.item_type==='subassembly';
+    return`<div style="display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--br)">
+      <div style="width:3px;height:36px;border-radius:2px;background:${ok?'var(--green)':'var(--red)'}; flex-shrink:0"></div>
+      <div style="flex:1;min-width:0">
+        <div style="font-family:var(--mono);font-size:12px;color:${isSub?'var(--purple)':'var(--teal)'};font-weight:600">${esc(i.child_pn)}</div>
+        <div style="font-size:11px;color:var(--t3);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p?.description||a2?.description||'—')}</div>
+      </div>
+      <div style="text-align:right;flex-shrink:0">
+        <div style="font-size:13px;font-weight:700;color:${ok?'var(--tx)':'var(--red)'}">${oh2!==null?fmt(oh2):'DS'}</div>
+        <div style="font-size:11px;color:var(--t3)">need ${need}</div>
+      </div>
+      ${isSub?'<span class="pill p-part" style="flex-shrink:0;font-size:10px">SUB</span>':''}
+    </div>`;
+  }).join('');
+  return`
+  <div style="padding:14px 16px 10px">
+    <div style="font-family:var(--mono);color:var(--teal);font-size:19px;font-weight:700;margin-bottom:4px">${esc(a.pn)}</div>
+    <div style="font-size:15px;color:var(--t2)">${esc(a.description||'—')}</div>
+  </div>
+  <div class="d-grid">
+    <div class="dg"><div class="dl">On Hand</div><div class="dv" style="font-size:28px;color:${oh<=0?'var(--red)':'var(--teal)'}">${fmt(oh)}</div></div>
+    <div class="dg"><div class="dl">Can Build</div><div class="dv" style="font-size:28px;color:${canBuild<=0?'var(--red)':canBuild<5?'var(--orange)':'var(--green)'}">${canBuild}</div></div>
+  </div>
+  ${bom.length?`
+  <div class="sec-hd">Bill of Materials (${bom.length} lines)</div>
+  <div class="lst" style="margin-bottom:8px">${bomRows}</div>
+  `:`<div class="empty" style="padding:24px"><div class="et">No BOM defined</div><div class="es">Add components in the ERP</div></div>`}`;
+}
+
+// ── ORDER DETAIL ──────────────────────────────────────────────────────────
+function openOrder(k,num,cust){saveNav();S.detail='order';S.detailId=k;render();$('view').scrollTo(0,0);}
+
+function renderOrderDetail(){
+  const k=S.detailId;
+  const lines=S.sales.filter(s=>(s.order_number||'__'+s.id)===k).sort((a,b)=>a.pn.localeCompare(b.pn));
+  if(!lines.length)return`<div class="empty"><div class="et">Order not found</div></div>`;
+  const lead=lines[0];
+  const shipped=lines.filter(l=>['Shipped','Delivered'].includes(l.fulfillment_status));
+  const pend=lines.filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
+  const allHold=pend.length>0&&pend.every(l=>l.fulfillment_status==='On Hold');
+  const fs=allHold?'On Hold':shipped.length>0&&pend.length>0?'Partial':
+    lines.reduce((b,x)=>{const r={'Shipped':5,'Delivered':4,'Packed':3,'On Hold':2,'Open':1,'Cancelled':0};return(r[x.fulfillment_status||'Open']||0)>(r[b]||0)?x.fulfillment_status:b;},'Open');
+  const pc=fs==='Packed'?'p-pack':fs==='Shipped'||fs==='Delivered'?'p-ship':fs==='On Hold'?'p-hold':'p-open';
+  const trk=lines.find(l=>l.tracking_number)?.tracking_number||'';
+  const cr=lines.find(l=>l.carrier)?.carrier||'';
+  const lineRows=lines.map(l=>{
+    const a=fA(l.pn),p=fP(l.pn);
+    const st=a?(a.total_on_hand||0):p?(p.total_unpckgd||0):null;
+    const ok=st===null||st>=(l.qty||1);
+    const lfs=l.fulfillment_status||'Open';
+    const lpc=lfs==='Packed'?'p-pack':lfs==='Shipped'||lfs==='Delivered'?'p-ship':lfs==='On Hold'?'p-hold':'p-open';
+    return`<div style="padding:12px 16px;border-bottom:1px solid var(--br)">
+      <div style="display:flex;align-items:flex-start;gap:10px">
+        <div style="flex:1;min-width:0">
+          <div style="font-family:var(--mono);font-size:13px;color:var(--teal);font-weight:600">${esc(l.pn)}</div>
+          <div style="font-size:12px;color:var(--t2);margin-top:2px">${esc(a?.description||p?.description||'—')}</div>
+          <div style="font-size:12px;color:var(--t3);margin-top:2px">Qty: <strong style="color:var(--tx)">${l.qty||1}</strong></div>
+        </div>
+        <div style="text-align:right;flex-shrink:0">
+          ${st!==null?`<div style="font-size:15px;font-weight:700;color:${ok?'var(--green)':'var(--red)'}">${fmt(st)} in stock</div>`:'<div style="font-size:12px;color:var(--t3)">Drop-ship</div>'}
+          <span class="pill ${lpc}" style="margin-top:5px">${lfs}</span>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+  const actions=fs==='Open'?`<button class="btn btn-p btn-w" onclick="markPacked('${esc(k)}')">📦 Mark All Packed</button>`:
+    fs==='Packed'?`<button class="btn btn-o btn-w" onclick="shipForm('${esc(k)}')">🚚 Mark Shipped</button>`:'';
+  return`
+  <div style="padding:14px 16px 10px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+      <span style="font-family:var(--mono);font-size:18px;font-weight:700">${esc(lead.order_number||k)}</span>
+      <span class="pill ${pc}">${fs}</span>
+    </div>
+    <div style="font-size:14px;font-weight:600;margin-bottom:3px">${esc(lead.customer_name||'Unknown Customer')}</div>
+    <div style="font-size:12px;color:var(--t3)">${lead.sale_date||'—'} &middot; ${lines.length} line${lines.length!==1?'s':''}</div>
+    ${trk?`<div style="margin-top:8px;padding:8px 10px;background:var(--b3);border-radius:var(--rs);font-size:12px"><span style="color:var(--t3)">${esc(cr)||'Tracking'}: </span><strong style="font-family:var(--mono)">${esc(trk)}</strong></div>`:''}
+  </div>
+  <div class="sec-hd">Order Lines</div>
+  <div class="lst" style="margin-bottom:12px">${lineRows}</div>
+  ${actions?`<div style="padding:0 16px 24px">${actions}</div>`:''}`;
+}
+
+// ── PART HISTORY ──────────────────────────────────────────────────────────
+async function openPart(pn){
+  saveNav();S.detail='part';S.detailId=pn;
+  render();$('view').scrollTo(0,0);
+  // Fetch correction history in background
+  try{
+    const{data}=await db.from('inv_corrections')
+      .select('adjustment,previous_qty,new_qty,reason,source,user_email,created_at')
+      .eq('pn',pn).order('created_at',{ascending:false}).limit(12);
+    S.partCorr[pn]=data||[];
+    if(S.detail==='part'&&S.detailId===pn){render();$('view').scrollTo(0,0);}
+  }catch(e){S.partCorr[pn]=[];}
 }
 
 // ── TASKS ─────────────────────────────────────────────────────────────────
@@ -668,7 +856,7 @@ function renderCounts(){
   if(!S.cycleCounts.length)return`<div class="empty"><div class="ei">✅</div><div class="et">No open counts</div><div class="es">All cycle counts are complete</div></div>`;
   const rows=S.cycleCounts.map(c=>{
     const items=JSON.parse(c.items||'[]');
-    return`<div class="li" onclick="openCount(${JSON.stringify(c.id)})">
+    return`<div class="li" onclick="openCount('${esc(c.id)}')">
       <div style="flex:1"><div class="li-t">${esc(c.name||'Count #'+c.id.slice(0,8))}</div><div class="li-s">${items.length} parts &middot; ${ago(c.created_at)}</div></div>
       <div style="color:var(--teal);font-size:13px;font-weight:600;flex-shrink:0">Start ›</div>
     </div>`;
@@ -693,14 +881,14 @@ function renderCountDetail(){
         <span style="font-size:13px;color:var(--t2);flex-shrink:0">Counted:</span>
         <input class="inp" style="flex:1;text-align:center;padding:9px;font-size:16px;font-weight:600" type="number" min="0"
           value="${S.countVals[item.pn]!==undefined?S.countVals[item.pn]:''}" placeholder="qty"
-          onchange="S.countVals[${JSON.stringify(item.pn)}]=parseInt(this.value)||0">
+          onchange="S.countVals['${esc(item.pn)}']=parseInt(this.value)||0">
       </div>
     </div>`;
   }).join('');
   return`
   <div style="padding:14px 16px 12px"><div style="font-size:18px;font-weight:700">${esc(c.name||'Cycle Count')}</div><div style="font-size:13px;color:var(--t3);margin-top:3px">${items.length} parts to count</div></div>
   <div class="lst" style="margin-bottom:14px">${rows}</div>
-  <div style="padding:0 16px 24px"><button class="btn btn-p btn-w" onclick="doCount(${JSON.stringify(c.id)})">Submit Count</button></div>`;
+  <div style="padding:0 16px 24px"><button class="btn btn-p btn-w" onclick="doCount('${esc(c.id)}')">Submit Count</button></div>`;
 }
 
 async function doCount(id){
@@ -735,7 +923,7 @@ function poCard(po){
   const sc=po.status==='On Order'||po.status==='Ordered'?'var(--teal)':po.status==='In Transit'?'var(--orange)':'var(--t3)';
   const pt=fP(po.pn);
   return`<div class="card ${exp?'exp':''}" data-poid="${esc(po.id)}">
-    <div class="c-hd" onclick="window._togPO(${JSON.stringify(po.id)})">
+    <div class="c-hd" onclick="window._togPO('${esc(po.id)}')">
       <div style="flex:1;min-width:0">
         <div style="font-family:var(--mono);font-weight:700;margin-bottom:3px">${esc(po.pn)}</div>
         ${pt?`<div style="font-size:12px;color:var(--t2);margin-bottom:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(pt.description||'')}</div>`:''}
@@ -751,7 +939,7 @@ function poCard(po){
       <div style="margin-bottom:12px"><label class="lbl">Qty Received</label>
         <input class="inp" type="number" id="rv-${esc(po.id)}" value="${po.qty||0}" min="0" max="${po.qty||999}">
       </div>
-      <button class="btn btn-p btn-sm" onclick="doReceive(${JSON.stringify(po.id)},${po.qty||0})">Mark Received</button>
+      <button class="btn btn-p btn-sm" onclick="doReceive('${esc(po.id)}',${po.qty||0})">Mark Received</button>
     </div>`:''}
   </div>`;
 }
