@@ -633,7 +633,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v2.4';
+const TGK_ERP_VERSION = 'v2.5';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -4497,7 +4497,9 @@ function renderIntegrations(){
       <button class="btn btn-teal" onclick="startShopifyOAuth()" title="Opens Shopify OAuth to automatically get your access token">🔗 Connect via OAuth</button>
       <button class="btn btn-teal" onclick="testShopify()">Test Connection</button>
       <button class="btn btn-sm" style="color:var(--purple);border-color:rgba(124,58,237,.3)" onclick="syncShopifyImages()" title="Pull product images from Shopify and attach them to matching assembly SKUs">🖼 Sync Images</button>
+      <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(224,123,40,.35);font-weight:700" onclick="bulkSyncShopifyBackorder()" id="bulk-shopify-sync-btn" title="Check every finished good and push the correct backorder/in-stock template to Shopify right now">⟳ Bulk Sync Backorder Status</button>
     </div>
+    <div id="bulk-shopify-sync-log" style="display:none;margin-top:10px;padding:10px 14px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;font-size:11px;font-family:var(--mono);color:var(--text2);max-height:200px;overflow-y:auto;line-height:1.7"></div>
     <div style="font-size:10px;color:var(--text3);margin-top:6px">🔗 OAuth: enter Store URL + Client ID → click Connect → approve in Shopify → token auto-saves. Requires redirect URI <code>https://tgkcommand.github.io/TGKErp/tgk_erp.html</code> added in your Dev Dashboard app version.</div>
     <div class="divider"></div>
     <div style="font-size:11px;color:var(--text3)">
@@ -5777,6 +5779,54 @@ async function loadShopifySyncLog(){
   }catch(e){
     wrap.innerHTML='<div style="font-size:11px;color:var(--red);padding:8px 0">Error: '+e.message+'</div>';
   }
+}
+async function bulkSyncShopifyBackorder(){
+  if(!S.shopify||!S.shopify.store||!S.shopify.key){toast('Add Shopify credentials first');return;}
+  if(S.settings.shopify_backorder_sync_enabled===false){toast('Backorder sync is disabled — enable it in the toggle above first');return;}
+  const btn=document.getElementById('bulk-shopify-sync-btn');
+  const log=document.getElementById('bulk-shopify-sync-log');
+  if(!confirm('This will check every finished good and push the correct backorder or in-stock template to Shopify. This may take a minute. Continue?'))return;
+  btn.disabled=true;btn.textContent='Syncing…';
+  log.style.display='block';log.innerHTML='Starting bulk sync…<br>';
+  const fgs=S.assemblies.filter(a=>a.is_fg&&!a.discontinued&&a.stage!=='dev');
+  let done=0,backorderCount=0,inStockCount=0,errorCount=0;
+  const restockDays=parseInt(S.settings.shopify_restock_days)||30;
+  const restockDate=new Date(Date.now()+restockDays*86400000).toISOString().slice(0,10);
+  for(const a of fgs){
+    const pn=dispPn(a);
+    const b=buildability(a.pn);
+    const oh=a.total_on_hand||0;
+    let isBackorder=false;
+    if(oh<=0){isBackorder=b.hasBOM?b.maxBuild<=0:true;}
+    const template=isBackorder?(S.settings.shopify_backorder_template||'backorder'):'';
+    try{
+      const r=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+        body:JSON.stringify({action:'update_template',store:S.shopify.store,key:S.shopify.key,pn,template,restock_date:isBackorder?restockDate:''})
+      });
+      const d=await r.json();
+      if(r.ok&&d.success){
+        if(isBackorder){backorderCount++;}else{inStockCount++;}
+        log.innerHTML+=(isBackorder?'<span style="color:var(--amber)">BACKORDER</span>':'<span style="color:var(--green)">IN STOCK&nbsp;&nbsp;</span>')+' '+escHtml(pn)+(isBackorder?' → restock '+restockDate:'')+'<br>';
+      } else {
+        errorCount++;
+        log.innerHTML+='<span style="color:var(--red)">ERROR&nbsp;&nbsp;&nbsp;&nbsp;</span> '+escHtml(pn)+' — '+(d.error||r.status)+'<br>';
+      }
+    } catch(e){
+      errorCount++;
+      log.innerHTML+='<span style="color:var(--red)">ERROR&nbsp;&nbsp;&nbsp;&nbsp;</span> '+escHtml(pn)+' — '+e.message+'<br>';
+    }
+    done++;
+    btn.textContent='Syncing… '+done+'/'+fgs.length;
+    log.scrollTop=log.scrollHeight;
+    // Small delay to avoid rate limiting
+    await new Promise(res=>setTimeout(res,150));
+  }
+  log.innerHTML+='<br><strong>Done.</strong> '+inStockCount+' in stock, '+backorderCount+' backordered, '+errorCount+' errors.';
+  log.scrollTop=log.scrollHeight;
+  btn.disabled=false;btn.textContent='⟳ Bulk Sync Backorder Status';
+  toast('✓ Bulk sync complete — '+backorderCount+' backorder, '+inStockCount+' in stock'+(errorCount?' | '+errorCount+' errors':''));
 }
 async function syncShopifyImages(){
   if(!S.shopify.key){toast('Save Shopify credentials first');return;}
