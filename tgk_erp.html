@@ -633,7 +633,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v2.6';
+const TGK_ERP_VERSION = 'v2.8';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -720,8 +720,10 @@ function computeDemand(){
     if(w<4)wk4[s.pn]=(wk4[s.pn]||0)+q;
   });
   const asmCalc={},partCalc={};
+  const devPnSet=new Set(S.assemblies.filter(a=>isDev(a)).map(a=>a.pn));
   S.assemblies.forEach(a=>{asmCalc[a.pn]={wk4:(wk4[a.pn]||0)/4,wk12:(wk12[a.pn]||0)/12};});
   Object.entries(S.boms).forEach(([parent,items])=>{
+    if(devPnSet.has(parent))return;
     const ad=asmCalc[parent];if(!ad)return;
     items.forEach(i=>{
       if(i.item_type==='assembly'&&asmCalc[i.child_pn]){
@@ -732,6 +734,7 @@ function computeDemand(){
   });
   S.parts.forEach(p=>{partCalc[p.pn]={wk4:(wk4[p.pn]||0)/4,wk12:(wk12[p.pn]||0)/12};});
   Object.entries(S.boms).forEach(([parent,items])=>{
+    if(devPnSet.has(parent))return;
     const ad=asmCalc[parent];if(!ad)return;
     items.forEach(i=>{
       if(i.item_type!=='part')return;
@@ -833,13 +836,30 @@ function fsPill(fs){
 }
 function isInternal(on){return(on||'').startsWith('WARRANTY-')||(on||'').startsWith('SHERROR-');}
 function countPendingOrders(){
-  const openNums=new Set();
+  // Match dashboard: freshOpen (non-stale) + Partial
+  const cutoff=daysAgo(60);
+  const byOrd={};
   S.sales.forEach(s=>{
     if(isInternal(s.order_number))return;
-    const fs=s.fulfillment_status||'Open';
-    if(fs==='Open'||fs==='Partial')openNums.add(s.order_number||('__noid__'+s.id));
+    const k=s.order_number||('__noid__'+s.id);
+    if(!byOrd[k])byOrd[k]=[];
+    byOrd[k].push(s);
   });
-  return openNums.size;
+  let count=0;
+  Object.values(byOrd).forEach(lines=>{
+    const rank={'Shipped':5,'Delivered':4,'Packed':3,'On Hold':2,'Partial':2,'Open':1,'Cancelled':0,'Refunded':0};
+    const shipped=lines.filter(l=>l.fulfillment_status==='Shipped'||l.fulfillment_status==='Delivered');
+    const pending=lines.filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
+    const allOnHold=pending.length>0&&pending.every(l=>l.fulfillment_status==='On Hold');
+    const eff=allOnHold?'On Hold':shipped.length>0&&pending.length>0&&!allOnHold?'Partial':
+      lines.reduce((b,x)=>(rank[x.fulfillment_status||'Open']||0)>(rank[b]||0)?x.fulfillment_status:b,lines[0].fulfillment_status||'Open');
+    if(eff==='Partial'){count++;return;}
+    if(eff==='Open'){
+      const date=lines.reduce((e,s)=>{const d=s.sale_date||'';return d&&(!e||d<e)?d:e;},'');
+      if(!date||date>=cutoff)count++;
+    }
+  });
+  return count;
 }
 function countGroupedStatus(status){
   const rank={'Shipped':5,'Delivered':4,'Packed':3,'On Hold':2,'Partial':2,'Open':1,'Cancelled':0,'Refunded':0};
@@ -2520,21 +2540,15 @@ function renderSales(){
   const staleOpen    =openOrders.filter(s=>s.sale_date&&s.sale_date<daysAgo(60));
   const shipped7     =allGrouped.filter(s=>s.fulfillment_status==='Shipped'&&s.shipped_at&&s.shipped_at.slice(0,10)>=daysAgo(7));
   const delivered7   =allGrouped.filter(s=>s.fulfillment_status==='Delivered'&&s.shipped_at&&s.shipped_at.slice(0,10)>=daysAgo(7));
+  const _msrpByPn=new Map(S.assemblies.map(a=>[a.pn,a.msrp||0]));
   const rev7=S.sales.filter(s=>!isInternal(s.order_number)&&(s.sale_date||'')>=daysAgo(7))
-    .reduce((t,s)=>{const a=S.assemblies.find(x=>x.pn===s.pn);return t+((a?.msrp||0)*(s.qty||1));},0);
+    .reduce((t,s)=>t+(_msrpByPn.get(s.pn)||0)*(s.qty||1),0);
 
   const needsActionStatuses='Open|Partial';
 
   const fstats=['Open','Pre-order','On Hold','Packed','Partial','Shipped','Delivered','Returned','Refunded','Cancelled'];
 
-  function isSplitOrder(orderNum){
-    if(!orderNum)return false;
-    const lines=S.sales.filter(x=>x.order_number===orderNum);
-    if(lines.length<2)return false;
-    const shipped=lines.some(x=>x.fulfillment_status==='Shipped'||x.fulfillment_status==='Delivered');
-    const open=lines.some(x=>!x.fulfillment_status||x.fulfillment_status==='Open');
-    return shipped&&open;
-  }
+  // isSplitOrder removed — _isPartialShip already on grouped orders
 
   const awaitingSub=(()=>{
     const parts=[];
@@ -2598,7 +2612,7 @@ function renderSales(){
     <button class="btn btn-sm" style="color:var(--text3)" onclick="testShopifyWebhook()" title="Ping the Shopify order webhook edge function to verify it is reachable">🔌 Test Webhook</button>
     <button class="btn btn-sm" style="color:var(--text3)" title="Remove duplicate order lines, preserve tracking" onclick="dedupeOrders()">🧽 Dedupe</button>
   </div>
-  <div id="bulk-bar" style="display:none;position:sticky;top:0;z-index:50;background:#1e2022;border-bottom:2px solid #2ABFAA;padding:8px 16px;align-items:center;gap:10px;flex-wrap:wrap"><span class="bulk-cnt" style="font-size:13px;font-weight:700;color:#fff;margin-right:4px"></span><button class="btn btn-teal btn-sm" onclick="bulkMarkShipped()">&#128666; Mark Shipped</button><button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="bulkMarkDelivered()">&#10003; Mark Delivered</button><button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="bulkMarkCancelled()">&#215; Cancel</button><button class="btn btn-sm" style="color:var(--text3)" onclick="window._salesSel.clear();refreshBulkBar();render()">Clear</button></div>
+  <div id="bulk-bar" style="display:none;position:fixed;bottom:80px;left:50%;transform:translateX(-50%);z-index:200;background:#1e2022;border:1px solid #2ABFAA;border-radius:10px;box-shadow:0 4px 24px rgba(0,0,0,.45);padding:10px 18px;align-items:center;gap:10px;flex-wrap:nowrap;white-space:nowrap"><span class="bulk-cnt" style="font-size:13px;font-weight:700;color:#fff;margin-right:4px"></span><button class="btn btn-teal btn-sm" onclick="bulkMarkShipped()">&#128666; Mark Shipped</button><button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="bulkMarkDelivered()">&#10003; Mark Delivered</button><button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="bulkMarkCancelled()">&#215; Cancel</button><button class="btn btn-sm" style="color:var(--text3)" onclick="window._salesSel.clear();refreshBulkBar();render()">Clear</button></div>
   <div class="tbl-wrap">
   <table data-tid="sales"><thead class="sticky-header"><tr><th style="width:34px;padding:6px 8px;text-align:center"><input type="checkbox" title="Select/deselect all visible" onchange="bulkSelAll(this.checked)" style="cursor:pointer;accent-color:#2ABFAA"></th><th>Date</th><th>Order #</th><th>Customer</th><th>SKU</th><th>Qty</th><th>Stock</th><th>Fulfillment</th><th>Tracking</th><th>Actions</th></tr></thead><tbody>
   ${list.map(s=>{
@@ -2607,16 +2621,15 @@ function renderSales(){
     const prt=asm?null:S.parts.find(p=>p.pn===s.pn)||null;
     const stock=asm?(asm.total_on_hand||0):prt?(prt.total_unpckgd||0):null;
     const canFill=stock!==null&&stock>=(s.qty||1);
-    const split=s._grouped&&isSplitOrder(s.order_number);
-    const allOrderLines=s._grouped?S.sales.filter(x=>x.order_number===s.order_number):[];
+    const allOrderLines=s._grouped?(s._allLines||[]):[];
     const dsLineCount=s._grouped?allOrderLines.filter(l=>!findAsm(l.pn)&&!S.parts.find(p=>p.pn===l.pn)).length:0;
     const allDropShip=s._grouped&&allOrderLines.length>0&&dsLineCount===allOrderLines.length;
     const repTracking=s.tracking_number||(allOrderLines.find(x=>x.tracking_number)?.tracking_number)||'';
     const repCarrier=s.carrier||(allOrderLines.find(x=>x.tracking_number)?.carrier)||'';
     const multiTrack=s._grouped&&allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length>1;
-    const custName=s.customer_name||(s._grouped?S.sales.find(x=>x.order_number===s.order_number&&x.customer_name)?.customer_name:'');
+    const custName=s.customer_name||(s._grouped?allOrderLines.find(x=>x.customer_name)?.customer_name:'');
     const _okey=s.order_number||s.id;
-    const _discCode=s.discount_code||(s._grouped?S.sales.find(x=>x.order_number===s.order_number&&x.discount_code)?.discount_code:null);
+    const _discCode=s.discount_code||(s._grouped?allOrderLines.find(x=>x.discount_code)?.discount_code:null);
     const _dealerParsed=_discCode?parseDealerPO(_discCode,S.dealers):null;
     const _dealerTag=_dealerParsed?`<span style="display:inline-block;font-size:9px;font-weight:700;color:var(--orange);background:var(--orange-dim);border-radius:3px;padding:1px 5px;margin-top:2px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="Dealer order: ${escHtml(_dealerParsed.dealer.name)} · PO ${escHtml(_dealerParsed.poNumber)}">&#127978; ${escHtml(_dealerParsed.dealer.name)}</span>`:(_discCode?`<span style="display:inline-block;font-size:9px;color:var(--purple);background:rgba(124,58,237,.1);border-radius:3px;padding:1px 5px;margin-top:2px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="Discount code: ${escHtml(_discCode)}">&#127991; ${escHtml(_discCode)}</span>`:'')
     return `<tr class="rowlink" data-order="${escHtml(s.order_number||s.id)}" onclick="rowClick(event,function(){S.activeSale='${s.id}';pushHist();render()})">
@@ -8035,16 +8048,23 @@ function timeAgo(iso){
 async function loadDealerVisitCounts(){
   if(S.dealerVisitsLoaded)return;
   try{
-    const{data,error}=await db.from('dealer_visits').select('dealer_id').limit(5000);
-    if(error){
-      const missing=error.code==='42P01'||error.message?.includes('does not exist');
-      S._visitLogMissing=missing;
-      S.dealerVisitsLoaded=true;
-      render();
-      return;
+    // Paginate to get accurate counts regardless of visit volume
+    let allRows=[],from=0,batchSize=1000,done=false;
+    while(!done){
+      const{data,error}=await db.from('dealer_visits').select('dealer_id').range(from,from+batchSize-1);
+      if(error){
+        const missing=error.code==='42P01'||error.message?.includes('does not exist');
+        S._visitLogMissing=missing;
+        S.dealerVisitsLoaded=true;
+        render();return;
+      }
+      allRows=allRows.concat(data||[]);
+      done=!data||data.length<batchSize;
+      from+=batchSize;
+      if(from>50000)break; // safety cap at 50k visits
     }
     const counts={};
-    (data||[]).forEach(r=>{counts[r.dealer_id]=(counts[r.dealer_id]||0)+1;});
+    allRows.forEach(r=>{counts[r.dealer_id]=(counts[r.dealer_id]||0)+1;});
     S.dealerVisitCounts=counts;
     S._visitLogMissing=false;
     S.dealerVisitsLoaded=true;
@@ -8106,7 +8126,8 @@ async function showDealerLog(dealerId,dealerName){
   dealer_name TEXT,
   visited_at TIMESTAMPTZ DEFAULT NOW(),
   user_agent TEXT,
-  referrer TEXT
+  referrer TEXT,
+  page TEXT
 );
 ALTER TABLE dealer_visits DISABLE ROW LEVEL SECURITY;</pre>`:''}
     </div>`;
@@ -8123,6 +8144,7 @@ ALTER TABLE dealer_visits DISABLE ROW LEVEL SECURITY;</pre>`:''}
     </td>
     <td style="font-size:11px;color:var(--text2)">${parseUA(v.user_agent)}</td>
     <td style="font-size:10px;color:var(--text3);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(v.referrer||'')}">${v.referrer?escHtml(v.referrer.replace(/^https?:\/\//,'').slice(0,50)):'Direct'}</td>
+    <td style="font-size:10px;color:var(--text3)">${v.page==='price_list_v2'?'<span style="color:var(--teal);font-weight:600">New Portal</span>':'<span style="color:var(--text3)">Legacy</span>'}</td>
   </tr>`).join('');
   wrap.innerHTML=`
     <div style="font-size:11px;color:var(--text3);margin-bottom:10px">${data.length} visit${data.length!==1?'s':''} recorded</div>
@@ -8131,7 +8153,8 @@ ALTER TABLE dealer_visits DISABLE ROW LEVEL SECURITY;</pre>`:''}
         <thead><tr>
           <th style="font-size:10px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text3);white-space:nowrap">Date & Time</th>
           <th style="font-size:10px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text3)">Device</th>
-          <th style="font-size:10px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text3)">Referred From</th>
+          <th style="font-size:10px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text3)">Source</th>
+          <th style="font-size:10px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text3)">Portal</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
@@ -8139,11 +8162,13 @@ ALTER TABLE dealer_visits DISABLE ROW LEVEL SECURITY;</pre>`:''}
 }
 
 async function clearDealerLog(dealerId,dealerName){
-  if(!confirm(`Clear all visit history for ${dealerName}?`))return;
+  const count=S.dealerVisitCounts[dealerId]||0;
+  if(!confirm('Permanently delete all '+count+' visit records for '+dealerName+'?\n\nThis cannot be undone.'))return;
   const{error}=await db.from('dealer_visits').delete().eq('dealer_id',dealerId);
   if(error){toast('Error: '+error.message);return;}
   S.dealerVisitCounts[dealerId]=0;
-  toast('Visit log cleared');
+  S.dealerVisitsLoaded=false; // force reload on next render
+  toast('✓ Visit log cleared for '+dealerName);
   closeModal();
   render();
 }
@@ -8561,13 +8586,12 @@ function openModal(type,data){
     <div class="form-row cols-2">${fi('m-msrp','MSRP',data.msrp||0,'type="number" step="0.01"')} ${fi('m-ship','Shipping Cost',data.shipping_cost||10,'type="number" step="0.01"')}</div>
     <div class="form-row cols-2">${fi('m-oh','On Hand',data.total_on_hand||0,'type="number"')} ${fs('m-status','Inventory Status',[['ok','In Stock'],['low','Low'],['critical','Critical']],data.status||'ok')}</div>
     <div class="form-row cols-2">
-      ${fs('m-stage','Lifecycle Stage',[['','Active — live product'],['dev','Dev — in development (excluded from production & demand)']],data.stage||'')}
+      ${fs('m-stage','Lifecycle Stage',[['','Active — live product'],['dev','Dev — in development (excluded from production & demand)'],['discontinued','Discontinued — retired, hidden from all views']],(data.stage==='discontinued'||data.discontinued)?'discontinued':(data.stage||''))}
       ${fi('m-cc-project','CC Project (dev link)',data.cc_project||'','placeholder="Command Center project name"')}
     </div>
     <div class="form-row cols-2">${fi('m-avg','Avg Sales / Wk',data.avg_sales_wk||0,'type="number" step="0.01"')} ${fi('m-product-url','Product Page URL',data.product_url||'','placeholder="https://tgkmotorsport.com/products/…"')}</div>
     <div class="form-row cols-2">${fi('m-pl-notes','Price List Notes',data.pl_notes||'','placeholder="Shown on dealer price list…"')} ${fi('m-drawing','Drawing / Spec URL',data.drawing_url||'','placeholder="https://…"')}</div>
-    <div class="form-row"><label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text2);cursor:pointer"><input type="checkbox" id="m-disc" ${data.discontinued?'checked':''}> 🗄 Discontinued — hide from Production &amp; queues</label></div>
-    <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px">
+        <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px">
       <div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Bill of Materials <span style="font-weight:400;text-transform:none;color:var(--text3);font-size:10px">(optional — add components this assembly consumes)</span></div>
       <div id="m-bom-existing">${existingRows}</div>
       <div id="m-bom-pending"></div>
@@ -9597,7 +9621,7 @@ async function modalDeleteBOM(bomId,childPn,parentPn){
 
 async function submitAsm(eid){
   const newPn=$('m-pn').value.trim();if(!newPn){toast('SKU required');return;}
-  const payload={pn:newPn,description:$('m-desc').value.trim(),category:$('m-cat').value.trim(),msrp:parseFloat($('m-msrp').value)||0,shipping_cost:parseFloat($('m-ship').value)||10,total_on_hand:parseInt($('m-oh').value)||0,status:$('m-status').value,avg_sales_wk:parseFloat($('m-avg').value)||0,drawing_url:$('m-drawing').value.trim(),image_url:($('m-image')?.value||'').trim()||null,discontinued:$('m-disc').checked,new_sku:($('m-new-sku')?.value||'').trim()||null,use_new_sku:!!($('m-use-new-sku')?.checked),stage:$('m-stage')?.value||null,cc_project:($('m-cc-project')?.value||'').trim()||null,pl_notes:($('m-pl-notes')?.value||'').trim()||null,product_url:($('m-product-url')?.value||'').trim()||null,updated_at:new Date().toISOString()};
+  const payload={pn:newPn,description:$('m-desc').value.trim(),category:$('m-cat').value.trim(),msrp:parseFloat($('m-msrp').value)||0,shipping_cost:parseFloat($('m-ship').value)||10,total_on_hand:parseInt($('m-oh').value)||0,status:$('m-status').value,avg_sales_wk:parseFloat($('m-avg').value)||0,drawing_url:$('m-drawing').value.trim(),image_url:($('m-image')?.value||'').trim()||null,discontinued:$('m-stage')?.value==='discontinued',stage:$('m-stage')?.value==='discontinued'?null:($('m-stage')?.value||null),new_sku:($('m-new-sku')?.value||'').trim()||null,use_new_sku:!!($('m-use-new-sku')?.checked),cc_project:($('m-cc-project')?.value||'').trim()||null,pl_notes:($('m-pl-notes')?.value||'').trim()||null,product_url:($('m-product-url')?.value||'').trim()||null,updated_at:new Date().toISOString()};
   let error,data;
   if(eid){
     const prev=S.assemblies.find(a=>a.id===eid);
@@ -11931,7 +11955,22 @@ function renderPlanning() {
   const sortDir   = sf.dir||'asc';
   const q=(sf.search||'').toLowerCase();
 
-  const allTracked=S.parts.filter(p=>!p.discontinued);
+  const _devBomPns=new Set();
+  const _activeBomPns=new Set();
+  Object.entries(S.boms).forEach(([parent,items])=>{
+    const bucket=isDevPn(parent)?_devBomPns:_activeBomPns;
+    items.forEach(i=>{if(i.item_type==='part')bucket.add(i.child_pn);});
+  });
+  function isDevOnlyPart(p){
+    if(!_devBomPns.has(p.pn))return false;
+    if(_activeBomPns.has(p.pn))return false;
+    if((p.avg_sales_wk||0)>0)return false;
+    if(avgWk(p)>0)return false;
+    if(calcForecast(p.pn)>0)return false;
+    return true;
+  }
+  const devOnlyParts=S.parts.filter(p=>!p.discontinued&&isDevOnlyPart(p));
+  const allTracked=S.parts.filter(p=>!p.discontinued&&!isDevOnlyPart(p));
   const trackedCount=allTracked.filter(p=>avgWk(p)>0||calcForecast(p.pn)>0).length;
   const kpiCritical =allTracked.filter(p=>getPlanningStatus(p)==='Critical').length;
   const kpiReorder  =allTracked.filter(p=>getPlanningStatus(p)==='Reorder').length;
@@ -11982,8 +12021,9 @@ function renderPlanning() {
     <div class="tab ${(!S.planTab||S.planTab==='purchasing')?'active':''}" onclick="S.planTab='purchasing';render()">&#128462; Purchasing</div>
     <div class="tab ${S.planTab==='minmax'?'active':''}" onclick="S.planTab='minmax';render()">&#128208; Min / Max &amp; Safety</div>
     <div class="tab ${S.planTab==='builder'?'active':''}" onclick="S.planTab='builder';render()">&#127959; Finished Goods</div>
+    <div class="tab ${S.planTab==='dev'?'active':''}" style="${S.planTab==='dev'?'':' color:var(--purple)'}" onclick="S.planTab='dev';render()">&#128300; DEV Parts (${devOnlyParts.length})</div>
   </div>
-  ${S.planTab!=='builder'?`  <div class="panel" style="padding:12px 16px">
+  ${(S.planTab!=='builder'&&S.planTab!=='dev')?`  <div class="panel" style="padding:12px 16px">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
       <div class="search-wrap" style="flex:1;min-width:160px"><span class="search-icon">⌕</span><input placeholder="Search part, description, vendor…" value="${sf.search||''}" oninput="setFilter('planning','search',this.value)"></div>
       <select class="form-input" style="width:auto;padding:6px 10px;font-size:11px" onchange="setFilter('planning','cat',this.value)">
@@ -12022,7 +12062,7 @@ function renderPlanning() {
       ${[4,8,12,26,52].map(w=>`<button class="filter-chip ${weeks===w?'on-teal':''}" onclick="S.forecastWeeks=${w};render()">${w}w</button>`).join('')}
     </div>
   </div>`:''}
-  ${S.planTab==='minmax'?renderMinMaxTab(parts):S.planTab==='builder'?renderPOBuilderTab():`
+  ${S.planTab==='minmax'?renderMinMaxTab(parts):S.planTab==='builder'?renderPOBuilderTab():S.planTab==='dev'?renderDevPartsTab(devOnlyParts):`
   <div class="tbl-wrap">
   <table data-tid="planning" style="font-size:12px"><thead class="sticky-header"><tr>
     <th style="cursor:pointer;padding:6px 8px" onclick="(()=>{const d=sortField==='pn'&&sortDir==='asc'?'desc':'asc';setFilter('planning','sort','pn');setFilter('planning','dir',d)})()">Part # ${sortField==='pn'?(sortDir==='asc'?'↑':'↓'):''}</th>
@@ -12139,6 +12179,64 @@ function renderPlanning() {
   </tbody></table></div>
   `}`;
 }
+
+function renderDevPartsTab(devParts){
+  if(!devParts.length)return`<div class="panel" style="margin:16px;padding:24px;text-align:center;color:var(--text3)">
+    <div style="font-size:14px;margin-bottom:6px">No DEV-only parts</div>
+    <div style="font-size:11px">Parts appear here when they are in a Dev assembly BOM and have no active demand or sales history.</div>
+  </div>`;
+  const rows=devParts.map(p=>{
+    const devAsms=[...new Set(
+      Object.entries(S.boms)
+        .filter(([par,items])=>isDevPn(par)&&items.some(i=>i.item_type==='part'&&i.child_pn===p.pn))
+        .map(([par])=>par)
+    )];
+    const oh=p.total_unpckgd||0;
+    const onOrder=openOrderedQty(p.pn);
+    const ohColor=oh<=0?'var(--red)':oh<=(p.min_qty||0)?'var(--orange)':'var(--text)';
+    return`<tr class="rowlink" onclick="rowClick(event,function(){lookupGo('part','${p.pn}')})">
+      <td class="pn" style="color:var(--purple)">${p.pn}</td>
+      <td style="font-size:11px;color:var(--text2);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.description||''}</td>
+      <td style="font-size:10px;color:var(--text3)">${p.vendor||'&#8212;'}</td>
+      <td style="font-size:10px;color:var(--purple)">${devAsms.map(a=>`<span style="background:rgba(124,58,237,.12);border-radius:3px;padding:0 4px;margin-right:2px">${a}</span>`).join('')}</td>
+      <td style="font-weight:700;color:${ohColor}">${oh}${onOrder>0?`<span style="font-size:9px;color:var(--teal);margin-left:3px">+${onOrder} on order</span>`:''}</td>
+      <td style="font-size:11px">${p.unit_cost>0?'$'+p.unit_cost.toFixed(2):'&#8212;'}</td>
+      <td onclick="event.stopPropagation()">
+        <button class="btn btn-sm" style="color:var(--purple);border-color:rgba(124,58,237,.3);font-size:10px" onclick="quickAddDevPO('${p.pn}')">+ Order</button>
+      </td>
+    </tr>`;
+  }).join('');
+  return`<div class="panel" style="padding:10px 16px;margin-bottom:0;border-left:3px solid var(--purple)">
+    <span style="font-size:12px;font-weight:700;color:var(--purple)">&#128300; DEV Parts</span>
+    <span style="font-size:11px;color:var(--text3);margin-left:8px">${devParts.length} part${devParts.length!==1?'s':''} used exclusively by Dev assemblies</span>
+  </div>
+  <div class="tbl-wrap"><table class="data-table" style="font-size:12px"><thead class="sticky-header"><tr>
+    <th>Part #</th><th>Description</th><th>Vendor</th><th>Dev Assembly</th><th>On Hand</th><th>Unit Cost</th><th style="width:80px"></th>
+  </tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+window.quickAddDevPO=async function(pn){
+  const p=S.parts.find(x=>x.pn===pn);if(!p)return;
+  const qty=prompt('Order qty for DEV part '+pn+':','1');
+  if(!qty||isNaN(parseInt(qty)))return;
+  const vendor=p.vendor||(prompt('Vendor (required):','')||'').trim();
+  if(!vendor)return;
+  const cost=p.unit_cost||0;
+  const notes=(prompt('Notes / purpose (optional):','')||'').trim();
+  try{
+    const{data,error}=await db.from('purchases').insert({
+      pn,vendor,qty:parseInt(qty),unit_cost:cost,
+      status:'Draft',order_date:new Date().toISOString().slice(0,10),
+      notes:'DEV ORDER'+(notes?' — '+notes:''),
+      updated_at:new Date().toISOString()
+    }).select().single();
+    if(error)throw error;
+    S.purchases=[data,...(S.purchases||[])];
+    toast('DEV PO drafted — '+pn+' x'+qty+' from '+vendor);
+    render();
+  }catch(e){toast('Error: '+e.message);}
+};
+
 
 function renderMinMaxTab(parts){
   if(!S.mmSelectedPns)S.mmSelectedPns=new Set();
@@ -17195,12 +17293,10 @@ function renderPriceList(){
   var cat=sf.cat||'';
   var _hwCatsAll=(HW_CATS||[]).concat(SUPPLY_CATS||[]);
   var list=S.assemblies.filter(function(a){
-    if(a.is_subassembly)return false;
+    if(a.category!=='Finished Goods')return false;
     if(a.discontinued)return false;
     if(isDev(a))return false;
     if(a.status==='Inactive')return false;
-    if(isHWPack(a.pn))return false;
-    if(_hwCatsAll.includes(a.category))return false;
     return true;
   });
   if(q)list=list.filter(function(a){return a.pn.toLowerCase().includes(q)||(a.description||'').toLowerCase().includes(q);});
