@@ -633,7 +633,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v2.5';
+const TGK_ERP_VERSION = 'v2.6';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -4970,7 +4970,8 @@ function ssAuth(): string {
   return btoa(k + ':' + s)
 }
 // ── Shopify backorder sync helper (BOM-aware) ──────────────────────────────
-async function bomMaxBuild(pn: string): Promise<{ hasBOM: boolean, maxBuild: number }> {
+async function bomMaxBuild(pn: string, depth = 0): Promise<{ hasBOM: boolean, maxBuild: number }> {
+  if (depth > 6) return { hasBOM: false, maxBuild: 0 } // guard infinite recursion
   const { data: bom } = await db.from('bom_items').select('child_pn,qty,item_type').eq('parent_pn', pn)
   if (!bom?.length) return { hasBOM: false, maxBuild: 0 }
   let maxBuild = Infinity
@@ -4980,7 +4981,14 @@ async function bomMaxBuild(pn: string): Promise<{ hasBOM: boolean, maxBuild: num
     let avail = 0
     if (isSub) {
       const { data: rows } = await db.from('assemblies').select('total_on_hand').eq('pn', item.child_pn).limit(1)
-      avail = Number(rows?.[0]?.total_on_hand) || 0
+      const oh = Number(rows?.[0]?.total_on_hand) || 0
+      if (oh > 0) {
+        avail = oh
+      } else {
+        // Zero on hand — check if the subassembly can itself be built from its BOM
+        const subB = await bomMaxBuild(item.child_pn, depth + 1)
+        avail = subB.hasBOM ? subB.maxBuild : 0
+      }
     } else {
       const { data: rows } = await db.from('parts').select('total_unpckgd').eq('pn', item.child_pn).limit(1)
       avail = Number(rows?.[0]?.total_unpckgd) || 0
@@ -12852,7 +12860,9 @@ function renderPurchasesEnhanced() {
 
 // ============================================================
 // ============================================================
-function buildability(pn){
+function buildability(pn,_depth){
+  _depth=_depth||0;
+  if(_depth>6)return{maxBuild:0,checks:[],hasBOM:false}; // guard infinite recursion
   const bom=(S.boms[pn]||[]);
   if(!bom.length)return{maxBuild:Infinity,checks:[],hasBOM:false};
   const pm={};S.parts.forEach(p=>pm[p.pn]=p);
@@ -12861,7 +12871,20 @@ function buildability(pn){
     const inAsm=!!am[i.child_pn],inPart=!!pm[i.child_pn];
     const isSub=i.item_type==='assembly'||i.item_type==='subassembly'||(inAsm&&!inPart);
     const src=isSub?am[i.child_pn]:pm[i.child_pn];
-    const avail=src?(isSub?(src.total_on_hand||0):(src.total_unpckgd||0)):0;
+    let avail;
+    if(isSub){
+      const oh=src?(src.total_on_hand||0):0;
+      if(oh>0){
+        // Subassembly has finished stock — use it
+        avail=oh;
+      } else {
+        // Zero on hand — check if the subassembly can itself be built from its BOM
+        const subB=buildability(i.child_pn,_depth+1);
+        avail=subB.hasBOM?subB.maxBuild:0;
+      }
+    } else {
+      avail=src?(src.total_unpckgd||0):0;
+    }
     return{pn:i.child_pn,desc:src?.description||'',need:i.qty,avail,isSub,
       maxFromThis:i.qty>0?Math.floor(avail/i.qty):Infinity,ok:avail>=i.qty,
       loc:isSub?'SUB-ASSY':(src?.location||'')};
