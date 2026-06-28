@@ -637,7 +637,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v3.3';
+const TGK_ERP_VERSION = 'v3.7';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -736,6 +736,7 @@ function buildLookupMaps(){
 }
 
 function computeDemand(){
+  buildLookupMaps(); // keep maps in sync with current S.parts/S.assemblies
   const wk4={},wk12={};
   const now=new Date();
   S.sales.forEach(s=>{
@@ -794,8 +795,7 @@ function computeDemand(){
     explodeBOMForBO(a.pn,bo,new Set([a.pn]));
   });
   // Pre-compute commonly used date cutoffs (avoids repeated new Date() in renders)
-  const _now=new Date();
-  function _dAgo(n){const d=new Date(_now);d.setDate(d.getDate()-n);return d.toISOString().slice(0,10);}
+  function _dAgo(n){const d=new Date(now);d.setDate(d.getDate()-n);return d.toISOString().slice(0,10);}
   // Pre-compute forecast demand per part
   const fwks=S.forecastWeeks||8;
   const fCutStr=_dAgo(fwks*7);
@@ -1348,8 +1348,22 @@ window.addEventListener('popstate',function(e){
   S.activePO=st.activePO||null;S.activeSale=st.activeSale||null;
   S.activeBuild=st.activeBuild||null;S.activeCount=st.activeCount||null;
   S.lookupSel=st.lookupSel||null;S.lookupQ=st.lookupQ||'';
+  // Reset invTab when leaving inventory
+  if(S.view!=='inventory')S.invTab=null;
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+  document.querySelectorAll('.nav-sub-item').forEach(n=>n.classList.remove('active'));
   const el=document.getElementById('nav-'+S.view);if(el)el.classList.add('active');
+  // Inventory sub-nav visibility + active pill
+  const _si=$('sub-nav-inventory');
+  if(_si){_si.style.display=S.view==='inventory'?'block':'none';_si.classList.toggle('open',S.view==='inventory');}
+  $('subnav-invparts')?.classList.toggle('active',S.view==='inventory'&&(S.invTab||'parts')==='parts');
+  $('subnav-invbackorder')?.classList.toggle('active',S.view==='inventory'&&S.invTab==='backorderlog');
+  // Dealer sub-nav visibility
+  const _sd=$('sub-nav-dealers');
+  if(_sd){const _do=['dealers','pricelist','fitments'].includes(S.view);_sd.style.display=_do?'block':'none';_sd.classList.toggle('open',_do);}
+  $('subnav-dealerlist')?.classList.toggle('active',S.view==='dealers');
+  $('subnav-pricelist')?.classList.toggle('active',S.view==='pricelist');
+  $('subnav-fitments')?.classList.toggle('active',S.view==='fitments');
   const tb=document.querySelector('.topbar-title');if(tb)tb.textContent=PAGE_TITLES[S.view]||'';
   if(S.activePO&&!S.poLines[S.activePO]){loadPOLines(S.activePO).then(render);}
   if(S.activeCount){loadCountLines(S.activeCount).then(render);}
@@ -1692,7 +1706,7 @@ function renderDashboard(){
   const openPOs=S.purchases.filter(p=>p.status!=='Received');
   const openPOAmt=openPOs.reduce((s,p)=>s+poExtended(p),0);
   const feed=buildActivityFeed(12);
-  function calcRev(arr){return arr.reduce(function(s,x){var a=S.assemblies.find(function(z){return z.pn===x.pn;});return s+(x.qty||1)*(a?a.msrp||0:0);},0);}
+  function calcRev(arr){return arr.reduce(function(s,x){var a=S._asmIdx?S._asmIdx[x.pn]:S.assemblies.find(function(z){return z.pn===x.pn;});return s+(x.qty||1)*(a?a.msrp||0:0);},0);}
   const now=new Date();
   const monthStart=new Date(now.getFullYear(),now.getMonth(),1).toISOString().slice(0,10);
   const lastMonthStart=new Date(now.getFullYear(),now.getMonth()-1,1).toISOString().slice(0,10);
@@ -2695,7 +2709,7 @@ function renderSales(){
     const stock=asm?(asm.total_on_hand||0):prt?(prt.total_unpckgd||0):null;
     const canFill=stock!==null&&stock>=(s.qty||1);
     const allOrderLines=s._grouped?(s._allLines||[]):[];
-    const dsLineCount=s._grouped?allOrderLines.filter(l=>!findAsm(l.pn)&&!S.parts.find(p=>p.pn===l.pn)).length:0;
+    const dsLineCount=s._grouped?allOrderLines.filter(l=>!findAsm(l.pn)&&!(S._partIdx?S._partIdx[l.pn]:S.parts.find(p=>p.pn===l.pn))).length:0;
     const allDropShip=s._grouped&&allOrderLines.length>0&&dsLineCount===allOrderLines.length;
     const repTracking=s.tracking_number||(allOrderLines.find(x=>x.tracking_number)?.tracking_number)||'';
     const repCarrier=s.carrier||(allOrderLines.find(x=>x.tracking_number)?.carrier)||'';
@@ -5840,12 +5854,23 @@ async function loadDashBackorderNotice(){
     data.forEach(function(r){if(!seen[r.pn])seen[r.pn]=r.created_at;});
     var skus=Object.keys(seen);
     var newest=seen[skus.reduce(function(a,b){return seen[a]>seen[b]?a:b;})];
+    // Respect dismiss: hide if no events newer than last dismiss
+    var dismissed=localStorage.getItem('bo_notice_dismissed_at');
+    if(dismissed&&newest<=dismissed){el.innerHTML='';return;}
     var ago=Math.round((Date.now()-new Date(newest).getTime())/60000);
     var agoTxt=ago<60?(ago+'m ago'):(Math.round(ago/60)+'h ago');
     var preview=skus.slice(0,4).map(function(s){
       return '<span style="font-family:var(--mono);font-size:11px;background:rgba(220,38,38,.1);color:#ef4444;border-radius:4px;padding:1px 6px">'+escHtml(s)+'</span>';
-    }).join(' ')+( skus.length>4?' <span style="color:var(--text3);font-size:11px">+'+( skus.length-4)+' more</span>':'');
-    el.innerHTML='<div class="panel" style="padding:10px 16px;border-left:3px solid #ef4444;margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">'+'<span style="font-size:16px;flex-shrink:0">&#128308;</span>'+'<div style="flex:1;min-width:0">'+'<div style="font-size:12px;font-weight:700;color:#ef4444;margin-bottom:4px">'+skus.length+' product'+(skus.length!==1?'s':'')+' put on backorder on Shopify in the last 48h</div>'+'<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center">'+preview+'<span style="font-size:10px;color:var(--text3);margin-left:4px">last: '+agoTxt+'</span></div>'+'</div>'+'<button class="btn btn-sm" style="flex-shrink:0;color:#ef4444;border-color:rgba(220,38,38,.35)" onclick="navInventory(\'backorderlog\')">View Log &rarr;</button>'+'</div>';
+    }).join(' ')+(skus.length>4?' <span style="color:var(--text3);font-size:11px">+'+(skus.length-4)+' more</span>':'');
+    el.innerHTML='<div class="panel" style="padding:10px 16px;border-left:3px solid #ef4444;margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
+      +'<span style="font-size:16px;flex-shrink:0">&#128308;</span>'
+      +'<div style="flex:1;min-width:0">'
+        +'<div style="font-size:12px;font-weight:700;color:#ef4444;margin-bottom:4px">'+skus.length+' product'+(skus.length!==1?'s':'')+' put on backorder on Shopify in the last 48h</div>'
+        +'<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center">'+preview+'<span style="font-size:10px;color:var(--text3);margin-left:4px">last: '+agoTxt+'</span></div>'
+      +'</div>'
+      +'<button class="btn btn-sm" style="flex-shrink:0;color:#ef4444;border-color:rgba(220,38,38,.35)" onclick="navInventory(\'backorderlog\')">View Log &rarr;</button>'
+      +'<button class="btn btn-sm" style="flex-shrink:0;color:var(--text3);border-color:var(--border)" onclick="localStorage.setItem(\'bo_notice_dismissed_at\',\''+newest+'\');document.getElementById(\'dash-bo-notice\').innerHTML=\'\'">Dismiss</button>'
+      +'</div>';
   }catch(e){
     // Fail silently on dashboard — don't surface errors here
   }
@@ -8436,6 +8461,7 @@ async function delBOMItem(id,parentPn){
   if(error){toast('Error: '+error.message);return;}
   if(item) pushUndo('bom_delete','bom_items',item,null,'Remove BOM item: '+item.child_pn+' from '+parentPn);
   if(S.boms[parentPn])S.boms[parentPn]=S.boms[parentPn].filter(i=>i.id!==id);
+  _clearBomCostCache();
   toast('BOM item removed');render();
 }
 function bomChildLookup(){
@@ -8509,6 +8535,7 @@ async function saveBOMItem(){
   if(error){toast('Error: '+error.message);return;}
   if(!S.boms[parent])S.boms[parent]=[];
   S.boms[parent].push(data);S.selBOM=parent;
+  _clearBomCostCache();
   toast('BOM item added');render();
 }
 async function recordPack(pn,asmId){
@@ -9075,7 +9102,7 @@ async function submitPart(eid){
 }
 
 async function deletePart(pn, id){
-  const inBOMs=Object.entries(S.boms).filter(([k,lines])=>{const _ia=S.assemblies.find(a=>a.pn===k);return _ia&&!_ia.discontinued&&lines.some(l=>l.child_pn===pn);}).map(([k])=>k);
+  const inBOMs=Object.entries(S.boms).filter(([k,lines])=>{const _ia=S._asmIdx?S._asmIdx[k]:S.assemblies.find(a=>a.pn===k);return _ia&&!_ia.discontinued&&lines.some(l=>l.child_pn===pn);}).map(([k])=>k);
   const hasStock=(S.parts.find(p=>p.id===id)?.total_unpckgd||0)>0;
   let msg=`Delete part ${pn}?`;
   if(inBOMs.length)msg+=`\n\n⚠ This part is used in ${inBOMs.length} BOM(s): ${inBOMs.slice(0,3).join(', ')}${inBOMs.length>3?' …':''}. BOM references will remain but the part will be gone.`;
@@ -9383,7 +9410,7 @@ async function deleteCategory(table,name){
 }
 
 async function deleteAsm(pn, id){
-  const inBOMs=Object.entries(S.boms).filter(([k,lines])=>{const _ia=S.assemblies.find(a=>a.pn===k);return _ia&&!_ia.discontinued&&lines.some(l=>l.child_pn===pn);}).map(([k])=>k);
+  const inBOMs=Object.entries(S.boms).filter(([k,lines])=>{const _ia=S._asmIdx?S._asmIdx[k]:S.assemblies.find(a=>a.pn===k);return _ia&&!_ia.discontinued&&lines.some(l=>l.child_pn===pn);}).map(([k])=>k);
   const openOrders=S.sales.filter(s=>s.pn===pn&&!['Delivered','Cancelled','Refunded','Returned'].includes(s.fulfillment_status||'Open'));
   let msg=`Delete assembly ${pn}?`;
   if(openOrders.length)msg+=`\n\n⚠ There are ${openOrders.length} open/in-progress orders for this assembly.`;
@@ -9763,6 +9790,7 @@ async function modalDeleteBOM(bomId,childPn,parentPn){
   var{error}=await db.from('bom_items').delete().eq('id',bomId);
   if(error){toast('Error: '+error.message);return;}
   if(S.boms[parentPn])S.boms[parentPn]=S.boms[parentPn].filter(function(b){return b.id!==bomId;});
+  _clearBomCostCache();
   var el=document.getElementById('m-bom-ex-'+bomId);if(el)el.remove();
   toast('BOM line removed');
 }
@@ -11938,9 +11966,9 @@ function _resolveItemType(item){
 function bomCostOf(pn, depth){
   if((depth||0)>6)return 0;
   const resolvedPn=_resolveAsmPn(pn);
-  if(!(depth||0)&&_bomCostCache[resolvedPn]!==undefined)return _bomCostCache[resolvedPn];
+  if(_bomCostCache[resolvedPn]!==undefined)return _bomCostCache[resolvedPn];
   const items=S.boms[resolvedPn]||[];
-  if(!items.length){if(!(depth||0))_bomCostCache[resolvedPn]=0;return 0;}
+  if(!items.length){_bomCostCache[resolvedPn]=0;return 0;}
   let t=0;
   for(const i of items){
     const itype=_resolveItemType(i);
@@ -11952,7 +11980,7 @@ function bomCostOf(pn, depth){
       t+=(p?costForQty(p,i.qty||1):(i.unit_cost||0))*(i.qty||1);
     }
   }
-  if(!(depth||0))_bomCostCache[resolvedPn]=t;
+  _bomCostCache[resolvedPn]=t;
   return t;
 }
 function lineCost(item){
