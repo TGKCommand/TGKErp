@@ -641,7 +641,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v4.8';
+const TGK_ERP_VERSION = 'v4.9';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -1105,8 +1105,7 @@ function setupRealtime(){
       } else if(p.eventType==='DELETE'){
         S.sales=S.sales.filter(s=>s.id!==p.old.id);
       }
-      updateBadge();
-      if(['sales','dashboard'].includes(S.view))scheduleRender();
+      updateBadge();scheduleRender(); // always re-render — new order badge/counts need updating
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'purchases'},p=>{
       if(p.eventType==='INSERT'){
@@ -10658,6 +10657,29 @@ function startAutoRefresh(){
       console.log('[TGK] Auto-refresh complete at',new Date().toLocaleTimeString());
     }catch(e){console.warn('[TGK] Auto-refresh failed:',e.message);}
   }, 60*1000); // check every 60s, only refresh if idle ≥ 5 min
+
+  // ── Active-session sales poll (30s) — realtime fallback ──────────────────
+  // Catches new Shopify orders even if realtime WebSocket drops or JWT filtering
+  // blocks events. Runs only when user is actively working (not idle).
+  setInterval(async function(){
+    if(!S.currentUserId)return;
+    if(Date.now()-S.lastActivity>IDLE_MS)return; // idle path handled by full refresh above
+    try{
+      const newest=S.sales.reduce(function(m,s){const t=s.created_at||'';return t>m?t:m;},'');
+      if(!newest)return;
+      const{data}=await db.from('sales').select('*').gt('created_at',newest).order('created_at',{ascending:false}).limit(50);
+      if(!data||!data.length)return;
+      var added=0;
+      data.forEach(function(row){
+        if(!S.sales.find(function(s){return s.id===row.id;})){
+          S.sales=[row,...S.sales];
+          showOrderAlert(row.order_number||'',row.pn||'');
+          added++;
+        }
+      });
+      if(added){computeDemand();updateBadge();scheduleRender();}
+    }catch(_e){/* silent — realtime handles this when working */}
+  },30*1000);
 }
 
 // ============================================================
@@ -17692,6 +17714,8 @@ try{history.replaceState(snapState(),'','#'+S.view);}catch(e){}
         db.auth.onAuthStateChange(async(event,sess)=>{
           if(event==='SIGNED_OUT')showAuthGate();
           if(event==='PASSWORD_RECOVERY')showSetPasswordGate(false);
+          // Reconnect realtime when JWT refreshes so RLS filtering keeps working
+          if(event==='TOKEN_REFRESHED'&&_rtChannel){try{setupRealtime();}catch(_e){}}
         });
         return;
       }
