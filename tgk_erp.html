@@ -637,7 +637,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v3.9';
+const TGK_ERP_VERSION = 'v4.0';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -7411,12 +7411,10 @@ async function testShipStation(){
 }
 
 function renderAI(){
-  const hasKey=!!(S.settings.anthropic_api_key);
   return `<div style="max-width:680px">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
       <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;font-weight:700;flex:1">Powered by Claude · Live Supabase Data · ${S.parts.length} parts · ${S.assemblies.length} assemblies</div>
-      <span class="pill ${hasKey?'pill-teal':'pill-red'}" style="font-size:9px">${hasKey?'API Key Set':'No API Key'}</span>
-      <button class="btn btn-sm" onclick="setAIKey()">${hasKey?'Change':'Set'} API Key</button>
+      <span class="pill pill-teal" style="font-size:9px">Via Proxy</span>
     </div>
     <div id="ai-chat" style="min-height:280px;max-height:420px;overflow-y:auto;margin-bottom:12px">
       ${S.aiHistory.map(m=>`<div class="ai-bubble ${m.role==='user'?'ai-user-bubble':''}">${m.text.replace(/\n/g,'<br>')}</div>`).join('')}
@@ -7432,15 +7430,6 @@ function renderAI(){
   </div>`;
 }
 
-async function setAIKey(){
-  const key=prompt('Paste your Anthropic API key (starts with sk-ant-).\nGet one at console.anthropic.com → API Keys.\nStored in your Supabase settings table.',S.settings.anthropic_api_key||'');
-  if(key===null)return;
-  const trimmed=key.trim();
-  const{error}=await db.from('settings').upsert({key:'anthropic_api_key',value:trimmed},{onConflict:'key'});
-  if(error){toast('Save failed: '+error.message);return;}
-  S.settings.anthropic_api_key=trimmed;
-  toast(trimmed?'API key saved':'API key cleared');render();
-}
 
 async function sendAI(){
   const inp=$('ai-input');const msg=inp.value.trim();
@@ -7454,14 +7443,11 @@ async function sendAI(){
   const openPOs=S.purchases.filter(p=>p.status!=='Received').map(p=>`${p.pn}@${p.vendor}(${p.status})`).join(', ');
   const ctx=`You are the AI assistant for TGK Motorsport ERP. TGK builds performance Audi/Tesla parts. Live Supabase data: ${S.parts.length} parts, ${S.assemblies.length} assemblies. Low stock (under 4wks): ${lowParts||'none'}. Critical (zero/negative stock): ${critAsm||'none'}. Open POs: ${openPOs||'none'}. 7-day orders: ${S.sales.filter(s=>s.sale_date>=daysAgo(7)).length}. Be specific, actionable, concise.`;
   try{
-    const apiKey=S.settings.anthropic_api_key||'';
-    if(!apiKey){
-      S.aiHistory.push({role:'assistant',text:'No API key configured. Click "Set API Key" above, paste your Anthropic API key (starts with sk-ant-), and try again. Get a key at console.anthropic.com → API Keys.'});
-      S.aiLoading=false;render();return;
-    }
     let data=null;
     for(let attempt=0;attempt<3;attempt++){
-      const res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:800,system:ctx,messages:S.aiHistory.map(m=>({role:m.role==='user'?'user':'assistant',content:m.text}))})});
+      const res=await fetch(SUPA_URL+'/functions/v1/anthropic-proxy',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:800,system:ctx,messages:S.aiHistory.map(m=>({role:m.role==='user'?'user':'assistant',content:m.text}))})});
+      if(res.status===503){data={error:{type:'proxy_not_configured',message:'AI proxy not configured — add ANTHROPIC_API_KEY to your Supabase edge function secrets (Dashboard → Edge Functions → anthropic-proxy → Secrets).'}}; break;}
+      if(res.status===401){data={error:{type:'auth_error',message:'Session expired — please sign out and back in.'}}; break;}
       data=await res.json();
       if(data.error&&(data.error.type==='overloaded_error'||res.status===529||res.status===429)){
         if(attempt<2){await new Promise(r=>setTimeout(r,(attempt+1)*2000));continue;}
@@ -7470,7 +7456,7 @@ async function sendAI(){
     }
     if(data.error){
       const friendly=data.error.type==='overloaded_error'?'Anthropic servers are busy right now — tried 3 times. Wait a moment and ask again.':
-        data.error.type==='authentication_error'?'Invalid API key. Click "Change API Key" above and re-paste it.':
+        data.error.type==='authentication_error'?'API key rejected by Anthropic — update ANTHROPIC_API_KEY in your edge function secrets.':
         'API error: '+(data.error.message||data.error.type);
       S.aiHistory.push({role:'assistant',text:friendly});
     } else {
@@ -9958,11 +9944,10 @@ function _updateAuthUI(){
   const ALL_NAV=['dashboard','lookup','parts','assemblies','boms','fitments','inventory','packqueue','cyclecounts','corrections','planning','purchases','sales','warranty','vendors','dealers','pricelist','ai','reports'];
   const ADMIN_ONLY=['nav-users','nav-integrations','nav-import','nav-backups'];
   const role=S.currentRole||'warehouse';
-  const enforce=localStorage.getItem('tgk_enforce_perms')==='true';
-  if(role==='admin'||!enforce){
+  if(role==='admin'){
     ALL_NAV.forEach(v=>{const el=document.getElementById('nav-'+v);if(el)el.style.display='';});
-    ADMIN_ONLY.forEach(id=>{const el=document.getElementById(id);if(el)el.style.display=role==='admin'?'':'none';});
-    const as=document.getElementById('admin-section');if(as)as.style.display=role==='admin'?'':'none';
+    ADMIN_ONLY.forEach(id=>{const el=document.getElementById(id);if(el)el.style.display='';});
+    const as=document.getElementById('admin-section');if(as)as.style.display='';
   } else {
     const ROLE_NAV={
       warehouse:['dashboard','lookup','parts','assemblies','boms','fitments','inventory','packqueue','cyclecounts','corrections','planning','purchases','sales','warranty','vendors','ai','reports'],
@@ -10326,15 +10311,13 @@ function renderUsers(){
     <td style="display:flex;gap:6px;align-items:center"><button class="action-btn" onclick="adminResetPassword('${p.email.replace(/'/g,"\\'")}')">&#8635; Reset PW</button>${delBtn}</td>
   </tr>`;}).join('');
 
-  const enforce=localStorage.getItem('tgk_enforce_perms')==='true';
-
   const matrixRows=S.profiles.map(p=>{
     const perms=p.nav_permissions||{};
     const roleDefaults=_ROLE_DEFAULTS[p.role]||_ROLE_DEFAULTS.warehouse;
     const cells=_NAV_MODULES.map(m=>{
       const hasCustom=p.nav_permissions!==null&&p.nav_permissions!==undefined;
       const val=hasCustom?(perms[m.id]!==false):(roleDefaults.includes(m.id));
-      const btn=`<button onclick="adminSetNavPerm('${p.id}','${m.id}',${!val})" title="${val?'Revoke':'Grant'} ${m.label}" style="width:28px;height:24px;border-radius:4px;border:none;cursor:pointer;font-size:12px;background:${val?(enforce?'var(--teal-dim)':'var(--bg4)'):'var(--bg3)'};color:${val?(enforce?'var(--teal)':'var(--text3)'):'var(--border2)'};transition:all .15s">${val?'✓':'—'}</button>`;
+      const btn=`<button onclick="adminSetNavPerm('${p.id}','${m.id}',${!val})" title="${val?'Revoke':'Grant'} ${m.label}" style="width:28px;height:24px;border-radius:4px;border:none;cursor:pointer;font-size:12px;background:${val?'var(--teal-dim)':'var(--bg3)'};color:${val?'var(--teal)':'var(--border2)'};transition:all .15s">${val?'✓':'—'}</button>`;
       return `<td style="text-align:center;padding:2px 3px">${btn}</td>`;
     }).join('');
     const hasCustomPerms=p.nav_permissions!==null&&p.nav_permissions!==undefined;
@@ -10375,16 +10358,9 @@ function renderUsers(){
         <span>🔒 Permission Matrix</span>
         <span style="font-size:10px;font-weight:400;color:var(--text3);margin-left:6px">Controls which modules each user can access</span>
       </div>
-      <div style="display:flex;align-items:center;gap:10px">
-        <span style="font-size:11px;color:${enforce?'var(--teal)':'var(--text3)'};font-weight:600">${enforce?'⚡ Enforcing':'○ Not enforced'}</span>
-        <button class="btn btn-sm ${enforce?'btn-teal':''}" onclick="adminToggleEnforce()" style="min-width:160px">
-          ${enforce?'✓ Enforcement ON — click to disable':'Enforcement OFF — click to enable'}
-        </button>
-      </div>
+      <span class="pill pill-teal" style="font-size:10px">⚡ Always enforced</span>
     </div>
-    ${!enforce?`<div style="background:var(--yellow-dim);border:1px solid rgba(217,119,6,.2);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--yellow);margin-bottom:12px">
-      <b>Enforcement is OFF</b> — all users currently see every module regardless of settings below. Toggle enforcement on when you're ready to activate these restrictions.
-    </div>`:''}
+
     <div style="overflow-x:auto;max-height:360px;overflow-y:auto">
       <table style="border-collapse:collapse;min-width:100%">
         <thead><tr style="border-bottom:2px solid var(--border)">
@@ -10431,14 +10407,6 @@ const _ROLE_DEFAULTS={
   customer_service:['dashboard','lookup','sales','warranty','dealers','corrections','ai','reports'],
   design:['dashboard','lookup','parts','assemblies','boms','pricelist','ai','reports']
 };
-
-function adminToggleEnforce(){
-  const cur=localStorage.getItem('tgk_enforce_perms')==='true';
-  localStorage.setItem('tgk_enforce_perms', cur?'false':'true');
-  _updateAuthUI();
-  render();
-  logAction((cur?'Disabled':'Enabled')+' permission enforcement','profiles',null,null,null).catch(()=>{});
-}
 
 async function adminSetNavPerm(userId,mod,val){
   const p=S.profiles.find(x=>x.id===userId);if(!p)return;
@@ -10637,10 +10605,26 @@ function startAutoRefresh(){
   if(S.autoRefreshTimer)clearInterval(S.autoRefreshTimer);
   const resetIdle=()=>S.lastActivity=Date.now();
   ['mousedown','keydown','touchstart','scroll'].forEach(e=>document.addEventListener(e,resetIdle,{passive:true}));
-  const IDLE_MS=5*60*1000; // 5 minutes
+  const IDLE_MS=5*60*1000; // 5 min — background refresh trigger
+  const LOGOUT_MS=8*60*60*1000; // 8 hours — hard logout
+  const WARN_MS=LOGOUT_MS-2*60*1000; // warn 2 min before
+  let _idleWarned=false;
   S.autoRefreshTimer=setInterval(async()=>{
-    if(Date.now()-S.lastActivity<IDLE_MS)return; // user active — skip
     if(!S.currentUserId)return; // not logged in
+    const _idle=Date.now()-S.lastActivity;
+    // Hard logout after 8 hours idle
+    if(_idle>=LOGOUT_MS){
+      clearInterval(S.autoRefreshTimer);S.autoRefreshTimer=null;
+      await db.auth.signOut();
+      location.reload();
+      return;
+    }
+    // Warn 2 minutes before logout
+    if(_idle>=WARN_MS&&!_idleWarned){
+      _idleWarned=true;
+      toast('Session expires in 2 minutes — click anywhere to stay signed in',8000);
+    }else if(_idle<WARN_MS){_idleWarned=false;}
+    if(_idle<IDLE_MS)return; // user active — skip background refresh
     try{
       const[salesData,partsData,purchData,corr]=await Promise.all([
         fetchAll((f,t)=>db.from('sales').select('*').order('created_at',{ascending:false}).range(f,t)),
@@ -11632,13 +11616,6 @@ async function aiSuggestMinMax(singlePn, pnList){
       note:st.avg>0?('Live: '+st.avg+'/wk avg, σ'+st.sd+', '+(p.lead_time_weeks||2)+'w lead'):importedAvg>0?('Spreadsheet avg: '+importedAvg+'/wk'):'No sales data'};
   });
 
-  const apiKey=S.settings.anthropic_api_key||'';
-  if(!apiKey){
-    S.mmSuggest=base;
-    toast('No API key set — using statistical suggestions (95% service level). Set a key in AI Assistant for AI-refined values.');
-    render();return;
-  }
-
   toast('Asking Claude to analyze '+tracked.length+' items…');
   S.mmLoading=true;render();
   const results=[];
@@ -11650,7 +11627,7 @@ async function aiSuggestMinMax(singlePn, pnList){
       const prompt='You are an inventory planning expert for a motorsport parts manufacturer. For each part below, recommend min_qty (reorder point) and max_qty (order-up-to level) and safety_stock. Fields: onhand=effective available stock (already minus backorder reservations), onOrder=qty already on open POs (already inbound, counts toward coverage). The statistical baseline (95% service) is given as statMin/statMax; adjust with judgment: round to sensible order quantities (always ensure max is a multiple of MOQ when moq>0), raise mins for volatile items (high stdev vs avg), keep slow movers lean, raise if curMin/curMax was already higher (may reflect business rules). Respond with ONLY a JSON array, no markdown: [{"pn":"...","min":N,"max":N,"safety":N,"note":"max 8 words"}]\n\nPARTS:\n'+lines;
       let data=null;
       for(let attempt=0;attempt<3;attempt++){
-        const res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:4000,messages:[{role:'user',content:prompt}]})});
+        const res=await fetch(SUPA_URL+'/functions/v1/anthropic-proxy',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:4000,messages:[{role:'user',content:prompt}]})});
         data=await res.json();
         if(data.error&&data.error.type==='overloaded_error'&&attempt<2){await new Promise(r=>setTimeout(r,(attempt+1)*2000));continue;}
         break;
