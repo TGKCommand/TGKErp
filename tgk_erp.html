@@ -637,7 +637,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v3.2';
+const TGK_ERP_VERSION = 'v3.3';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -694,6 +694,7 @@ const S = {
   customCats:{parts:[],assemblies:[]},
   customVendors:[],
   vendors:[],
+  _asmIdx:{}, _partIdx:{},   // lookup maps — rebuilt by buildLookupMaps()
   dealerVisitCounts:{},   // { dealer_id: count } — loaded on demand
   dealerVisitsLoaded:false,
   _visitLogMissing:false,  // true if dealer_visits table doesn't exist
@@ -711,6 +712,29 @@ const DEFAULT_PRICING_TIERS=[
 const $  = id => document.getElementById(id);
 const fc = (v,d=2) => '$'+Number(v||0).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const fn = v => Number(v||0).toLocaleString();
+let _bomCostCache={};
+function _clearBomCostCache(){_bomCostCache={};}
+
+// Build O(1) lookup maps from parts/assemblies arrays.
+// Called once after loadAll and after any realtime mutation to parts or assemblies.
+function buildLookupMaps(){
+  _clearBomCostCache();
+  const ai={},pi={};
+  S.assemblies.forEach(function(a){
+    ai[a.pn]=a;
+    if(a.new_sku)ai[a.new_sku]=a;
+    const u=(a.pn||'').toUpperCase();if(u&&!ai[u])ai[u]=a;
+    if(a.new_sku){const nu=a.new_sku.toUpperCase();if(nu&&!ai[nu])ai[nu]=a;}
+  });
+  S.parts.forEach(function(p){
+    pi[p.pn]=p;
+    if(p.new_sku)pi[p.new_sku]=p;
+    const u=(p.pn||'').toUpperCase();if(u&&!pi[u])pi[u]=p;
+    if(p.new_sku){const nu=p.new_sku.toUpperCase();if(nu&&!pi[nu])pi[nu]=p;}
+  });
+  S._asmIdx=ai;S._partIdx=pi;
+}
+
 function computeDemand(){
   const wk4={},wk12={};
   const now=new Date();
@@ -769,7 +793,23 @@ function computeDemand(){
     boBacklog[a.pn]=bo;
     explodeBOMForBO(a.pn,bo,new Set([a.pn]));
   });
-  S.calc={asm:asmCalc,part:partCalc,boReservedPart,boBacklog,salesLen:S.sales.length,bomLen:Object.keys(S.boms).length};
+  // Pre-compute commonly used date cutoffs (avoids repeated new Date() in renders)
+  const _now=new Date();
+  function _dAgo(n){const d=new Date(_now);d.setDate(d.getDate()-n);return d.toISOString().slice(0,10);}
+  // Pre-compute forecast demand per part
+  const fwks=S.forecastWeeks||8;
+  const fCutStr=_dAgo(fwks*7);
+  const fCounts={};
+  S.sales.forEach(function(s){
+    if(!s.pn||!s.sale_date||s.fulfillment_status==='Cancelled')return;
+    if(s.sale_date>=fCutStr)fCounts[s.pn]=(fCounts[s.pn]||0)+(s.qty||1);
+  });
+  const forecastMap={};
+  S.parts.forEach(function(p){forecastMap[p.pn]=(fCounts[p.pn]||0)/fwks;});
+  S.calc={asm:asmCalc,part:partCalc,boReservedPart,boBacklog,
+    salesLen:S.sales.length,bomLen:Object.keys(S.boms).length,
+    d7:_dAgo(7),d30:_dAgo(30),d60:_dAgo(60),d90:_dAgo(90),
+    forecastWks:fwks,forecast:forecastMap};
 }
 
 function avgWk(p){
@@ -1000,6 +1040,7 @@ async function loadAll(){
     });
     S.liveActivity.sort((a,b)=>new Date(b.ts||0)-new Date(a.ts||0));
     S.liveActivity=S.liveActivity.slice(0,100);
+    buildLookupMaps();
     setSyncState('ok');
     updateBadge();
     render();
@@ -1018,6 +1059,7 @@ function setupRealtime(){
       if(p.eventType==='INSERT')S.parts=[...S.parts,p.new].sort((a,b)=>a.pn.localeCompare(b.pn));
       else if(p.eventType==='UPDATE')S.parts=S.parts.map(x=>x.id===p.new.id?p.new:x);
       else if(p.eventType==='DELETE')S.parts=S.parts.filter(x=>x.id!==p.old.id);
+      buildLookupMaps();
       updateBadge();if(['parts','inventory','dashboard'].includes(S.view))scheduleRender();
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'assemblies'},p=>{
@@ -1025,6 +1067,7 @@ function setupRealtime(){
       if(p.eventType==='INSERT')S.assemblies=[...S.assemblies,norm(p.new)].sort((a,b)=>a.pn.localeCompare(b.pn));
       else if(p.eventType==='UPDATE')S.assemblies=S.assemblies.map(x=>x.id===p.new.id?norm(p.new):x);
       else if(p.eventType==='DELETE')S.assemblies=S.assemblies.filter(x=>x.id!==p.old.id);
+      buildLookupMaps();
       if(['assemblies','dashboard'].includes(S.view))scheduleRender();
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'sales'},p=>{
@@ -1411,11 +1454,12 @@ function escHtml(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt
 function dispPn(a){return(a&&a.use_new_sku&&a.new_sku)?a.new_sku:((a&&a.pn)||'');}
 function findAsm(pn){
   if(!pn)return undefined;
-  var a=S.assemblies.find(function(x){return x.pn===pn;});
-  if(a)return a;
+  if(S._asmIdx)return S._asmIdx[pn]||S._asmIdx[String(pn).toUpperCase()]||undefined;
+  var a=S.assemblies.find(function(x){return x.pn===pn;});if(a)return a;
   return S.assemblies.find(function(x){return x.new_sku&&x.new_sku===pn;});
 }
 function resolveToCanonicalPn(pn){
+  if(S._asmIdx){const a=S._asmIdx[pn]||S._asmIdx[String(pn).toUpperCase()];return(a&&a.pn!==pn)?a.pn:pn;}
   var a=S.assemblies.find(function(x){return x.new_sku&&x.new_sku===pn;});
   return a?a.pn:pn;
 }
@@ -5779,53 +5823,6 @@ async function testShopify(){
   }
 }
 
-async function loadShopifySyncLog(){
-  var wrap=document.getElementById('shopify-sync-log-wrap');
-  if(!wrap)return;
-  wrap.innerHTML='<div style="font-size:11px;color:var(--text3);padding:8px 0">Loading...</div>';
-  try{
-    var{data,error}=await db.from('shopify_sync_log').select('*').order('created_at',{ascending:false}).limit(100);
-    if(error||!data||!data.length){
-      wrap.innerHTML='<div style="font-size:11px;color:var(--text3);padding:8px 0">'+(error?'Error: '+error.message:'No sync events logged yet.')+'</div>';
-      return;
-    }
-    var rows=data.map(function(r){
-      var action=r.action==='backorder'
-        ?'<span style="background:rgba(220,38,38,.12);color:#ef4444;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700">BACKORDER</span>'
-        :'<span style="background:rgba(42,191,170,.12);color:var(--teal);border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700">REVERTED</span>';
-      var src=(r.trigger_source||'').replace('_',' ');
-      var oh=r.new_oh!=null?r.new_oh:'—';
-      var mb=r.max_build!=null?r.max_build:'—';
-      var rd=r.restock_date||'—';
-      var ts=r.created_at?new Date(r.created_at).toLocaleString():'—';
-      return '<tr style="border-bottom:1px solid var(--border)">'
-        +'<td style="padding:6px 8px;font-family:var(--mono);font-size:11px;color:var(--teal)">'+escHtml(r.pn||'')+'</td>'
-        +'<td style="padding:6px 8px">'+action+'</td>'
-        +'<td style="padding:6px 8px;font-size:10px;color:var(--text2)">'+escHtml(src)+'</td>'
-        +'<td style="padding:6px 8px;font-size:10px;color:var(--text2);text-align:center">'+oh+'</td>'
-        +'<td style="padding:6px 8px;font-size:10px;color:var(--text2);text-align:center">'+mb+'</td>'
-        +'<td style="padding:6px 8px;font-size:10px;color:var(--text2)">'+escHtml(rd)+'</td>'
-        +'<td style="padding:6px 8px;font-size:10px;color:var(--text3)">'+escHtml(r.user_email||'—')+'</td>'
-        +'<td style="padding:6px 8px;font-size:10px;color:var(--text3);white-space:nowrap">'+ts+'</td>'
-        +'</tr>';
-    }).join('');
-    wrap.innerHTML='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px">'
-      +'<thead><tr style="border-bottom:2px solid var(--border)">'
-      +'<th style="padding:5px 8px;text-align:left;color:var(--text3);font-size:10px;text-transform:uppercase;letter-spacing:.05em">SKU</th>'
-      +'<th style="padding:5px 8px;text-align:left;color:var(--text3);font-size:10px;text-transform:uppercase;letter-spacing:.05em">Action</th>'
-      +'<th style="padding:5px 8px;text-align:left;color:var(--text3);font-size:10px;text-transform:uppercase;letter-spacing:.05em">Trigger</th>'
-      +'<th style="padding:5px 8px;text-align:center;color:var(--text3);font-size:10px;text-transform:uppercase;letter-spacing:.05em">Stock</th>'
-      +'<th style="padding:5px 8px;text-align:center;color:var(--text3);font-size:10px;text-transform:uppercase;letter-spacing:.05em">Buildable</th>'
-      +'<th style="padding:5px 8px;text-align:left;color:var(--text3);font-size:10px;text-transform:uppercase;letter-spacing:.05em">Restock Date</th>'
-      +'<th style="padding:5px 8px;text-align:left;color:var(--text3);font-size:10px;text-transform:uppercase;letter-spacing:.05em">User</th>'
-      +'<th style="padding:5px 8px;text-align:left;color:var(--text3);font-size:10px;text-transform:uppercase;letter-spacing:.05em">Time</th>'
-      +'</tr></thead>'
-      +'<tbody>'+rows+'</tbody></table></div>'
-      +'<div style="font-size:10px;color:var(--text3);margin-top:6px">Showing last '+data.length+' events</div>';
-  }catch(e){
-    wrap.innerHTML='<div style="font-size:11px;color:var(--red);padding:8px 0">Error: '+e.message+'</div>';
-  }
-}
 async function loadDashBackorderNotice(){
   var el=document.getElementById('dash-bo-notice');
   if(!el)return;
@@ -11881,13 +11878,14 @@ function renderPOBuilder(){
 }
 // ============================================================
 // ============================================================
-function calcForecast(pn) {
-  const weeks = S.forecastWeeks;
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - weeks*7);
-  const cutStr = cutoff.toISOString().slice(0,10);
-  const count = S.sales.filter(s=>s.pn===pn && s.sale_date>=cutStr).reduce((a,s)=>a+(s.qty||1),0);
-  return count/weeks; // weekly demand
+function calcForecast(pn){
+  // Use value pre-computed in computeDemand when forecastWeeks matches
+  if(S.calc&&S.calc.forecast&&S.calc.forecastWks===(S.forecastWeeks||8))return S.calc.forecast[pn]||0;
+  // Fallback: compute live (only hits if forecastWeeks changed mid-session)
+  const weeks=S.forecastWeeks||8;
+  const cutoff=new Date();cutoff.setDate(cutoff.getDate()-weeks*7);
+  const cutStr=cutoff.toISOString().slice(0,10);
+  return S.sales.filter(s=>s.pn===pn&&s.sale_date>=cutStr).reduce((a,s)=>a+(s.qty||1),0)/weeks;
 }
 
 const HW_CATS=['Bolts/Washers/Nuts','Orings','Fittings','Heims & Sphericals','Suspension Hardware','Hardware'];
@@ -11904,25 +11902,23 @@ function _getBreaks(p){
 
 function _findPart(childPn){
   if(!childPn)return null;
-  const raw=String(childPn);
-  const clean=raw.trim().toUpperCase();
+  if(S._partIdx){const u=String(childPn).trim().toUpperCase();return S._partIdx[childPn]||S._partIdx[u]||null;}
+  const raw=String(childPn),clean=raw.trim().toUpperCase();
   let p=S.parts.find(x=>x.pn===raw);if(p)return p;
   p=S.parts.find(x=>x.pn===clean);if(p)return p;
   p=S.parts.find(x=>(x.pn||'').toUpperCase()===clean);if(p)return p;
   p=S.parts.find(x=>x.new_sku&&x.new_sku===raw);if(p)return p;
-  p=S.parts.find(x=>x.new_sku&&(x.new_sku||'').toUpperCase()===clean);if(p)return p;
-  return null;
+  return S.parts.find(x=>x.new_sku&&(x.new_sku||'').toUpperCase()===clean)||null;
 }
 
 function _findAsm2(childPn){
   if(!childPn)return null;
-  const raw=String(childPn);
-  const clean=raw.trim().toUpperCase();
+  if(S._asmIdx){const u=String(childPn).trim().toUpperCase();return S._asmIdx[childPn]||S._asmIdx[u]||null;}
+  const raw=String(childPn),clean=raw.trim().toUpperCase();
   let a=S.assemblies.find(x=>x.pn===raw);if(a)return a;
   a=S.assemblies.find(x=>x.pn===clean);if(a)return a;
   a=S.assemblies.find(x=>(x.pn||'').toUpperCase()===clean);if(a)return a;
-  a=S.assemblies.find(x=>x.use_new_sku&&x.new_sku&&(x.new_sku===raw||(x.new_sku||'').toUpperCase()===clean));if(a)return a;
-  return null;
+  return S.assemblies.find(x=>x.use_new_sku&&x.new_sku&&(x.new_sku===raw||(x.new_sku||'').toUpperCase()===clean))||null;
 }
 
 function _resolveAsmPn(childPn){
@@ -11942,8 +11938,9 @@ function _resolveItemType(item){
 function bomCostOf(pn, depth){
   if((depth||0)>6)return 0;
   const resolvedPn=_resolveAsmPn(pn);
+  if(!(depth||0)&&_bomCostCache[resolvedPn]!==undefined)return _bomCostCache[resolvedPn];
   const items=S.boms[resolvedPn]||[];
-  if(!items.length)return 0;
+  if(!items.length){if(!(depth||0))_bomCostCache[resolvedPn]=0;return 0;}
   let t=0;
   for(const i of items){
     const itype=_resolveItemType(i);
@@ -11955,6 +11952,7 @@ function bomCostOf(pn, depth){
       t+=(p?costForQty(p,i.qty||1):(i.unit_cost||0))*(i.qty||1);
     }
   }
+  if(!(depth||0))_bomCostCache[resolvedPn]=t;
   return t;
 }
 function lineCost(item){
@@ -13131,8 +13129,8 @@ function buildability(pn,_depth){
   if(_depth>6)return{maxBuild:0,checks:[],hasBOM:false}; // guard infinite recursion
   const bom=(S.boms[pn]||[]);
   if(!bom.length)return{maxBuild:Infinity,checks:[],hasBOM:false};
-  const pm={};S.parts.forEach(p=>pm[p.pn]=p);
-  const am={};S.assemblies.forEach(a=>am[a.pn]=a);
+  const pm=S._partIdx||{}; // use global index — avoids O(n) rebuild per call
+  const am=S._asmIdx||{};
   const checks=bom.map(i=>{
     const inAsm=!!am[i.child_pn],inPart=!!pm[i.child_pn];
     const isSub=i.item_type==='assembly'||i.item_type==='subassembly'||(inAsm&&!inPart);
