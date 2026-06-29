@@ -641,7 +641,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v6.5';
+const TGK_ERP_VERSION = 'v6.6';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -823,6 +823,21 @@ function avgWk(p){
 function avgWk4(p){
   const c=S.calc&&S.calc.part&&S.calc.part[p.pn];
   return c?c.wk4:0;
+}
+// Effective weekly demand: weighted blend favouring recent data; 4wk used directly when trending up.
+// Falls back to manually-set avg_sales_wk when no live sales data exists.
+function effectiveWkDemand(p){
+  const c=S.calc&&S.calc.part&&S.calc.part[p.pn];
+  const wk4=(c&&c.wk4)||0;
+  const wk12=(c&&c.wk12)||0;
+  if(wk4>0&&wk12>0){
+    // Both windows have data
+    if(wk4>wk12)return wk4;             // trending up — use higher rate to plan for growth
+    return(wk4*2+wk12)/3;              // stable/falling — weighted blend: recent counts 2x
+  }
+  if(wk12>0)return wk12;               // only 12wk window has data
+  if(wk4>0)return wk4;                 // only 4wk window has data
+  return p.avg_sales_wk||0;            // no live data — fall back to manual avg
 }
 function asmAvgWk(a){
   const c=S.calc&&S.calc.asm&&S.calc.asm[a.pn];
@@ -12142,10 +12157,13 @@ function openOrderedQty(pn) {
 }
 
 function calcReorderPoint(p) {
-  const wkDemand = avgWk(p) || calcForecast(p.pn);
+  const demand = effectiveWkDemand(p);
   const lt = p.lead_time_weeks || 1;
   const safety = p.safety_stock || 0;
-  return Math.ceil(wkDemand * lt + safety);
+  // Manual floor: if min_qty is set by hand, trust it (+ safety buffer on top)
+  if(p.min_qty > 0) return Math.ceil(p.min_qty + safety);
+  // Auto floor: lead-time demand + safety — ensures we can survive while waiting for an order
+  return Math.ceil(demand * lt + safety);
 }
 
 function calcSuggestedQty(p) {
@@ -12154,7 +12172,7 @@ function calcSuggestedQty(p) {
   const reserved = boReserved(p.pn);
   const available = Math.max(0, curr - reserved);
   const onOrder = openOrderedQty(p.pn);
-  const wkDemand = avgWk(p) || calcForecast(p.pn);
+  const wkDemand = effectiveWkDemand(p); // weighted blend, 4wk used when trending up, manual avg as fallback
   const lt = p.lead_time_weeks || 1;
   const fw = S.forecastWeeks || 8;
 
@@ -12191,7 +12209,7 @@ function getPlanningStatus(p) {
   const reserved=boReserved(p.pn);
   const effectiveStock=Math.max(0,oh-reserved)+onOrder;
   const effectiveOh=Math.max(0,oh-reserved);
-  const wkDemand=avgWk(p)||calcForecast(p.pn);
+  const wkDemand=effectiveWkDemand(p);
   const wksStock=wkDemand>0?effectiveOh/wkDemand:null; // weeks of stock remaining
   const fw=S.forecastWeeks||8;
   const lt=p.lead_time_weeks||1;
@@ -12221,13 +12239,12 @@ function renderPlanning() {
     if(!_devBomPns.has(p.pn))return false;
     if(_activeBomPns.has(p.pn))return false;
     if((p.avg_sales_wk||0)>0)return false;
-    if(avgWk(p)>0)return false;
-    if(calcForecast(p.pn)>0)return false;
+    if(effectiveWkDemand(p)>0)return false;
     return true;
   }
   const devOnlyParts=S.parts.filter(p=>!p.discontinued&&isDevOnlyPart(p));
   const allTracked=S.parts.filter(p=>!p.discontinued&&!isDevOnlyPart(p));
-  const trackedCount=allTracked.filter(p=>avgWk(p)>0||calcForecast(p.pn)>0).length;
+  const trackedCount=allTracked.filter(p=>effectiveWkDemand(p)>0).length;
   const kpiCritical =allTracked.filter(p=>getPlanningStatus(p)==='Out of Stock').length;
   const kpiReorder  =allTracked.filter(p=>getPlanningStatus(p)==='Order Now').length;
   const kpiWatch    =allTracked.filter(p=>getPlanningStatus(p)==='Watch').length;
@@ -12360,7 +12377,7 @@ function renderPlanning() {
     const orderQty=sq>0&&effectiveMOQ>0?Math.ceil(sq/effectiveMOQ)*effectiveMOQ:Math.max(sq,moq);
     const onOrder=openOrderedQty(p.pn);
     const effectiveStock=effectiveOh+onOrder;
-    const wkd=(avgWk(p)||calcForecast(p.pn));
+    const wkd=effectiveWkDemand(p); // weighted/trending-aware demand rate
     const wk4d=avgWk4(p);
     const wksStock=wkd>0?(displayOh/wkd).toFixed(1):null;
 
@@ -12560,7 +12577,7 @@ function renderMinMaxTab(parts){
     const oh=p.total_unpckgd||0;
     const status=getPlanningStatus(p);
     const statusCls={Critical:'pill-red',Reorder:'pill-orange','On Order':'pill-teal','Below MOQ':'pill-muted',Overstock:'pill-yellow',OK:'pill-teal'}[status]||'pill-muted';
-    const wkd=avgWk(p)||calcForecast(p.pn);
+    const wkd=effectiveWkDemand(p);
     const sel=S.mmSelectedPns.has(p.pn);
     const pending=S.mmSuggest&&S.mmSuggest.find(s=>s.pn===p.pn);
     return `<tr class="rowlink ${sel?'row-selected':''}" onclick="rowClick(event,function(){lookupGo('part','${p.pn}')})">
