@@ -641,7 +641,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v5.9';
+const TGK_ERP_VERSION = 'v6.0';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -769,7 +769,7 @@ function computeDemand(){
     if(devPnSet.has(parent))return;
     const ad=asmCalc[parent];if(!ad)return;
     items.forEach(i=>{
-      if(i.item_type!=='part')return;
+      if(i.item_type==='assembly'||i.item_type==='subassembly')return; // skip sub-assemblies (handled separately); include 'part', 'packaging', null, etc.
       if(!partCalc[i.child_pn])partCalc[i.child_pn]={wk4:0,wk12:0};
       partCalc[i.child_pn].wk4+=ad.wk4*(i.qty||1);
       partCalc[i.child_pn].wk12+=ad.wk12*(i.qty||1);
@@ -12157,7 +12157,14 @@ function calcSuggestedQty(p) {
   if(max > 0) return Math.max(0, Math.ceil(max - available - onOrder));
   const wkDemand = avgWk(p) || calcForecast(p.pn);
   const needed = Math.ceil(wkDemand * S.forecastWeeks + reserved);
-  return Math.max(0, needed - available - onOrder); // net need after current stock and inbound
+  let sq = Math.max(0, needed - available - onOrder); // net need after current stock and inbound
+  if(sq <= 0) return 0;
+  // Effective MOQ: explicit moq takes priority; otherwise lowest price break acts as floor
+  const moq = p.moq || 0;
+  const breaks = _getBreaks(p).filter(function(b){return b.qty>0&&b.price>0;}).sort(function(a,b){return a.qty-b.qty;});
+  const effectiveMOQ = moq > 0 ? moq : (breaks.length > 0 ? breaks[0].qty : 0);
+  if(effectiveMOQ > 0) sq = Math.ceil(sq / effectiveMOQ) * effectiveMOQ; // round up to nearest MOQ multiple
+  return sq;
 }
 
 function getPlanningStatus(p) {
@@ -12330,7 +12337,9 @@ function renderPlanning() {
     const displayOh=oh-reserved;
     const sq=calcSuggestedQty(p);
     const moq=p.moq||0;
-    const orderQty=Math.max(sq,moq);
+    const _pb=_getBreaks(p).filter(function(b){return b.qty>0&&b.price>0;}).sort(function(a,b){return a.qty-b.qty;});
+    const effectiveMOQ=moq>0?moq:(_pb.length>0?_pb[0].qty:0); // lowest break = implicit MOQ when no explicit MOQ
+    const orderQty=sq>0&&effectiveMOQ>0?Math.ceil(sq/effectiveMOQ)*effectiveMOQ:Math.max(sq,moq);
     const onOrder=openOrderedQty(p.pn);
     const effectiveStock=effectiveOh+onOrder;
     const wkd=(avgWk(p)||calcForecast(p.pn));
@@ -12386,13 +12395,13 @@ function renderPlanning() {
         ${demSrcIcon}${bomBadge}
       </td>
       <td style="font-weight:700;color:${wksColor};font-size:12px;font-family:var(--mono)" title="Weeks of stock at current demand rate">${wksStock!==null?wksStock+'w':'—'}</td>
-      <td style="vertical-align:middle;padding:6px 8px" title="Reorder point: ${rp} · Net need: ${sq} · MOQ: ${moq||'none'} · On order: ${onOrder}">
+      <td style="vertical-align:middle;padding:6px 8px" title="Reorder point: ${rp} · Net need: ${sq} · MOQ: ${effectiveMOQ>0?(effectiveMOQ+(moq>0?' (explicit)':' (Tier 1 break)')):'none'} · On order: ${onOrder}">
         ${alreadyCovered
           ? '<span style="color:var(--teal);font-size:11px;font-weight:700">&#10003; Covered</span><div style="font-size:9px;color:var(--text3);margin-top:1px">'+onOrder+' inbound</div>'
           : sq===0
             ? '<span style="color:var(--text3);font-size:12px">&mdash;</span>'+(moq>0?'<div style="font-size:9px;color:var(--text3)">optional min '+moq+'</div>':'')
             : '<span style="font-size:13px;font-weight:700;color:'+(moq>sq?'var(--orange)':'var(--text)')+'">'+orderQty+'</span>'
-              +(moq>sq?'<div style="font-size:9px;color:var(--text3);margin-top:1px">need '+sq+' / min '+moq+'</div>':'')
+              +(effectiveMOQ>sq?'<div style="font-size:9px;color:var(--text3);margin-top:1px">need '+sq+' / min '+(moq>0?moq:'Tier 1: '+effectiveMOQ)+'</div>':'')
               +(pbHint?'<div style="font-size:9px;color:var(--yellow);margin-top:1px">&#128161; '+pbHint+'</div>':'')
         }
       </td>
