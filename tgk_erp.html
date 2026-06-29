@@ -641,7 +641,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v5.1';
+const TGK_ERP_VERSION = 'v5.2';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -1063,7 +1063,7 @@ function setupRealtime(){
       else if(p.eventType==='UPDATE')S.parts=S.parts.map(x=>x.id===p.new.id?p.new:x);
       else if(p.eventType==='DELETE')S.parts=S.parts.filter(x=>x.id!==p.old.id);
       buildLookupMaps();
-      updateBadge();if(['parts','inventory','dashboard'].includes(S.view))scheduleRender();
+      updateBadge();if(['parts','inventory','dashboard','packqueue'].includes(S.view))scheduleRender();
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'assemblies'},p=>{
       const norm=a=>{const p=/^\d{2}-\d{4}/.test(a.pn||'')&&!isHWPack(a.pn);const d=a.is_subassembly;return{...a,is_subassembly:(d===true||d===false)?d:p};};
@@ -1071,7 +1071,7 @@ function setupRealtime(){
       else if(p.eventType==='UPDATE')S.assemblies=S.assemblies.map(x=>x.id===p.new.id?norm(p.new):x);
       else if(p.eventType==='DELETE')S.assemblies=S.assemblies.filter(x=>x.id!==p.old.id);
       buildLookupMaps();
-      if(['assemblies','dashboard'].includes(S.view))scheduleRender();
+      if(['assemblies','dashboard','packqueue'].includes(S.view))scheduleRender();
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'sales'},p=>{
       if(p.eventType==='INSERT'){
@@ -13975,6 +13975,7 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
   }
 
   const undoOps=[];
+  try {
   if(bom.length>0){
     for(const item of bom){
       const delta = isUnpack ? item.qty*qty : -(item.qty*qty);
@@ -13986,7 +13987,8 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
         undoOps.push({action:'update',table:'assemblies',data:{...sa,total_on_hand:newOhS},prev:{...sa}});
         await db.from('assemblies').update({total_on_hand:newOhS,updated_at:new Date().toISOString()}).eq('id',sa.id);
         S.assemblies=S.assemblies.map(x=>x.pn===item.child_pn?{...x,total_on_hand:newOhS}:x);
-        await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:sa.total_on_hand||0,new_qty:newOhS,adjustment:delta,reason:(isUnpack?'Unpack':'Pack')+' '+qty+'×'+pn+' (subassembly)',user_email:S.currentUser||null,source:isUnpack?'unpack':'pack'});
+        asmMap[item.child_pn]={...sa,total_on_hand:newOhS}; // keep running balance (mirrors liveAsmMap fix)
+        await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:sa.total_on_hand||0,new_qty:newOhS,adjustment:delta,reason:(isUnpack?'Unpack':'Pack')+' '+qty+'\u00d7'+pn+' (subassembly)',user_email:S.currentUser||null,source:isUnpack?'unpack':'pack'});
       } else {
         const p=partMap[item.child_pn];
         if(!p) continue;
@@ -13994,7 +13996,8 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
         undoOps.push({action:'update',table:'parts',data:{...p,total_unpckgd:newQty},prev:{...p}});
         await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
         S.parts=S.parts.map(x=>x.pn===item.child_pn?{...x,total_unpckgd:newQty}:x);
-        await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:delta,reason:(isUnpack?'Unpack':'Pack')+' '+qty+'×'+pn,user_email:S.currentUser||null,source:isUnpack?'unpack':'pack'});
+        partMap[item.child_pn]={...partMap[item.child_pn],total_unpckgd:newQty}; // keep running balance
+        await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:delta,reason:(isUnpack?'Unpack':'Pack')+' '+qty+'\u00d7'+pn,user_email:S.currentUser||null,source:isUnpack?'unpack':'pack'});
       }
     }
   }
@@ -14008,13 +14011,18 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
 
   await db.from('pack_log').insert({pn,qty:isUnpack?-qty:qty,pack_date:new Date().toISOString(),type:isUnpack?'unpack':'pack',notes:qty+'x '+(isUnpack?'unpacked':'packed')});
 
-  pushUndoMulti((isUnpack?'Unpack':'Pack')+' '+qty+'×'+pn+' (incl. components)',undoOps);
+  pushUndoMulti((isUnpack?'Unpack':'Pack')+' '+qty+'\u00d7'+pn+' (incl. components)',undoOps);
   updateBadge();
   syncShopifyTemplate(pn,newOh);
-  toast((isUnpack?'Unpacked':'Packed')+' '+qty+'× '+pn);
-  buildLookupMaps(); // rebuild part/asm indexes so render() sees updated quantities
-  render();
+  toast((isUnpack?'Unpacked':'Packed')+' '+qty+'\u00d7 '+pn);
   if(!isUnpack){var _lf=(S.labelFiles&&S.labelFiles[pn])||[];if(_lf.length)showLabelPrintPrompt(pn,qty,_lf);else checkAndPromptLabel(pn,qty);}
+  } catch(e) {
+    console.error('[TGK] packUnits error:',e);
+    toast('Error during '+(isUnpack?'unpack':'pack')+': '+(e.message||String(e)),6000);
+  } finally {
+    buildLookupMaps();
+    render();
+  }
 }
 
 // ============================================================
