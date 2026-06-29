@@ -641,7 +641,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v5.7';
+const TGK_ERP_VERSION = 'v5.9';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -1408,7 +1408,7 @@ function syncShopifyTemplate(pn,newOh){
   // cannot cover a build. If we can assemble the item, it is not truly out of stock.
   var isBackorder=false;
   if(newOh<=0){
-    var b=buildability(pn);
+    var b=buildabilityForBackorder(pn);
     if(b.hasBOM){
       // Has a BOM: backorder only if zero buildable units from components
       isBackorder=(b.maxBuild<=0);
@@ -6006,7 +6006,7 @@ async function bulkSyncShopifyBackorder(){
   const restockDate=new Date(Date.now()+restockDays*86400000).toISOString().slice(0,10);
   for(const a of fgs){
     const pn=dispPn(a);
-    const b=buildability(a.pn);
+    const b=buildabilityForBackorder(a.pn);
     const oh=a.total_on_hand||0;
     let isBackorder=false;
     if(oh<=0){isBackorder=b.hasBOM?b.maxBuild<=0:true;}
@@ -12157,7 +12157,7 @@ function calcSuggestedQty(p) {
   if(max > 0) return Math.max(0, Math.ceil(max - available - onOrder));
   const wkDemand = avgWk(p) || calcForecast(p.pn);
   const needed = Math.ceil(wkDemand * S.forecastWeeks + reserved);
-  return Math.max(0, needed - onOrder); // don't order what's already inbound
+  return Math.max(0, needed - available - onOrder); // net need after current stock and inbound
 }
 
 function getPlanningStatus(p) {
@@ -12169,11 +12169,13 @@ function getPlanningStatus(p) {
   const reserved=boReserved(p.pn);
   const effectiveStock=Math.max(0,oh-reserved)+onOrder;
   const effectiveOh=Math.max(0,oh-reserved);
-  if(effectiveOh<=0&&onOrder===0)return 'Critical';
+  const wkDemand=avgWk(p)||calcForecast(p.pn);
+  if(effectiveOh<=0&&onOrder===0)return 'Out of Stock';  // red — zero stock, nothing inbound
   if(effectiveOh<=rp&&onOrder>0&&effectiveStock>rp)return 'On Order';
   if(effectiveOh<=rp&&moq>0&&sq<moq)return 'Below MOQ';
-  if(effectiveOh<=rp)return 'Reorder';
+  if(effectiveOh<=rp)return 'Order Now';                 // red — below reorder point
   if(p.max_qty>0&&oh>p.max_qty)return 'Overstock';
+  if(wkDemand>0&&rp>0&&effectiveOh<rp*2)return 'Watch'; // yellow — getting close
   return 'OK';
 }
 
@@ -12188,7 +12190,7 @@ function renderPlanning() {
   const _activeBomPns=new Set();
   Object.entries(S.boms).forEach(([parent,items])=>{
     const bucket=isDevPn(parent)?_devBomPns:_activeBomPns;
-    items.forEach(i=>{if(i.item_type==='part')bucket.add(i.child_pn);});
+    items.forEach(i=>{const _t=i.item_type||'part';if(_t!=='assembly'&&_t!=='subassembly')bucket.add(i.child_pn);});
   });
   function isDevOnlyPart(p){
     if(!_devBomPns.has(p.pn))return false;
@@ -12201,8 +12203,9 @@ function renderPlanning() {
   const devOnlyParts=S.parts.filter(p=>!p.discontinued&&isDevOnlyPart(p));
   const allTracked=S.parts.filter(p=>!p.discontinued&&!isDevOnlyPart(p));
   const trackedCount=allTracked.filter(p=>avgWk(p)>0||calcForecast(p.pn)>0).length;
-  const kpiCritical =allTracked.filter(p=>getPlanningStatus(p)==='Critical').length;
-  const kpiReorder  =allTracked.filter(p=>getPlanningStatus(p)==='Reorder').length;
+  const kpiCritical =allTracked.filter(p=>getPlanningStatus(p)==='Out of Stock').length;
+  const kpiReorder  =allTracked.filter(p=>getPlanningStatus(p)==='Order Now').length;
+  const kpiWatch    =allTracked.filter(p=>getPlanningStatus(p)==='Watch').length;
   const kpiOnOrder  =allTracked.filter(p=>getPlanningStatus(p)==='On Order').length;
   const kpiOverstock=allTracked.filter(p=>getPlanningStatus(p)==='Overstock').length;
 
@@ -12215,7 +12218,7 @@ function renderPlanning() {
   if(sf.cat)    parts=parts.filter(p=>(p.category||'')===sf.cat);
   if(sf.status) parts=parts.filter(p=>getPlanningStatus(p)===sf.status);
 
-  const STATUS_PRI={Critical:0,Reorder:1,'Below MOQ':2,Overstock:3,'On Order':4,OK:5};
+  const STATUS_PRI={'Out of Stock':0,'Order Now':1,'Watch':2,'Below MOQ':3,Overstock:4,'On Order':5,OK:6};
   const trendRatio=p=>{const w12=avgWk(p),w4=avgWk4(p);return(w12>0&&w4>0)?w4/w12:1;};
   parts.sort((a,b)=>{
     let cmp=0;
@@ -12227,22 +12230,23 @@ function renderPlanning() {
       case 'weeks':{const wa=avgWk(a)>0?Math.max(0,(a.total_unpckgd||0)-boReserved(a.pn))/avgWk(a):9999,wb=avgWk(b)>0?Math.max(0,(b.total_unpckgd||0)-boReserved(b.pn))/avgWk(b):9999;cmp=wa-wb;break;}
       case 'trend': cmp=trendRatio(a)-trendRatio(b);break;
       case 'status':cmp=(STATUS_PRI[getPlanningStatus(a)]||5)-(STATUS_PRI[getPlanningStatus(b)]||5);break;
-      default:      cmp=((a.total_unpckgd||0)-calcReorderPoint(a))-((b.total_unpckgd||0)-calcReorderPoint(b));
+      default:{const _wa=avgWk(a)>0?Math.max(0,(a.total_unpckgd||0)-boReserved(a.pn))/avgWk(a):99999,_wb=avgWk(b)>0?Math.max(0,(b.total_unpckgd||0)-boReserved(b.pn))/avgWk(b):99999;cmp=_wa-_wb;break;}
     }
     return sortDir==='desc'?-cmp:cmp;
   });
 
-  const needsReorder=allTracked.filter(p=>getPlanningStatus(p)==='Reorder');
+  const needsReorder=allTracked.filter(p=>getPlanningStatus(p)==='Order Now'||getPlanningStatus(p)==='Out of Stock');
   const overstock=allTracked.filter(p=>p.max_qty>0&&(p.total_unpckgd||0)>p.max_qty);
 
   const sSt=(val,label)=>`<button class="filter-chip ${sf.status===val?'on-teal':''}" onclick="setFilter('planning','status','${sf.status===val?'':val}')">${label}</button>`;
   const sSort=(val,label)=>{const arr=sortField===val?(sortDir==='asc'?'↑':'↓'):'';return`<button class="filter-chip ${sortField===val?'on-teal':''}" onclick="(()=>{const _sf=S.filters.planning||{};const nd=_sf.sort==='${val}'&&_sf.dir==='asc'?'desc':'asc';setFilter('planning','sort','${val}');setFilter('planning','dir',nd);})()"> ${label}${arr?' '+arr:''}</button>`;};
 
   return `
-  <div class="kpi-grid" style="grid-template-columns:repeat(5,1fr)">
+  <div class="kpi-grid" style="grid-template-columns:repeat(6,1fr)">
     <div class="kpi" style="cursor:pointer" onclick="setFilter('planning','status','')"><div class="kpi-label">All Parts</div><div class="kpi-value">${allTracked.length}</div><div class="kpi-sub">${trackedCount} with velocity</div></div>
-    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('planning','status',sf.status==='Critical'?'':\'Critical\')"><div class="kpi-label">Critical</div><div class="kpi-value">${kpiCritical}</div><div class="kpi-sub">zero stock</div></div>
-    <div class="kpi kpi-orange" style="cursor:pointer" onclick="setFilter('planning','status',sf.status==='Reorder'?'':\'Reorder\')"><div class="kpi-label">Reorder</div><div class="kpi-value">${kpiReorder}</div><div class="kpi-sub">needs ordering</div></div>
+    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('planning','status',sf.status==='Out of Stock'?'':\'Out of Stock\')"><div class="kpi-label">Out of Stock</div><div class="kpi-value">${kpiCritical}</div><div class="kpi-sub">zero stock, no PO</div></div>
+    <div class="kpi kpi-orange" style="cursor:pointer" onclick="setFilter('planning','status',sf.status==='Order Now'?'':\'Order Now\')"><div class="kpi-label">Order Now</div><div class="kpi-value">${kpiReorder}</div><div class="kpi-sub">below reorder point</div></div>
+    <div class="kpi kpi-yellow" style="cursor:pointer" onclick="setFilter('planning','status',sf.status==='Watch'?'':\'Watch\')"><div class="kpi-label">Watch</div><div class="kpi-value">${kpiWatch}</div><div class="kpi-sub">getting close</div></div>
     <div class="kpi kpi-teal" style="cursor:pointer" onclick="setFilter('planning','status',sf.status==='On Order'?'':\'On Order\')"><div class="kpi-label">On Order</div><div class="kpi-value">${kpiOnOrder}</div><div class="kpi-sub">PO open</div></div>
     <div class="kpi kpi-yellow" style="cursor:pointer" onclick="setFilter('planning','status',sf.status==='Overstock'?'':\'Overstock\')"><div class="kpi-label">Overstock</div><div class="kpi-value">${kpiOverstock}</div><div class="kpi-sub">above max</div></div>
   </div>
@@ -12270,8 +12274,9 @@ function renderPlanning() {
     <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--border)">
       <span style="font-size:11px;color:var(--text3);flex-shrink:0;width:44px">Status:</span>
       <button class="filter-chip ${!sf.status?'on-teal':''}" onclick="setFilter('planning','status','')">All (${allTracked.length})</button>
-      ${sSt('Critical','🔴 Critical ('+kpiCritical+')')}
-      ${sSt('Reorder','🟠 Reorder ('+kpiReorder+')')}
+      ${sSt('Out of Stock','🔴 Out of Stock ('+kpiCritical+')')}
+      ${sSt('Order Now','🟠 Order Now ('+kpiReorder+')')}
+      ${sSt('Watch','🟡 Watch ('+kpiWatch+')')}
       ${sSt('On Order','🟢 On Order ('+kpiOnOrder+')')}
       ${sSt('Overstock','🟡 Overstock ('+kpiOverstock+')')}
       ${sSt('Below MOQ','⚪ Below MOQ')}
@@ -12355,7 +12360,7 @@ function renderPlanning() {
     const pbHint=nextBreakHint(p,orderQty);
 
     const status=getPlanningStatus(p);
-    const statusCls={Critical:'pill-red',Reorder:'pill-orange','On Order':'pill-teal','Below MOQ':'pill-muted',Overstock:'pill-yellow',OK:'pill-teal'}[status]||'pill-muted';
+    const statusCls={'Out of Stock':'pill-red','Order Now':'pill-orange','Watch':'pill-yellow','On Order':'pill-teal','Below MOQ':'pill-muted',Overstock:'pill-yellow',OK:'pill-teal'}[status]||'pill-muted';
 
     const alreadyCovered=sq<=0&&onOrder>0;
     const needsOrder=effectiveOh<=rp&&sq>0&&orderQty>0&&!(moq>0&&sq<moq);
@@ -12395,9 +12400,11 @@ function renderPlanning() {
       <td onclick="event.stopPropagation()" style="padding:4px 8px;vertical-align:middle;white-space:nowrap">
         ${alreadyCovered
           ? `<span style="font-size:11px;color:var(--teal);font-weight:700">&#10003; Covered</span><div style="font-size:9px;color:var(--text3)">${onOrder} inbound</div>`
-          : orderQty>0
+          : (status==='Out of Stock'||status==='Order Now')&&orderQty>0
             ? `<button class="btn btn-primary btn-sm" onclick="event.stopPropagation();openPartOrderModal('${p.pn}')" title="Order ${orderQty} × ${p.pn}">Order ${orderQty}</button>`
-            : `<button class="btn btn-sm" onclick="event.stopPropagation();openPartOrderModal('${p.pn}')" style="color:var(--text3)">Order</button>`
+            : orderQty>0
+              ? `<button class="btn btn-sm" onclick="event.stopPropagation();openPartOrderModal('${p.pn}')" style="color:var(--text3);border-color:var(--border2)" title="Order ${orderQty} × ${p.pn}">Order ${orderQty}</button>`
+              : `<button class="btn btn-sm" onclick="event.stopPropagation();openPartOrderModal('${p.pn}')" style="color:var(--text3)">Order</button>`
         }
       </td>
     </tr>`;
@@ -13236,6 +13243,45 @@ function buildability(pn,_depth){
   const maxBuild=checks.length?Math.max(0,Math.min(...checks.map(c=>c.maxFromThis))):0;
   return{maxBuild,checks,hasBOM:true};
 }
+
+// Like buildability() but ignores packaging/supply BOM items so that running out
+// of stickers, boxes or foam does NOT trigger a Shopify backorder flag.
+// Only real components (raw goods and subassemblies) gate the backorder decision.
+function buildabilityForBackorder(pn){
+  var bom=S.boms[pn]||[];
+  if(!bom.length)return buildability(pn); // no BOM — fall through to standard logic
+
+  // Strip packaging and supply-category items
+  var supplyLower=(SUPPLY_CATS||[]).map(function(s){return s.toLowerCase();});
+  var realBOM=bom.filter(function(i){
+    if(i.item_type==='packaging')return false;
+    var cp=S.parts.find(function(p){return p.pn===i.child_pn;});
+    if(cp){
+      var cat=(cp.category||'').toLowerCase();
+      if(supplyLower.some(function(s){return cat===s;}))return false;
+      if(cat.includes('box')||cat.includes('packaging')||cat.includes('shipping'))return false;
+    }
+    return true;
+  });
+
+  // If every BOM item was a supply, the assembly can be built component-wise — not a backorder
+  if(!realBOM.length)return{maxBuild:1,hasBOM:true};
+
+  // Compute max buildable from real components only
+  var pm={},am={};
+  S.parts.forEach(function(p){pm[p.pn]=p;});
+  S.assemblies.forEach(function(a){am[a.pn]=a;});
+  var maxBuilds=realBOM.map(function(i){
+    var inAsm=!!am[i.child_pn];
+    var src=inAsm?am[i.child_pn]:pm[i.child_pn];
+    var avail=src?(inAsm?(src.total_on_hand||0):(src.total_unpckgd||0)):0;
+    return i.qty>0?Math.floor(avail/i.qty):Infinity;
+  });
+  var maxBuild=Math.max(0,Math.min.apply(null,maxBuilds));
+  return{maxBuild:maxBuild,hasBOM:true};
+}
+
+
 
 function openOrderDemand(pn){
   return S.sales.filter(s=>s.pn===pn&&(!s.fulfillment_status||s.fulfillment_status==='Open')).reduce((t,s)=>t+(s.qty||1),0);
