@@ -641,7 +641,7 @@ td[class*=money]{font-variant-numeric:tabular-nums}
 // ============================================================
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v5.3';
+const TGK_ERP_VERSION = 'v5.6';
 const TGK_ERP_BUILD_DATE = '2026-06-26';
 let db = null;
 // Stamp version badge once DOM is ready
@@ -3471,12 +3471,17 @@ async function submitReturnV2(orderNum){
 
   const custName=lead.customer_name||'';
   const custEmail=lead.customer_email||'';
-  await db.from('warranty_claims').insert({
+  const{error:wtyErr}=await db.from('warranty_claims').insert({
     order_number:orderNum,pn:lines.map(l=>l.pn).join(', '),qty:lines.reduce(function(t,l){return t+(l.qty||1);},0),
     customer_name:custName||null,customer_email:custEmail||null,
     issue:reason+(fullNotes?' — '+fullNotes:''),resolution_type:'refund',
     status:'Resolved',resolved_at:new Date().toISOString(),created_at:new Date().toISOString()
   });
+  if(wtyErr){
+    const isRLS=wtyErr.message&&(wtyErr.message.includes('row-level security')||wtyErr.code==='42501'||wtyErr.message.includes('permission'));
+    if(isRLS)toast('\u26a0 Warranty log blocked — run: ALTER TABLE warranty_claims DISABLE ROW LEVEL SECURITY in Supabase',8000);
+    else console.warn('[TGK] warranty_claims insert failed:',wtyErr.message);
+  }
 
   logAction('Return '+lines.map(function(l){return l.qty+'× '+l.pn;}).join(', ')+' on '+orderNum,'sales',orderNum,null,null).catch(function(){});
   closeModal();
@@ -4755,7 +4760,8 @@ CREATE TABLE IF NOT EXISTS vendors (
   created_at timestamptz DEFAULT now(),
   updated_at timestamptz DEFAULT now()
 );
-ALTER TABLE vendors DISABLE ROW LEVEL SECURITY;</pre>
+ALTER TABLE vendors DISABLE ROW LEVEL SECURITY;
+ALTER TABLE warranty_claims DISABLE ROW LEVEL SECURITY;</pre>
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">1 — Install Supabase CLI & login</div>
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:10px;font-family:var(--mono);color:var(--text2);overflow-x:auto">npm install -g supabase
@@ -8867,8 +8873,9 @@ function openModal(type,data){
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitManualCorrection(document.getElementById('mc-pn').value,+document.getElementById('mc-new').value,document.getElementById('mc-reason').value)">Apply Correction</button></div>`;
   }
   else if(type==='addWarranty'){
-    title='Log Warranty Claim';
-    S.wtyItems=[];
+    const _editClaim=data.editId?(S.warrantyClaims||[]).find(function(w){return w.id===data.editId;}):null;
+    title=_editClaim?'Edit Warranty Claim':'Log Warranty Claim';
+    S.wtyItems=_editClaim&&_editClaim.claim_items?_editClaim.claim_items.map(function(i,idx){return Object.assign({},i,{idx:idx});}):[];
     const allPNs=[...S.parts.filter(p=>!p.discontinued).map(p=>p.pn),...S.assemblies.filter(a=>!a.discontinued).map(a=>a.pn)].sort();
     const discPNsWty=[...S.parts.filter(p=>p.discontinued).map(p=>p.pn),...S.assemblies.filter(a=>a.discontinued).map(a=>a.pn)].sort();
     body=`<div class="form-row cols-2">
@@ -8928,7 +8935,31 @@ function openModal(type,data){
       <div class="form-row cols-2">${fi('wty-ship-city','City','')} ${fi('wty-ship-state','State / Province','')}</div>
       <div class="form-row cols-2">${fi('wty-ship-zip','ZIP / Postal Code','')} ${fi('wty-ship-country','Country','US')}</div>
     </div>
-    <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitWarranty()">Log Claim</button></div>`;
+    <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" id="wty-submit-btn" onclick="submitWarranty()">Log Claim</button></div>`;
+    // Pre-fill fields if editing — do after DOM renders
+    if(_editClaim){
+      setTimeout(function(){
+        var el,sd=_editClaim.shipping_details||{};
+        if(el=document.getElementById('wty-order'))el.value=_editClaim.order_number||'';
+        if(el=document.getElementById('wty-name'))el.value=_editClaim.customer_name||'';
+        if(el=document.getElementById('wty-email'))el.value=_editClaim.customer_email||'';
+        if(el=document.getElementById('wty-issue'))el.value=_editClaim.issue||'';
+        if(el=document.getElementById('wty-resolution'))el.value=_editClaim.resolution_type||'no_action';
+        wtyShowItemsIfReplacement();
+        if(sd.street1){
+          if(el=document.getElementById('wty-ship-name'))el.value=sd.name||'';
+          if(el=document.getElementById('wty-ship-addr1'))el.value=sd.street1||'';
+          if(el=document.getElementById('wty-ship-addr2'))el.value=sd.street2||'';
+          if(el=document.getElementById('wty-ship-city'))el.value=sd.city||'';
+          if(el=document.getElementById('wty-ship-state'))el.value=sd.state||'';
+          if(el=document.getElementById('wty-ship-zip'))el.value=sd.postal_code||'';
+          if(el=document.getElementById('wty-ship-country'))el.value=sd.country||'US';
+        }
+        _wtyRenderItems();
+        var btn=document.getElementById('wty-submit-btn');
+        if(btn){btn.textContent='Update Claim';btn.onclick=function(){updateWarranty(_editClaim.id);};}
+      },30);
+    }
   }
   else if(type==='custom'){
     title=data.title||'';
@@ -9517,7 +9548,15 @@ async function submitWarranty(){
   const claim_items=items.map(function(i){return{pn:i.pn,type:i.type,qty:i.qty,description:i.description};});
   const payload={pn,order_number:(document.getElementById('wty-order')?.value||'').trim(),customer_name:(document.getElementById('wty-name')?.value||'').trim(),customer_email:(document.getElementById('wty-email')?.value||'').trim(),issue,resolution_type:resolution,claim_items:claim_items.length?claim_items:null,shipping_details,status:'Open'};
   const{data,error}=await db.from('warranty_claims').insert(payload).select().single();
-  if(error){toast('Error: '+error.message);return;}
+  if(error){
+    const isRLS=error.message&&(error.message.includes('row-level security')||error.code==='42501'||error.message.includes('permission'));
+    if(isRLS){
+      toast('\u26a0 Permission denied — run in Supabase SQL Editor:\nALTER TABLE warranty_claims DISABLE ROW LEVEL SECURITY;',10000);
+    } else {
+      toast('Error saving warranty claim: '+error.message);
+    }
+    return;
+  }
   S.wtyItems=[];
   S.warrantyClaims=[data,...S.warrantyClaims];
   logAction('Created warranty claim — '+issue.slice(0,60),'warranty_claims',pn||null,null,null).catch(()=>{});
@@ -13174,7 +13213,7 @@ function buildability(pn,_depth){
   const am={};S.assemblies.forEach(a=>am[a.pn]=a);
   const checks=bom.map(i=>{
     const inAsm=!!am[i.child_pn],inPart=!!pm[i.child_pn];
-    const isSub=i.item_type==='assembly'||i.item_type==='subassembly'||(inAsm&&!inPart);
+    const isSub=i.item_type==='assembly'||i.item_type==='subassembly'||inAsm; // inAsm alone: assembly table is authoritative
     const src=isSub?am[i.child_pn]:pm[i.child_pn];
     let avail;
     if(isSub){
@@ -13388,7 +13427,7 @@ async function submitCustomPackList(){
     if(bom.length>0){
       for(const item of bom){
         const _cpInAsm=!!liveAsmMap[item.child_pn],_cpInPart=!!partMap[item.child_pn];
-        const isSub=isAsmBOMItem(item.item_type)||(_cpInAsm&&!_cpInPart);
+        const isSub=isAsmBOMItem(item.item_type)||_cpInAsm; // assembly table is authoritative
         const src=isSub?liveAsmMap[item.child_pn]:partMap[item.child_pn];
         const avail=src?(isSub?(src.total_on_hand||0):(src.total_unpckgd||0)):0;
         const need=item.qty*qty;
@@ -13398,7 +13437,7 @@ async function submitCustomPackList(){
     if(bom.length>0){
       for(const item of bom){
         const delta=-(item.qty*qty);
-        const _cpIsAsmDeduct=isAsmBOMItem(item.item_type)||(!!liveAsmMap[item.child_pn]&&!partMap[item.child_pn]);
+        const _cpIsAsmDeduct=isAsmBOMItem(item.item_type)||!!liveAsmMap[item.child_pn]; // assembly table is authoritative
         if(_cpIsAsmDeduct){
           const sa=liveAsmMap[item.child_pn];if(!sa)continue;
           const newOh=(sa.total_on_hand||0)+delta;
@@ -13964,7 +14003,7 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
   if(!isUnpack && bom.length>0) {
     for(const item of bom){
       const _inAsm=!!asmMap[item.child_pn],_inPart=!!partMap[item.child_pn];
-      const isSub=item.item_type==='assembly'||item.item_type==='subassembly'||(_inAsm&&!_inPart);
+      const isSub=item.item_type==='assembly'||item.item_type==='subassembly'||_inAsm; // assembly table is authoritative
       const src=isSub?asmMap[item.child_pn]:partMap[item.child_pn];
       const avail=src?(isSub?(src.total_on_hand||0):(src.total_unpckgd||0)):0;
       const need=item.qty*qty;
@@ -13980,7 +14019,7 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
   if(bom.length>0){
     for(const item of bom){
       const delta = isUnpack ? item.qty*qty : -(item.qty*qty);
-      const _isAsmLine=item.item_type==='assembly'||item.item_type==='subassembly'||(!!asmMap[item.child_pn]&&!partMap[item.child_pn]);
+      const _isAsmLine=item.item_type==='assembly'||item.item_type==='subassembly'||!!asmMap[item.child_pn]; // assembly table is authoritative
       if(_isAsmLine){
         const sa=asmMap[item.child_pn];
         if(!sa) continue;
@@ -14956,10 +14995,25 @@ async function openLabelPrompt(pn,qty){
 }
 
 var _labelPromptQueue=[];
+var _pendingLabelFiles=[];   // remaining labels for the current SKU
+var _pendingLabelPn='';
+var _pendingLabelQty=1;
+var _labelSkuTotal=0;        // total labels for current SKU (for "1 of 3" display)
+var _labelIsAdvancing=false; // true when _closeOrAdvanceLabel is driving the next label
 
 function _closeOrAdvanceLabel(){
-  if(_labelPromptQueue.length){_processNextLabelPrompt();}
-  else{closeModal();}
+  if(_pendingLabelFiles.length){
+    // More labels remain for this same SKU — step to next one
+    _labelIsAdvancing=true;
+    showLabelPrintPrompt(_pendingLabelPn,_pendingLabelQty,_pendingLabelFiles);
+  } else if(_labelPromptQueue.length){
+    // Done with this SKU's labels — move to next SKU
+    _labelIsAdvancing=false;
+    _processNextLabelPrompt();
+  } else {
+    _labelIsAdvancing=false;
+    closeModal();
+  }
 }
 
 async function _processNextLabelPrompt(){
@@ -15000,35 +15054,64 @@ async function checkAndPromptLabel(pn,qty){
 function showLabelPrintPrompt(pn,qty,labelFiles){
   var ov=$('modal-overlay'),bx=$('modal-box');
   if(!ov||!bx){_closeOrAdvanceLabel();return;}
-  var hasMore=_labelPromptQueue.length>0;
+
+  // Fresh SKU (not a label-to-label advance) — record total
+  if(!_labelIsAdvancing){_labelSkuTotal=labelFiles.length;}
+  _labelIsAdvancing=false;
+
+  // Context for when user advances to next label
+  _pendingLabelPn=pn;
+  _pendingLabelQty=qty;
+
+  // Show only the FIRST label; stash the rest
+  var f=labelFiles[0];
+  _pendingLabelFiles=labelFiles.slice(1);
+
+  var hasMoreLabels=_pendingLabelFiles.length>0;
+  var hasMoreSkus=_labelPromptQueue.length>0;
+  var isDymo=/\.label$/i.test(f.file_url||'');
   var asm=S.assemblies.find(function(a){return a.pn===pn;})||{};
   var desc=asm.description||'';
 
-  var rows=labelFiles.map(function(f){
-    var isDymo=/\.label$/i.test(f.file_url||'');
-    return '<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--bg3);border-radius:8px;margin-bottom:8px;border:1px solid var(--border)">'
-      +'<span style="font-size:22px;flex-shrink:0">&#127991;</span>'
-      +'<div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(f.file_name||'Label')+'</div>'
-      +(isDymo?'<div style="font-size:10px;color:var(--orange);margin-top:2px">DYMO .label file \u2014 open in DYMO Connect to print</div>':'')+'</div>'
-      +(isDymo
-        ?'<a href="'+escHtml(f.file_url)+'" target="_blank" class="btn btn-sm" onclick="_closeOrAdvanceLabel()">Download</a>'
-        :'<button class="btn btn-primary btn-sm" onclick="printLabelD450(\''+escHtml(f.file_url)+'\',\''+escHtml(f.file_name||pn)+'\',\''+escHtml(pn)+'\','+qty+');_closeOrAdvanceLabel()">&#128424; Print D450</button>')
-      +'</div>';
-  }).join('');
+  // Progress bar — "Label 2 of 3"
+  var currentNum=_labelSkuTotal-labelFiles.length+1;
+  var progressBar=_labelSkuTotal>1
+    ?'<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">'
+     +'<span style="font-size:10px;color:var(--teal);font-weight:600;white-space:nowrap">Label '+currentNum+' of '+_labelSkuTotal+'</span>'
+     +'<div style="flex:1;height:3px;background:var(--bg4);border-radius:2px">'
+     +'<div style="width:'+Math.round((currentNum/_labelSkuTotal)*100)+'%;height:100%;background:var(--teal);border-radius:2px"></div>'
+     +'</div></div>'
+    :'';
 
-  var queueNote=hasMore?('<div style="font-size:10px;color:var(--text3);margin-top:6px">+'+_labelPromptQueue.length+' more SKU'+((_labelPromptQueue.length!==1)?'s':'')+' to follow</div>'):'';
+  var row='<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--bg3);border-radius:8px;margin-bottom:8px;border:1px solid var(--border)">'
+    +'<span style="font-size:22px;flex-shrink:0">&#127991;</span>'
+    +'<div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(f.file_name||'Label')+'</div>'
+    +(isDymo?'<div style="font-size:10px;color:var(--orange);margin-top:2px">DYMO .label file \u2014 open in DYMO Connect to print</div>':'')+'</div>'
+    +(isDymo
+      ?'<a href="'+escHtml(f.file_url)+'" target="_blank" class="btn btn-sm" onclick="_closeOrAdvanceLabel()">Download</a>'
+      :'<button class="btn btn-primary btn-sm" onclick="printLabelD450(\''+escHtml(f.file_url)+'\',\''+escHtml(f.file_name||pn)+'\',\''+escHtml(pn)+'\','+qty+');_closeOrAdvanceLabel()">&#128424; Print D450</button>')
+    +'</div>';
+
+  var nextNote='';
+  if(hasMoreLabels){
+    nextNote='<div style="font-size:10px;color:var(--text3);margin-top:6px">'+_pendingLabelFiles.length+' more label'+((_pendingLabelFiles.length!==1)?'s':'')+' for this SKU after this</div>';
+  }else if(hasMoreSkus){
+    nextNote='<div style="font-size:10px;color:var(--text3);margin-top:6px">+'+_labelPromptQueue.length+' more SKU'+((_labelPromptQueue.length!==1)?'s':'')+' to follow</div>';
+  }
+
+  var skipLabel=hasMoreLabels?'Skip this label &rarr;':(hasMoreSkus?'Skip SKU &rarr;':'Skip');
 
   bx.innerHTML='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">'
     +'<div style="font-size:15px;font-weight:700;color:var(--text)">&#127991; Print Label</div>'
     +'<button onclick="_closeOrAdvanceLabel()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">&times;</button>'
     +'</div>'
     +'<div style="font-size:11px;color:var(--teal);font-family:var(--mono);margin-bottom:4px;font-weight:700">'+escHtml(pn)+'</div>'
-    +(desc?'<div style="font-size:11px;color:var(--text3);margin-bottom:12px">'+escHtml(desc)+'</div>':'<div style="margin-bottom:12px"></div>')
-    +rows+queueNote
-    +'<div style="font-size:10px;color:var(--text3);padding:8px 10px;background:var(--bg3);border-radius:6px;margin-top:4px;line-height:1.5">'
+    +(desc?'<div style="font-size:11px;color:var(--text3);margin-bottom:10px">'+escHtml(desc)+'</div>':'<div style="margin-bottom:10px"></div>')
+    +progressBar+row+nextNote
+    +'<div style="font-size:10px;color:var(--text3);padding:8px 10px;background:var(--bg3);border-radius:6px;margin-top:8px;line-height:1.5">'
     +'&#128396; In the print dialog: select <b>DYMO LabelWriter 450</b>, paper <b>2&#x22;\u00d74&#x22;</b>, margins <b>None</b>.'
     +'</div>'
-    +'<div class="modal-footer"><button class="btn" onclick="_closeOrAdvanceLabel()">'+(hasMore?'Skip &rarr;':'Skip')+'</button></div>';
+    +'<div class="modal-footer"><button class="btn" onclick="_closeOrAdvanceLabel()">'+skipLabel+'</button></div>';
   bx.style.width='460px';
   ov.classList.remove('hidden');
 }
@@ -15179,7 +15262,9 @@ function renderWarranty() {
       <td style="display:flex;gap:4px;flex-wrap:wrap">
         ${canShip?`<button class="btn btn-teal btn-sm" onclick="shipWarrantyReplacement('${w.id}')">🚚 Ship</button>`:''}
         ${!canShip&&nextStatus[w.status]?`<button class="action-btn" onclick="advanceWarranty('${w.id}','${nextStatus[w.status]}')">→ ${nextStatus[w.status]}</button>`:''}
-        <button class="action-btn" title="${w.tracking_number?'Update tracking':'Enter tracking manually'}" onclick="openManualTrackingModal('warranty','${w.id}')">${w.tracking_number?'✎ Track':'📦 Track'}</button>
+        <button class="action-btn" title="Edit this claim" onclick="openModal('addWarranty',{editId:'${w.id}'})">✎</button>
+        ${(w.status==='Shipped'||w.tracking_number)?`<button class="action-btn" title="Unship — clear tracking and revert status" onclick="unshipWarranty('${w.id}')">↩ Unship</button>`:''}
+        <button class="action-btn" title="${w.tracking_number?'Update tracking':'Enter tracking manually'}" onclick="openManualTrackingModal('warranty','${w.id}')">${w.tracking_number?'📦 Track':'📦 Track'}</button>
         <button class="action-btn del" onclick="deleteWarranty('${w.id}')">×</button>
       </td>
     </tr>`;
@@ -15253,8 +15338,9 @@ function renderShipmentErrors(){
       <td style="display:flex;gap:4px;flex-wrap:wrap">
         ${canShip?`<button class="btn btn-teal btn-sm" onclick="shipShipmentError('${e.id}')">🚚 Ship</button>`:''}
         ${!canShip&&nextStatus[e.status]?`<button class="action-btn" onclick="advanceShipmentError('${e.id}','${nextStatus[e.status]}')">→ ${nextStatus[e.status]}</button>`:''}
-        <button class="action-btn" onclick="openModal('addShipmentError',{id:'${e.id}'})">✎</button>
-        ${!e.tracking_number?`<button class="action-btn" title="Enter tracking manually" onclick="openManualTrackingModal('shiperror','${e.id}')">📦 Track</button>`:''}
+        <button class="action-btn" title="Edit this error" onclick="openModal('addShipmentError',{id:'${e.id}'})">✎</button>
+        ${e.tracking_number?`<button class="action-btn" title="Unship — clear tracking and revert to Open" onclick="unshipShipmentError('${e.id}')">↩ Unship</button>`:''}
+        <button class="action-btn" title="${e.tracking_number?'Update tracking':'Enter tracking manually'}" onclick="openManualTrackingModal('shiperror','${e.id}')">📦 Track</button>
         <button class="action-btn del" onclick="deleteShipmentError('${e.id}')">×</button>
       </td>
     </tr>`;
@@ -15276,6 +15362,67 @@ async function deleteWarranty(id) {
   S.warrantyClaims=S.warrantyClaims.filter(w=>w.id!==id);
   logAction('Deleted warranty claim','warranty_claims',null,null,null).catch(()=>{});
   toast('Claim deleted');render();
+}
+
+async function updateWarranty(id){
+  const issue=(document.getElementById('wty-issue')?.value||'').trim();
+  if(!issue){toast('Issue description required');return;}
+  const resolution=document.getElementById('wty-resolution')?.value||'no_action';
+  const items=S.wtyItems||[];
+  let shipping_details=null;
+  if(resolution==='replacement'){
+    const addr1=(document.getElementById('wty-ship-addr1')?.value||'').trim();
+    const city=(document.getElementById('wty-ship-city')?.value||'').trim();
+    const zip=(document.getElementById('wty-ship-zip')?.value||'').trim();
+    if(!addr1||!city||!zip){toast('Street, city and ZIP required for replacement');return;}
+    shipping_details={
+      name:(document.getElementById('wty-ship-name')?.value||'').trim(),
+      street1:addr1,
+      street2:(document.getElementById('wty-ship-addr2')?.value||'').trim(),
+      city,state:(document.getElementById('wty-ship-state')?.value||'').trim(),
+      postal_code:zip,country:(document.getElementById('wty-ship-country')?.value||'US').trim()
+    };
+  }
+  const asmRef=document.getElementById('wty-asm-val')?.value||'';
+  const firstItem=items[0];
+  const pn=asmRef||(firstItem?.pn)||'';
+  const claim_items=items.map(function(i){return{pn:i.pn,type:i.type,qty:i.qty,description:i.description};});
+  const payload={pn,
+    order_number:(document.getElementById('wty-order')?.value||'').trim(),
+    customer_name:(document.getElementById('wty-name')?.value||'').trim(),
+    customer_email:(document.getElementById('wty-email')?.value||'').trim(),
+    issue,resolution_type:resolution,
+    claim_items:claim_items.length?claim_items:null,
+    shipping_details};
+  const{error}=await db.from('warranty_claims').update(payload).eq('id',id);
+  if(error){
+    const isRLS=error.message&&(error.message.includes('row-level security')||error.code==='42501');
+    if(isRLS)toast('⚠ Permission denied — run: ALTER TABLE warranty_claims DISABLE ROW LEVEL SECURITY in Supabase',8000);
+    else toast('Error: '+error.message);
+    return;
+  }
+  S.warrantyClaims=S.warrantyClaims.map(function(w){return w.id===id?Object.assign({},w,payload):w;});
+  S.wtyItems=[];
+  logAction('Updated warranty claim — '+issue.slice(0,60),'warranty_claims',pn||null,null,null).catch(function(){});
+  closeModal();toast('✓ Warranty claim updated');render();
+}
+
+async function unshipWarranty(id){
+  if(!confirm('Unship this warranty claim?\n\nTracking will be cleared and status reverted to Approved.\n\nNote: if inventory was deducted when the replacement shipped, restore it manually.'))return;
+  const claim=(S.warrantyClaims||[]).find(function(w){return w.id===id;});
+  const revertStatus=claim&&claim.status==='Shipped'?'Approved':'In Review';
+  const{error}=await db.from('warranty_claims').update({tracking_number:null,carrier:null,shipped_at:null,ss_order_id:null,status:revertStatus}).eq('id',id);
+  if(error){toast('Error: '+error.message);return;}
+  S.warrantyClaims=S.warrantyClaims.map(function(w){return w.id===id?Object.assign({},w,{tracking_number:null,carrier:null,shipped_at:null,ss_order_id:null,status:revertStatus}):w;});
+  toast('✓ Unshipped — status → '+revertStatus);render();
+}
+
+async function unshipShipmentError(id){
+  if(!confirm('Unship this shipment error?\n\nTracking will be cleared and status reverted to Open.'))return;
+  const{error}=await db.from('shipment_errors').update({tracking_number:null,carrier:null,shipped_at:null,ss_order_id:null,status:'Open'}).eq('id',id);
+  if(error){toast('Error: '+error.message);return;}
+  S.shipmentErrors=(S.shipmentErrors||[]).map(function(e){return e.id===id?Object.assign({},e,{tracking_number:null,carrier:null,shipped_at:null,ss_order_id:null,status:'Open'}):e;});
+  toast('✓ Unshipped — status → Open');render();
 }
 
 function openManualTrackingModal(type, id){
