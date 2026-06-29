@@ -192,7 +192,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v8.0';
+const TGK_ERP_VERSION = 'v8.1';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -211,7 +211,7 @@ const S = {
   undoStack:[], backups:[], lastBackup:null, autoBackupTimer:null, autoRefreshTimer:null, lastActivity:Date.now(),
   backupTableOk:null, // null=unknown, true=exists, false=missing
   backupError:null,   // last error string if backup failed
-  forecastWeeks:8,
+  forecastWeeks:4,
   activePO:null, poLines:{}, poTracking:{},
   selectedParts:new Set(), selectedAsms:new Set(), bulkEditMode:null,
   workOrderMode:false, workOrderBuilds:{},
@@ -384,6 +384,7 @@ function asmAvgWk(a){
   return a.avg_sales_wk||0;
 }
 function boReserved(pn){return(S.calc&&S.calc.boReservedPart&&S.calc.boReservedPart[pn])||0;}
+function unitsInAssemblies(pn){var t=0;S.assemblies.forEach(function(a){var oh=a.total_on_hand||0;if(oh<=0)return;(S.boms[a.pn]||[]).forEach(function(i){if(i.child_pn!==pn)return;var tp=i.item_type||'part';if(tp!=='assembly'&&tp!=='subassembly')t+=oh*(i.qty||1);});});return Math.round(t);}
 
 function liveStatus(a){
   if(a&&a.stage==='dev')return 'dev';
@@ -1471,6 +1472,7 @@ function renderParts(){
       <option value="__disc__" ${sf.cat==='__disc__'?'selected':''}>&#9888; Discontinued (${S.parts.filter(p=>p.discontinued).length})</option>
       ${cats.map(c=>`<option value="${c}" ${sf.cat===c?'selected':''}>${c}</option>`).join('')}
     </select>
+    <button class="btn btn-sm" onclick="massSetMOQFromTiers()" title="Set MOQ to Tier 1 minimum for all parts with price breaks">&#128178; Set MOQs from Tiers</button>
     <button class="btn btn-sm" style="margin-left:auto" onclick="openModal('manageCategories',{table:'parts'})">&#9881; Categories</button>
     <button class="btn btn-sm" onclick="openModal('manageVendors',{})">&#9881; Vendors</button>
     <span class="filter-count">${list.length} parts</span>
@@ -11228,6 +11230,23 @@ function addAllReorder(vendorFilter){
   render();
 }
 
+window.massSetMOQFromTiers=async function(){
+  var eligible=S.parts.filter(function(p){if(p.discontinued)return false;return _getBreaks(p).filter(function(b){return b.qty>0&&b.price>0;}).length>0;});
+  if(!eligible.length){toast('No parts with price tiers found');return;}
+  if(!confirm('Set MOQ to Tier 1 minimum for '+eligible.length+' parts that have price breaks set?'))return;
+  var updated=0,skipped=0;
+  for(var i=0;i<eligible.length;i++){
+    var p=eligible[i];
+    var brks=_getBreaks(p).filter(function(b){return b.qty>0&&b.price>0;}).sort(function(a,b){return a.qty-b.qty;});
+    if(!brks.length){skipped++;continue;}
+    var newMOQ=brks[0].qty;
+    if(p.moq===newMOQ){skipped++;continue;}
+    p.moq=newMOQ;
+    try{await db.from('parts').update({moq:newMOQ,updated_at:new Date().toISOString()}).eq('id',p.id);updated++;}catch(e){skipped++;}
+  }
+  toast(updated+' MOQs updated from Tier 1 ('+skipped+' already set or skipped)');
+  render();
+};
 function saveCart(){
   try{localStorage.setItem('tgk_po_cart',JSON.stringify({cart:S.poCart||[],shipping:S.poCartShipping||{}}));}
   catch(e){}
@@ -11738,6 +11757,7 @@ function renderPlanning() {
     <th>Description</th><th>Vendor</th>
     <th style="cursor:pointer" onclick="(()=>{const d=sortField==='oh'&&sortDir==='asc'?'desc':'asc';setFilter('planning','sort','oh');setFilter('planning','dir',d)})()">Stock ${sortField==='oh'?(sortDir==='asc'?'↑':'↓'):''}</th>
     <th title="Units reserved for backordered assemblies" style="white-space:nowrap">BO Rsv</th>
+    <th title="Units of this part currently packed into finished goods on hand" style="white-space:nowrap">In Asm</th>
     <th style="cursor:pointer" onclick="(()=>{const d=sortField==='demand'&&sortDir==='asc'?'desc':'asc';setFilter('planning','sort','demand');setFilter('planning','dir',d)})()">Demand ${sortField==='demand'?(sortDir==='asc'?'↑':'↓'):sortField==='trend'?'(trend sorted)':''}</th>
     <th style="cursor:pointer" onclick="(()=>{const d=sortField==='weeks'&&sortDir==='asc'?'desc':'asc';setFilter('planning','sort','weeks');setFilter('planning','dir',d)})()">Wks ${sortField==='weeks'?(sortDir==='asc'?'↑':'↓'):''}</th>
     <th title="Qty to order: net need rounded up to MOQ. Grey/dash = at target. Teal = already on order.">Order Qty</th>
@@ -11824,6 +11844,7 @@ function renderPlanning() {
 
 
       <td style="text-align:center">${(()=>{const r=boReserved(p.pn);if(!r)return '<span style="color:var(--text3);font-size:10px">—</span>';const src=Object.entries((S.calc&&S.calc.boBacklog)||{}).filter(([asm])=>{const bom=S.boms[asm]||[];return bom.some(i=>i.item_type==='part'&&i.child_pn===p.pn);}).map(([asm,bo])=>{const item=(S.boms[asm]||[]).find(i=>i.child_pn===p.pn);return asm+' ×'+bo+'(needs '+(item?.qty||1)+'ea)';}).join(', ');return '<span style="font-weight:700;color:var(--orange)" title="Reserved for: '+escHtml(src)+'">'+r+'</span>';})()}</td>
+      <td style="text-align:center;font-size:11px">${(()=>{const _u=unitsInAssemblies(p.pn);return _u>0?'<span style="font-weight:700;color:var(--teal)" title="Packed into finished goods">'+ _u+'</span>':'<span style="color:var(--text3);font-size:10px">—</span>';})()}</td>
       <td class="money-neutral" style="white-space:nowrap" title="${trendTitle}">
         ${wkd.toFixed(2)}/wk${trend?` <span style="color:${trendColor};font-weight:700">${trend}</span>`:''}
         ${demSrcIcon}${bomBadge}
