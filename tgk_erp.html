@@ -192,7 +192,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v8.5';
+const TGK_ERP_VERSION = 'v8.7';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -613,7 +613,10 @@ function notifyHoldAlert(sale){
   var snippet='Order #'+(sale.order_number||'')+' '+(sale.pn||'')+' went On Hold'+(sale.customer_name?' — '+sale.customer_name:'');
   db.from('chat_notifications').insert({
     to_email:target,from_name:'Order Alert',snippet:snippet.slice(0,150)
-  }).then(function(r){if(r.error)console.warn('[hold-alert]',r.error.message);});
+  }).then(function(r){
+    if(r.error){console.warn('[hold-alert]',r.error.message);return;}
+    if(target===S.currentUser)return;
+  });
 }
 function setupRealtime(){
   if(_rtChannel){try{_rtChannel.unsubscribe();}catch(e){}}
@@ -19186,7 +19189,7 @@ function _buildRefundCard(unref){
   +'</div>';
 }
 
-const _chat={msgs:[],team:[],open:false,unread:0,_idx:-1,_ready:false};
+const _chat={msgs:[],team:[],alerts:[],open:false,unread:0,tab:'msgs',_idx:-1,_ready:false};
 
 async function initChat(){
   if(!S.currentUser||_chat._ready)return;
@@ -19202,8 +19205,9 @@ async function initChat(){
     var {data:_msgs,error:_me}=await db.from('chat_messages').select('*').order('created_at',{ascending:true}).limit(80);
     if(_me){console.warn('[chat] messages:',_me.message);toast('Chat: '+_me.message);}
     else{_chat.msgs=_msgs||[];_renderChatMessages();_scrollChatBottom();}
-    var {data:_nrs}=await db.from('chat_notifications').select('id').eq('to_email',S.currentUser).is('read_at',null);
-    _chat.unread=(_nrs||[]).length;
+    var {data:_nlist}=await db.from('chat_notifications').select('*').eq('to_email',S.currentUser).order('created_at',{ascending:false}).limit(50);
+    _chat.alerts=_nlist||[];
+    _chat.unread=_chat.alerts.filter(function(n){return !n.read_at;}).length;
     _updateChatBadge();
     db.channel('chat-live').on('postgres_changes',{event:'INSERT',schema:'public',table:'chat_messages'},
       function(p){
@@ -19215,9 +19219,11 @@ async function initChat(){
     db.channel('chat-notif-'+S.currentUser.replace(/[^a-z0-9]/gi,'-').slice(0,40))
       .on('postgres_changes',{event:'INSERT',schema:'public',table:'chat_notifications'},function(p){
         if(p.new.to_email!==S.currentUser)return;
+        _chat.alerts.unshift(p.new);
         _chat.unread++;_updateChatBadge();
+        if(_chat.open&&_chat.tab==='alerts')_renderChatAlerts();
         if(window.Notification&&Notification.permission==='granted'){
-          try{new Notification('TGK — '+(p.new.from_name||'Someone')+' mentioned you',{body:p.new.snippet||'',tag:'tgk-chat'});}catch(e){}
+          try{new Notification('TGK — '+(p.new.from_name||'Someone'),{body:p.new.snippet||'',tag:'tgk-chat'});}catch(e){}
         }
       }).subscribe();
     if(window.Notification&&Notification.permission==='default'){
@@ -19238,21 +19244,86 @@ function toggleChat(){
   panel.classList.toggle('open',_chat.open);
   if(_chat.open){
     if(!_chat._ready)initChat();
-    setTimeout(_scrollChatBottom,80);
-    if(_chat.unread>0){
-      db.from('chat_notifications').update({read_at:new Date().toISOString()})
-        .eq('to_email',S.currentUser).is('read_at',null).then(function(){_chat.unread=0;_updateChatBadge();});
+    if(_chat.tab==='msgs'){
+      setTimeout(_scrollChatBottom,80);
+      setTimeout(function(){var i=document.getElementById('chat-input');if(i)i.focus();},120);
+    }else{
+      _renderChatAlerts();
     }
-    setTimeout(function(){var i=document.getElementById('chat-input');if(i)i.focus();},120);
   }
 }
 window.toggleChat=toggleChat;
 
+function setChatTab(tab){
+  _chat.tab=tab;
+  var msgsBtn=document.getElementById('chat-tab-msgs'),alertsBtn=document.getElementById('chat-tab-alerts');
+  var msgsEl=document.getElementById('chat-messages'),alertsEl=document.getElementById('chat-alerts'),inputWrap=document.getElementById('chat-input-wrap');
+  if(!msgsBtn||!alertsBtn)return;
+  var on='border-bottom:2px solid var(--teal);color:var(--teal)',off='border-bottom:2px solid transparent;color:var(--text3)';
+  if(tab==='msgs'){
+    msgsBtn.style.cssText='flex:1;padding:8px;font-size:11px;font-weight:700;border:none;cursor:pointer;background:transparent;'+on;
+    alertsBtn.style.cssText='flex:1;padding:8px;font-size:11px;font-weight:700;border:none;cursor:pointer;background:transparent;position:relative;'+off;
+    if(msgsEl)msgsEl.style.display='flex';
+    if(alertsEl)alertsEl.style.display='none';
+    if(inputWrap)inputWrap.style.display='flex';
+    setTimeout(_scrollChatBottom,50);
+  }else{
+    alertsBtn.style.cssText='flex:1;padding:8px;font-size:11px;font-weight:700;border:none;cursor:pointer;background:transparent;position:relative;'+on;
+    msgsBtn.style.cssText='flex:1;padding:8px;font-size:11px;font-weight:700;border:none;cursor:pointer;background:transparent;'+off;
+    if(msgsEl)msgsEl.style.display='none';
+    if(alertsEl)alertsEl.style.display='block';
+    if(inputWrap)inputWrap.style.display='none';
+    _renderChatAlerts();
+    if(_chat.unread>0){
+      db.from('chat_notifications').update({read_at:new Date().toISOString()})
+        .eq('to_email',S.currentUser).is('read_at',null).then(function(){
+          _chat.alerts.forEach(function(a){if(!a.read_at)a.read_at=new Date().toISOString();});
+          _chat.unread=0;_updateChatBadge();
+        });
+    }
+  }
+}
+window.setChatTab=setChatTab;
+
+function _renderChatAlerts(){
+  var el=document.getElementById('chat-alerts');
+  if(!el)return;
+  var badge=document.getElementById('chat-tab-alerts-badge');
+  if(badge){
+    if(_chat.unread>0){badge.style.display='inline-block';badge.textContent=_chat.unread;}
+    else badge.style.display='none';
+  }
+  if(!_chat.alerts.length){
+    el.innerHTML='<div style="padding:32px;text-align:center;color:var(--text3);font-size:12px">No alerts yet</div>';
+    return;
+  }
+  el.innerHTML=_chat.alerts.map(function(a){
+    var d=new Date(a.created_at);
+    var timeStr=d.toLocaleDateString(undefined,{month:'short',day:'numeric'})+' · '+d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});
+    var isOrderAlert=a.from_name==='Order Alert';
+    var icon=isOrderAlert?'🔔':'💬';
+    return '<div style="padding:10px 14px;border-bottom:1px solid var(--border);'+(a.read_at?'':'background:rgba(13,148,136,.05)')+'">'
+      +'<div style="display:flex;align-items:flex-start;gap:8px">'
+      +'<span style="font-size:14px;flex-shrink:0">'+icon+'</span>'
+      +'<div style="flex:1;min-width:0">'
+      +'<div style="font-size:11px;font-weight:700;color:'+(isOrderAlert?'var(--orange)':'var(--teal)')+'">'+escHtml(a.from_name||'')+'</div>'
+      +'<div style="font-size:12px;color:var(--text);line-height:1.4;margin-top:2px;word-break:break-word">'+escHtml(a.snippet||'')+'</div>'
+      +'<div style="font-size:9px;color:var(--text3);margin-top:4px">'+timeStr+'</div>'
+      +'</div></div></div>';
+  }).join('');
+}
+
 function _updateChatBadge(){
   var b=document.getElementById('chat-badge');
-  if(!b)return;
-  if(_chat.unread>0){b.textContent=_chat.unread>9?'9+':String(_chat.unread);b.style.display='flex';}
-  else b.style.display='none';
+  if(b){
+    if(_chat.unread>0){b.textContent=_chat.unread>9?'9+':String(_chat.unread);b.style.display='flex';}
+    else b.style.display='none';
+  }
+  var tb=document.getElementById('chat-tab-alerts-badge');
+  if(tb){
+    if(_chat.unread>0){tb.style.display='inline-block';tb.textContent=_chat.unread>9?'9+':_chat.unread;}
+    else tb.style.display='none';
+  }
 }
 function _scrollChatBottom(){
   var el=document.getElementById('chat-messages');
@@ -19407,9 +19478,14 @@ function _chatInit(){
     +'display:none;align-items:center;justify-content:center;border:2px solid var(--bg)"></span>'
     +'</button>'
     +'<div id="chat-panel">'
-    +'<div id="chat-header"><span id="chat-header-title">\ud83d\udcac Team Chat</span>'
+    +'<div id="chat-header"><span id="chat-header-title">\ud83d\udcac Team</span>'
     +'<button id="chat-header-close" onclick="toggleChat()">&times;</button></div>'
+    +'<div id="chat-tabs" style="display:flex;border-bottom:1px solid var(--border);flex-shrink:0">'
+    +'<button id="chat-tab-msgs" onclick="setChatTab(\'msgs\')" style="flex:1;padding:8px;font-size:11px;font-weight:700;border:none;cursor:pointer;background:transparent;border-bottom:2px solid var(--teal);color:var(--teal)">Chat</button>'
+    +'<button id="chat-tab-alerts" onclick="setChatTab(\'alerts\')" style="flex:1;padding:8px;font-size:11px;font-weight:700;border:none;cursor:pointer;background:transparent;border-bottom:2px solid transparent;color:var(--text3);position:relative">Alerts<span id="chat-tab-alerts-badge" style="display:none;margin-left:5px;background:var(--red);color:#fff;font-size:9px;font-weight:700;border-radius:8px;padding:1px 5px"></span></button>'
+    +'</div>'
     +'<div id="chat-messages"><div style="padding:20px;text-align:center;color:var(--text3);font-size:11px">Loading\u2026</div></div>'
+    +'<div id="chat-alerts" style="display:none;flex:1;overflow-y:auto;padding:6px 0"></div>'
     +'<div id="chat-input-wrap"><div id="chat-mention-list"></div>'
     +'<textarea id="chat-input" rows="1" placeholder="Message\u2026 type @ to mention"'
     +' oninput="chatInputChange(this)" onkeydown="chatKeyDown(event)"></textarea>'
