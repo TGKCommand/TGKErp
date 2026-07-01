@@ -192,7 +192,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v10.4';
+const TGK_ERP_VERSION = 'v10.5';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -14192,22 +14192,35 @@ function printCycleCount(countId){
   if(!lines.length){toast('No lines to print');return;}
   const label=({all:'Raw Parts',fg:'Finished Goods',sub:'Subassemblies',everything:'Everything'})[count?.category_filter]||(count?.category_filter?.startsWith('bom:')?'BOM Count — '+count.category_filter.slice(4):count?.category_filter||'Count');
 
-  const groups={};
-  lines.forEach(l=>{
-    const sec=l.section||(l.item_type==='assembly'?'Assemblies':'Parts');
-    (groups[sec]=groups[sec]||[]).push(l);
+  // Enrich lines with real category from local part/asm data, then group
+  const pmPrint={};S.parts.forEach(function(p){pmPrint[p.pn]=p;});
+  const amPrint={};S.assemblies.forEach(function(a){amPrint[a.pn]=a;});
+  const linesEnriched=lines.map(function(l){
+    var src=l.item_type==='assembly'?amPrint[l.pn]:pmPrint[l.pn];
+    return Object.assign({},l,{_cat:(src&&src.category)||'Uncategorized'});
   });
 
-  const rows=Object.entries(groups).map(([sec,ls])=>`
-    <tr class="section-row"><td colspan="6">${sec.toUpperCase()}</td></tr>
-    ${ls.map(l=>`<tr>
-      <td class="pn-cell">${l.pn}</td>
-      <td class="desc-cell">${l.description||''}</td>
-      ${l.bomQty?`<td class="num-cell">${l.bomQty}/unit</td>`:'<td></td>'}
-      <td class="num-cell">${l.expected_qty||0}</td>
-      <td class="count-cell"></td>
-      <td class="notes-cell"></td>
-    </tr>`).join('')}`).join('');
+  // Build grouped rows sorted by category then part number
+  const catGroups={};
+  linesEnriched.forEach(function(l){
+    (catGroups[l._cat]=catGroups[l._cat]||[]).push(l);
+  });
+  const sortedCats=Object.keys(catGroups).sort();
+
+  const rows=sortedCats.map(function(cat){
+    const ls=catGroups[cat].sort(function(a,b){return (a.pn||'').localeCompare(b.pn||'');});
+    return '<tr class="section-row"><td colspan="6">'+cat.toUpperCase()+'</td></tr>'
+      +ls.map(function(l){
+        return '<tr>'
+          +'<td class="pn-cell">'+l.pn+'</td>'
+          +'<td class="desc-cell">'+(l.description||'')+'</td>'
+          +(l.bomQty?'<td class="num-cell">'+l.bomQty+'/unit</td>':'<td></td>')
+          +'<td class="num-cell">'+(l.expected_qty||0)+'</td>'
+          +'<td class="count-cell"></td>'
+          +'<td class="notes-cell"></td>'
+          +'</tr>';
+      }).join('');
+  }).join('');
 
   const win=window.open('','_blank','width=900,height=700');
   win.document.write(`<!DOCTYPE html><html><head><title>Cycle Count — ${label}</title>
@@ -14344,13 +14357,22 @@ function renderCountDetail(count) {
     ${sortTh('Variance','variance')}
     <th>Notes</th>
   </tr></thead><tbody>
-  ${(function(){return displayLines.map(function(line){
-    var variance=line.actual_qty!=null?(line.actual_qty-(line.expected_qty||0)):null;
-    var varClass=variance===null?'':variance>0?'variance-pos':variance<0?'variance-neg':'variance-zero';
-    var haveCell=isDone?('<span class="money-neutral">'+(line.actual_qty!==null&&line.actual_qty!==undefined?line.actual_qty:'\u2014')+'</span>'):('<input class="qty-input cc-count-input" type="number" placeholder="\u2014" value="'+(line.actual_qty!==null&&line.actual_qty!==undefined?line.actual_qty:'')+'" data-lid="'+line.id+'" onblur="if(this.dataset.dirty){this.dataset.dirty=\'\';updateCountLine(this.dataset.lid,+this.value);}" oninput="this.dataset.dirty=\'1\';" onkeydown="ccCountKeydown(event,this)" style="width:80px;font-size:14px;font-weight:600;text-align:center">');
-    var noteCell=isDone?('<span class="t3xs">'+(line.notes||'')+'</span>'):('<input class="inline-edit" value="'+(line.notes||'')+'" placeholder="Note" onchange="updateCountLineNote(\''+line.id+'\',this.value)" style="max-width:140px">');
-    return '<tr data-lid="'+line.id+'"><td class="pn">'+line.pn+(line.item_type==='assembly'?'<br>'+bomTag(line.pn,'assembly'):'')+'</td>'+'<td style="font-size:10px;color:var(--text3);white-space:nowrap">'+escHtml(line._cat||'')+'</td>'+'<td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(line.description||'')+'</td>'+'<td class="money-neutral">'+(line.expected_qty||0)+'</td>'+'<td>'+haveCell+'</td>'+'<td><span class="var-cell '+varClass+'">'+(variance===null?'\u2014':(variance>=0?'+':'')+variance)+'</span></td>'+'<td>'+noteCell+'</td></tr>';
-  }).join('');})()}
+  ${(function(){
+    var rows=[];
+    var lastCat=null;
+    displayLines.forEach(function(line){
+      if(ccSort==='cat'&&line._cat!==lastCat){
+        lastCat=line._cat;
+        rows.push('<tr><td colspan="7" style="background:var(--bg3);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--text2);padding:6px 12px;border-bottom:2px solid var(--border)">'+escHtml(line._cat||'Uncategorized')+'</td></tr>');
+      }
+      var variance=line.actual_qty!=null?(line.actual_qty-(line.expected_qty||0)):null;
+      var varClass=variance===null?'':variance>0?'variance-pos':variance<0?'variance-neg':'variance-zero';
+      var haveCell=isDone?('<span class="money-neutral">'+(line.actual_qty!==null&&line.actual_qty!==undefined?line.actual_qty:'\u2014')+'</span>'):('<input class="qty-input cc-count-input" type="number" placeholder="\u2014" value="'+(line.actual_qty!==null&&line.actual_qty!==undefined?line.actual_qty:'')+'" data-lid="'+line.id+'" onblur="if(this.dataset.dirty){this.dataset.dirty=\'\';updateCountLine(this.dataset.lid,+this.value);}" oninput="this.dataset.dirty=\'1\';" onkeydown="ccCountKeydown(event,this)" style="width:80px;font-size:14px;font-weight:600;text-align:center">');
+      var noteCell=isDone?('<span class="t3xs">'+(line.notes||'')+'</span>'):('<input class="inline-edit" value="'+(line.notes||'')+'" placeholder="Note" onchange="updateCountLineNote(\''+line.id+'\',this.value)" style="max-width:140px">');
+      rows.push('<tr data-lid="'+line.id+'"><td class="pn">'+line.pn+(line.item_type==='assembly'?'<br>'+bomTag(line.pn,'assembly'):'')+'</td>'+'<td style="font-size:10px;color:var(--text3);white-space:nowrap">'+escHtml(line._cat||'')+'</td>'+'<td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(line.description||'')+'</td>'+'<td class="money-neutral">'+(line.expected_qty||0)+'</td>'+'<td>'+haveCell+'</td>'+'<td><span class="var-cell '+varClass+'">'+(variance===null?'\u2014':(variance>=0?'+':'')+variance)+'</span></td>'+'<td>'+noteCell+'</td></tr>');
+    });
+    return rows.join('');
+  })()}
   </tbody></table></div>`;
 }
 
