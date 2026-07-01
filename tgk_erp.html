@@ -192,7 +192,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v10.5';
+const TGK_ERP_VERSION = 'v10.7';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -566,7 +566,12 @@ async function loadAll(){
     S.boms={};
     (Array.isArray(bomItems)?bomItems:(bomItems.data||[])).forEach(i=>{if(!S.boms[i.parent_pn])S.boms[i.parent_pn]=[];S.boms[i.parent_pn].push(i);});
     if(!S.selBOM&&Object.keys(S.boms).length)S.selBOM=Object.keys(S.boms)[0];
-    if(warrantyClaims.error){console.error('loadAll: warranty_claims failed',warrantyClaims.error);toast('Warning: warranty claims failed to load — '+warrantyClaims.error.message,6000);}
+    if(warrantyClaims.error){
+      const isRLS=warrantyClaims.error.code==='42501'||warrantyClaims.error.message?.includes('row-level security')||warrantyClaims.error.message?.includes('permission');
+      if(isRLS)S._warrantyRlsError=true;
+      console.error('loadAll: warranty_claims failed',warrantyClaims.error);
+      toast('Warning: warranty claims failed to load — '+warrantyClaims.error.message,6000);
+    }
     S.warrantyClaims=warrantyClaims.data||[];
     if(shipmentErrors.error){console.error('loadAll: shipment_errors failed',shipmentErrors.error);S._shipmentErrorsErr=shipmentErrors.error.message;}
     else{S._shipmentErrorsErr=null;}
@@ -9091,15 +9096,12 @@ async function submitWarranty(){
   const payload={pn,order_number:(document.getElementById('wty-order')?.value||'').trim(),customer_name:(document.getElementById('wty-name')?.value||'').trim(),customer_email:(document.getElementById('wty-email')?.value||'').trim(),issue,resolution_type:resolution,claim_items:claim_items.length?claim_items:null,shipping_details,status:'Open'};
   const{data,error}=await db.from('warranty_claims').insert(payload).select().single();
   if(error){
-    const isRLS=error.message&&(error.message.includes('row-level security')||error.code==='42501'||error.message.includes('permission'));
-    if(isRLS){
-      toast('\u26a0 Permission denied — run in Supabase SQL Editor:\nALTER TABLE warranty_claims DISABLE ROW LEVEL SECURITY;',10000);
-    } else {
-      toast('Error saving warranty claim: '+error.message);
-    }
+    const isRLS=error.code==='42501'||error.message?.includes('row-level security')||error.message?.includes('permission');
+    if(isRLS){S._warrantyRlsError=true;render();}
+    toast(isRLS?'\u26a0 RLS is blocking warranty claims \u2014 see the banner on the Warranty page for the SQL fix':'Error saving warranty claim: '+error.message,8000);
     return;
   }
-  S.wtyItems=[];
+    S.wtyItems=[];
   S.warrantyClaims=[data,...S.warrantyClaims];
   logAction('Created warranty claim — '+issue.slice(0,60),'warranty_claims',pn||null,null,null).catch(()=>{});
   closeModal();toast('Warranty claim logged');render();
@@ -14980,6 +14982,9 @@ function renderWarranty() {
   </div>`;
   if(tab==='errors') return tabBar+renderShipmentErrors();
 
+  const rlsBanner=S._warrantyRlsError?'<div style="margin-bottom:16px;padding:14px 16px;background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.25);border-radius:8px"><div style="font-size:13px;font-weight:700;color:var(--red);margin-bottom:6px">\u26a0 Row Level Security is blocking warranty claims</div><div style="font-size:12px;color:var(--text2);margin-bottom:10px">Run this once in Supabase SQL Editor to fix inserts, updates, and reads:</div><pre style="font-size:11px;background:var(--bg3);padding:10px 12px;border-radius:6px;overflow-x:auto;margin-bottom:10px">ALTER TABLE warranty_claims DISABLE ROW LEVEL SECURITY;</pre><div style="font-size:10px;color:var(--text3)">Refresh after running the SQL. <button class=\"btn btn-sm\" onclick=\"S._warrantyRlsError=false;render()\">Dismiss</button></div></div>':'';
+
+
   const sf=S.filters.warranty||{};
   let list=S.warrantyClaims;
   const q=(sf.search||'').toLowerCase();
@@ -14988,7 +14993,7 @@ function renderWarranty() {
   const statuses=['Open','In Review','Approved','Shipped','Denied','Resolved'];
   const counts={};statuses.forEach(s=>{counts[s]=S.warrantyClaims.filter(w=>w.status===s).length;});
   const resLabel={'no_action':'','replacement':'🔄 Replace','repair':'🔧 Repair','refund':'💰 Refund'};
-  return tabBar+`
+  return tabBar+rlsBanner+`
   <div class="kpi-grid" style="grid-template-columns:repeat(6,1fr)">
     ${statuses.map(s=>`<div class="kpi ${s==='Open'?'kpi-red':s==='Shipped'?'kpi-teal':s==='Resolved'?'kpi-green':''}"><div class="kpi-label">${s}</div><div class="kpi-value">${counts[s]||0}</div></div>`).join('')}
   </div>
@@ -15111,7 +15116,7 @@ function renderShipmentErrors(){
 
 async function advanceWarranty(id, newStatus) {
   const {error}=await db.from('warranty_claims').update({status:newStatus,resolved_at:['Resolved','Denied','Shipped'].includes(newStatus)?new Date().toISOString():null}).eq('id',id);
-  if(error){toast('Error');return;}
+  if(error){const isRLS=error.code==='42501'||error.message?.includes('row-level security');if(isRLS){S._warrantyRlsError=true;render();}toast(isRLS?'\u26a0 RLS blocking warranty update \u2014 see banner on Warranty page':'Error updating status: '+error.message);return;}
   S.warrantyClaims=S.warrantyClaims.map(w=>w.id===id?{...w,status:newStatus}:w);
   logAction('Warranty claim → '+newStatus,'warranty_claims',null,null,null).catch(()=>{});
   toast('Status → '+newStatus);render();
