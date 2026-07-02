@@ -9,6 +9,39 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<!--
+═══════════════════════════════════════════════════════════════════
+  TGK ERP — TABLE OF CONTENTS (approx line numbers, update on major edits)
+═══════════════════════════════════════════════════════════════════
+  ~L198    State & config (S object)
+  ~L287    Demand engine (computeDemand, effectiveWkDemand)
+  ~L634    Realtime subscriptions (setupRealtime)
+  ~L799    Navigation (nav, navBack, lookupGo, goToPO)
+  ~L1293   Dashboard
+  ~L1617   Assemblies view
+  ~L1701   BOM editor
+  ~L2041   Purchases legacy view
+  ~L2176   Sales Orders view
+  ~L3543   Edit Order / status logic
+  ~L3859   Dealers view & visit log
+  ~L4162   Integrations (Shopify/ShipStation/Alerts)
+  ~L7315   Dealer portal builders
+  ~L8222   Modals (openModal)
+  ~L8817   Bulk edit
+  ~L9621   Auth & permissions
+  ~L10372  Reports & valuation snapshot
+  ~L11033  Master Lookup dossiers
+  ~L11560  PO Builder & cart
+  ~L11912  Purchasing/Planning (reorder engine)
+  ~L12710  PO detail & receiving
+  ~L13028  Production & packing (buildability, packUnits)
+  ~L14008  Cycle counts
+  ~L14659  Activity log (grouped corrections)
+  ~L15109  Warranty / customer resolution
+  ~L17560  Master Price List
+  ~L19652  Team chat & alerts
+═══════════════════════════════════════════════════════════════════
+-->
 <script>
 if(window.top!==window.self){try{if(window.top.location.origin!==window.self.location.origin){window.top.location.replace(window.self.location.href);}}catch(_){document.documentElement.style.visibility="hidden";}}</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
@@ -192,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v11.4';
+const TGK_ERP_VERSION = 'v12.0';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -747,12 +780,36 @@ function setupRealtime(){
       updateBadge();
       if(S.view==='warranty')scheduleRender();
     })
+    .on('postgres_changes',{event:'*',schema:'public',table:'bom_items'},p=>{
+      // Keep S.boms live across sessions — BOM edits on one machine update buildability everywhere
+      const row=p.eventType==='DELETE'?p.old:p.new;
+      const parent=row&&row.parent_pn;
+      if(!parent)return;
+      if(!S.boms[parent])S.boms[parent]=[];
+      if(p.eventType==='INSERT'){
+        if(!S.boms[parent].find(i=>i.id===p.new.id))S.boms[parent].push(p.new);
+        S.boms[parent].sort((a,b)=>(a.sort_order||0)-(b.sort_order||0));
+      }else if(p.eventType==='UPDATE'){
+        S.boms[parent]=S.boms[parent].map(i=>i.id===p.new.id?p.new:i);
+      }else if(p.eventType==='DELETE'){
+        S.boms[parent]=S.boms[parent].filter(i=>i.id!==p.old.id);
+        if(!S.boms[parent].length)delete S.boms[parent];
+      }
+      if(typeof _bomCostCache!=='undefined')_bomCostCache={}; // BOM changed — cost memo stale
+      if(['boms','packqueue','planning','lookup'].includes(S.view))scheduleRender();
+    })
     .subscribe((status)=>{
+      const wasDown=_rtStatus!=='SUBSCRIBED'&&_rtStatus!=='connecting';
       _rtStatus=status;
       const dot=document.getElementById('sync-dot');
       const lbl=document.getElementById('sync-label');
       if(dot){dot.className='sync-dot'+(status==='SUBSCRIBED'?' ok':status==='CHANNEL_ERROR'?' err':' busy');}
       if(lbl){lbl.textContent=status==='SUBSCRIBED'?'Live — Real-time':status==='CHANNEL_ERROR'?'Disconnected':'Connecting…';}
+      if(status==='SUBSCRIBED'&&wasDown){
+        // Websocket was down — realtime does NOT replay missed events, so catch up with a full refresh
+        console.warn('[TGK] Realtime reconnected after gap — running catch-up refresh');
+        if(typeof refreshAll==='function')refreshAll().catch(e=>console.warn('[TGK] catch-up refresh failed:',e?.message||e));
+      }
       if(status==='CHANNEL_ERROR'){
         setTimeout(()=>{toast('Reconnecting to live sync…');setupRealtime();},5000);
       }
@@ -1252,7 +1309,18 @@ function applyNewVendor(id){
   toast('"'+name+'" added — saves when you save the record');
 }
 function rowClick(e,fn){if(e.target.closest('button,input,select,a,label'))return;fn();}
-function setFilter(ns,k,val){if(!S.filters[ns])S.filters[ns]={};S.filters[ns][k]=val;render();}
+let _filterDebounce=null;
+function setFilter(ns,k,val){
+  if(!S.filters[ns])S.filters[ns]={};
+  S.filters[ns][k]=val;
+  if(k==='search'){
+    // Debounce text search: full-page render per keystroke is the main typing lag source
+    if(_filterDebounce)clearTimeout(_filterDebounce);
+    _filterDebounce=setTimeout(function(){_filterDebounce=null;render();},150);
+    return;
+  }
+  render();
+}
 function addAction(){const m={parts:'addPart',assemblies:'addAsm',purchases:'addPO',dealers:'addDealer',sales:'addSale'};if(m[S.view])openModal(m[S.view],{});}
 
 function renderDashboard(){
@@ -1591,7 +1659,7 @@ function renderAssemblies(){
   const cats=[...new Set(S.assemblies.map(a=>a.category||'').filter(Boolean))].sort();
   const q=(sf.search||'').toLowerCase();
   if(q)list=list.filter(a=>a.pn.toLowerCase().includes(q)||((a.description||'').toLowerCase().includes(q)));
-  if(sf.cat)list=list.filter(a=>a.category===sf.cat);
+  if(sf.cat)list=list.filter(a=>sf.cat==='__none__'?!a.category:a.category===sf.cat);
   if(sf.status)list=list.filter(a=>liveStatus(a)===sf.status);
   const hasFilter=!!(sf.search||sf.cat||sf.status||sf.kind||sf.showDisc);
   const asmSelCount=S.selectedAsms.size;
@@ -1603,6 +1671,7 @@ function renderAssemblies(){
     </div>
     <select class="form-input" style="width:160px" onchange="setFilter('asm','cat',this.value)">
       <option value="">All Categories</option>
+      <option value="__none__" ${sf.cat==='__none__'?'selected':''}>(No Category) (${S.assemblies.filter(a=>!a.category&&!a.discontinued).length})</option>
       ${cats.map(c=>`<option value="${c}" ${sf.cat===c?'selected':''}>${c}</option>`).join('')}
     </select>
     <select class="form-input" style="width:130px" onchange="setFilter('asm','status',this.value)">
@@ -8213,7 +8282,7 @@ function openModal(type,data){
     title='Edit PO — '+(data.vendor||'');
     body=`<div class="form-row"><div class="form-group"><label class="form-label">Vendor</label>${buildVendorSelect('eph-vendor',data.vendor||'')}</div></div>
     <div class="form-row cols-2">${fi('eph-arrival','Expected Arrival',data.expected_date||'','type="date"')} ${fi('eph-orderdate','Order Date',data.order_date||'','type="date"')}</div>
-    <div class="form-row">${fi('eph-notes','Notes',data.notes||'')}</div>
+    <div class="form-row cols-2">${fi('eph-freight','Freight + Duties ($)',data.freight_cost||0,'type="number" step="0.01" min="0" title="Total freight, duties, and import fees for this PO. Prorated across lines by value for landed cost."')} ${fi('eph-notes','Notes',data.notes||'')}</div>
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitEditPOHeader('${data.id}')">Save PO</button></div>`;
   }
   else if(type==='addSale'){
@@ -10312,6 +10381,27 @@ const REPORT_DEFS = [
   {id:'warranty_claims',  cat:'Warranty',  label:'Warranty Claims',        icon:'🔄', desc:'All warranty claims with status and resolution'},
 ];
 
+window.takeValuationSnapshot=async function(){
+  // Inventory valuation: raw parts at unit_cost + finished goods at BOM cost. Stored in settings under a dated key.
+  var partsVal=0,partsUnits=0;
+  S.parts.forEach(function(p){if(p.discontinued)return;var oh=Math.max(0,p.total_unpckgd||0);partsVal+=oh*(p.unit_cost||0);partsUnits+=oh;});
+  var fgVal=0,fgUnits=0;
+  S.assemblies.forEach(function(a){if(a.discontinued)return;var oh=Math.max(0,a.total_on_hand||0);if(!oh)return;var c=(typeof bomCostOf==='function'?bomCostOf(a.pn,0):0)||0;fgVal+=oh*c;fgUnits+=oh;});
+  var snap={date:new Date().toISOString().slice(0,10),taken_at:new Date().toISOString(),by:S.currentUser||null,
+    parts_value:+partsVal.toFixed(2),parts_units:partsUnits,fg_value:+fgVal.toFixed(2),fg_units:fgUnits,total_value:+(partsVal+fgVal).toFixed(2)};
+  var key='inv_valuation_'+snap.date;
+  try{
+    await db.from('settings').upsert({key:key,value:snap,updated_at:new Date().toISOString()},{onConflict:'key'});
+    S.settings[key]=snap;
+    toast('\ud83d\udcf8 Valuation snapshot saved: '+fc(snap.total_value)+' ('+fc(snap.parts_value)+' raw + '+fc(snap.fg_value)+' FG)',7000);
+    render();
+  }catch(e){toast('Snapshot failed: '+e.message);}
+};
+function listValuationSnapshots(){
+  return Object.keys(S.settings||{}).filter(function(k){return k.indexOf('inv_valuation_')===0;})
+    .map(function(k){return S.settings[k];}).filter(function(v){return v&&v.date;})
+    .sort(function(a,b){return b.date.localeCompare(a.date);});
+}
 function renderReports(){
   const rs=S.rptState||{};
   const selId=rs.sel||null;
@@ -10373,7 +10463,16 @@ function renderReports(){
   if(canChart&&S.rptState.chartView)window._rptChartDef={id:def.id,data:rows.data,cols:rows.cols};
   else if(!canChart)S.rptState.chartView=false;
 
-  return `<div style="display:grid;grid-template-columns:260px 1fr;gap:18px;min-height:500px;align-items:start">
+  return `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+    <div style="flex:1;min-width:200px">
+      <div style="font-size:12px;font-weight:700">\ud83d\udcf8 Inventory Valuation Snapshot</div>
+      <div style="font-size:10px;color:var(--text3)">Capture total inventory value (raw parts at unit cost + finished goods at BOM cost) for end-of-period records</div>
+    </div>
+    ${(()=>{const snaps=listValuationSnapshots();const last=snaps[0];
+      return (last?'<div style="font-size:11px;color:var(--text2);text-align:right"><div>Last: <b>'+fc(last.total_value)+'</b> on '+last.date+'</div><div style="font-size:9px;color:var(--text3)">'+fc(last.parts_value)+' raw \u00b7 '+fc(last.fg_value)+' FG \u00b7 '+snaps.length+' snapshot'+(snaps.length!==1?'s':'')+'</div></div>':'<span style="font-size:10px;color:var(--text3)">No snapshots yet</span>');})()}
+    <button class="btn btn-teal btn-sm" onclick="takeValuationSnapshot()">\ud83d\udcf8 Take Snapshot</button>
+  </div>
+  <div style="display:grid;grid-template-columns:260px 1fr;gap:18px;min-height:500px;align-items:start">
     <div style="overflow-y:auto;max-height:calc(100vh - 100px);padding-right:4px;position:sticky;top:0">${selectorHtml}</div>
     <div>
 
@@ -11098,6 +11197,7 @@ function partDossier(pn){
   const whereUsed=Object.entries(S.boms).filter(([parent,items])=>{const _wa=S.assemblies.find(a=>a.pn===parent);return _wa&&!_wa.discontinued&&items.some(i=>i.child_pn===pn);}).map(([parent,items])=>({parent,qty:items.find(i=>i.child_pn===pn)?.qty||0}));
   const rp=calcReorderPoint(p);
   const corr=S.corrections.filter(c=>c.pn===pn).slice(0,8);
+  const receipts=S.corrections.filter(c=>c.pn===pn&&c.source==='po_receipt').slice(0,10);
   const openLines=[];Object.values(S.poLines).forEach(ls=>ls.forEach(l=>{if(l.pn===pn&&l.qty_received<l.qty_ordered)openLines.push(l);}));
   const openPOs=S.purchases.filter(po=>po.pn===pn&&po.status!=='Received');
   const partClaims=S.warrantyClaims.filter(w=>w.pn===pn);
@@ -11188,6 +11288,16 @@ function partDossier(pn){
           <span style="font-size:9px;color:var(--text3);font-family:var(--mono);white-space:nowrap">${timeAgo(c.created_at)}</span>
         </div>`;
       }).join('')}
+    </div>
+    <div class="panel" style="padding:0"><div class="section-header">Receiving History (${receipts.length})</div>
+      ${receipts.length===0?'<div class="section-empty">No PO receipts recorded</div>':receipts.map(r=>{
+        const poRef=(r.reason||'').match(/\[(.+?)\]/);
+        return `<div class="check-row">
+          <span style="font-size:10px;font-family:var(--mono);color:var(--text3);white-space:nowrap">${(r.created_at||'').slice(0,10)}</span>
+          <span class="money" style="color:var(--green);font-weight:700">+${r.adjustment}</span>
+          <span style="font-size:10px;color:var(--text2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml((r.reason||'').replace(/\[.+?\]/,'').trim())}</span>
+          ${poRef?`<span style="font-size:9px;background:var(--orange-dim);color:var(--orange);border-radius:3px;padding:1px 5px">${escHtml(poRef[1])}</span>`:''}
+        </div>`;}).join('')}
     </div>
     <div class="panel" style="padding:0"><div class="section-header" style="display:flex;align-items:center;justify-content:space-between"><span>Warranty Claims (${partClaims.length})</span><button class="btn btn-sm btn-teal" style="font-size:10px;padding:2px 8px" onclick="nav('warranty')">View All →</button></div>
       ${partClaims.length===0?'<div class="section-empty">None — clean record ✓</div>':partClaims.slice(0,4).map(w=>`
@@ -11427,6 +11537,20 @@ window.massSetMOQFromTiers=async function(){
   toast(updated+' MOQs updated from Tier 1 ('+skipped+' already set or skipped)');
   render();
 };
+window.recalcCart=function(){
+  var changed=0;
+  S.poCart.forEach(function(c){
+    var p=S.parts.find(function(x){return x.pn===c.pn;});
+    if(!p)return;
+    var fresh=Math.max(calcSuggestedQty(p),p.moq||0);
+    if(fresh>0&&fresh!==c.qty){c.qty=fresh;changed++;}
+  });
+  // Drop lines that no longer need ordering at all
+  var before=S.poCart.length;
+  S.poCart=S.poCart.filter(function(c){var p=S.parts.find(function(x){return x.pn===c.pn;});return !p||calcSuggestedQty(p)>0||c.qty>0;});
+  saveCart();render();
+  toast(changed?('\u21bb '+changed+' cart line'+(changed!==1?'s':'')+' updated to current suggested qty'):'Cart is already up to date');
+};
 function saveCart(){
   try{localStorage.setItem('tgk_po_cart',JSON.stringify({cart:S.poCart||[],shipping:S.poCartShipping||{}}));}
   catch(e){}
@@ -11552,6 +11676,7 @@ function renderPOBuilder(){
     <div class="panel" style="padding:0;position:sticky;top:12px">
       <div style="padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
         <div><div style="font-size:13px;font-weight:700">🛒 PO Cart</div><div style="font-size:10.5px;color:var(--text3)">${S.poCart.length} line${S.poCart.length!==1?'s':''} · ${Object.keys(cartVendors).length||0} vendor${Object.keys(cartVendors).length!==1?'s':''}</div></div>
+        ${S.poCart.length?'<button class="btn btn-sm" onclick="recalcCart()" title="Update every line to the current suggested quantity (demand and stock may have changed since it was added)">↻ Recalc</button>':''}
         <div class="money" style="font-size:17px;font-weight:700;color:var(--orange)">${fc(cartTotal)}</div>
       </div>
       <div style="max-height:52vh;overflow-y:auto">${cartHtml}</div>
@@ -12048,7 +12173,9 @@ function renderPlanning() {
       <td style="text-align:center">${(()=>{const r=boReserved(p.pn);if(!r)return '<span style="color:var(--text3);font-size:10px">—</span>';const src=Object.entries((S.calc&&S.calc.boBacklog)||{}).filter(([asm])=>{const bom=S.boms[asm]||[];return bom.some(i=>i.item_type==='part'&&i.child_pn===p.pn);}).map(([asm,bo])=>{const item=(S.boms[asm]||[]).find(i=>i.child_pn===p.pn);return asm+' ×'+bo+'(needs '+(item?.qty||1)+'ea)';}).join(', ');return '<span style="font-weight:700;color:var(--orange)" title="Reserved for: '+escHtml(src)+'">'+r+'</span>';})()}</td>
       <td style="text-align:center;font-size:11px">${(()=>{const _u=unitsInAssemblies(p.pn);return _u>0?'<span style="font-weight:700;color:var(--teal)" title="Packed into finished goods">'+ _u+'</span>':'<span style="color:var(--text3);font-size:10px">—</span>';})()}</td>
       <td class="money-neutral" style="white-space:nowrap" title="${trendTitle}">
-        ${wkd.toFixed(2)}/wk${trend?` <span style="color:${trendColor};font-weight:700">${trend}</span>`:''}
+        ${status==='No Data'
+          ?`<input class="inline-edit" type="number" step="0.01" min="0" style="width:58px;padding:3px 5px;font-size:11px" placeholder="avg/wk" value="${p.avg_sales_wk||''}" onclick="event.stopPropagation()" onchange="savePlanField('${p.id}','avg_sales_wk',+this.value,'${p.pn}')" title="No sales data — set a manual weekly average to enable planning">`
+          :`${wkd.toFixed(2)}/wk${trend?` <span style="color:${trendColor};font-weight:700">${trend}</span>`:''}`}
         ${demSrcIcon}${bomBadge}
       </td>
       <td style="font-weight:700;font-size:12px;font-family:var(--mono);vertical-align:middle" title="Weeks of stock at current demand rate${wksNeg?' — IN DEFICIT: reserved backorders exceed on-hand stock':''}"><span style="color:${wksColor};background:${wksBg};padding:${wksPad};border-radius:${wksRadius};display:inline-block">${wksStock!==null?wksStock+'w':'—'}</span></td>
@@ -12629,6 +12756,9 @@ function renderPODetail(po) {
   const totalOrdered = lines.reduce((s,l)=>s+(l.qty_ordered||0)*(l.unit_cost||0),0);
   const totalReceived = lines.reduce((s,l)=>s+(l.qty_received||0)*(l.unit_cost||0),0);
   const allDone = lines.length>0 && lines.every(l=>l.qty_received>=l.qty_ordered);
+  const freight = po.freight_cost||0;
+  const landedTotal = totalOrdered + freight;
+  const freightPct = totalOrdered>0 ? freight/totalOrdered : 0; // prorate by line value
 
   return `
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
@@ -12637,7 +12767,10 @@ function renderPODetail(po) {
       <div style="font-size:14px;font-weight:700;color:var(--text)">${po.vendor} — PO</div>
       <div class="t3s">${po.order_date||''} · ${poPill(po.status)}</div>
     </div>
-    <div class="money-cost" style="font-size:15px;font-weight:700">${fc(totalOrdered)}</div>
+    <div style="text-align:right">
+      <div class="money-cost" style="font-size:15px;font-weight:700">${fc(totalOrdered)}</div>
+      ${freight>0?`<div style="font-size:10px;color:var(--text3)" title="Parts ${fc(totalOrdered)} + freight/duties ${fc(freight)}">Landed: <b style="color:var(--orange)">${fc(landedTotal)}</b> (+${(freightPct*100).toFixed(1)}%)</div>`:''}
+    </div>
     ${po.status==='Draft'?`<button class="btn btn-primary" style="background:var(--orange);border-color:var(--orange);font-size:13px;padding:8px 18px" onclick="approvePO('${po.id}')">📤 Approve &amp; Place Order</button>`:''}
     ${!allDone&&po.status!=='Draft'?`<button class="btn btn-primary" onclick="receiveAllLines('${po.id}')">✓ Receive All</button>`:''}
     <button class="btn btn-sm" onclick="openEditPOHeader('${po.id}')" title="Edit vendor, dates, notes">✎ Edit PO</button>
@@ -12895,11 +13028,13 @@ async function submitEditPOLine(lineId, poId){
   const cost=parseFloat(document.getElementById('epl-cost').value)||0;
   if(!qty||qty<=0){toast('Qty must be greater than 0');return;}
   const payload={description:desc,qty_ordered:qty,unit_cost:cost,updated_at:new Date().toISOString()};
+  const _prevLine=(S.poLines[poId]||[]).find(function(l){return l.id===lineId;});
   const{error}=await db.from('po_lines').update(payload).eq('id',lineId);
   if(error){toast('Error: '+error.message);return;}
   if(S.poLines[poId]){
     S.poLines[poId]=S.poLines[poId].map(function(l){return l.id===lineId?Object.assign({},l,payload):l;});
   }
+  logAction('Edited PO line '+(_prevLine?_prevLine.pn:'')+' (qty '+(_prevLine?_prevLine.qty_ordered:'?')+'\u2192'+qty+', cost '+(_prevLine?_prevLine.unit_cost:'?')+'\u2192'+cost+')','po_lines',_prevLine?_prevLine.pn:null,_prevLine||null,payload).catch(function(){});
   closeModal();render();toast('Line updated');
 }
 
@@ -12914,11 +13049,14 @@ async function submitEditPOHeader(poId){
   const arrival=document.getElementById('eph-arrival').value||null;
   const orderDate=document.getElementById('eph-orderdate').value||null;
   const notes=document.getElementById('eph-notes').value.trim();
+  const freight=parseFloat(document.getElementById('eph-freight')?.value)||0;
   if(!vendor){toast('Vendor required');return;}
-  const payload={vendor,expected_date:arrival,order_date:orderDate,notes,updated_at:new Date().toISOString()};
+  const payload={vendor,expected_date:arrival,order_date:orderDate,notes,freight_cost:freight,updated_at:new Date().toISOString()};
+  const _prevPO=S.purchases.find(function(p){return p.id===poId;});
   const{error}=await db.from('purchases').update(payload).eq('id',poId);
   if(error){toast('Error: '+error.message);return;}
   S.purchases=S.purchases.map(function(p){return p.id===poId?Object.assign({},p,payload):p;});
+  logAction('Edited PO header ('+vendor+')','purchases',null,_prevPO||null,payload).catch(function(){});
   closeModal();render();toast('PO updated');
 }
 
@@ -17570,9 +17708,13 @@ async function savePriceField(asmId,field,value){
   if(field==='sales_price'){update[field]=(value===''||value==='--')?null:(parseFloat(value)||null);}
   else if(field==='pl_active'){update[field]=(value===true||value==='true');}
   else{update[field]=value;}
+  var _prev=S.assemblies.find(function(a){return a.id===asmId;});
   var r=await db.from('assemblies').update(update).eq('id',asmId);
   if(r.error){toast('Error: '+r.error.message);return;}
   S.assemblies=S.assemblies.map(function(a){return a.id===asmId?Object.assign({},a,update):a;});
+  if(field==='msrp'||field==='sales_price'||field==='pl_active'){
+    logAction('Price list: '+(_prev?_prev.pn:asmId)+' '+field+' '+(_prev?_prev[field]:'?')+'\u2192'+update[field],'assemblies',_prev?_prev.pn:null,_prev?{[field]:_prev[field]}:null,{[field]:update[field]}).catch(function(){});
+  }
   render();
 }
 function printPriceList(){
