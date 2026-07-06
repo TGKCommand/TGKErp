@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v15.0';
+const TGK_ERP_VERSION = 'v15.3';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -4961,13 +4961,20 @@ Deno.serve(async (req) => {
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
     const orderMap = await buildOrderMap()
     let page = 1, totalPages = 1, markedHold = 0, markedOpen = 0
+    const stillOnHoldOrderNums = new Set<string>() // order numbers ShipStation currently reports as on_hold —
+    // a split/drop-ship order can have ONE line genuinely on hold while ShipStation reports the OVERALL
+    // order as awaiting_shipment (because the other line is ready to move). Without tracking this, the
+    // release pass below would incorrectly release the still-held line just because its order number also
+    // shows up in the awaiting_shipment list — causing it to flip Open→On Hold→Open→On Hold every cycle.
     while (page <= totalPages) {
       const res = await fetch('https://ssapi.shipstation.com/orders?orderStatus=on_hold&pageSize=500&page=' + page, { headers: { Authorization: 'Basic ' + auth } })
       if (!res.ok) return json({ error: 'ShipStation error ' + res.status }, 502)
       const data = await res.json()
       totalPages = data.pages || 1
       for (const order of (data.orders || [])) {
-        const lines = orderMap[stripHash(order.orderNumber || '')] || []
+        const rawNum = stripHash(order.orderNumber || '')
+        stillOnHoldOrderNums.add(rawNum)
+        const lines = orderMap[rawNum] || []
         const ids = lines.filter((l: any) => ['Open','Packed'].includes(l.fulfillment_status)).map((l: any) => l.id as string)
         if (ids.length) {
           await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', ids)
@@ -4986,6 +4993,7 @@ Deno.serve(async (req) => {
         rTotalPages = relData.pages || 1
         for (const order of (relData.orders || [])) {
           const rawNum = stripHash(order.orderNumber || '')
+          if (stillOnHoldOrderNums.has(rawNum)) continue // this order still has a genuinely-held line — don't release it
           const toRelease = (heldLines || []).filter((l: any) => stripHash(l.order_number || '') === rawNum).map((l: any) => l.id as string)
           if (toRelease.length) {
             await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', toRelease)
@@ -9296,41 +9304,82 @@ function renderBulkEdit(table){
 async function saveBulkEdit(table){
   const isParts=table==='parts';
   const ids=isParts?[...S.selectedParts]:[...S.selectedAsms];
-  let saved=0,errors=0;
-  const btn=event?.target;if(btn){btn.disabled=true;btn.textContent='Saving…';}
+  const btn=event?.target;
 
+  // STEP 1: Snapshot every row's values from the DOM into a plain array FIRST, before touching the
+  // database at all. This is the critical fix — the old code read document.querySelector(...) fresh
+  // on EACH loop iteration, one row at a time, with an await in between. If anything rebuilt the bulk
+  // edit table mid-save (a background render, a realtime update, any race at all), later-in-loop rows
+  // would silently read from stale/missing/freshly-defaulted DOM elements and write blank values to
+  // the database — with no error, since optional chaining swallows a missing element into ''. Reading
+  // everything up front, synchronously, before any network call starts, makes the save immune to that
+  // class of bug entirely: once this snapshot is taken, nothing that happens afterward — a render, a
+  // closed tab, anything — can change what gets written.
+  const rows=[];
+  const missing=[];
   for(const id of ids){
-    let payload={updated_at:new Date().toISOString()};
-    const desc=document.querySelector('.be-desc[data-id="'+id+'"]')?.value.trim()||'';
-    const cat=document.querySelector('.be-cat[data-id="'+id+'"]')?.value||'';
-    payload.description=desc;payload.category=cat;
+    const descEl=document.querySelector('.be-desc[data-id="'+id+'"]');
+    const catEl=document.querySelector('.be-cat[data-id="'+id+'"]');
+    if(!descEl||!catEl){missing.push(id);continue;}
+    let payload={id,updated_at:new Date().toISOString()};
+    payload.description=descEl.value.trim();
+    payload.category=catEl.value||'';
     if(isParts){
-      payload.vendor=document.querySelector('.be-vendor[data-id="'+id+'"]')?.value||'';
-      payload.unit_cost=parseFloat(document.querySelector('.be-cost[data-id="'+id+'"]')?.value)||0;
-      payload.location=document.querySelector('.be-loc[data-id="'+id+'"]')?.value.trim()||'';
-      payload.lead_time_weeks=parseInt(document.querySelector('.be-lead[data-id="'+id+'"]')?.value)||1;
+      const vendorEl=document.querySelector('.be-vendor[data-id="'+id+'"]');
+      const costEl=document.querySelector('.be-cost[data-id="'+id+'"]');
+      const locEl=document.querySelector('.be-loc[data-id="'+id+'"]');
+      const leadEl=document.querySelector('.be-lead[data-id="'+id+'"]');
+      if(!vendorEl||!costEl||!locEl||!leadEl){missing.push(id);continue;}
+      payload.vendor=vendorEl.value||'';
+      payload.unit_cost=parseFloat(costEl.value)||0;
+      payload.location=locEl.value.trim();
+      payload.lead_time_weeks=parseInt(leadEl.value)||1;
     }else{
-      payload.msrp=parseFloat(document.querySelector('.be-msrp[data-id="'+id+'"]')?.value)||0;
-      payload.shipping_cost=parseFloat(document.querySelector('.be-ship[data-id="'+id+'"]')?.value)||10;
-      payload.status=document.querySelector('.be-status[data-id="'+id+'"]')?.value||'ok';
-      payload.location=document.querySelector('.be-asm-loc[data-id="'+id+'"]')?.value.trim()||'';
+      const msrpEl=document.querySelector('.be-msrp[data-id="'+id+'"]');
+      const shipEl=document.querySelector('.be-ship[data-id="'+id+'"]');
+      const statusEl=document.querySelector('.be-status[data-id="'+id+'"]');
+      const locEl=document.querySelector('.be-asm-loc[data-id="'+id+'"]');
+      if(!msrpEl||!shipEl||!statusEl||!locEl){missing.push(id);continue;}
+      payload.msrp=parseFloat(msrpEl.value)||0;
+      payload.shipping_cost=parseFloat(shipEl.value)||10;
+      payload.status=statusEl.value||'ok';
+      payload.location=locEl.value.trim();
     }
-    const{error}=await db.from(isParts?'parts':'assemblies').update(payload).eq('id',id);
-    if(error)errors++;
-    else{
-      if(isParts)S.parts=S.parts.map(x=>x.id===id?{...x,...payload}:x);
-      else S.assemblies=S.assemblies.map(x=>x.id===id?{...x,...payload}:x);
-      saved++;
-    }
+    rows.push(payload);
   }
 
-  if(errors)toast('Saved '+saved+', '+errors+' errors');
-  else{
+  // STEP 2: If ANY row's inputs couldn't be found, abort the entire save before writing anything.
+  // A partial, silently-corrupted save is far worse than making the user click Save again.
+  if(missing.length){
+    toast('⚠ Save aborted — '+missing.length+' row(s) had missing form fields (the table may have been refreshed mid-edit). Nothing was saved. Please try again.',8000);
+    return;
+  }
+  if(!rows.length){toast('Nothing to save');return;}
+
+  if(btn){btn.disabled=true;btn.textContent='Saving '+rows.length+'…';}
+  const _beforeUnloadWarn=function(e){e.preventDefault();e.returnValue='';return '';};
+  window.addEventListener('beforeunload',_beforeUnloadWarn);
+
+  try{
+    // STEP 3: Write everything as a single batch upsert instead of N sequential round-trips. This
+    // shrinks the "vulnerable window" where closing the tab could interrupt anything from potentially
+    // minutes (one row at a time, awaited) down to a single network request — either the whole batch
+    // lands or it doesn't, there's no longer a partial-completion state to worry about.
+    const{error}=await db.from(isParts?'parts':'assemblies').upsert(rows,{onConflict:'id'});
+    if(error){
+      toast('⚠ Save failed — nothing was written: '+error.message,8000);
+      return;
+    }
+    const saved=rows.length;
+    if(isParts)S.parts=S.parts.map(x=>{const r=rows.find(r=>r.id===x.id);return r?{...x,...r}:x;});
+    else S.assemblies=S.assemblies.map(x=>{const r=rows.find(r=>r.id===x.id);return r?{...x,...r}:x;});
     logAction('Bulk edited '+saved+' '+table,''+table,null,null,null).catch(()=>{});
-  toast('\u2713 '+saved+' '+(isParts?'parts':'assemblies')+' updated');
+    toast('\u2713 '+saved+' '+(isParts?'parts':'assemblies')+' updated');
     S.bulkEditMode=null;
     if(isParts)S.selectedParts=new Set();
     else S.selectedAsms=new Set();
+  }finally{
+    window.removeEventListener('beforeunload',_beforeUnloadWarn);
   }
   render();
 }
