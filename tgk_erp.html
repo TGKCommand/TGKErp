@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v13.4';
+const TGK_ERP_VERSION = 'v13.6';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -9108,11 +9108,14 @@ window.loadShopifyCSVFile=function(inputEl){
       const withText=entry.candidates.filter(function(c){return c.title||c.body;});
       const sorted=[...withText].sort(function(a,b){return((a.title||'')+(a.body||'')).length-((b.title||'')+(b.body||'')).length;});
       const picked=sorted[0]||entry.candidates[0]||{};
+      const initialPrice=(entry.candidates.find(function(c){return c.price>0;})||{}).price;
       matches.push({
         asm:asm,
         shopifyTitle:picked.title,
         shopifyBody:picked.body,
-        shopifyPrice:(entry.candidates.find(function(c){return c.price>0;})||{}).price,
+        shopifyPrice:initialPrice,
+        finalDescription:picked.title||picked.body||'', // what actually gets saved — editable in the preview
+        finalMsrp:initialPrice||0,
         needsDesc:needsDesc,
         needsMsrp:needsMsrp,
         candidates:entry.candidates.length>1?entry.candidates:null, // only surface alternatives when there's a real choice
@@ -9127,16 +9130,17 @@ window.loadShopifyCSVFile=function(inputEl){
     }
     const rowsHtml=matches.map(function(m,i){
       const newDesc=m.shopifyTitle||m.shopifyBody||'';
-      const multiPageNote=m.candidates?('<div style="margin-top:4px;padding:6px 8px;background:rgba(234,88,12,.06);border:1px solid rgba(234,88,12,.2);border-radius:5px">'
-        +'<div style="font-size:9px;font-weight:700;color:var(--orange);margin-bottom:4px">&#9888; This SKU is sold under '+m.candidates.length+' different product pages \u2014 picked the shortest by default, choose another below if this isn\'t the right one:</div>'
+      const multiPageNote=m.candidates?('<div style="margin-top:6px;padding:6px 8px;background:rgba(234,88,12,.06);border:1px solid rgba(234,88,12,.2);border-radius:5px">'
+        +'<div style="font-size:9px;font-weight:700;color:var(--orange);margin-bottom:4px">&#9888; This SKU is sold under '+m.candidates.length+' different product pages \u2014 picked the shortest by default, or write your own below:</div>'
         +'<select class="form-input" style="font-size:10px;padding:3px 6px" onchange="pickShopifyCandidate('+i+',this.value)">'
         +m.candidates.map(function(c,ci){return '<option value="'+ci+'"'+(ci===m.pickedIdx?' selected':'')+'>'+escHtml((c.title||c.body||'(no title)').slice(0,70))+'</option>';}).join('')
         +'</select></div>'):'';
-      return '<div style="display:flex;align-items:flex-start;gap:10px;padding:6px 8px;border-bottom:1px solid var(--border);font-size:11px" id="shopify-match-row-'+i+'">'
-        +'<div style="width:90px;flex-shrink:0;padding-top:2px"><span class="pn" style="color:var(--teal);font-weight:700">'+escHtml(dispPn(m.asm))+'</span></div>'
+      return '<div style="display:flex;align-items:flex-start;gap:10px;padding:8px;border-bottom:1px solid var(--border);font-size:11px" id="shopify-match-row-'+i+'">'
+        +'<div style="width:90px;flex-shrink:0;padding-top:6px"><span class="pn" style="color:var(--teal);font-weight:700">'+escHtml(dispPn(m.asm))+'</span></div>'
         +'<div style="flex:1;overflow:hidden">'
-        +(m.needsDesc?('<div>Description &rarr; <span style="color:var(--teal)" id="shopify-desc-preview-'+i+'">'+escHtml(newDesc.slice(0,80))+(newDesc.length>80?'…':'')+'</span></div>'):'')
-        +(m.needsMsrp?('<div>MSRP &rarr; <span style="color:var(--teal)">'+fc(m.shopifyPrice)+'</span></div>'):'')
+        +(m.needsDesc?('<div style="margin-bottom:4px"><div style="font-size:9px;color:var(--text3);margin-bottom:2px">Description (edit freely \u2014 this is what gets saved):</div>'
+          +'<textarea class="form-input" rows="2" style="width:100%;font-size:11px;resize:vertical" id="shopify-desc-edit-'+i+'" oninput="editShopifyDescription('+i+',this.value)">'+escHtml(newDesc)+'</textarea></div>'):'')
+        +(m.needsMsrp?('<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px"><span style="font-size:9px;color:var(--text3)">MSRP:</span><input type="number" step="0.01" class="form-input" style="width:90px;font-size:11px;padding:3px 6px" value="'+(m.shopifyPrice||0)+'" oninput="editShopifyMsrp('+i+',this.value)"></div>'):'')
         +multiPageNote
         +'</div></div>';
     }).join('');
@@ -9156,15 +9160,24 @@ window.pickShopifyCandidate=function(matchIdx,candidateIdx){
   if(!m||!m.candidates)return;
   const c=m.candidates[+candidateIdx];
   if(!c)return;
+  const newDesc=c.title||c.body||'';
   m.shopifyTitle=c.title;
   m.shopifyBody=c.body;
-  if(c.price>0)m.shopifyPrice=c.price;
+  m.finalDescription=newDesc; // switching the dropdown overwrites any manual edit — that's expected
+  if(c.price>0){m.shopifyPrice=c.price;m.finalMsrp=c.price;}
   m.pickedIdx=+candidateIdx;
-  const preview=document.getElementById('shopify-desc-preview-'+matchIdx);
-  if(preview){
-    const newDesc=c.title||c.body||'';
-    preview.textContent=newDesc.slice(0,80)+(newDesc.length>80?'…':'');
-  }
+  const ta=document.getElementById('shopify-desc-edit-'+matchIdx);
+  if(ta)ta.value=newDesc;
+  const priceInput=document.querySelector('#shopify-match-row-'+matchIdx+' input[type="number"]');
+  if(priceInput&&c.price>0)priceInput.value=c.price;
+};
+window.editShopifyDescription=function(matchIdx,value){
+  const m=(S._shopifyFillMatches||[])[matchIdx];
+  if(m)m.finalDescription=value;
+};
+window.editShopifyMsrp=function(matchIdx,value){
+  const m=(S._shopifyFillMatches||[])[matchIdx];
+  if(m)m.finalMsrp=parseFloat(value)||0;
 };
 window.applyShopifyFill=async function(){
   const matches=S._shopifyFillMatches||[];
@@ -9172,8 +9185,15 @@ window.applyShopifyFill=async function(){
   let ok=0,failed=0;
   for(const m of matches){
     const payload={};
-    if(m.needsDesc)payload.description=(m.shopifyTitle||m.shopifyBody||'').slice(0,500);
-    if(m.needsMsrp)payload.msrp=m.shopifyPrice;
+    if(m.needsDesc){
+      const finalDesc=(m.finalDescription!==undefined?m.finalDescription:(m.shopifyTitle||m.shopifyBody||'')).trim();
+      if(finalDesc)payload.description=finalDesc.slice(0,500);
+    }
+    if(m.needsMsrp){
+      const finalMsrp=m.finalMsrp!==undefined?m.finalMsrp:m.shopifyPrice;
+      if(finalMsrp>0)payload.msrp=finalMsrp;
+    }
+    if(!Object.keys(payload).length)continue; // user cleared both fields — nothing to save for this row
     payload.updated_at=new Date().toISOString();
     const{error}=await db.from('assemblies').update(payload).eq('id',m.asm.id);
     if(error){failed++;console.error('[TGK] Shopify fill failed for',m.asm.pn,error.message);}
@@ -17175,7 +17195,7 @@ function renderFitmentsGuide() {
   const makes=[...new Set(S.fitments.map(f=>f.make||'').filter(Boolean))].sort();
 
   let asmList=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&byPn[a.pn]);
-  if(q)asmList=asmList.filter(a=>a.pn.toLowerCase().includes(q)||(a.description||'').toLowerCase().includes(q)||
+  if(q)asmList=asmList.filter(a=>a.pn.toLowerCase().includes(q)||dispPn(a).toLowerCase().includes(q)||(a.description||'').toLowerCase().includes(q)||
     (byPn[a.pn]||[]).some(f=>(f.make||'').toLowerCase().includes(q)||(f.model||'').toLowerCase().includes(q)));
   if(makeFilter)asmList=asmList.filter(a=>(byPn[a.pn]||[]).some(f=>f.make===makeFilter));
   asmList.sort((a,b)=>a.pn.localeCompare(b.pn));
@@ -17212,7 +17232,8 @@ function renderFitmentsGuide() {
       <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:10px;flex-wrap:wrap">
         <div style="flex:1;min-width:200px">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px">
-            <span style="font-family:var(--mono);font-size:13px;font-weight:700;color:var(--teal)">${escHtml(a.pn)}</span>
+            <span style="font-family:var(--mono);font-size:13px;font-weight:700;color:var(--teal)">${escHtml(dispPn(a))}</span>
+            ${a.use_new_sku&&a.new_sku?`<span style="font-size:9px;color:var(--text3);margin-left:2px">Superseded: ${escHtml(a.pn)}</span>`:''}
             ${a.category?`<span class="bomtag ${catBomClass(a.category)}">${escHtml(a.category)}</span>`:''}
           </div>
           <div style="font-size:12px;color:var(--text2)">${escHtml(a.description||'')}</div>
@@ -17690,7 +17711,7 @@ window.printFitmentGuide=function(){
   const makeFilter=sf.make||'';
   const byPn={};S.fitments.forEach(f=>{if(!byPn[f.pn])byPn[f.pn]=[];byPn[f.pn].push(f);});
   let asmList=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&byPn[a.pn]);
-  if(q)asmList=asmList.filter(a=>a.pn.toLowerCase().includes(q)||(a.description||'').toLowerCase().includes(q)||(byPn[a.pn]||[]).some(f=>(f.make||'').toLowerCase().includes(q)||(f.model||'').toLowerCase().includes(q)));
+  if(q)asmList=asmList.filter(a=>a.pn.toLowerCase().includes(q)||dispPn(a).toLowerCase().includes(q)||(a.description||'').toLowerCase().includes(q)||(byPn[a.pn]||[]).some(f=>(f.make||'').toLowerCase().includes(q)||(f.model||'').toLowerCase().includes(q)));
   if(makeFilter)asmList=asmList.filter(a=>(byPn[a.pn]||[]).some(f=>f.make===makeFilter));
   asmList.sort((a,b)=>a.pn.localeCompare(b.pn));
 
@@ -17712,7 +17733,7 @@ window.printFitmentGuide=function(){
       return `<tr><td>${g.make}</td><td>${g.model}</td><td>${years}</td></tr>`;
     }).join('');
     const t1=fc((a.msrp||0)*(1-t1Disc));
-    return `<div class="part-section"><div class="part-header"><span class="pn">${a.pn}</span><span class="desc">${a.description||''}</span><span class="price">Dealer: ${t1} &nbsp;&middot;&nbsp; MSRP: ${fc(a.msrp||0)}</span></div><table><thead><tr><th>Make</th><th>Model</th><th>Year(s)</th></tr></thead><tbody>${tableRows}</tbody></table></div>`;
+    return `<div class="part-section"><div class="part-header"><span class="pn">${escHtml(dispPn(a))}${a.use_new_sku&&a.new_sku?' <span style="font-size:9px;color:#9ca3af;font-weight:400">(Superseded: '+escHtml(a.pn)+')</span>':''}</span><span class="desc">${a.description||''}</span><span class="price">Dealer: ${t1} &nbsp;&middot;&nbsp; MSRP: ${fc(a.msrp||0)}</span></div><table><thead><tr><th>Make</th><th>Model</th><th>Year(s)</th></tr></thead><tbody>${tableRows}</tbody></table></div>`;
   }).join('');
 
   const w=window.open('','_blank');
