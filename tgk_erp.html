@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v13.2';
+const TGK_ERP_VERSION = 'v13.4';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -9045,15 +9045,26 @@ function _parseShopifyCSV(text){
   if(iSku<0)return{rows:[],error:'"Variant SKU" column not found. This doesn\'t look like a Shopify product export. Headers found: '+hdr.slice(0,10).join(', ')+(hdr.length>10?'…':'')};
   if(iTitle<0&&iBody<0)return{rows:[],error:'Neither "Title" nor "Body (HTML)" column found — nothing to import as a description.'};
   const rows=[];
+  // Shopify only writes Title/Body/Vendor on the FIRST row of each product (Handle group) — every
+  // additional variant row after it has its own SKU and Price but leaves Title/Body blank. Without
+  // carrying the parent product's title/body forward, every variant past the first would silently
+  // get no description at all. Track the last non-blank title/body seen for the CURRENT handle only,
+  // so we never bleed one product's info into a different product below it.
+  let carryHandle='',carryTitle='',carryBody='';
   for(let i=1;i<allRows.length;i++){
     const cells=allRows[i];
     const sku=(cells[iSku]||'').trim();
-    if(!sku)continue; // Shopify repeats product rows per-variant/image with blank SKU on continuation rows
-    const title=(iTitle>=0?(cells[iTitle]||''):'').trim();
-    const bodyRaw=(iBody>=0?(cells[iBody]||''):'').trim();
+    const handle=(iHandle>=0?(cells[iHandle]||''):'').trim();
+    let title=(iTitle>=0?(cells[iTitle]||''):'').trim();
+    let bodyRaw=(iBody>=0?(cells[iBody]||''):'').trim();
+    if(handle&&handle!==carryHandle){ // new product group started — reset carry-forward state
+      carryHandle=handle;carryTitle='';carryBody='';
+    }
+    if(title)carryTitle=title; else if(handle===carryHandle)title=carryTitle;
+    if(bodyRaw)carryBody=bodyRaw; else if(handle===carryHandle)bodyRaw=carryBody;
+    if(!sku)continue; // pure image-continuation rows still have no SKU — correctly skipped
     const body=bodyRaw.replace(/<[^>]+>/g,' ').replace(/&nbsp;/g,' ').replace(/\s+/g,' ').trim(); // strip HTML + collapse any embedded newlines for a clean plain-text description
     const price=iPrice>=0?parseFloat(cells[iPrice]):null;
-    const handle=(iHandle>=0?(cells[iHandle]||''):'').trim();
     rows.push({sku:sku,title:title,body:body,price:(price>0?price:null),handle:handle});
   }
   return{rows:rows,error:null};
@@ -9068,21 +9079,45 @@ window.loadShopifyCSVFile=function(inputEl){
     const{rows,error}=_parseShopifyCSV(e.target.result);
     const prev=document.getElementById('shopify-fill-preview');
     if(error){if(prev)prev.innerHTML='<div style="color:var(--red);font-size:12px;margin-top:10px">'+escHtml(error)+'</div>';return;}
-    // Match each Shopify row to an assembly (resolving legacy/new SKU), find what's actually blank
-    const matches=[];
+    // Match each Shopify row to an assembly (resolving legacy/new SKU). A single SKU can legitimately
+    // appear under SEVERAL different product pages when Convermax generates one listing per vehicle
+    // platform for the same physical part (e.g. one motor mount SKU sold as "for Q7", "for SQ5", "for
+    // S4/S5" etc. — 34 SKUs in a typical TGK catalog do this). Rather than silently keeping whichever
+    // one happens to appear first in the file, group every candidate per SKU and let the shortest,
+    // most generic description win by default — but keep every alternative visible and pickable.
+    const bySkuRaw={};
     const unmatched=[];
-    const alreadyFull=[];
-    const seen=new Set();
     rows.forEach(function(r){
       const rf=resolveFitmentPn(r.sku);
       if(!rf.matched){unmatched.push(r.sku);return;}
       const asm=S.assemblies.find(function(a){return a.pn===rf.pn;});
-      if(!asm||seen.has(asm.id))return;
-      const needsDesc=!asm.description&&(r.title||r.body);
-      const needsMsrp=(!asm.msrp||asm.msrp===0)&&r.price>0;
-      if(!needsDesc&&!needsMsrp){alreadyFull.push(r.sku);return;}
-      seen.add(asm.id);
-      matches.push({asm:asm,shopifyTitle:r.title,shopifyBody:r.body,shopifyPrice:r.price,needsDesc:needsDesc,needsMsrp:needsMsrp});
+      if(!asm)return;
+      if(!bySkuRaw[asm.id])bySkuRaw[asm.id]={asm:asm,candidates:[]};
+      bySkuRaw[asm.id].candidates.push({title:r.title,body:r.body,price:r.price,handle:r.handle});
+    });
+    const matches=[];
+    const alreadyFull=[];
+    Object.values(bySkuRaw).forEach(function(entry){
+      const asm=entry.asm;
+      const needsDesc=!asm.description;
+      const needsMsrp=!asm.msrp||asm.msrp===0;
+      if(!needsDesc&&!needsMsrp){alreadyFull.push(asm.pn);return;}
+      // Default pick: shortest non-empty title+body combo — vehicle-specific pages tend to pad the
+      // generic part description with fitment-specific marketing copy, so shorter is usually the
+      // more neutral, reusable description for a part sold across many vehicle pages.
+      const withText=entry.candidates.filter(function(c){return c.title||c.body;});
+      const sorted=[...withText].sort(function(a,b){return((a.title||'')+(a.body||'')).length-((b.title||'')+(b.body||'')).length;});
+      const picked=sorted[0]||entry.candidates[0]||{};
+      matches.push({
+        asm:asm,
+        shopifyTitle:picked.title,
+        shopifyBody:picked.body,
+        shopifyPrice:(entry.candidates.find(function(c){return c.price>0;})||{}).price,
+        needsDesc:needsDesc,
+        needsMsrp:needsMsrp,
+        candidates:entry.candidates.length>1?entry.candidates:null, // only surface alternatives when there's a real choice
+        pickedIdx:entry.candidates.indexOf(picked)
+      });
     });
     S._shopifyFillMatches=matches;
     const unmatchedHtml=unmatched.length?('<div style="margin-top:14px;padding:10px 12px;background:rgba(220,38,38,.06);border:1px solid rgba(220,38,38,.2);border-radius:6px"><div style="font-size:11px;font-weight:700;color:var(--red);margin-bottom:4px">\u26a0 '+unmatched.length+' SKU(s) in the file don\'t match any assembly (checked both legacy PN and new SKU):</div><div style="font-size:10px;color:var(--text2);font-family:var(--mono)">'+unmatched.slice(0,30).map(escHtml).join(', ')+(unmatched.length>30?' \u2026 and '+(unmatched.length-30)+' more':'')+'</div></div>'):'';
@@ -9092,11 +9127,17 @@ window.loadShopifyCSVFile=function(inputEl){
     }
     const rowsHtml=matches.map(function(m,i){
       const newDesc=m.shopifyTitle||m.shopifyBody||'';
-      return '<div style="display:flex;align-items:center;gap:10px;padding:6px 8px;border-bottom:1px solid var(--border);font-size:11px">'
-        +'<div style="width:90px;flex-shrink:0"><span class="pn" style="color:var(--teal);font-weight:700">'+escHtml(dispPn(m.asm))+'</span></div>'
+      const multiPageNote=m.candidates?('<div style="margin-top:4px;padding:6px 8px;background:rgba(234,88,12,.06);border:1px solid rgba(234,88,12,.2);border-radius:5px">'
+        +'<div style="font-size:9px;font-weight:700;color:var(--orange);margin-bottom:4px">&#9888; This SKU is sold under '+m.candidates.length+' different product pages \u2014 picked the shortest by default, choose another below if this isn\'t the right one:</div>'
+        +'<select class="form-input" style="font-size:10px;padding:3px 6px" onchange="pickShopifyCandidate('+i+',this.value)">'
+        +m.candidates.map(function(c,ci){return '<option value="'+ci+'"'+(ci===m.pickedIdx?' selected':'')+'>'+escHtml((c.title||c.body||'(no title)').slice(0,70))+'</option>';}).join('')
+        +'</select></div>'):'';
+      return '<div style="display:flex;align-items:flex-start;gap:10px;padding:6px 8px;border-bottom:1px solid var(--border);font-size:11px" id="shopify-match-row-'+i+'">'
+        +'<div style="width:90px;flex-shrink:0;padding-top:2px"><span class="pn" style="color:var(--teal);font-weight:700">'+escHtml(dispPn(m.asm))+'</span></div>'
         +'<div style="flex:1;overflow:hidden">'
-        +(m.needsDesc?('<div>Description &rarr; <span style="color:var(--teal)">'+escHtml(newDesc.slice(0,80))+(newDesc.length>80?'…':'')+'</span></div>'):'')
+        +(m.needsDesc?('<div>Description &rarr; <span style="color:var(--teal)" id="shopify-desc-preview-'+i+'">'+escHtml(newDesc.slice(0,80))+(newDesc.length>80?'…':'')+'</span></div>'):'')
         +(m.needsMsrp?('<div>MSRP &rarr; <span style="color:var(--teal)">'+fc(m.shopifyPrice)+'</span></div>'):'')
+        +multiPageNote
         +'</div></div>';
     }).join('');
     if(prev)prev.innerHTML='<div style="margin-top:12px">'
@@ -9109,6 +9150,21 @@ window.loadShopifyCSVFile=function(inputEl){
   reader.onerror=function(){toast('Could not read file');};
   reader.readAsText(file);
   inputEl.value='';
+};
+window.pickShopifyCandidate=function(matchIdx,candidateIdx){
+  const m=(S._shopifyFillMatches||[])[matchIdx];
+  if(!m||!m.candidates)return;
+  const c=m.candidates[+candidateIdx];
+  if(!c)return;
+  m.shopifyTitle=c.title;
+  m.shopifyBody=c.body;
+  if(c.price>0)m.shopifyPrice=c.price;
+  m.pickedIdx=+candidateIdx;
+  const preview=document.getElementById('shopify-desc-preview-'+matchIdx);
+  if(preview){
+    const newDesc=c.title||c.body||'';
+    preview.textContent=newDesc.slice(0,80)+(newDesc.length>80?'…':'');
+  }
 };
 window.applyShopifyFill=async function(){
   const matches=S._shopifyFillMatches||[];
