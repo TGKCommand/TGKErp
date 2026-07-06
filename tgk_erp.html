@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v12.5';
+const TGK_ERP_VERSION = 'v12.7';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1019,6 +1019,18 @@ function openSubBuild(subPn, parentPn, parentQty){
   S.buildQty=null;
   pushHist();render();
 }
+function resolveFitmentPn(rawPn){
+  // Fitments MUST always be stored under the assembly's stable legacy pn — never the display/new SKU —
+  // because that's the only identifier guaranteed not to change. This normalizes whatever was typed
+  // or imported (old PN, new SKU, mixed case) to the one true canonical key.
+  const cleaned=(rawPn||'').trim().toUpperCase();
+  if(!cleaned)return{pn:'',matched:false};
+  const direct=S.assemblies.find(function(a){return a.pn===cleaned;});
+  if(direct)return{pn:direct.pn,matched:true};
+  const byNewSku=S.assemblies.find(function(a){return a.use_new_sku&&a.new_sku&&a.new_sku.toUpperCase()===cleaned;});
+  if(byNewSku)return{pn:byNewSku.pn,matched:true};
+  return{pn:cleaned,matched:false}; // no assembly found — keep as typed but flag it
+}
 function resolveCanonicalPn(pn){
   // If a part/assembly uses new_sku and this pn matches the display SKU, return the real stored pn
   var asm=S.assemblies.find(function(a){return a.pn===pn;});
@@ -1647,10 +1659,47 @@ function renderParts(){
   </tbody></table></div>`;
 }
 
+function findDuplicateAssemblyPairs(){
+  // A duplicate pair = a "legacy" row with an activated new_sku, AND a separate row whose pn
+  // literally equals that new_sku. Both display as the same SKU everywhere (dispPn resolves them
+  // to the same string) but are two different database records — split data, split BOMs, split stock.
+  const byPn={};S.assemblies.forEach(function(a){byPn[a.pn]=a;});
+  const pairs=[];
+  S.assemblies.forEach(function(legacy){
+    if(!legacy.use_new_sku||!legacy.new_sku||legacy.new_sku===legacy.pn)return;
+    const dup=byPn[legacy.new_sku];
+    if(dup&&dup.id!==legacy.id)pairs.push({legacy:legacy,dup:dup});
+  });
+  return pairs;
+}
 function renderAssemblies(){
   if(S.bulkEditMode==='assemblies')return renderBulkEdit('assemblies');
   const sf=S.filters.asm||{};
-  let list=sf.showDisc?S.assemblies.filter(a=>a.discontinued):S.assemblies.filter(a=>!a.discontinued);
+  // Consolidate duplicate SKU pairs for display: show ONE row per real product, preferring
+  // whichever physical row has actual data, but keep it tagged with the superseded PN. This is
+  // display-only — the underlying duplicate rows are untouched until merged via the cleanup tool.
+  const _dupPairs=findDuplicateAssemblyPairs();
+  const _hideIds=new Set();
+  const _mergedView={};
+  _dupPairs.forEach(function(pr){
+    const legacy=pr.legacy,dup=pr.dup; // legacy carries the pn/new_sku/use_new_sku identity — always keep its identity fields
+    _hideIds.add(dup.id); // the "dup" row (pn === legacy.new_sku) is always the one merged away from the list
+    _mergedView[legacy.id]=Object.assign({},legacy,{
+      description:legacy.description||dup.description,
+      msrp:(legacy.msrp>0)?legacy.msrp:dup.msrp,
+      shipping_cost:(legacy.shipping_cost&&legacy.shipping_cost!==10)?legacy.shipping_cost:(dup.shipping_cost||legacy.shipping_cost),
+      status:legacy.status||dup.status,
+      location:legacy.location||dup.location,
+      image_url:legacy.image_url||dup.image_url,
+      pl_notes:legacy.pl_notes||dup.pl_notes,
+      product_url:legacy.product_url||dup.product_url,
+      total_on_hand:(legacy.total_on_hand||0)+(dup.total_on_hand||0), // stock genuinely exists in both places until merged
+      _dupDonorId:dup.id,_dupDonorPn:dup.pn
+    });
+  });
+  let list=(sf.showDisc?S.assemblies.filter(a=>a.discontinued):S.assemblies.filter(a=>!a.discontinued))
+    .filter(function(a){return !_hideIds.has(a.id);})
+    .map(function(a){return _mergedView[a.id]||a;});
   if(sf.kind==='dev')list=list.filter(a=>isDev(a));
   else if(sf.kind==='fg')list=list.filter(a=>!a.is_subassembly&&!isHWPack(a.pn)&&!isDev(a));
   else if(sf.kind==='sub')list=list.filter(a=>a.is_subassembly&&!isHWPack(a.pn)&&!isDev(a));
@@ -1684,6 +1733,7 @@ function renderAssemblies(){
     <button class="filter-chip ${sf.kind==='dev'?'on-teal':''}" style="${sf.kind==='dev'?'':'color:var(--purple)'}" onclick="setFilter('asm','kind',${sf.kind==='dev'?"''":"'dev'"})">&#128300; Dev Pipeline (${S.assemblies.filter(a=>!a.discontinued&&isDev(a)).length})</button>
     <button class="filter-chip ${sf.showDisc?'on-teal':''}" onclick="setFilter('asm','showDisc',${sf.showDisc?'false':'true'})">🗄 Discontinued (${S.assemblies.filter(a=>a.discontinued).length})</button>
     ${hasFilter?`<button class="btn btn-sm" style="color:var(--text3)" onclick="S.filters.asm={};S.searchQ='';render()">✕ Clear filters</button>`:''}
+    ${_dupPairs.length?`<button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3);background:rgba(220,38,38,.05)" onclick="openDuplicateMergeReview()" title="These SKU pairs are showing merged for display only — the underlying duplicate database rows still exist and are double-counting stock/BOMs until merged">&#9888; ${_dupPairs.length} Duplicate SKU${_dupPairs.length!==1?'s':''} — Review &amp; Merge</button>`:''}
     <button class="btn btn-sm" style="margin-left:auto" onclick="openModal('manageCategories',{table:'assemblies'})">⚙ Categories</button>
     <button class="btn btn-sm" onclick="printAllBOMs()" title="Print all BOMs as PDF">🖨 All BOMs</button>
     <span class="filter-count">${list.length} assemblies</span>
@@ -8847,6 +8897,83 @@ async function confirmBulkDiscontinue(table){
   else toast('🗄 '+ids.length+' '+(ids.length===1?noun+'y':noun+(isParts?'s':'ies'))+' discontinued.',4000);
 }
 
+window.openDuplicateMergeReview=function(){
+  const pairs=findDuplicateAssemblyPairs();
+  if(!pairs.length){toast('No duplicate SKUs found');return;}
+  const rowsHtml=pairs.map(function(pr,i){
+    const legacy=pr.legacy,dup=pr.dup;
+    const legacyBoms=(S.boms[legacy.pn]||[]).length;
+    const dupBoms=(S.boms[dup.pn]||[]).length;
+    const bomsMatch=legacyBoms===dupBoms; // heuristic — same line count suggests a migration copy, not a real divergence
+    const bomWarning=(legacyBoms>0&&dupBoms>0&&!bomsMatch)
+      ?'<div style="color:var(--red);font-size:10px;font-weight:700">&#9888; BOM line counts differ ('+legacyBoms+' vs '+dupBoms+') — review manually before merging, do not auto-merge</div>'
+      :(dupBoms>0?'<div style="color:var(--orange);font-size:10px">Duplicate has '+dupBoms+' BOM line(s) that look like a migration copy — will be discarded on merge (legacy BOM is kept)</div>':'');
+    const canAutoMerge=!(legacyBoms>0&&dupBoms>0&&!bomsMatch);
+    return '<div style="border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin-bottom:10px" id="dupmerge-row-'+i+'">'
+      +'<div style="display:flex;justify-content:space-between;align-items:start;gap:12px">'
+      +'<div style="flex:1">'
+      +'<div style="font-size:12px;font-weight:700;color:var(--teal)">'+escHtml(legacy.pn)+' <span style="color:var(--text3);font-weight:400">(legacy — keeps BOM &amp; sales history)</span></div>'
+      +'<div style="font-size:11px;color:var(--text2)">'+escHtml(legacy.description||'(no description)')+' &middot; MSRP '+fc(legacy.msrp||0)+' &middot; OH '+(legacy.total_on_hand||0)+' &middot; '+legacyBoms+' BOM line(s)</div>'
+      +'<div style="font-size:12px;font-weight:700;color:var(--orange);margin-top:6px">'+escHtml(dup.pn)+' <span style="color:var(--text3);font-weight:400">(duplicate — will be deleted)</span></div>'
+      +'<div style="font-size:11px;color:var(--text2)">'+escHtml(dup.description||'(no description)')+' &middot; MSRP '+fc(dup.msrp||0)+' &middot; OH '+(dup.total_on_hand||0)+' &middot; '+dupBoms+' BOM line(s)</div>'
+      +bomWarning
+      +'</div>'
+      +'<button class="btn btn-sm '+(canAutoMerge?'btn-teal':'')+'" '+(canAutoMerge?'':'disabled title="Resolve the BOM mismatch manually first"')+' onclick="mergeDuplicateAssemblyPair(\''+legacy.id+'\',\''+dup.id+'\',this)">'+(canAutoMerge?'Merge \u2192 keep '+escHtml(legacy.pn):'Needs Review')+'</button>'
+      +'</div></div>';
+  }).join('');
+  openModal('custom',{
+    title:'Duplicate SKU Review ('+pairs.length+')',
+    wide:true,
+    html:'<div style="font-size:12px;color:var(--text2);margin-bottom:14px">Each pair below represents ONE physical product tracked as two separate database rows — usually left over from a SKU migration. Merging copies the duplicate\'s data onto the legacy row (only filling blanks), moves its on-hand stock, then deletes the duplicate. This cannot be undone — take a backup first if you haven\'t recently.</div>'+rowsHtml
+  });
+};
+window.mergeDuplicateAssemblyPair=async function(legacyId,dupId,btnEl){
+  const legacy=S.assemblies.find(function(a){return a.id===legacyId;});
+  const dup=S.assemblies.find(function(a){return a.id===dupId;});
+  if(!legacy||!dup){toast('Row not found — refresh and try again');return;}
+  if(!confirm('Merge '+dup.pn+' into '+legacy.pn+'? The duplicate row will be permanently deleted.'))return;
+  if(btnEl){btnEl.disabled=true;btnEl.textContent='Merging…';}
+  try{
+    const payload={
+      description:legacy.description||dup.description,
+      msrp:(legacy.msrp>0)?legacy.msrp:dup.msrp,
+      shipping_cost:(legacy.shipping_cost&&legacy.shipping_cost!==10)?legacy.shipping_cost:(dup.shipping_cost||legacy.shipping_cost),
+      status:legacy.status||dup.status,
+      location:legacy.location||dup.location,
+      image_url:legacy.image_url||dup.image_url,
+      pl_notes:legacy.pl_notes||dup.pl_notes,
+      product_url:legacy.product_url||dup.product_url,
+      sales_price:legacy.sales_price||dup.sales_price,
+      ship_us:legacy.ship_us||dup.ship_us,
+      ship_ca:legacy.ship_ca||dup.ship_ca,
+      ship_intl:legacy.ship_intl||dup.ship_intl,
+      total_on_hand:(legacy.total_on_hand||0)+(dup.total_on_hand||0),
+      updated_at:new Date().toISOString()
+    };
+    const{error:updErr}=await db.from('assemblies').update(payload).eq('id',legacyId);
+    if(updErr)throw new Error('Update failed: '+updErr.message);
+    // Move any sales/warranty/shipment-error rows recorded under the duplicate's pn to the legacy pn
+    await db.from('sales').update({pn:legacy.pn}).eq('pn',dup.pn);
+    await db.from('warranty_claims').update({pn:legacy.pn}).eq('pn',dup.pn);
+    await db.from('shipment_errors').update({expected_pn:legacy.pn}).eq('expected_pn',dup.pn);
+    await db.from('shipment_errors').update({actual_pn:legacy.pn}).eq('actual_pn',dup.pn);
+    // Discard the duplicate's own BOM (it's a migration copy of the legacy BOM, not independent data —
+    // the caller already confirmed line counts matched or is force-merging)
+    await db.from('bom_items').delete().eq('parent_pn',dup.pn);
+    // If the duplicate is used as a component inside any OTHER assembly's BOM, repoint it to the legacy pn
+    await db.from('bom_items').update({child_pn:legacy.pn}).eq('child_pn',dup.pn);
+    const{error:delErr}=await db.from('assemblies').delete().eq('id',dupId);
+    if(delErr)throw new Error('Delete failed: '+delErr.message);
+    S.assemblies=S.assemblies.map(function(a){return a.id===legacyId?Object.assign({},a,payload):a;}).filter(function(a){return a.id!==dupId;});
+    delete S.boms[dup.pn];
+    logAction('Merged duplicate SKU '+dup.pn+' into '+legacy.pn,'assemblies',legacy.pn,dup,payload).catch(function(){});
+    toast('\u2713 Merged '+dup.pn+' into '+legacy.pn);
+    closeModal();render();
+  }catch(e){
+    toast('Merge failed: '+e.message,7000);
+    if(btnEl){btnEl.disabled=false;btnEl.textContent='Retry Merge';}
+  }
+};
 window.startBulkEdit=async function(table){
   // Always enter bulk edit with FRESH rows from the DB — protects against any stale/partial
   // in-memory state rendering blank fields, which could then be saved over good data.
@@ -16935,6 +17062,7 @@ function renderFitmentsManage() {
     </select>
     <span class="t3s">${rows.length} rows &middot; ${pns.length} SKUs</span>
     <button class="btn btn-teal btn-sm" onclick="(function(){var el=document.getElementById('fit-add-row');if(el){el.style.display=el.style.display==='none'?'block':'none';if(el.style.display==='block')document.getElementById('fit-new-pn')?.focus();}})()">+ Add Row</button>
+    <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="fixFitmentSkuMismatches()" title="Find and fix fitment rows accidentally stored under an activated new SKU instead of the canonical part number">&#128295; Fix SKU Mismatches</button>
     <button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.25)" onclick="deleteAllFitments()">&#128465; Delete All</button>
   </div>
 
@@ -16942,7 +17070,8 @@ function renderFitmentsManage() {
     <div style="font-size:12px;font-weight:700;color:var(--text);margin-bottom:10px">Add Fitment Row</div>
     <div style="display:grid;grid-template-columns:1.2fr 1fr 1fr 72px 72px 1fr 1fr;gap:8px;align-items:end;flex-wrap:wrap">
       <div><div style="font-size:9px;font-weight:700;color:var(--text3);margin-bottom:3px;text-transform:uppercase;letter-spacing:.07em">Part #</div>
-        <input id="fit-new-pn" class="form-input" placeholder="TGK-0001" style="font-family:var(--mono);text-transform:uppercase"></div>
+        <input id="fit-new-pn" class="form-input" list="fit-pn-dl" placeholder="TGK-0001" style="font-family:var(--mono);text-transform:uppercase">
+        <datalist id="fit-pn-dl">${S.assemblies.filter(function(a){return !a.discontinued;}).map(function(a){return '<option value="'+escHtml(dispPn(a))+'">'+escHtml(a.description||'')+'</option>';}).join('')}</datalist></div>
       <div><div style="font-size:9px;font-weight:700;color:var(--text3);margin-bottom:3px;text-transform:uppercase;letter-spacing:.07em">Make</div>
         <input id="fit-new-make" class="form-input" list="fit-makes-dl" placeholder="Audi">
         <datalist id="fit-makes-dl">${[...new Set(S.fitments.map(f=>f.make||'').filter(Boolean))].sort().map(m=>`<option value="${escHtml(m)}">`).join('')}</datalist></div>
@@ -16968,8 +17097,12 @@ function renderFitmentsManage() {
   </tr></thead><tbody>
   ${rows.slice(0,500).map(f=>{
     const fdata=JSON.stringify({pn:f.pn,make:f.make||'',model:f.model||'',year_from:f.year_from,year_to:f.year_to,submodel:f.submodel||'',notes:f.notes||''}).replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+    const _asm=S.assemblies.find(function(a){return a.pn===f.pn;});
+    const _pnCell=_asm
+      ?(escHtml(dispPn(_asm))+(_asm.use_new_sku&&_asm.new_sku?'<div style="font-size:9px;color:var(--text3);font-weight:400">'+escHtml(_asm.pn)+'</div>':''))
+      :('<span style="color:var(--red)" title="No assembly matches this PN — this fitment will not appear on the dealer site">&#9888; '+escHtml(f.pn)+'</span>');
     return `<tr id="fit-row-${f.id}">
-    <td class="pn">${escHtml(f.pn)}</td>
+    <td class="pn">${_pnCell}</td>
     <td>${escHtml(f.make||'')}</td>
     <td>${escHtml(f.model||'')}</td>
     <td class="money-neutral">${f.year_from||'—'}</td>
@@ -17110,6 +17243,32 @@ window.previewFitmentCSV=function(){
   el.innerHTML=`<span style="color:var(--teal)">&#10003; ${rows.length} row${rows.length!==1?'s':''} ready to insert &mdash; ${pns.length} unique SKU${pns.length!==1?'s':''}: ${pns.slice(0,6).map(escHtml).join(', ')}${pns.length>6?' …':''}</span><div style="font-size:10px;color:var(--text3);margin-top:3px">Years consolidated where consecutive. Click Import to proceed.</div>`;
 };
 
+window.fixFitmentSkuMismatches=async function(){
+  // One-time reconciliation: find fitment rows stored under an assembly's NEW SKU instead of its
+  // canonical legacy pn, and remap them. This retroactively fixes rows created before the resolver existed.
+  const bad=S.fitments.filter(function(f){
+    const direct=S.assemblies.find(function(a){return a.pn===f.pn;});
+    if(direct)return false; // already canonical
+    const byNew=S.assemblies.find(function(a){return a.use_new_sku&&a.new_sku&&a.new_sku===f.pn;});
+    return !!byNew;
+  });
+  if(!bad.length){toast('No mismatches found — all fitments already use canonical PNs');return;}
+  const preview=bad.slice(0,10).map(function(f){
+    const a=S.assemblies.find(function(x){return x.new_sku===f.pn;});
+    return f.pn+' \u2192 '+(a?a.pn:'?');
+  }).join('\n');
+  if(!confirm('Found '+bad.length+' fitment row(s) stored under a new SKU instead of the canonical PN:\n\n'+preview+(bad.length>10?'\n… and '+(bad.length-10)+' more':'')+'\n\nRemap them now?'))return;
+  let fixed=0,failed=0;
+  for(const f of bad){
+    const a=S.assemblies.find(function(x){return x.new_sku===f.pn;});
+    if(!a)continue;
+    const{error}=await db.from('fitments').update({pn:a.pn}).eq('id',f.id);
+    if(error){failed++;console.error('[TGK] fitment remap failed for',f.id,error.message);}
+    else{fixed++;S.fitments=S.fitments.map(function(x){return x.id===f.id?{...x,pn:a.pn}:x;});}
+  }
+  toast('\u2713 Remapped '+fixed+' fitment row'+(fixed!==1?'s':'')+(failed?' ('+failed+' failed)':''),6000);
+  render();
+};
 window.importFitmentCSV=async function(mode){
   const text=document.getElementById('fit-csv-input')?.value||'';
   const{rows,error}=_parseFitCSV(text);
@@ -17134,9 +17293,22 @@ window.importFitmentCSV=async function(mode){
     return;
   }
 
+  // Resolve every row's PN to the assembly's canonical (legacy) pn — the CSV may contain a mix of
+  // old PNs and activated new SKUs (e.g. re-exported from Shopify/Convermax after a SKU migration).
+  // Without this, rows keyed by a new SKU silently vanish from the dealer site's fitment lookup.
+  const _unmatched=new Set();
+  rows.forEach(function(r){
+    const _rf=resolveFitmentPn(r.pn);
+    if(!_rf.matched)_unmatched.add(r.pn);
+    r.pn=_rf.pn;
+  });
   const pns=[...new Set(rows.map(r=>r.pn))];
   const modeLabel=mode==='replace'?'replace ALL existing fitments for these '+pns.length+' SKU(s)':'add '+rows.length+' row(s)';
-  if(!confirm('Import: '+modeLabel+'?\n\n'+pns.slice(0,8).join(', ')+(pns.length>8?' … and '+(pns.length-8)+' more':'')))return;
+  let confirmMsg='Import: '+modeLabel+'?\n\n'+pns.slice(0,8).join(', ')+(pns.length>8?' … and '+(pns.length-8)+' more':'');
+  if(_unmatched.size){
+    confirmMsg+='\n\n\u26a0 '+_unmatched.size+' PN(s) in the file don\'t match any assembly (old or new SKU) — they will still be imported as typed but won\'t appear on the dealer site until a matching assembly exists:\n'+[..._unmatched].slice(0,10).join(', ')+([..._unmatched].length>10?' …':'');
+  }
+  if(!confirm(confirmMsg))return;
 
   const prev2=document.getElementById('fit-csv-preview');
   function _setStatus(msg,col){if(prev2)prev2.innerHTML='<span style="color:'+col+'">'+msg+'</span>';}
@@ -17184,7 +17356,13 @@ window.fitmentAddNew=async function(){
   var notes=(document.getElementById('fit-new-notes')?.value||'').trim()||null;
   if(!pn){toast('Part # is required');return;}
   if(!make||!model){toast('Make and Model are required');return;}
-  var row={pn:pn,make:make,model:model,year_from:yf,year_to:yt||yf,submodel:sub,notes:notes};
+  var _rf=resolveFitmentPn(pn);
+  if(!_rf.matched){
+    if(!confirm('"'+pn+'" doesn\'t match any assembly (old PN or activated new SKU). Save anyway as typed?\n\nThis fitment won\'t show on the dealer site until a matching assembly exists.'))return;
+  } else if(_rf.pn!==pn){
+    toast('Resolved to canonical PN: '+_rf.pn+' (was '+pn+')',5000);
+  }
+  var row={pn:_rf.pn,make:make,model:model,year_from:yf,year_to:yt||yf,submodel:sub,notes:notes};
   var res=await db.from('fitments').insert(row).select().single();
   if(res.error){toast('Error: '+res.error.message);return;}
   S.fitments=[...S.fitments,res.data];
@@ -17238,7 +17416,9 @@ window.fitmentSaveEdit=async function(id){
   var yf=parseInt(get('year_from'))||null;
   var yt=parseInt(get('year_to'))||null;
   if(!pn||!make||!model){toast('Part #, Make and Model are required');return;}
-  var updates={pn:pn,make:make,model:model,year_from:yf,year_to:yt||yf,submodel:get('submodel')||null,notes:get('notes')||null};
+  var _rf=resolveFitmentPn(pn);
+  if(!_rf.matched&&!confirm('"'+pn+'" doesn\'t match any assembly. Save anyway as typed?'))return;
+  var updates={pn:_rf.pn,make:make,model:model,year_from:yf,year_to:yt||yf,submodel:get('submodel')||null,notes:get('notes')||null};
   var res=await db.from('fitments').update(updates).eq('id',id);
   if(res.error){toast('Error: '+res.error.message);return;}
   S.fitments=S.fitments.map(function(f){return f.id===id?Object.assign({},f,updates):f;});
