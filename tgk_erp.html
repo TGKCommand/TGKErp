@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v14.3';
+const TGK_ERP_VERSION = 'v14.5';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -648,15 +648,24 @@ async function loadAll(){
 
 let _rtChannel=null, _rtStatus='connecting';
 var _recentHoldAlerts={};
-function notifyHoldAlert(sale){
+async function notifyHoldAlert(sale){
   var raw=S.settings&&S.settings.hold_alert_emails;
   var targets=Array.isArray(raw)?raw:(typeof raw==='string'?(function(){try{return JSON.parse(raw)||[];}catch(e){return[];}})():[]);
   if(!targets.length)return;
   var dedupeKey=sale.id||(sale.order_number+'|'+sale.pn);
   var now=Date.now();
-  if(_recentHoldAlerts[dedupeKey]&&now-_recentHoldAlerts[dedupeKey]<10000)return; // already notified for this line in the last 10s
+  // In-memory guard: catches same-tab re-fires from overlapping refresh paths within one session.
+  // 30 min, not 10 sec — a hold situation doesn't need re-alerting every few minutes while it persists.
+  if(_recentHoldAlerts[dedupeKey]&&now-_recentHoldAlerts[dedupeKey]<30*60*1000)return;
   _recentHoldAlerts[dedupeKey]=now;
   var snippet='Order #'+(sale.order_number||'')+' '+(sale.pn||'')+' went On Hold'+(sale.customer_name?' — '+sale.customer_name:'');
+  // Database guard: catches the multi-tab / multi-teammate case, where each open session runs its own
+  // copy of this logic and would otherwise each independently insert the same alert.
+  try{
+    const cutoff=new Date(Date.now()-30*60*1000).toISOString();
+    const{data:existing}=await db.from('chat_notifications').select('id').eq('snippet',snippet.slice(0,150)).gte('created_at',cutoff).limit(1);
+    if(existing&&existing.length)return; // another session already sent this exact alert recently
+  }catch(e){console.warn('[hold-alert] dedupe check failed, proceeding anyway:',e.message);}
   targets.forEach(function(target){
     if(!target)return;
     db.from('chat_notifications').insert({
@@ -13003,6 +13012,10 @@ async function goToPO(id){
 window.goToPO=goToPO;
 
 async function openPODetail(id) {
+  // Push a history snapshot BEFORE opening — without this, navBack() has nothing to pop and the
+  // back button can't return to wherever the user actually was (e.g. re-opening the list at the
+  // same scroll/filter state, or a previous PO if navigating PO-to-PO).
+  S.navHistory=[...(S.navHistory||[]).slice(-29),{view:S.view,activePO:S.activePO,activeSale:S.activeSale,activeBuild:S.activeBuild,buildStack:[...(S.buildStack||[])],activeCount:S.activeCount,lookupSel:S.lookupSel,lookupQ:S.lookupQ,countMode:S.countMode,intTab:S.intTab}];
   S.activePO = id;
   await loadPOLines(id);
   const po=S.purchases.find(p=>p.id===id);
@@ -13187,7 +13200,7 @@ function renderPODetail(po) {
 
   return `
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
-    <button class="btn btn-sm" onclick="S.activePO=null;render()">← Back to POs</button>
+    <button class="btn btn-sm" onclick="(S.navHistory&&S.navHistory.length)?navBack():(function(){S.activePO=null;render();})()">← Back</button>
     <div style="flex:1">
       <div style="font-size:14px;font-weight:700;color:var(--text)">${po.vendor} — PO</div>
       <div class="t3s">${po.order_date||''} · ${poPill(po.status)}</div>
@@ -17878,7 +17891,14 @@ function render(){
   updateBadge();
 }
 
+let _refreshSalesInFlight=null;
 async function refreshSales(){
+  // Multiple things can call this close together (60s incremental poll, the 5-min auto hold sync,
+  // manual refresh) — if two overlap, each captures its own "previous status" snapshot before the
+  // other has written its result, and both can independently see the same Open→On Hold transition,
+  // firing duplicate alerts. Coalesce concurrent calls into a single in-flight promise to prevent it.
+  if(_refreshSalesInFlight)return _refreshSalesInFlight;
+  _refreshSalesInFlight=(async()=>{
   var prevById={};
   S.sales.forEach(function(s){prevById[s.id]=s.fulfillment_status;});
   const data=await fetchAll((f,t)=>db.from('sales').select('*').order('created_at',{ascending:false}).range(f,t));
@@ -17890,6 +17910,8 @@ async function refreshSales(){
     }
   });
   computeDemand();updateBadge();
+  })();
+  try{await _refreshSalesInFlight;}finally{_refreshSalesInFlight=null;}
 }
 async function refreshParts(){
   const{data}=await db.from('parts').select('*').order('pn');
