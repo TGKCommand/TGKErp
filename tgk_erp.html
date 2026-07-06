@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v13.0';
+const TGK_ERP_VERSION = 'v13.1';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1025,9 +1025,12 @@ function resolveFitmentPn(rawPn){
   // or imported (old PN, new SKU, mixed case) to the one true canonical key.
   const cleaned=(rawPn||'').trim().toUpperCase();
   if(!cleaned)return{pn:'',matched:false};
-  const direct=S.assemblies.find(function(a){return a.pn===cleaned;});
+  const direct=S.assemblies.find(function(a){return(a.pn||'').trim().toUpperCase()===cleaned;});
   if(direct)return{pn:direct.pn,matched:true};
-  const byNewSku=S.assemblies.find(function(a){return a.use_new_sku&&a.new_sku&&a.new_sku.toUpperCase()===cleaned;});
+  // Match on the stored new_sku value alone — do NOT require use_new_sku to be true. Shopify's live
+  // SKU can already be the new one even if the "activated" toggle in the ERP hasn't been flipped yet,
+  // and requiring both was silently failing matches for exactly that case.
+  const byNewSku=S.assemblies.find(function(a){return a.new_sku&&a.new_sku.trim().toUpperCase()===cleaned;});
   if(byNewSku)return{pn:byNewSku.pn,matched:true};
   return{pn:cleaned,matched:false}; // no assembly found — keep as typed but flag it
 }
@@ -1745,7 +1748,6 @@ function renderAssemblies(){
     ${hasFilter?`<button class="btn btn-sm" style="color:var(--text3)" onclick="S.filters.asm={};S.searchQ='';render()">✕ Clear filters</button>`:''}
     ${_dupPairs.length?`<button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3);background:rgba(220,38,38,.05)" onclick="openDuplicateMergeReview()" title="These SKU pairs are showing merged for display only — the underlying duplicate database rows still exist and are double-counting stock/BOMs until merged">&#9888; ${_dupPairs.length} Duplicate SKU${_dupPairs.length!==1?'s':''} — Review &amp; Merge</button>`:''}
     ${(function(){var _empty=findEmptyAssemblyRecords();return _empty.length?'<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3);background:rgba(234,88,12,.05)" onclick="openEmptyRecordsReview()" title="These rows have no duplicate counterpart to pull data from — they were never actually filled in and need real data typed or filled from Shopify">&#9998; '+_empty.length+' Empty Record'+(_empty.length!==1?'s':'')+' (No Duplicate — Needs Data)</button>':'';})()}
-    <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="openShopifyFillTool()" title="Import a Shopify product export CSV to fill in missing descriptions and MSRPs">&#128230; Fill from Shopify Export</button>
     <button class="btn btn-sm" style="margin-left:auto" onclick="openModal('manageCategories',{table:'assemblies'})">⚙ Categories</button>
     <button class="btn btn-sm" onclick="printAllBOMs()" title="Print all BOMs as PDF">🖨 All BOMs</button>
     <span class="filter-count">${list.length} assemblies</span>
@@ -9047,18 +9049,6 @@ function _parseShopifyCSV(text){
   }
   return{rows:rows,error:null};
 }
-window.openShopifyFillTool=function(){
-  openModal('custom',{
-    title:'Fill from Shopify Export',
-    html:'<div style="font-size:12px;color:var(--text2);margin-bottom:12px">Upload your Shopify product export CSV (Products &rarr; Export &rarr; All products &rarr; CSV). Matches by SKU (resolves legacy PN or activated new SKU automatically) and fills ONLY blank descriptions and $0 MSRPs \u2014 it never overwrites data that already exists, so this is safe to run any time.</div>'
-      +'<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">'
-      +'<input type="file" id="shopify-csv-file" accept=".csv,text/csv" style="display:none" onchange="loadShopifyCSVFile(this)">'
-      +'<button class="btn btn-teal btn-sm" onclick="document.getElementById(\'shopify-csv-file\').click()">&#128193; Upload Shopify Export CSV</button>'
-      +'<span id="shopify-csv-filename" style="font-size:11px;color:var(--text3)"></span>'
-      +'</div>'
-      +'<div id="shopify-fill-preview"></div>'
-  });
-};
 window.loadShopifyCSVFile=function(inputEl){
   const file=inputEl.files&&inputEl.files[0];
   if(!file)return;
@@ -9071,20 +9061,24 @@ window.loadShopifyCSVFile=function(inputEl){
     if(error){if(prev)prev.innerHTML='<div style="color:var(--red);font-size:12px;margin-top:10px">'+escHtml(error)+'</div>';return;}
     // Match each Shopify row to an assembly (resolving legacy/new SKU), find what's actually blank
     const matches=[];
+    const unmatched=[];
+    const alreadyFull=[];
     const seen=new Set();
     rows.forEach(function(r){
-      const rf=resolveFitmentPn(r.sku); // reuses the same legacy/new-SKU resolver built for fitments
+      const rf=resolveFitmentPn(r.sku);
+      if(!rf.matched){unmatched.push(r.sku);return;}
       const asm=S.assemblies.find(function(a){return a.pn===rf.pn;});
       if(!asm||seen.has(asm.id))return;
       const needsDesc=!asm.description&&(r.title||r.body);
       const needsMsrp=(!asm.msrp||asm.msrp===0)&&r.price>0;
-      if(!needsDesc&&!needsMsrp)return;
+      if(!needsDesc&&!needsMsrp){alreadyFull.push(r.sku);return;}
       seen.add(asm.id);
-      matches.push({asm:asm,shopifyTitle:r.title,shopifyBody:r.body,shopifyPrice:r.price,needsDesc:needsDesc,needsMsrp:needsMsrp,matchedVia:rf.matched?(asm.pn===r.sku?'direct':'resolved from '+r.sku):'unmatched'});
+      matches.push({asm:asm,shopifyTitle:r.title,shopifyBody:r.body,shopifyPrice:r.price,needsDesc:needsDesc,needsMsrp:needsMsrp});
     });
     S._shopifyFillMatches=matches;
+    const unmatchedHtml=unmatched.length?('<div style="margin-top:14px;padding:10px 12px;background:rgba(220,38,38,.06);border:1px solid rgba(220,38,38,.2);border-radius:6px"><div style="font-size:11px;font-weight:700;color:var(--red);margin-bottom:4px">\u26a0 '+unmatched.length+' SKU(s) in the file don\'t match any assembly (checked both legacy PN and new SKU):</div><div style="font-size:10px;color:var(--text2);font-family:var(--mono)">'+unmatched.slice(0,30).map(escHtml).join(', ')+(unmatched.length>30?' \u2026 and '+(unmatched.length-30)+' more':'')+'</div></div>'):'';
     if(!matches.length){
-      if(prev)prev.innerHTML='<div style="font-size:12px;color:var(--text3);margin-top:10px">No blank fields could be filled \u2014 either nothing matched by SKU, or every matched assembly already has its description and MSRP.</div>';
+      if(prev)prev.innerHTML='<div style="font-size:12px;color:var(--text3);margin-top:10px">No blank fields to fill \u2014 '+(alreadyFull.length?alreadyFull.length+' matched assembl'+(alreadyFull.length!==1?'ies already have':'y already has')+' description and MSRP.':'nothing in this file matched an assembly.')+'</div>'+unmatchedHtml;
       return;
     }
     const rowsHtml=matches.map(function(m,i){
@@ -9100,6 +9094,7 @@ window.loadShopifyCSVFile=function(inputEl){
       +'<div style="font-size:12px;font-weight:700;margin-bottom:8px">'+matches.length+' assembl'+(matches.length!==1?'ies':'y')+' will be updated:</div>'
       +'<div style="max-height:280px;overflow-y:auto;border:1px solid var(--border);border-radius:6px">'+rowsHtml+'</div>'
       +'<button class="btn btn-teal" style="margin-top:12px" onclick="applyShopifyFill()">Apply '+matches.length+' Update'+(matches.length!==1?'s':'')+'</button>'
+      +unmatchedHtml
       +'</div>';
   };
   reader.onerror=function(){toast('Could not read file');};
@@ -16624,6 +16619,28 @@ function renderImport() {
     <div id="tracking-diag-result" style="display:none;margin-top:12px"></div>
   </div>
 
+
+  <div class="panel" style="border-left:4px solid var(--teal);margin-bottom:18px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+      <div style="font-size:22px">&#128230;</div>
+      <div>
+        <div style="font-size:14px;font-weight:700">Fill Assembly Data from Shopify</div>
+        <div class="t3s">Recover missing descriptions and MSRPs on assemblies by matching against your live Shopify catalog &mdash; resolves legacy PN or activated new SKU automatically. Only fills blank fields, never overwrites existing data.</div>
+      </div>
+    </div>
+    <div style="font-size:12px;color:var(--text2);margin-bottom:12px;line-height:1.9">
+      <b>Step 1:</b> Shopify Admin &rarr; Products &rarr; <b>Export</b> &rarr; All products &rarr; CSV for Excel<br>
+      <b>Step 2:</b> Choose that CSV file below and review the matches before applying.
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <label style="display:inline-flex;align-items:center;gap:8px;padding:8px 18px;background:var(--teal-dim);border:1px solid rgba(13,148,136,.3);border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;color:var(--teal)">
+        &#128196; Choose Shopify Product Export CSV
+        <input type="file" accept=".csv" id="shopify-import-file" style="display:none" onchange="loadShopifyCSVFile(this)">
+      </label>
+      <span class="t3s" id="shopify-csv-filename">No file selected yet</span>
+    </div>
+    <div id="shopify-fill-preview" style="margin-top:12px"></div>
+  </div>
 
   <div class="panel" style="border-left:4px solid var(--teal);margin-bottom:18px">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
