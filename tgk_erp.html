@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v15.4';
+const TGK_ERP_VERSION = 'v15.5';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -5447,8 +5447,32 @@ Deno.serve(async (req) => {
         console.log('[SS] ORDER_NOTIFY → On Hold:', resolvedNum)
       } else if (order.orderStatus === 'awaiting_shipment') {
         const ids = erpLines.filter((l: any) => l.fulfillment_status === 'On Hold').map((l: any) => l.id)
-        if (ids.length) await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', ids)
-        console.log('[SS] ORDER_NOTIFY → Released hold:', resolvedNum)
+        if (ids.length) {
+          // Split/drop-ship orders: ShipStation can report the OVERALL order as awaiting_shipment
+          // because one line is ready to move, even while ANOTHER line on the same order number is
+          // still genuinely on hold. Releasing here unconditionally caused those held lines to flip
+          // Open→On Hold→Open every time a webhook fired — a real, repeating transition that correctly
+          // triggered a real notification each time, which is why it looked like duplicate notifications
+          // but was actually the underlying data genuinely flip-flopping. Before releasing, confirm this
+          // specific order number is NOT still on ShipStation's own on-hold list.
+          let stillOnHold = false, checkSucceeded = false
+          try {
+            const checkRes = await fetch('https://ssapi.shipstation.com/orders?orderNumber=' + encodeURIComponent(rawNum) + '&orderStatus=on_hold&pageSize=10', { headers: { Authorization: 'Basic ' + ssAuth() } })
+            if (checkRes.ok) {
+              const checkData = await checkRes.json()
+              stillOnHold = (checkData.orders || []).some((o: any) => stripHash(o.orderNumber || '') === rawNum)
+              checkSucceeded = true
+            }
+          } catch (_e) { /* checkSucceeded stays false — handled below */ }
+          if (checkSucceeded && !stillOnHold) {
+            await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', ids)
+            console.log('[SS] ORDER_NOTIFY → Released hold:', resolvedNum)
+          } else if (!checkSucceeded) {
+            console.log('[SS] ORDER_NOTIFY → could not verify hold status for', resolvedNum, '— release skipped this time, hold_sync will catch it on the next pass if appropriate')
+          } else {
+            console.log('[SS] ORDER_NOTIFY → awaiting_shipment received for', resolvedNum, 'but order still has a held line on ShipStation — release skipped')
+          }
+        }
       }
     }
   }
