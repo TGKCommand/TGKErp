@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v13.6';
+const TGK_ERP_VERSION = 'v13.7';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -241,7 +241,7 @@ const S = {
   shipstation:{connected:false,key:'',secret:''},
   aiHistory:[{role:'assistant',text:'Hi — I\'m your TGK ERP assistant. Ask me about inventory levels, what needs reordering, BOM analysis, or pack planning.'}],
   aiLoading:false,
-  undoStack:[], backups:[], lastBackup:null, autoBackupTimer:null, autoRefreshTimer:null, lastActivity:Date.now(),
+  undoStack:[], backups:[], lastBackup:null, autoBackupTimer:null, autoRefreshTimer:null, autoHoldSyncTimer:null, lastActivity:Date.now(),
   backupTableOk:null, // null=unknown, true=exists, false=missing
   backupError:null,   // last error string if backup failed
   forecastWeeks:4,
@@ -4250,7 +4250,7 @@ async function checkEdgeFunctions(){
       try{return JSON.parse(txt).pong===true;}catch(e){return false;}
     }catch(e){return false;}
   };
-  S.fnStatus={shopify:await test('shopify-orders'),shipstation:await test('shipstation-ship'),holdSync:await test('shipstation-hold-sync'),deliverySync:await test('shipstation-delivery-sync')};
+  S.fnStatus={shopify:await test('shopify-orders'),shipstation:await test('shipstation-ship'),holdSync:await test('shipstation-ship'),deliverySync:await test('shipstation-delivery-sync')};
   const both=S.fnStatus.shopify&&S.fnStatus.shipstation;
   toast(both?'✓ Both edge functions are live!':'Check complete — see status below');
   render();
@@ -4350,7 +4350,7 @@ function renderIntegrations(){
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span style="font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.06em;font-size:9px">Integration status</span><button class="btn btn-sm" onclick="checkEdgeFunctions()">↻ Check Live Status</button></div>
       <div style="padding:3px 0">✓ Manual tracking entry on Ship — working</div>
       <div style="padding:3px 0">Shipping webhook (shipstation-ship): ${fnPill(S.fnStatus?.shipstation)}</div>
-      <div style="display:flex;align-items:center;gap:8px;padding:3px 0">Hold sync (shipstation-hold-sync): ${fnPill(S.fnStatus?.holdSync)} <span class="t3xs">every 5 min</span> <button class="btn btn-sm" onclick="runHoldSync&&runHoldSync()">▶ Run now</button></div>
+      <div style="display:flex;align-items:center;gap:8px;padding:3px 0">Hold sync (via shipstation-ship): ${fnPill(S.fnStatus?.holdSync)} <span class="t3xs">auto-runs every 5 min while the ERP is open</span> <button class="btn btn-sm" onclick="runHoldSync&&runHoldSync()">▶ Run now</button></div>
       <div style="display:flex;align-items:center;gap:8px;padding:3px 0">Delivery sync (shipstation-delivery-sync): ${fnPill(S.fnStatus?.deliverySync)} <span class="t3xs">every hour · auto-marks Delivered</span> <button class="btn btn-sm" onclick="runDeliverySync()">▶ Run now</button></div>
       <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
         <div style="font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">🔧 Diagnostics</div>
@@ -10672,6 +10672,30 @@ async function startAutoBackup() {
 
 function startAutoRefresh(){
   if(S.autoRefreshTimer)clearInterval(S.autoRefreshTimer);
+  if(S.autoHoldSyncTimer)clearInterval(S.autoHoldSyncTimer);
+  // Auto hold sync — Integrations has always claimed this runs "every 5 min", but no timer ever
+  // existed to actually do it; syncHoldsOnly()/runHoldSync() were click-only. Holds are time-
+  // sensitive (fraud flags, backorders, CS issues) so this runs independent of idle state.
+  S.autoHoldSyncTimer=setInterval(async()=>{
+    if(!S.currentUserId)return;
+    if(!(S.shopify?.store&&S.shopify?.key))return; // Shopify not configured — nothing to sync against
+    try{
+      const res=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+        body:JSON.stringify({action:'hold_sync'})
+      });
+      if(!res.ok)return; // silent — this is a background job, not a user-initiated action
+      const data=await res.json().catch(()=>({}));
+      const h=data.markedHold||0,o=data.markedOpen||0;
+      if(h+o>0){
+        await refreshSales();
+        const modalOpen=document.getElementById('modal-overlay')?.style.display!=='none';
+        if(!modalOpen)render();
+        toast('⏸ Auto hold sync — '+h+' on hold, '+o+' released',4000);
+      }
+    }catch(e){console.warn('[TGK] Auto hold sync failed:',e.message);}
+  },5*60*1000);
   const resetIdle=()=>S.lastActivity=Date.now();
   ['mousedown','keydown','touchstart','scroll'].forEach(e=>document.addEventListener(e,resetIdle,{passive:true}));
   const IDLE_MS=5*60*1000; // 5 min — background refresh trigger
