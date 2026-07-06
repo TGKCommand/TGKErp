@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v12.8';
+const TGK_ERP_VERSION = 'v13.0';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1659,6 +1659,16 @@ function renderParts(){
   </tbody></table></div>`;
 }
 
+function findEmptyAssemblyRecords(){
+  // Rows that have an activated new SKU but no data AND no duplicate counterpart row to merge from —
+  // these were never actually filled in, full stop. Distinct from findDuplicateAssemblyPairs(), which
+  // only catches cases where a SECOND physical row exists holding the real data.
+  const dupIds=new Set();
+  findDuplicateAssemblyPairs().forEach(function(pr){dupIds.add(pr.legacy.id);dupIds.add(pr.dup.id);});
+  return S.assemblies.filter(function(a){
+    return !a.discontinued&&!a.description&&!(a.msrp>0)&&!dupIds.has(a.id);
+  });
+}
 function findDuplicateAssemblyPairs(){
   // A duplicate pair = a "legacy" row with an activated new_sku, AND a separate row whose pn
   // literally equals that new_sku. Both display as the same SKU everywhere (dispPn resolves them
@@ -1734,6 +1744,8 @@ function renderAssemblies(){
     <button class="filter-chip ${sf.showDisc?'on-teal':''}" onclick="setFilter('asm','showDisc',${sf.showDisc?'false':'true'})">🗄 Discontinued (${S.assemblies.filter(a=>a.discontinued).length})</button>
     ${hasFilter?`<button class="btn btn-sm" style="color:var(--text3)" onclick="S.filters.asm={};S.searchQ='';render()">✕ Clear filters</button>`:''}
     ${_dupPairs.length?`<button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3);background:rgba(220,38,38,.05)" onclick="openDuplicateMergeReview()" title="These SKU pairs are showing merged for display only — the underlying duplicate database rows still exist and are double-counting stock/BOMs until merged">&#9888; ${_dupPairs.length} Duplicate SKU${_dupPairs.length!==1?'s':''} — Review &amp; Merge</button>`:''}
+    ${(function(){var _empty=findEmptyAssemblyRecords();return _empty.length?'<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3);background:rgba(234,88,12,.05)" onclick="openEmptyRecordsReview()" title="These rows have no duplicate counterpart to pull data from — they were never actually filled in and need real data typed or filled from Shopify">&#9998; '+_empty.length+' Empty Record'+(_empty.length!==1?'s':'')+' (No Duplicate — Needs Data)</button>':'';})()}
+    <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="openShopifyFillTool()" title="Import a Shopify product export CSV to fill in missing descriptions and MSRPs">&#128230; Fill from Shopify Export</button>
     <button class="btn btn-sm" style="margin-left:auto" onclick="openModal('manageCategories',{table:'assemblies'})">⚙ Categories</button>
     <button class="btn btn-sm" onclick="printAllBOMs()" title="Print all BOMs as PDF">🖨 All BOMs</button>
     <span class="filter-count">${list.length} assemblies</span>
@@ -8897,6 +8909,22 @@ async function confirmBulkDiscontinue(table){
   else toast('🗄 '+ids.length+' '+(ids.length===1?noun+'y':noun+(isParts?'s':'ies'))+' discontinued.',4000);
 }
 
+window.openEmptyRecordsReview=function(){
+  const empty=findEmptyAssemblyRecords();
+  if(!empty.length){toast('No empty records found');return;}
+  const rowsHtml=empty.map(function(a){
+    return '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border-bottom:1px solid var(--border)">'
+      +'<div><span class="pn" style="color:var(--teal);font-weight:700">'+escHtml(dispPn(a))+'</span>'
+      +(a.use_new_sku&&a.new_sku?'<span style="font-size:9px;color:var(--text3);margin-left:6px">(was '+escHtml(a.pn)+')</span>':'')
+      +'</div>'
+      +'<button class="btn btn-sm" onclick="closeModal();openModal(\'editAsm\',S.assemblies.find(function(x){return x.id===\''+a.id+'\';}))">Edit</button>'
+      +'</div>';
+  }).join('');
+  openModal('custom',{
+    title:'Empty Assembly Records ('+empty.length+')',
+    html:'<div style="font-size:12px;color:var(--text2);margin-bottom:12px">These SKUs have <b>no duplicate database row</b> to pull data from \u2014 unlike the merge-able duplicates, there\'s nothing to automatically consolidate here. They genuinely need a description, price, and bin typed in (or filled from your Shopify listing, since the new SKU is presumably already live there). Click Edit to fill one in, or use Bulk Edit Selected from the Assemblies list.</div>'+rowsHtml
+  });
+};
 window.openDuplicateMergeReview=function(){
   const pairs=findDuplicateAssemblyPairs();
   if(!pairs.length){toast('No duplicate SKUs found');return;}
@@ -8974,6 +9002,128 @@ window.mergeDuplicateAssemblyPair=async function(legacyId,dupId,btnEl){
     if(btnEl){btnEl.disabled=false;btnEl.textContent='Retry Merge';}
   }
 };
+function _parseShopifyCSV(text){
+  if(text.charCodeAt(0)===0xFEFF)text=text.slice(1);
+  const lines=text.split(/\r?\n/).filter(function(l){return l.trim();});
+  if(lines.length<2)return{rows:[],error:'CSV needs at least a header and one data row'};
+  function parseRow(line){
+    const cells=[];let field='';let inQ=false;let i=0;
+    while(i<line.length){
+      const ch=line[i];
+      if(inQ){
+        if(ch==='"'&&line[i+1]==='"'){field+='"';i+=2;}
+        else if(ch==='"'){inQ=false;i++;}
+        else{field+=ch;i++;}
+      }else{
+        if(ch==='"'){inQ=true;i++;}
+        else if(ch===','){cells.push(field);field='';i++;}
+        else{field+=ch;i++;}
+      }
+    }
+    cells.push(field);
+    return cells;
+  }
+  const hdr=parseRow(lines[0]).map(function(h){return h.replace(/^[\ufeff"']+|["']+$/g,'').trim();});
+  const idx=function(name){return hdr.indexOf(name);};
+  // Shopify's standard product export column names — stable across stores
+  const iSku=idx('Variant SKU')>=0?idx('Variant SKU'):idx('SKU');
+  const iTitle=idx('Title');
+  const iBody=idx('Body (HTML)');
+  const iPrice=idx('Variant Price')>=0?idx('Variant Price'):idx('Price');
+  const iHandle=idx('Handle');
+  if(iSku<0)return{rows:[],error:'"Variant SKU" column not found. This doesn\'t look like a Shopify product export. Headers found: '+hdr.slice(0,10).join(', ')+(hdr.length>10?'…':'')};
+  if(iTitle<0&&iBody<0)return{rows:[],error:'Neither "Title" nor "Body (HTML)" column found — nothing to import as a description.'};
+  const rows=[];
+  for(let i=1;i<lines.length;i++){
+    const cells=parseRow(lines[i]);
+    const sku=(cells[iSku]||'').trim();
+    if(!sku)continue; // Shopify repeats product rows per-variant/image with blank SKU on continuation rows
+    const title=(iTitle>=0?(cells[iTitle]||''):'').trim();
+    const bodyRaw=(iBody>=0?(cells[iBody]||''):'').trim();
+    const body=bodyRaw.replace(/<[^>]+>/g,' ').replace(/&nbsp;/g,' ').replace(/\s+/g,' ').trim(); // strip HTML for a plain-text description
+    const price=iPrice>=0?parseFloat(cells[iPrice]):null;
+    const handle=(iHandle>=0?(cells[iHandle]||''):'').trim();
+    rows.push({sku:sku,title:title,body:body,price:(price>0?price:null),handle:handle});
+  }
+  return{rows:rows,error:null};
+}
+window.openShopifyFillTool=function(){
+  openModal('custom',{
+    title:'Fill from Shopify Export',
+    html:'<div style="font-size:12px;color:var(--text2);margin-bottom:12px">Upload your Shopify product export CSV (Products &rarr; Export &rarr; All products &rarr; CSV). Matches by SKU (resolves legacy PN or activated new SKU automatically) and fills ONLY blank descriptions and $0 MSRPs \u2014 it never overwrites data that already exists, so this is safe to run any time.</div>'
+      +'<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">'
+      +'<input type="file" id="shopify-csv-file" accept=".csv,text/csv" style="display:none" onchange="loadShopifyCSVFile(this)">'
+      +'<button class="btn btn-teal btn-sm" onclick="document.getElementById(\'shopify-csv-file\').click()">&#128193; Upload Shopify Export CSV</button>'
+      +'<span id="shopify-csv-filename" style="font-size:11px;color:var(--text3)"></span>'
+      +'</div>'
+      +'<div id="shopify-fill-preview"></div>'
+  });
+};
+window.loadShopifyCSVFile=function(inputEl){
+  const file=inputEl.files&&inputEl.files[0];
+  if(!file)return;
+  const reader=new FileReader();
+  reader.onload=function(e){
+    const fn=document.getElementById('shopify-csv-filename');
+    if(fn)fn.textContent='\u2713 '+file.name+' ('+Math.round(file.size/1024)+' KB)';
+    const{rows,error}=_parseShopifyCSV(e.target.result);
+    const prev=document.getElementById('shopify-fill-preview');
+    if(error){if(prev)prev.innerHTML='<div style="color:var(--red);font-size:12px;margin-top:10px">'+escHtml(error)+'</div>';return;}
+    // Match each Shopify row to an assembly (resolving legacy/new SKU), find what's actually blank
+    const matches=[];
+    const seen=new Set();
+    rows.forEach(function(r){
+      const rf=resolveFitmentPn(r.sku); // reuses the same legacy/new-SKU resolver built for fitments
+      const asm=S.assemblies.find(function(a){return a.pn===rf.pn;});
+      if(!asm||seen.has(asm.id))return;
+      const needsDesc=!asm.description&&(r.title||r.body);
+      const needsMsrp=(!asm.msrp||asm.msrp===0)&&r.price>0;
+      if(!needsDesc&&!needsMsrp)return;
+      seen.add(asm.id);
+      matches.push({asm:asm,shopifyTitle:r.title,shopifyBody:r.body,shopifyPrice:r.price,needsDesc:needsDesc,needsMsrp:needsMsrp,matchedVia:rf.matched?(asm.pn===r.sku?'direct':'resolved from '+r.sku):'unmatched'});
+    });
+    S._shopifyFillMatches=matches;
+    if(!matches.length){
+      if(prev)prev.innerHTML='<div style="font-size:12px;color:var(--text3);margin-top:10px">No blank fields could be filled \u2014 either nothing matched by SKU, or every matched assembly already has its description and MSRP.</div>';
+      return;
+    }
+    const rowsHtml=matches.map(function(m,i){
+      const newDesc=m.shopifyTitle||m.shopifyBody||'';
+      return '<div style="display:flex;align-items:center;gap:10px;padding:6px 8px;border-bottom:1px solid var(--border);font-size:11px">'
+        +'<div style="width:90px;flex-shrink:0"><span class="pn" style="color:var(--teal);font-weight:700">'+escHtml(dispPn(m.asm))+'</span></div>'
+        +'<div style="flex:1;overflow:hidden">'
+        +(m.needsDesc?('<div>Description &rarr; <span style="color:var(--teal)">'+escHtml(newDesc.slice(0,80))+(newDesc.length>80?'…':'')+'</span></div>'):'')
+        +(m.needsMsrp?('<div>MSRP &rarr; <span style="color:var(--teal)">'+fc(m.shopifyPrice)+'</span></div>'):'')
+        +'</div></div>';
+    }).join('');
+    if(prev)prev.innerHTML='<div style="margin-top:12px">'
+      +'<div style="font-size:12px;font-weight:700;margin-bottom:8px">'+matches.length+' assembl'+(matches.length!==1?'ies':'y')+' will be updated:</div>'
+      +'<div style="max-height:280px;overflow-y:auto;border:1px solid var(--border);border-radius:6px">'+rowsHtml+'</div>'
+      +'<button class="btn btn-teal" style="margin-top:12px" onclick="applyShopifyFill()">Apply '+matches.length+' Update'+(matches.length!==1?'s':'')+'</button>'
+      +'</div>';
+  };
+  reader.onerror=function(){toast('Could not read file');};
+  reader.readAsText(file);
+  inputEl.value='';
+};
+window.applyShopifyFill=async function(){
+  const matches=S._shopifyFillMatches||[];
+  if(!matches.length)return;
+  let ok=0,failed=0;
+  for(const m of matches){
+    const payload={};
+    if(m.needsDesc)payload.description=(m.shopifyTitle||m.shopifyBody||'').slice(0,500);
+    if(m.needsMsrp)payload.msrp=m.shopifyPrice;
+    payload.updated_at=new Date().toISOString();
+    const{error}=await db.from('assemblies').update(payload).eq('id',m.asm.id);
+    if(error){failed++;console.error('[TGK] Shopify fill failed for',m.asm.pn,error.message);}
+    else{ok++;S.assemblies=S.assemblies.map(function(a){return a.id===m.asm.id?Object.assign({},a,payload):a;});}
+  }
+  logAction('Filled '+ok+' assembly record(s) from Shopify export','assemblies',null,null,null).catch(function(){});
+  toast('\u2713 Updated '+ok+' assembl'+(ok!==1?'ies':'y')+(failed?' ('+failed+' failed)':''),6000);
+  S._shopifyFillMatches=null;
+  closeModal();render();
+};
 window.startBulkEdit=async function(table){
   // Always enter bulk edit with FRESH rows from the DB — protects against any stale/partial
   // in-memory state rendering blank fields, which could then be saved over good data.
@@ -9034,9 +9184,10 @@ function renderBulkEdit(table){
       const _pfOn=!a.description&&_desc; // prefill active — tint the fields
       const _pfStyle=_pfOn?';border-color:var(--orange);background:rgba(234,88,12,.05)':'';
       const _pfTitle=_pfOn?('title="Suggested from '+(_sib?'assembly '+escHtml(_sib.pn):'parts record '+escHtml(_pf.pn))+' \u2014 will be saved on Save All"'):'';
+      const _noSource=!a.description&&!_desc; // genuinely empty — no sibling, no parts match, nothing to suggest
       return`<tr data-id="${a.id}">
       <td class="pn" style="color:var(--teal);font-weight:700;white-space:nowrap">${dispPn(a)}${a.use_new_sku&&a.new_sku?`<div style="font-size:9px;color:var(--text3);font-weight:400">${a.pn}</div>`:''}</td>
-      <td><input class="inline-edit be-desc" data-id="${a.id}" value="${escHtml(_desc)}" style="width:100%;min-width:150px${_pfStyle}" ${_pfTitle}></td>
+      <td><input class="inline-edit be-desc" data-id="${a.id}" value="${escHtml(_desc)}" style="width:100%;min-width:150px${_pfStyle}" ${_pfTitle} placeholder="${_noSource?'No data source found \u2014 type manually':''}"></td>
       <td><select class="form-input be-cat" data-id="${a.id}" style="min-width:110px">${catSel}</select></td>
       <td><input class="inline-edit be-msrp" data-id="${a.id}" type="number" step="0.01" value="${_msrp}" style="width:80px${(_pfOn&&_msrp>0&&!(a.msrp>0))?_pfStyle:''}"></td>
       <td><input class="inline-edit be-ship" data-id="${a.id}" type="number" step="0.01" value="${_ship}" style="width:70px"></td>
