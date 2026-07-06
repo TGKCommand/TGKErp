@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v13.1';
+const TGK_ERP_VERSION = 'v13.2';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -9004,28 +9004,37 @@ window.mergeDuplicateAssemblyPair=async function(legacyId,dupId,btnEl){
     if(btnEl){btnEl.disabled=false;btnEl.textContent='Retry Merge';}
   }
 };
+function _tokenizeCSV(text,delim){
+  // Full-file tokenizer that tracks quote state across the ENTIRE text, not line by line.
+  // This matters because export tools (Shopify's Body (HTML), Convermax's Notes) can contain
+  // literal newlines inside a quoted field — splitting on \n before parsing quotes would chop
+  // that single logical row into fragments and misalign every column after it.
+  delim=delim||',';
+  const rows=[];
+  let row=[],field='',inQ=false,i=0;
+  const n=text.length;
+  while(i<n){
+    const ch=text[i];
+    if(inQ){
+      if(ch==='"'&&text[i+1]==='"'){field+='"';i+=2;}
+      else if(ch==='"'){inQ=false;i++;}
+      else{field+=ch;i++;} // includes literal \n / \r inside quotes — that's correct, it's part of the field
+    }else{
+      if(ch==='"'){inQ=true;i++;}
+      else if(ch===delim){row.push(field);field='';i++;}
+      else if(ch==='\r'){i++;} // ignore bare CR, \r\n handled by the \n branch below
+      else if(ch==='\n'){row.push(field);rows.push(row);row=[];field='';i++;}
+      else{field+=ch;i++;}
+    }
+  }
+  if(field!==''||row.length>0){row.push(field);rows.push(row);} // final row with no trailing newline
+  return rows.filter(function(r){return r.length>1||(r.length===1&&r[0].trim()!=='');}); // drop stray blank lines
+}
 function _parseShopifyCSV(text){
   if(text.charCodeAt(0)===0xFEFF)text=text.slice(1);
-  const lines=text.split(/\r?\n/).filter(function(l){return l.trim();});
-  if(lines.length<2)return{rows:[],error:'CSV needs at least a header and one data row'};
-  function parseRow(line){
-    const cells=[];let field='';let inQ=false;let i=0;
-    while(i<line.length){
-      const ch=line[i];
-      if(inQ){
-        if(ch==='"'&&line[i+1]==='"'){field+='"';i+=2;}
-        else if(ch==='"'){inQ=false;i++;}
-        else{field+=ch;i++;}
-      }else{
-        if(ch==='"'){inQ=true;i++;}
-        else if(ch===','){cells.push(field);field='';i++;}
-        else{field+=ch;i++;}
-      }
-    }
-    cells.push(field);
-    return cells;
-  }
-  const hdr=parseRow(lines[0]).map(function(h){return h.replace(/^[\ufeff"']+|["']+$/g,'').trim();});
+  const allRows=_tokenizeCSV(text);
+  if(allRows.length<2)return{rows:[],error:'CSV needs at least a header and one data row'};
+  const hdr=allRows[0].map(function(h){return h.replace(/^[\ufeff"']+|["']+$/g,'').trim();});
   const idx=function(name){return hdr.indexOf(name);};
   // Shopify's standard product export column names — stable across stores
   const iSku=idx('Variant SKU')>=0?idx('Variant SKU'):idx('SKU');
@@ -9036,13 +9045,13 @@ function _parseShopifyCSV(text){
   if(iSku<0)return{rows:[],error:'"Variant SKU" column not found. This doesn\'t look like a Shopify product export. Headers found: '+hdr.slice(0,10).join(', ')+(hdr.length>10?'…':'')};
   if(iTitle<0&&iBody<0)return{rows:[],error:'Neither "Title" nor "Body (HTML)" column found — nothing to import as a description.'};
   const rows=[];
-  for(let i=1;i<lines.length;i++){
-    const cells=parseRow(lines[i]);
+  for(let i=1;i<allRows.length;i++){
+    const cells=allRows[i];
     const sku=(cells[iSku]||'').trim();
     if(!sku)continue; // Shopify repeats product rows per-variant/image with blank SKU on continuation rows
     const title=(iTitle>=0?(cells[iTitle]||''):'').trim();
     const bodyRaw=(iBody>=0?(cells[iBody]||''):'').trim();
-    const body=bodyRaw.replace(/<[^>]+>/g,' ').replace(/&nbsp;/g,' ').replace(/\s+/g,' ').trim(); // strip HTML for a plain-text description
+    const body=bodyRaw.replace(/<[^>]+>/g,' ').replace(/&nbsp;/g,' ').replace(/\s+/g,' ').trim(); // strip HTML + collapse any embedded newlines for a clean plain-text description
     const price=iPrice>=0?parseFloat(cells[iPrice]):null;
     const handle=(iHandle>=0?(cells[iHandle]||''):'').trim();
     rows.push({sku:sku,title:title,body:body,price:(price>0?price:null),handle:handle});
@@ -17311,31 +17320,17 @@ window.loadFitmentCSVFile=function(inputEl){
 function _parseFitCSV(text) {
   if(text.charCodeAt(0)===0xFEFF)text=text.slice(1);
 
-  const lines=text.split(/\r?\n/).filter(l=>l.trim());
-  if(lines.length<2)return{rows:[],error:'CSV needs at least a header and one data row'};
+  // Sniff the delimiter from the raw first line before full tokenizing (cheap and safe — headers
+  // never contain quoted commas/semicolons/tabs in practice).
+  const firstLineRaw=text.split(/\r?\n/,1)[0]||'';
+  const delim=firstLineRaw.includes('\t')?'\t':firstLineRaw.includes(';')?';':',';
 
-  const firstLine=lines[0];
-  const delim=firstLine.includes('\t')?'\t':firstLine.includes(';')?';':',';
+  // Full-file tokenize using the shared parser — handles quoted fields containing literal
+  // newlines (e.g. a multi-line Notes field), which a naive line-split would corrupt.
+  const allRows=_tokenizeCSV(text,delim).map(function(r){return r.map(function(c){return c.trim();});});
+  if(allRows.length<2)return{rows:[],error:'CSV needs at least a header and one data row'};
 
-  function parseRow(line){
-    const cells=[];let field='';let inQ=false;let i=0;
-    while(i<line.length){
-      const ch=line[i];
-      if(inQ){
-        if(ch==='"'&&line[i+1]==='"'){field+='"';i+=2;}
-        else if(ch==='"'){inQ=false;i++;}
-        else{field+=ch;i++;}
-      }else{
-        if(ch==='"'){inQ=true;i++;}
-        else if(ch===delim){cells.push(field.trim());field='';i++;}
-        else{field+=ch;i++;}
-      }
-    }
-    cells.push(field.trim());
-    return cells;
-  }
-
-  const hdr=parseRow(firstLine).map(h=>h.replace(/^["']|["']$/g,'').toLowerCase().trim());
+  const hdr=allRows[0].map(h=>h.replace(/^["']|["']$/g,'').toLowerCase().trim());
   const col=name=>{
     const aliases={
       pn:['part number','partnumber','part#','partno','sku','part_number','part no','part no.','pn','item number','item#','item no','product sku','product number'],
@@ -17360,8 +17355,8 @@ function _parseFitCSV(text) {
   if(iMake<0||iModel<0)return{rows:[],error:'Make and/or Model column not found. Headers found: '+hdr.join(', ')};
 
   const raw=[];
-  for(let i=1;i<lines.length;i++){
-    const cells=parseRow(lines[i]);
+  for(let i=1;i<allRows.length;i++){
+    const cells=allRows[i];
     const pn=(cells[iPN]||'').trim();
     if(!pn)continue;
     const make=(cells[iMake]||'').trim()||null;
