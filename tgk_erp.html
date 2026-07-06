@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v15.5';
+const TGK_ERP_VERSION = 'v15.6';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -483,12 +483,7 @@ function countPendingOrders(){
   });
   let count=0;
   Object.values(byOrd).forEach(lines=>{
-    const rank={'Shipped':5,'Delivered':4,'Packed':3,'On Hold':2,'Partial':2,'Open':1,'Cancelled':0,'Refunded':0};
-    const shipped=lines.filter(l=>l.fulfillment_status==='Shipped'||l.fulfillment_status==='Delivered');
-    const pending=lines.filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
-    const allOnHold=pending.length>0&&pending.every(l=>l.fulfillment_status==='On Hold');
-    const eff=allOnHold?'On Hold':shipped.length>0&&pending.length>0&&!allOnHold?'Partial':
-      lines.reduce((b,x)=>(rank[x.fulfillment_status||'Open']||0)>(rank[b]||0)?x.fulfillment_status:b,lines[0].fulfillment_status||'Open');
+    const{status:eff}=computeEffectiveOrderStatus(lines);
     if(eff==='Partial'){count++;return;}
     if(eff==='Open'){
       const date=lines.reduce((e,s)=>{const d=s.sale_date||'';return d&&(!e||d<e)?d:e;},'');
@@ -498,7 +493,6 @@ function countPendingOrders(){
   return count;
 }
 function countGroupedStatus(status){
-  const rank={'Shipped':5,'Delivered':4,'Packed':3,'On Hold':2,'Partial':2,'Open':1,'Cancelled':0,'Refunded':0};
   const byOrder={};
   S.sales.forEach(s=>{
     if(isInternal(s.order_number))return;
@@ -508,13 +502,7 @@ function countGroupedStatus(status){
   });
   return Object.values(byOrder).filter(lines=>{
     if(lines.length===1)return(lines[0].fulfillment_status||'Open')===status;
-    const shippedLines=lines.filter(l=>l.fulfillment_status==='Shipped'||l.fulfillment_status==='Delivered');
-    const pendingLines=lines.filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
-    const allPendingOnHold=pendingLines.length>0&&pendingLines.every(l=>l.fulfillment_status==='On Hold');
-    const effectiveStatus=allPendingOnHold?'On Hold':
-      shippedLines.length>0&&pendingLines.length>0&&!allPendingOnHold?'Partial':
-      lines.reduce((best,x)=>(rank[x.fulfillment_status||'Open']||0)>(rank[best]||0)?x.fulfillment_status:best,lines[0].fulfillment_status||'Open');
-    return effectiveStatus===status;
+    return computeEffectiveOrderStatus(lines).status===status;
   }).length;
 }
 
@@ -1353,9 +1341,7 @@ function renderDashboard(){
       if(!grp.date||grp.date>=daysAgo(60))return;
       const pending=grp.lines.filter(function(l){return!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open');});
       if(pending.length===0)return;
-      const shipped=grp.lines.filter(function(l){return l.fulfillment_status==='Shipped'||l.fulfillment_status==='Delivered';});
-      const allOnHold=pending.every(function(l){return l.fulfillment_status==='On Hold';});
-      const eff=allOnHold?'On Hold':shipped.length>0?'Partial':'Open';
+      const{status:eff}=computeEffectiveOrderStatus(grp.lines);
       if(eff==='Open')nums.add(k);
     });
     return nums;
@@ -2278,11 +2264,7 @@ function renderSales(){
         if(lines.length===1)return lines[0];
         const lead=lines.reduce((a,b)=>(rank[b.fulfillment_status||'Open']||0)>(rank[a.fulfillment_status||'Open']||0)?b:a,lines[0]);
         const totalQty=lines.reduce((t,s)=>t+(s.qty||1),0);
-        const shippedLines=lines.filter(l=>l.fulfillment_status==='Shipped'||l.fulfillment_status==='Delivered');
-        const pendingLines=lines.filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
-        const allPendingOnHold=pendingLines.length>0&&pendingLines.every(l=>l.fulfillment_status==='On Hold');
-        const isPartial=shippedLines.length>0&&pendingLines.length>0&&!allPendingOnHold;
-        const effectiveStatus=allPendingOnHold?'On Hold':isPartial?'Partial':lead.fulfillment_status;
+        const{status:effectiveStatus,shipped:shippedLines,pending:pendingLines,allPendingOnHold,isPartial}=computeEffectiveOrderStatus(lines);
         const orderDate=lines.reduce((earliest,s)=>{const d=s.sale_date||s.created_at?.slice(0,10)||'';return d&&(!earliest||d<earliest)?d:earliest;},'');
         const orderTs=lines.reduce((latest,s)=>{const d=s.sale_date||s.created_at?.slice(0,10)||'';if(d===orderDate){const ts=s.created_at||'';return ts>latest?ts:latest;}return latest;},'');
         return{...lead,_grouped:true,_lineCount:lines.length,_allLines:lines,qty:totalQty,pn:'Multiple',
@@ -17969,6 +17951,22 @@ function isUserActivelyWorking(){
   // refresh normally. This protects against workflows added later that forget to update this list.
   if(S.lastActivity&&(Date.now()-S.lastActivity)<2*60*1000)return true;
   return false;
+}
+function computeEffectiveOrderStatus(lines){
+  // Single source of truth for "what status should a multi-line (split) order show as." This used to
+  // be reimplemented inline in four separate places across the file — the KPI counters, the report
+  // grouping, the dashboard's stale-order widget, and the main Sales Orders list — each written
+  // slightly differently. They mostly agreed on the easy cases but that kind of duplication is exactly
+  // how a real order (one line shipped, one line genuinely on hold) can show different aggregate
+  // statuses in different parts of the app depending purely on which copy of the logic rendered it.
+  const rank={'Shipped':5,'Delivered':4,'Packed':3,'On Hold':2,'Partial':2,'Open':1,'Cancelled':0,'Refunded':0};
+  const shipped=lines.filter(l=>l.fulfillment_status==='Shipped'||l.fulfillment_status==='Delivered');
+  const pending=lines.filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
+  const allPendingOnHold=pending.length>0&&pending.every(l=>l.fulfillment_status==='On Hold');
+  const isPartial=shipped.length>0&&pending.length>0&&!allPendingOnHold;
+  const status=allPendingOnHold?'On Hold':isPartial?'Partial':
+    lines.reduce((best,x)=>(rank[x.fulfillment_status||'Open']||0)>(rank[best]||0)?x.fulfillment_status:best,lines[0].fulfillment_status||'Open');
+  return{status,shipped,pending,allPendingOnHold,isPartial};
 }
 function scheduleRender(){
   if(_renderPending)return;
