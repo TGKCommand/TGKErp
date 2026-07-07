@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v15.6';
+const TGK_ERP_VERSION = 'v15.7';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1067,6 +1067,21 @@ function trackingUrl(carrier, tracking){
   if(c.includes('ONTRAC'))return'https://www.ontrac.com/tracking/?number='+t;
   if(c.includes('LSO'))return'https://www.lso.com/go/track?tracking_id='+t;
   return'https://track.aftership.com/'+encodeURIComponent(tracking);
+}
+function cascadeShopifySync(childPn){
+  // Buildability is a DERIVED property — assembly B's max-buildable depends on component stock that
+  // assembly A's packing can silently deplete. syncShopifyTemplate() only ever fires for whichever SKU
+  // was directly acted on, so if a shared component runs out because of unrelated activity, every OTHER
+  // assembly that also depends on it can sit at Max Buildable: 0 with Shopify never being told. Whenever
+  // a part's stock changes for any reason, walk every assembly's BOM, find the ones using this part,
+  // and re-check backorder status for any of them that are already sitting at zero on-hand.
+  if(!childPn)return;
+  Object.entries(S.boms||{}).forEach(([parentPn,lines])=>{
+    if(!lines.some(l=>l.child_pn===childPn))return;
+    const parent=S.assemblies.find(a=>a.pn===parentPn);
+    if(!parent)return;
+    if((parent.total_on_hand||0)<=0)syncShopifyTemplate(parentPn,parent.total_on_hand||0);
+  });
 }
 function syncShopifyTemplate(pn,newOh){
   if(!pn||!S.shopify||!S.shopify.store)return; // key now lives in edge function secrets
@@ -11632,7 +11647,7 @@ function assemblyDossier(pn){
       ${recentSales.length===0?'<div class="section-empty">No sales history</div>':`<table><tbody>
       ${recentSales.map(s=>`<tr><td style="font-size:10px;font-family:var(--mono);color:var(--text3)">${(s.sale_date||'').slice(0,10)}</td>
       <td class="pn">${s.order_number||''}</td><td class="money-neutral">×${s.qty||1}</td>
-      <td><span class="pill ${s.fulfillment_status==='Shipped'?'pill-teal':s.fulfillment_status==='Delivered'?'pill-green':'pill-yellow'}" style="font-size:9px">${s.fulfillment_status||'Open'}</span></td></tr>`).join('')}</tbody></table>`}
+      <td><span class="pill ${s.fulfillment_status==='Shipped'?'pill-teal':s.fulfillment_status==='Delivered'?'pill-green':s.fulfillment_status==='On Hold'?'pill-red':s.fulfillment_status==='Partial'?'pill-orange':s.fulfillment_status==='Cancelled'||s.fulfillment_status==='Refunded'?'pill-muted':'pill-yellow'}" style="font-size:9px">${s.fulfillment_status||'Open'}</span></td></tr>`).join('')}</tbody></table>`}
     </div>
     ${(()=>{
       const asmOpenLines=[];
@@ -13858,6 +13873,7 @@ async function submitCustomPackList(){
           S.assemblies=S.assemblies.map(x=>x.pn===item.child_pn?{...x,total_on_hand:newOh}:x);
           liveAsmMap[item.child_pn]={...sa,total_on_hand:newOh}; // keep running balance (mirrors partMap update for parts)
           await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:sa.total_on_hand||0,new_qty:newOh,adjustment:delta,reason:'Custom Pack '+qty+'x'+pn+' (sub)',user_email:S.currentUser||null,source:'pack'});
+          cascadeShopifySync(item.child_pn);
         }else{
           const p=partMap[item.child_pn];if(!p)continue;
           const newQty=(p.total_unpckgd||0)+delta;
@@ -13866,6 +13882,7 @@ async function submitCustomPackList(){
           S.parts=S.parts.map(x=>x.pn===item.child_pn?{...x,total_unpckgd:newQty}:x);
           partMap[item.child_pn]={...partMap[item.child_pn],total_unpckgd:newQty};
           await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:delta,reason:'Custom Pack '+qty+'x'+pn,user_email:S.currentUser||null,source:'pack'});
+          cascadeShopifySync(item.child_pn);
         }
       }
     }
@@ -14455,6 +14472,7 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
         S.assemblies=S.assemblies.map(x=>x.pn===item.child_pn?{...x,total_on_hand:newOhS}:x);
         asmMap[item.child_pn]={...sa,total_on_hand:newOhS}; // keep running balance (mirrors liveAsmMap fix)
         await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:sa.total_on_hand||0,new_qty:newOhS,adjustment:delta,reason:(isUnpack?'Unpack':'Pack')+' '+qty+'\u00d7'+pn+' (subassembly)',user_email:S.currentUser||null,source:isUnpack?'unpack':'pack'});
+        cascadeShopifySync(item.child_pn);
       } else {
         const p=partMap[item.child_pn];
         if(!p) continue;
@@ -14464,6 +14482,7 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
         S.parts=S.parts.map(x=>x.pn===item.child_pn?{...x,total_unpckgd:newQty}:x);
         partMap[item.child_pn]={...partMap[item.child_pn],total_unpckgd:newQty}; // keep running balance
         await db.from('inv_corrections').insert({pn:item.child_pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:delta,reason:(isUnpack?'Unpack':'Pack')+' '+qty+'\u00d7'+pn,user_email:S.currentUser||null,source:isUnpack?'unpack':'pack'});
+        cascadeShopifySync(item.child_pn);
       }
     }
   }
@@ -14747,6 +14766,7 @@ async function applySpotCount(){
     const histEl=document.getElementById('spot-history');
     if(histEl){histEl.innerHTML=`<div class="panel" style="padding:10px 14px;border-left:3px solid ${adj===0?'var(--teal)':adj>0?'var(--green)':'var(--red)'}"><div style="font-size:12px;font-weight:600">${escHtml(p.pn||"")} — ${adj===0?'No change':adj>0?'+'+adj+' added':adj+' removed'}</div><div class="t3s">${prev} → ${newQty} · ${escHtml(reason||"")}</div></div>`;}
     toast(p.pn+': '+prev+' → '+newQty+(adj===0?' (no change)':(adj>0?' (+'+adj+')':' ('+adj+')')));
+    cascadeShopifySync(p.pn);
   } else {
     const prev=a.total_on_hand||0;
     const adj=newQty-prev;
@@ -14893,6 +14913,7 @@ async function applyWalkCount(){
       if(error){errors++;continue;}
       S.parts=S.parts.map(x=>x.pn===item.pn?{...x,total_unpckgd:item.counted}:x);
       await db.from('inv_corrections').insert({pn:item.pn,previous_qty:item.exp,new_qty:item.counted,adjustment:item.counted-item.exp,reason:'Walk Count',user_email:S.currentUser||null,source:'walk_count'});
+      cascadeShopifySync(item.pn);
       applied++;
     }
     applied++;
@@ -15146,6 +15167,7 @@ async function applyCountCorrections(countId) {
       S.parts=S.parts.map(p=>p.pn===line.pn?{...p,total_unpckgd:newQty}:p);
       await db.from('inv_corrections').insert({pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count '+(line.notes?'— '+line.notes:''),user_email:S.currentUser||null,source:'cycle_count',reference_id:countId});
       S.corrections=[{pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count',source:'cycle_count',created_at:new Date().toISOString()},...S.corrections];
+      cascadeShopifySync(line.pn);
     }
   }
   await db.from('cycle_counts').update({status:'Complete',completed_at:new Date().toISOString()}).eq('id',countId);
