@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v17.7';
+const TGK_ERP_VERSION = 'v17.8';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -5841,7 +5841,12 @@ async function loadInvBackorderLog(){
         data=(res.data||[]).filter(function(r){
           if(seen.has(r.pn))return false; // keep only the first (=latest, since sorted desc) row per SKU
           seen.add(r.pn);
-          return r.action==='backorder';
+          if(r.action!=='backorder')return false;
+          // A PN with no current match is almost always a stale entry left behind by a SKU rename
+          // that happened before rename-propagation into this log existed — it no longer corresponds
+          // to anything real, so it can't be trusted as a genuine "currently backordered" item.
+          var stillExists=S.assemblies.some(function(a){return a.pn===r.pn;})||S.parts.some(function(p){return p.pn===r.pn;});
+          return stillExists;
         });
       }
     }else{
@@ -5856,7 +5861,11 @@ async function loadInvBackorderLog(){
       return;
     }
     var rows=data.filter(function(r){
-      if(search&&!(r.pn||'').toLowerCase().includes(search))return false;
+      if(search){
+        var _sItem=S.assemblies.find(function(a){return a.pn===r.pn;})||S.parts.find(function(p){return p.pn===r.pn;});
+        var _searchable=(r.pn||'')+' '+(_sItem?dispPn(_sItem):'')+' '+(_sItem&&_sItem.new_sku?_sItem.new_sku:'');
+        if(!_searchable.toLowerCase().includes(search))return false;
+      }
       var item=S.assemblies.find(function(a){return a.pn===r.pn;})||S.parts.find(function(p){return p.pn===r.pn;});
       if(item&&!eligibleForBackorderSync(item))return false; // ineligible items (retired, dev, subassembly, hardware pack, pre-order) shouldn't clutter a log about active finished-goods inventory
       return true;
@@ -5889,8 +5898,10 @@ async function loadInvBackorderLog(){
       var rd=r.restock_date?escHtml(r.restock_date):'—';
       var user=r.user_email?(r.user_email.split('@')[0]):'auto';
       var ts=r.created_at?new Date(r.created_at).toLocaleString():'—';
+      var _item=S.assemblies.find(function(a){return a.pn===r.pn;})||S.parts.find(function(p){return p.pn===r.pn;});
+      var _skuDisp=_item?dispPn(_item):r.pn;
       html+='<tr style="border-bottom:1px solid var(--border);transition:background .1s" onmouseover="this.style.background=\'var(--bg2)\'" onmouseout="this.style.background=\'\'">'
-        +'<td style="padding:7px 10px;font-family:var(--mono);font-size:11px;font-weight:600;color:var(--teal)">'+escHtml(r.pn||'')+'</td>'
+        +'<td style="padding:7px 10px;font-family:var(--mono);font-size:11px;font-weight:600;color:var(--teal)">'+escHtml(_skuDisp||'')+'</td>'
         +'<td style="padding:7px 10px">'+badge+'</td>'
         +'<td style="padding:7px 10px;font-size:11px;color:var(--text2)">'+src+'</td>'
         +'<td style="padding:7px 10px;font-size:11px;color:var(--text2);text-align:center">'+oh+'</td>'
@@ -9092,6 +9103,7 @@ async function submitPart(eid){
       if(conflict){toast(newPn+' already exists — choose a different SKU');return;}
       await db.from('bom_items').update({child_pn:newPn}).eq('child_pn',oldPn);
       await db.from('inv_corrections').update({pn:newPn}).eq('pn',oldPn);
+      await db.from('shopify_sync_log').update({pn:newPn}).eq('pn',oldPn);
       Object.values(S.boms).forEach(lines=>lines.forEach(l=>{if(l.child_pn===oldPn)l.child_pn=newPn;}));
       S.corrections=S.corrections.map(c=>c.pn===oldPn?{...c,pn:newPn}:c);
     }
@@ -10219,6 +10231,7 @@ async function submitAsm(eid){
       await db.from('bom_items').update({child_pn:newPn}).eq('child_pn',oldPn);
       await db.from('bom_items').update({parent_pn:newPn}).eq('parent_pn',oldPn);
       await db.from('inv_corrections').update({pn:newPn}).eq('pn',oldPn);
+      await db.from('shopify_sync_log').update({pn:newPn}).eq('pn',oldPn);
       Object.values(S.boms).forEach(lines=>lines.forEach(l=>{if(l.child_pn===oldPn)l.child_pn=newPn;}));
       if(S.boms[oldPn]){S.boms[newPn]=S.boms[oldPn];delete S.boms[oldPn];}
       if(S.selBOM===oldPn)S.selBOM=newPn;
