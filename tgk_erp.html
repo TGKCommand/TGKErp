@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v16.6';
+const TGK_ERP_VERSION = 'v16.9';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -2547,6 +2547,8 @@ function renderSaleDetail(s){
     <button class="btn btn-sm chip-teal" data-order="${escHtml(s.order_number||'')}" data-id="${s.id}" onclick="printInvoiceForOrder(this.dataset.order,this.dataset.id)" title="Generate printable invoice">&#128247; Invoice</button>
     <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" data-order="${escHtml(s.order_number||'')}" data-id="${s.id}" onclick="printPackingSlip(this.dataset.order,this.dataset.id)" title="Print packing slip (goes in box)">&#128230; Packing Slip</button>
     <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" data-order="${escHtml(s.order_number||'')}" data-id="${s.id}" onclick="printPickList(this.dataset.order,this.dataset.id)" title="Print pick list for this order">&#128203; Pick List</button>
+    <button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="openModal('addWarranty',{order_number:'${escHtml(jsEsc(s.order_number||''))}',customer_name:'${escHtml(jsEsc(allLines[0]?.customer_name||''))}',customer_email:'${escHtml(jsEsc(allLines[0]?.customer_email||''))}'})" title="Log a warranty claim for this order, pre-filled with the order and customer info">&#9888; Log Warranty</button>
+    <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="openShipmentErrorModal(null,{order_number:'${escHtml(jsEsc(s.order_number||''))}',customer_name:'${escHtml(jsEsc(allLines[0]?.customer_name||''))}',customer_email:'${escHtml(jsEsc(allLines[0]?.customer_email||''))}',expected_pn:'${escHtml(jsEsc(s.pn||''))}'})" title="Log a shipment error for this order, pre-filled with the order, customer, and expected SKU">&#128230; Log Ship Error</button>
   </div>
 
 
@@ -4895,6 +4897,20 @@ async function bomMaxBuild(pn: string, depth = 0): Promise<{ hasBOM: boolean, ma
   }
   return { hasBOM: true, maxBuild: maxBuild === Infinity ? 0 : Math.max(0, maxBuild) }
 }
+async function cascadeShopifyBackorder(childPn: string): Promise<void> {
+  // Server-side equivalent of the ERP's client-side cascadeShopifySync. Only matters when the
+  // directly-shipped item was a PART — parts can be shared components across several assemblies,
+  // so depleting one via a direct-part sale can push ANOTHER assembly's buildability to zero without
+  // that assembly's own stock ever changing. Without this, only the part's own Shopify listing (if it
+  // has one) gets rechecked; every assembly depending on it silently goes stale.
+  const { data: boms } = await db.from('bom_items').select('parent_pn').eq('child_pn', childPn)
+  const parentPns = [...new Set((boms || []).map((b: any) => b.parent_pn))]
+  if (!parentPns.length) return
+  const { data: parents } = await db.from('assemblies').select('pn,total_on_hand').in('pn', parentPns)
+  for (const parent of (parents || [])) {
+    if ((parent.total_on_hand || 0) <= 0) await syncShopifyBackorder(parent.pn, parent.total_on_hand || 0)
+  }
+}
 async function syncShopifyBackorder(pn: string, newOh: number): Promise<void> {
   const { data: toggleRow } = await db.from('settings').select('value').eq('key', 'shopify_backorder_sync_enabled').limit(1)
   const syncEnabled = toggleRow?.[0]?.value
@@ -5469,13 +5485,28 @@ Deno.serve(async (req) => {
         const lineQty = (line as any).qty || 1
         const { data: asms } = await db.from('assemblies').select('id,total_on_hand').eq('pn', pn).limit(1)
         const asm = asms?.[0]
-        if (!asm) continue
-        const prev = asm.total_on_hand || 0
-        const newOh = prev - lineQty
-        await db.from('assemblies').update({ total_on_hand: newOh, updated_at: new Date().toISOString() }).eq('id', asm.id)
-        await db.from('inv_corrections').insert({ pn, previous_qty: prev, new_qty: newOh, adjustment: -lineQty, reason: 'Shipped via ShipStation ' + resolvedOrderNum + ' ' + tracking, source: 'shipment' })
-        console.log('[SS] Deducted', lineQty, 'of', pn, 'on', resolvedOrderNum, '| on_hand:', prev, '->', newOh)
-        await syncShopifyBackorder(pn, newOh)
+        if (asm) {
+          const prev = asm.total_on_hand || 0
+          const newOh = prev - lineQty
+          await db.from('assemblies').update({ total_on_hand: newOh, updated_at: new Date().toISOString() }).eq('id', asm.id)
+          await db.from('inv_corrections').insert({ pn, previous_qty: prev, new_qty: newOh, adjustment: -lineQty, reason: 'Shipped via ShipStation ' + resolvedOrderNum + ' ' + tracking, source: 'shipment' })
+          console.log('[SS] Deducted', lineQty, 'of', pn, 'on', resolvedOrderNum, '| on_hand:', prev, '->', newOh)
+          await syncShopifyBackorder(pn, newOh)
+          continue
+        }
+        // Directly-sold part (not an assembly) — same deduction, different table. Without this branch,
+        // a part-only order shipping via ShipStation silently got zero inventory deduction AND its
+        // Shopify backorder status was never re-checked, since the loop used to skip past it here.
+        const { data: prts } = await db.from('parts').select('id,total_unpckgd').eq('pn', pn).limit(1)
+        const prt = prts?.[0]
+        if (!prt) continue
+        const prevP = prt.total_unpckgd || 0
+        const newQtyP = prevP - lineQty
+        await db.from('parts').update({ total_unpckgd: newQtyP, updated_at: new Date().toISOString() }).eq('id', prt.id)
+        await db.from('inv_corrections').insert({ pn, previous_qty: prevP, new_qty: newQtyP, adjustment: -lineQty, reason: 'Shipped via ShipStation ' + resolvedOrderNum + ' ' + tracking, source: 'shipment' })
+        console.log('[SS] Deducted', lineQty, 'of', pn, '(part) on', resolvedOrderNum, '| on_hand:', prevP, '->', newQtyP)
+        await syncShopifyBackorder(pn, newQtyP)
+        await cascadeShopifyBackorder(pn)
       }
     }
   }
@@ -8741,12 +8772,12 @@ function openModal(type,data){
     body=`<div class="form-row cols-2">
     <div class="form-group"><label class="form-label">Order #</label>
       <div style="display:flex;gap:6px">
-        <input id="wty-order" class="form-input" value="" placeholder="e.g. #8525" style="flex:1">
+        <input id="wty-order" class="form-input" value="${escHtml(_editClaim?.order_number||data.order_number||'')}" placeholder="e.g. #8525" style="flex:1">
         <button type="button" class="btn btn-sm" onclick="wtyLookupOrder(document.getElementById('wty-order')?.value)" title="Auto-fill customer info from order">↻ Fill</button>
       </div>
     </div>
-    ${fi('wty-name','Customer Name','')}</div>
-    <div class="form-row">${fi('wty-email','Customer Email','','type="email"')}</div>
+    ${fi('wty-name','Customer Name',_editClaim?.customer_name||data.customer_name||'')}</div>
+    <div class="form-row">${fi('wty-email','Customer Email',_editClaim?.customer_email||data.customer_email||'','type="email"')}</div>
     <div class="form-row"><div class="form-group"><label class="form-label">Issue Description</label><textarea class="form-input" id="wty-issue" rows="2" placeholder="Describe the issue…"></textarea></div></div>
     <div class="form-row"><div class="form-group"><label class="form-label">Resolution Type</label>
       <select id="wty-resolution" class="form-input" onchange="wtyShowItemsIfReplacement()">
@@ -13559,6 +13590,8 @@ async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
     const {data:corrRow}=await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,user_email:S.currentUser||null,source:'po_receipt'}).select().single();
     if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
     S.corrections = [{pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,source:'po_receipt',created_at:new Date().toISOString()},...S.corrections];
+    syncShopifyTemplate(pn,newQty);
+    cascadeShopifySync(pn);
   }
 
   if(remaining>0){
@@ -13599,6 +13632,8 @@ async function closeShortBackorder(lineId, poId, pn, qtyOrdered, qtyAlreadyRecei
       await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
       S.parts=S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
       await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:recvNow,reason:'PO Receipt (closed short, '+remaining+' backordered)',user_email:S.currentUser||null,source:'po_receipt'});
+      syncShopifyTemplate(pn,newQty);
+      cascadeShopifySync(pn);
     }
   }
   await db.from('po_lines').update({qty_received:totalReceived,status:'Backordered',notes:remaining+' backordered',updated_at:new Date().toISOString()}).eq('id',lineId);
@@ -13649,6 +13684,8 @@ async function unreceiveLine(lineId, poId){
     S.parts=S.parts.map(p=>p.pn===line.pn?{...p,total_unpckgd:newQty}:p);
     const {data:corrRow}=await db.from('inv_corrections').insert({pn:line.pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:-line.qty_received,reason:'Receipt reversed (received in error)',user_email:S.currentUser||null,source:'po_receipt'}).select().single();
     if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
+    syncShopifyTemplate(line.pn,newQty);
+    cascadeShopifySync(line.pn);
   }
   undoOps.push({action:'update',table:'po_lines',data:{id:lineId},prev:{...stripMeta(line)}});
   await db.from('po_lines').update({qty_received:0,status:'Pending',notes:null,updated_at:new Date().toISOString()}).eq('id',lineId);
@@ -13676,6 +13713,8 @@ async function checkInLineQuick(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived
     const po=S.purchases.find(p=>p.id===poId);
     const poRef=po?(' ['+po.vendor+(po.order_date?' '+po.order_date:'')+']'):'';
     await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason:'PO Receipt — Bulk'+poRef,user_email:S.currentUser||null,source:'po_receipt'});
+    syncShopifyTemplate(pn,newQty);
+    cascadeShopifySync(pn);
   }
   if(S.poLines[poId]) S.poLines[poId]=S.poLines[poId].map(l=>l.id===lineId?{...l,qty_received:newReceived,status:'Complete'}:l);
 }
@@ -16208,8 +16247,9 @@ async function saveManualTracking(type, id){
   toast('✓ Tracking saved');render();
 }
 
-function openShipmentErrorModal(editId){
+function openShipmentErrorModal(editId, prefill){
   const se=editId?(S.shipmentErrors||[]).find(e=>e.id===editId):null;
+  const pf=prefill||{};
   const errTypes=[['wrong_item','Wrong Item shipped'],['wrong_qty','Wrong Quantity shipped'],['missing_item','Item missing / not shipped'],['extra_item','Extra item included'],['damaged','Damaged in transit']];
   const resolutions=[['none','No resolution yet'],['reship_correct','Reship correct item'],['send_additional','Send additional qty'],['customer_keeps','Customer keeps — no action'],['return_required','Return required from customer']];
   const statuses=['Open','Reshipping','Resolved'];
@@ -16226,13 +16266,13 @@ function openShipmentErrorModal(editId){
       <div class="form-group">
         <label class="form-label">Order #</label>
         <div style="display:flex;gap:6px">
-          <input id="se-order" class="form-input" value="${escHtml(se?.order_number||'')}" placeholder="e.g. #8525" style="flex:1">
+          <input id="se-order" class="form-input" value="${escHtml(se?.order_number||pf.order_number||'')}" placeholder="e.g. #8525" style="flex:1">
           <button type="button" class="btn btn-sm" onclick="seLookupOrder()" title="Auto-fill from order">↻ Fill</button>
         </div>
       </div>
-      <div class="form-group"><label class="form-label">Customer Name</label><input id="se-customer" class="form-input" value="${escHtml(se?.customer_name||'')}" placeholder="Customer name"></div>
+      <div class="form-group"><label class="form-label">Customer Name</label><input id="se-customer" class="form-input" value="${escHtml(se?.customer_name||pf.customer_name||'')}" placeholder="Customer name"></div>
     </div>
-    <div class="form-row"><div class="form-group"><label class="form-label">Customer Email</label><input id="se-email" class="form-input" type="email" value="${escHtml(se?.customer_email||'')}" placeholder="customer@email.com"></div></div>
+    <div class="form-row"><div class="form-group"><label class="form-label">Customer Email</label><input id="se-email" class="form-input" type="email" value="${escHtml(se?.customer_email||pf.customer_email||'')}" placeholder="customer@email.com"></div></div>
     <div class="form-row">
       <div class="form-group"><label class="form-label">Error Type</label>
         <select id="se-type" class="form-input" onchange="seToggleActual()">
@@ -16244,7 +16284,7 @@ function openShipmentErrorModal(editId){
       <div style="padding:12px;background:var(--teal-dim);border-radius:8px;border:1px solid rgba(13,148,136,.2)">
         <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">✓ Expected (ordered)</div>
         <div class="form-group" style="margin-bottom:8px"><label class="form-label">SKU</label>
-          <input id="se-exp-pn" class="form-input" list="se-all-pns" value="${escHtml(se?.expected_pn||'')}" placeholder="Expected SKU" autocomplete="off">
+          <input id="se-exp-pn" class="form-input" list="se-all-pns" value="${escHtml(se?.expected_pn||pf.expected_pn||'')}" placeholder="Expected SKU" autocomplete="off">
           <datalist id="se-all-pns">${allPNs.map(p=>pnOpt(p)).join('')}</datalist>
         </div>
         <div class="form-group"><label class="form-label">Qty</label><input id="se-exp-qty" type="number" min="1" value="${se?.expected_qty||1}" class="form-input"></div>
