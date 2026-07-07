@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v17.9';
+const TGK_ERP_VERSION = 'v18.0';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1146,9 +1146,20 @@ function syncShopifyTemplate(pn,newOh){
   console.log('[Shopify template] '+pn+': newOh='+newOh+' -> template='+(template||'(revert to normal)'));
   var restockDate='';
   if(isBackorder){
-    var restockDays=parseInt(S.settings.shopify_restock_days)||30;
-    restockDate=new Date(Date.now()+restockDays*86400000).toISOString().slice(0,10);
-    console.log('[Shopify backorder] '+pn+': restock_date='+restockDate+' ('+restockDays+' days)');
+    // If this item is already flagged as backordered, keep its original restock date instead of
+    // pushing it 30 days further out every time a sync happens to run again — otherwise a bulk sync
+    // (or any repeat sync) would make the countdown perpetually reset and never actually count down.
+    // Only compute a fresh date when this is a genuinely new backorder event (it wasn't backordered
+    // a moment ago).
+    var _existing=S.currentBackorders&&S.currentBackorders[pn];
+    if(_existing&&_existing.restock_date){
+      restockDate=_existing.restock_date;
+      console.log('[Shopify backorder] '+pn+': already backordered — keeping original restock_date='+restockDate);
+    }else{
+      var restockDays=parseInt(S.settings.shopify_restock_days)||30;
+      restockDate=new Date(Date.now()+restockDays*86400000).toISOString().slice(0,10);
+      console.log('[Shopify backorder] '+pn+': new backorder — restock_date='+restockDate+' ('+restockDays+' days)');
+    }
   }
   fetch(SUPA_URL+'/functions/v1/shopify-orders',{
     method:'POST',
@@ -5928,11 +5939,8 @@ async function bulkSyncShopifyBackorder(){
   log.style.display='block';log.innerHTML='Starting bulk sync…<br>';
   const _hwAll=(HW_CATS||[]).concat(SUPPLY_CATS||[]);
   const fgs=S.assemblies.filter(a=>{
-    if(a.is_subassembly)return false;
-    if(a.discontinued)return false;
-    if(isDev(a))return false;
+    if(!eligibleForBackorderSync(a))return false; // excludes subassemblies, hardware packs, pre-order, discontinued, dev
     if(a.status==='Inactive')return false;
-    if(isHWPack(a.pn))return false;
     if(_hwAll.includes(a.category))return false;
     if(a.pl_active===false)return false;
     if(!(a.msrp>0))return false;
@@ -5940,7 +5948,6 @@ async function bulkSyncShopifyBackorder(){
   });
   let done=0,backorderCount=0,inStockCount=0,errorCount=0;
   const restockDays=parseInt(S.settings.shopify_restock_days)||30;
-  const restockDate=new Date(Date.now()+restockDays*86400000).toISOString().slice(0,10);
   for(const a of fgs){
     const pn=dispPn(a);
     const b=buildabilityForBackorder(a.pn);
@@ -5948,6 +5955,14 @@ async function bulkSyncShopifyBackorder(){
     let isBackorder=false;
     if(oh<=0){isBackorder=b.hasBOM?b.maxBuild<=0:true;}
     const template=isBackorder?(S.settings.shopify_backorder_template||'backorder'):'';
+    // Keep the original restock date if this item is already backordered, rather than pushing it
+    // 30 days further out every time the bulk sync happens to run — otherwise the countdown would
+    // reset every run instead of actually counting down toward a real date.
+    let restockDate='';
+    if(isBackorder){
+      const _existing=S.currentBackorders&&S.currentBackorders[pn];
+      restockDate=(_existing&&_existing.restock_date)?_existing.restock_date:new Date(Date.now()+restockDays*86400000).toISOString().slice(0,10);
+    }
     try{
       const r=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{
         method:'POST',
