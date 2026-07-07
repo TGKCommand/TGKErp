@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v15.7';
+const TGK_ERP_VERSION = 'v16.0';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -332,13 +332,30 @@ function computeDemand(){
   const asmCalc={},partCalc={};
   const devPnSet=new Set(S.assemblies.filter(a=>isDev(a)).map(a=>a.pn));
   S.assemblies.forEach(a=>{asmCalc[a.pn]={wk4:(wk4[a.pn]||0)/4,wk12:(wk12[a.pn]||0)/12};});
+  const asmByPn={};S.assemblies.forEach(a=>{asmByPn[a.pn]=a;});
+  function _productionUrgency(pn){
+    // How urgently does THIS assembly need to be built again, based on its own buffer stock vs its
+    // own sales rate? An assembly sitting on months of stock doesn't need production soon — so its
+    // components shouldn't be flagged for reorder just because the assembly sells at a steady clip.
+    // Tapers from full demand (near the assembly's own reorder point) to zero (well-buffered), using
+    // the same 2-week lead-time horizon parts already default to for their own reorder point.
+    const a=asmByPn[pn],ad=asmCalc[pn];
+    if(!a||!ad)return 1;
+    const wk=ad.wk12>0?ad.wk12:ad.wk4;
+    if(!(wk>0))return 1; // no sales history to judge buffer against — assume full urgency (safer default)
+    const weeksOfSupply=Math.max(0,a.total_on_hand||0)/wk;
+    if(weeksOfSupply<=2)return 1;      // at/near where it would need reordering — full component demand
+    if(weeksOfSupply<=6)return 0.5;    // moderately buffered — partial demand, some replenishment still sensible
+    return 0;                          // well-buffered — no near-term production planned, don't pull components in
+  }
   Object.entries(S.boms).forEach(([parent,items])=>{
     if(devPnSet.has(parent))return;
     const ad=asmCalc[parent];if(!ad)return;
+    const urgency=_productionUrgency(parent);
     items.forEach(i=>{
       if(i.item_type==='assembly'&&asmCalc[i.child_pn]){
-        asmCalc[i.child_pn].wk4+=ad.wk4*(i.qty||1);
-        asmCalc[i.child_pn].wk12+=ad.wk12*(i.qty||1);
+        asmCalc[i.child_pn].wk4+=ad.wk4*(i.qty||1)*urgency;
+        asmCalc[i.child_pn].wk12+=ad.wk12*(i.qty||1)*urgency;
       }
     });
   });
@@ -346,11 +363,12 @@ function computeDemand(){
   Object.entries(S.boms).forEach(([parent,items])=>{
     if(devPnSet.has(parent))return;
     const ad=asmCalc[parent];if(!ad)return;
+    const urgency=_productionUrgency(parent);
     items.forEach(i=>{
       if(i.item_type==='assembly'||i.item_type==='subassembly')return; // skip sub-assemblies (handled separately); include 'part', 'packaging', null, etc.
       if(!partCalc[i.child_pn])partCalc[i.child_pn]={wk4:0,wk12:0};
-      partCalc[i.child_pn].wk4+=ad.wk4*(i.qty||1);
-      partCalc[i.child_pn].wk12+=ad.wk12*(i.qty||1);
+      partCalc[i.child_pn].wk4+=ad.wk4*(i.qty||1)*urgency;
+      partCalc[i.child_pn].wk12+=ad.wk12*(i.qty||1)*urgency;
     });
   });
   const boReservedPart={}; // part pn -> total qty reserved across all backorder explosions
@@ -1320,6 +1338,7 @@ let _filterDebounce=null;
 function setFilter(ns,k,val){
   if(!S.filters[ns])S.filters[ns]={};
   S.filters[ns][k]=val;
+  if(ns==='sales'&&k==='fstatus')S.filters.sales.readiness=null; // these two are mutually exclusive views of the list
   if(k==='search'){
     // Debounce text search: full-page render per keystroke is the main typing lag source
     if(_filterDebounce)clearTimeout(_filterDebounce);
@@ -2299,6 +2318,7 @@ function renderSales(){
   }
 
   const allGrouped=groupSales(S.sales);
+  const splitNeededOrders=allGrouped.filter(s=>s._grouped&&computeOrderShipReadiness(s._allLines||[])?.level==='split');
 
   const sf=S.filters.sales||{};
   const q=(sf.search||S.searchQ||'').toLowerCase();
@@ -2317,6 +2337,7 @@ function renderSales(){
       return false;
     });
   }
+  if(sf.readiness==='split')list=list.filter(s=>s._grouped&&computeOrderShipReadiness(s._allLines||[])?.level==='split');
 
   const openOrders   =allGrouped.filter(s=>(s.fulfillment_status||'Open')==='Open');
   const partialOrders=allGrouped.filter(s=>s.fulfillment_status==='Partial');
@@ -2349,7 +2370,7 @@ function renderSales(){
   }
 
   return `
-  <div class="kpi-grid kpi-grid-4">
+  <div class="kpi-grid kpi-grid-5">
     <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','${needsActionStatuses}')" title="Show Open + Partial orders">
       <div class="kpi-label">Awaiting Fulfillment</div>
       <div class="kpi-value">${freshOpen.length+partialOrders.length}</div>
@@ -2359,6 +2380,11 @@ function renderSales(){
       <div class="kpi-label">On Hold</div>
       <div class="kpi-value">${onHoldOrders.length}</div>
       <div class="kpi-sub">${preOrders.length?preOrders.length+' pre-order':'Awaiting release'}</div>
+    </div>
+    <div class="kpi ${splitNeededOrders.length?'kpi-yellow':''}" style="cursor:pointer" onclick="(()=>{const isOn=S.filters.sales?.readiness==='split';S.filters.sales={...S.filters.sales,readiness:isOn?null:'split',fstatus:isOn?S.filters.sales.fstatus:null};render()})()" title="Multi-product orders where some lines are in stock and others aren't — pack/ship what's ready, leave the rest. Click again to clear.">
+      <div class="kpi-label">Needs Split</div>
+      <div class="kpi-value">${splitNeededOrders.length}</div>
+      <div class="kpi-sub">${splitNeededOrders.length?'Partial stock available':'None right now'}</div>
     </div>
     <div class="kpi kpi-teal"><div class="kpi-label">Shipped — 7 Days</div><div class="kpi-value">${shipped7.length}</div><div class="kpi-sub">${delivered7.length} delivered</div></div>
     <div class="kpi kpi-green"><div class="kpi-label">Est. Revenue — 7 Days</div><div class="kpi-value" style="font-size:17px">${fc(rev7)}</div></div>
@@ -2378,8 +2404,9 @@ function renderSales(){
     <div class="search-wrap" style="flex:1;min-width:180px;max-width:280px"><span class="search-icon">⌕</span>
       <input placeholder="Order #, SKU or customer…" value="${sf.search||''}" oninput="setFilter('sales','search',this.value)">
     </div>
-    <button class="filter-chip ${!sf.fstatus?'on-teal':''}" onclick="setFilter('sales','fstatus','')">All</button>
+    <button class="filter-chip ${!sf.fstatus&&!sf.readiness?'on-teal':''}" onclick="setFilter('sales','fstatus','')">All</button>
     ${fstats.map(s=>`<button class="filter-chip ${chipActive(s)?'on-teal':''}" onclick="setFilter('sales','fstatus','${s}')">${s}</button>`).join('')}
+    ${sf.readiness==='split'?`<span class="filter-chip on-teal" style="cursor:default">⚠ Needs Split</span>`:''}
     <span class="filter-count" style="margin-left:auto;white-space:nowrap">${list.length} orders</span>
     <button class="btn btn-primary btn-sm" onclick='openModal("addSale",{})'>+ Order</button>
     <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="printBatchPickList()" title="Print pick list for all Open + Packed orders">&#128203; Batch Pick List</button>
@@ -2409,6 +2436,7 @@ function renderSales(){
     const allOrderLines=s._grouped?(s._allLines||[]):[];
     const dsLineCount=s._grouped?allOrderLines.filter(l=>!findAsm(l.pn)&&!(S._partIdx?S._partIdx[l.pn]:S.parts.find(p=>p.pn===l.pn))).length:0;
     const allDropShip=s._grouped&&allOrderLines.length>0&&dsLineCount===allOrderLines.length;
+    const _readiness=s._grouped?computeOrderShipReadiness(allOrderLines):null;
     const repTracking=s.tracking_number||(allOrderLines.find(x=>x.tracking_number)?.tracking_number)||'';
     const repCarrier=s.carrier||(allOrderLines.find(x=>x.tracking_number)?.carrier)||'';
     const multiTrack=s._grouped&&allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length>1;
@@ -2424,7 +2452,7 @@ function renderSales(){
     <td style="font-size:11px;color:var(--text2);max-width:130px"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(custName||'—')}</div>${_dealerTag}</td>
     <td class="pn" style="color:${s._grouped?'var(--text3)':'var(--teal)'}" title="${s._grouped?'':(()=>{var _r=resolveCanonicalPn(s.pn);var _src=_r?(S.assemblies.find(x=>x.pn===_r.pn)||S.parts.find(x=>x.pn===_r.pn)):null;return(_src?.description||'').replace(/"/g,'&quot;');})()}">${s._grouped?'Multiple SKUs':s.pn}</td>
     <td class="money-neutral" style="font-weight:700">${s._grouped?s.qty+' total':(s.qty||1)}</td>
-    <td>${s._grouped?(allDropShip?`<span style="font-size:10px;color:var(--purple);font-weight:600">↓ Drop-ship</span>`:dsLineCount>0?`<span class="t3xs">${dsLineCount} DS line${dsLineCount>1?'s':''}</span>`:`<span style="color:var(--text3)">—</span>`):stock===null?`<span style="font-size:10px;color:var(--purple);font-weight:600">↓ Drop-ship</span>`:`<span class="money" style="color:${canFill?'var(--green)':'var(--red)'};font-weight:700">${stock}</span>`}</td>
+    <td>${s._grouped?(_readiness?(_readiness.level==='ready'?`<span style="font-size:10px;color:var(--green);font-weight:700" title="All ${_readiness.total} pending line(s) have enough stock to ship together right now">✓ Ready to ship</span>`:_readiness.level==='blocked'?`<span style="font-size:10px;color:var(--red);font-weight:700" title="None of the ${_readiness.total} pending line(s) have enough stock">✗ Nothing in stock</span>`:`<span style="font-size:10px;color:var(--orange);font-weight:700" title="${_readiness.ready} of ${_readiness.total} pending line(s) are in stock — consider splitting this shipment">⚠ Split — ${_readiness.ready}/${_readiness.total} ready</span>`):(allDropShip?`<span style="font-size:10px;color:var(--purple);font-weight:600">↓ Drop-ship</span>`:`<span style="color:var(--text3)">—</span>`)):stock===null?`<span style="font-size:10px;color:var(--purple);font-weight:600">↓ Drop-ship</span>`:`<span class="money" style="color:${canFill?'var(--green)':'var(--red)'};font-weight:700">${stock}</span>`}</td>
     <td>${fsPill(s.fulfillment_status||'Open')}${s._grouped&&['Shipped','Delivered'].includes(s.fulfillment_status||'')&&!hasBoxLog(s.order_number||s.id)?'<span title="Shipping box not yet logged" style="font-size:10px;margin-left:4px;cursor:pointer;opacity:.7" onclick="event.stopPropagation();openShippingBoxModal(\'\'${escHtml(s.order_number||s.id)}\'\')">&#128230;</span>':''}${s._isPartialShip?` <span style="font-size:9px;color:${s._allPendingOnHold?'var(--orange)':'var(--yellow)'};font-weight:700">✂ ${s._shippedCount} shipped · ${s._pendingCount} ${s._allPendingOnHold?'on hold':'pending'}</span>`:''}${s.on_hold&&!s._isPartialShip?` <span style="font-size:9px;color:var(--orange);font-weight:700">⏸ Hold</span>`:''}</td>
     <td style="font-size:10px;font-family:var(--mono)">${multiTrack?`<span style="color:var(--yellow)" title="${allOrderLines.filter(x=>x.tracking_number).map(x=>(x.carrier?x.carrier+' ':'')+x.tracking_number).join('\n')}">🔀 ${allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length} shipments</span>`:repTracking?`<a href="${trackingUrl(repCarrier,repTracking)}" target="_blank" style="color:var(--teal);text-decoration:none" title="Track ${repCarrier} ${repTracking}">${repCarrier?repCarrier+' ':''}${repTracking} ↗</a>`:'<span style="color:var(--text3)">—</span>'}</td>
     <td style="display:flex;gap:4px">
@@ -2491,7 +2519,14 @@ function renderSaleDetail(s){
   const refundAmt=allLines.reduce((t,x)=>t+(x.refund_amount||0),0);
   const onHold=allLines.some(x=>x.on_hold);
 
-  const moves=S.corrections.filter(c=>allLines.some(l=>l.pn===c.pn)).slice(0,8);
+  // inv_corrections has no structured order_number column — the only reliable link back to a specific
+  // order is whatever appears in the free-text `reason` field (e.g. "Drop-ship — order #9429",
+  // "Shipped via ShipStation #9418..."). Filtering by SKU alone pulls in every historical movement for
+  // that part number from ANY order, cycle count, or pack action — completely unrelated orders sharing
+  // a SKU would show up here as if they happened on THIS order. Require the reason text to actually
+  // mention this order's number (with or without the # prefix) before including it.
+  const _thisOrderNum=(s.order_number||'').replace(/^#/,'');
+  const moves=S.corrections.filter(c=>allLines.some(l=>l.pn===c.pn)&&_thisOrderNum&&(c.reason||'').includes(_thisOrderNum)).slice(0,8);
 
   return `
 
@@ -3107,6 +3142,7 @@ async function submitReturnV2(orderNum){
         await db.from('parts').update({total_unpckgd:newOh,updated_at:new Date().toISOString()}).eq('id',prt.id);
         S.parts=S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newOh}:p);
         await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newOh,adjustment:qty2,reason:'Return — '+reason+' (order '+orderNum+')',user_email:S.currentUser||null,source:'return'});
+        cascadeShopifySync(pn);
         results.push('+'+qty2+' '+pn);
       }
     }
@@ -12477,9 +12513,15 @@ function renderPlanning() {
   });
   function isDevOnlyPart(p){
     if(!_devBomPns.has(p.pn))return false;   // not in any dev BOM at all
-    if(_activeBomPns.has(p.pn))return false;  // also used in an active assembly — keep in main tab
+    if(_activeBomPns.has(p.pn))return false;  // also used in an active assembly → keep in main tab
     return true;                               // exclusively in dev BOMs → filter out of main tab
   }
+  // Parts that flow straight into production and are never sold as a standalone SKU. Their "demand"
+  // is 100% derived from assembly builds (via computeDemand's BOM-explosion), not from their own sales
+  // history — worth flagging visually so a low on-hand number here doesn't read as alarming the same
+  // way it would for a directly-sold part; it's expected to track production, not sit as shelf stock.
+  const _soldDirectlyPns=new Set(S.sales.map(s=>s.pn).filter(Boolean));
+  function isComponentOnly(p){return _activeBomPns.has(p.pn)&&!_soldDirectlyPns.has(p.pn);}
   const devOnlyParts=S.parts.filter(p=>!p.discontinued&&isDevOnlyPart(p));
   const allTracked=S.parts.filter(p=>!p.discontinued&&!isDevOnlyPart(p));
   // ── Per-render memoization: prime on-order map, compute status + suggested qty ONCE per part ──
@@ -12667,7 +12709,7 @@ function renderPlanning() {
     const wksRadius=wksNeg?'4px':'0';
 
     return `<tr class="rowlink" onclick="rowClick(event,function(){lookupGo('part','${p.pn}')})">
-      <td class="pn" style="color:var(--text)">${dispPn(p)}${p.use_new_sku&&p.new_sku?`<div style="font-size:9px;color:var(--text3);font-weight:400">${escHtml(p.pn)}</div>`:''}</td>
+      <td class="pn" style="color:var(--text)">${dispPn(p)}${p.use_new_sku&&p.new_sku?`<div style="font-size:9px;color:var(--text3);font-weight:400">${escHtml(p.pn)}</div>`:''}${isComponentOnly(p)?`<div style="font-size:8.5px;color:var(--purple);font-weight:600;margin-top:2px" title="Never sold directly — used only as a BOM component. Demand here is driven entirely by assembly production needs, not standalone sales.">&#9881; Component Only</div>`:''}</td>
       <td style="max-width:115px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${p.description||''}</td>
       <td style="font-size:10px;color:var(--text3);max-width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.vendor||''}</td>
       <td title="Reorder point: ${rp}${onOrder>0?' · '+onOrder+' on open PO':''}${reserved>0?' · '+reserved+' reserved for backorders':''}">
@@ -17989,6 +18031,21 @@ function computeEffectiveOrderStatus(lines){
   const status=allPendingOnHold?'On Hold':isPartial?'Partial':
     lines.reduce((best,x)=>(rank[x.fulfillment_status||'Open']||0)>(rank[best]||0)?x.fulfillment_status:best,lines[0].fulfillment_status||'Open');
   return{status,shipped,pending,allPendingOnHold,isPartial};
+}
+function computeOrderShipReadiness(allOrderLines){
+  const _pendingLines=allOrderLines.filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
+  if(_pendingLines.length===0)return null;
+  let ready=0,blocked=0;
+  _pendingLines.forEach(l=>{
+    const _a=findAsm(l.pn);
+    const _p=_a?null:S.parts.find(p=>p.pn===l.pn);
+    const _stock=_a?(_a.total_on_hand||0):_p?(_p.total_unpckgd||0):null;
+    if(_stock===null||_stock>=(l.qty||1))ready++; // drop-ship (no local stock record) always counts as ready
+    else blocked++;
+  });
+  return blocked===0?{level:'ready',ready,blocked,total:_pendingLines.length}
+    :ready===0?{level:'blocked',ready,blocked,total:_pendingLines.length}
+    :{level:'split',ready,blocked,total:_pendingLines.length};
 }
 function scheduleRender(){
   if(_renderPending)return;
