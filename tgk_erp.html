@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v16.1';
+const TGK_ERP_VERSION = 'v16.3';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -2417,6 +2417,7 @@ function renderSales(){
     <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="syncHoldsOnly()" title="Poll ShipStation for on-hold orders">⏸ Holds</button>
     <button class="btn btn-sm" id="cancel-sync-btn" style="color:var(--red);border-color:rgba(239,68,68,.3)" onclick="syncCancellationsOnly()" title="Poll ShipStation for recently cancelled orders">✕ Cancels</button>
     <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" id="delivery-sync-btn" onclick="syncDeliveries()" title="Check ShipStation for delivered shipments and update order status">🚚 Deliveries</button>
+    <button id="master-tracking-sync-btn" class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="masterTrackingSync(false)" title="Pull tracking numbers for all recently shipped orders from ShipStation — last 30 days">&#128225; Tracking</button>
     <span style="width:1px;height:18px;background:var(--border2);margin:0 2px;flex-shrink:0"></span>
     <button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="ssOrderAudit()" title="Find ShipStation orders missing from ERP">📦 SS Audit</button>
     <button class="btn btn-sm" style="color:var(--text3)" onclick="diagHolds()" title="Diagnose hold sync issues">🔍 Diagnose</button>
@@ -7178,6 +7179,51 @@ async function ssBulkSyncRun(){
   }
 }
 
+async function masterTrackingSync(customRange){
+  // One-click version of ssBulkSyncRun for use directly from Sales Orders, instead of requiring a
+  // trip to Integrations and manually picking dates every time. Defaults to the last 30 days (same
+  // default the Integrations version uses) since that covers the overwhelming majority of "did this
+  // just ship" checks; a wider custom range is still one click away for catching up after a gap.
+  let since,until;
+  if(customRange){
+    const today=new Date().toISOString().slice(0,10);
+    const daysBack=parseInt(prompt('Sync tracking for the last how many days?','30'))||30;
+    since=new Date(Date.now()-daysBack*24*3600*1000).toISOString().slice(0,10);
+    until=today;
+  }else{
+    until=new Date().toISOString().slice(0,10);
+    since=new Date(Date.now()-30*24*3600*1000).toISOString().slice(0,10);
+  }
+  const btn=document.getElementById('master-tracking-sync-btn');
+  if(btn){btn.disabled=true;btn.textContent='⏳ Syncing…';}
+  toast('Syncing tracking from ShipStation ('+since+' → '+until+')… this can take up to a minute',4000);
+  const edgeUrl=SUPA_URL+'/functions/v1/shipstation-ship';
+  const controller=new AbortController();
+  const tOut=setTimeout(()=>controller.abort(),90000);
+  try{
+    const res=await fetch(edgeUrl,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'bulk_sync',since,until}),
+      signal:controller.signal
+    });
+    clearTimeout(tOut);
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok){
+      if(res.status===504||res.status===524)toast('⏱ Sync timed out — try Integrations → Bulk Sync with a shorter date range',6000);
+      else toast('⚠ Sync failed: '+(data.error||'HTTP '+res.status),6000);
+      return;
+    }
+    await refreshSales();
+    render();
+    toast('✓ Tracking synced — '+(data.synced||0)+' shipment'+(data.synced!==1?'s':'')+' applied'+(data.notFound?', '+data.notFound+' order(s) not found in ERP':''),6000);
+  }catch(e){
+    if(e.name==='AbortError')toast('⏱ Sync timed out after 90s — try a shorter range from Integrations → Bulk Sync',6000);
+    else toast('Error: '+e.message,5000);
+  }finally{
+    if(btn){btn.disabled=false;btn.innerHTML='&#128225; Sync All Tracking';}
+  }
+}
 async function ssCheckSecrets(){
   const el=document.getElementById('ss-diag-result');
   el.style.display='block';
