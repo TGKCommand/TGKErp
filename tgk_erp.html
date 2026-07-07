@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v17.6';
+const TGK_ERP_VERSION = 'v17.7';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1100,6 +1100,17 @@ function trackingUrl(carrier, tracking){
   if(c.includes('LSO'))return'https://www.lso.com/go/track?tracking_id='+t;
   return'https://track.aftership.com/'+encodeURIComponent(tracking);
 }
+function eligibleForBackorderSync(item){
+  // Only genuine finished goods should ever have their Shopify listing touched by the automated
+  // backorder sync. Subassemblies and hardware packs aren't standalone Shopify products in the same
+  // sense; Pre-Order items use their own separate Shopify template that this automation must never
+  // overwrite; discontinued and dev-stage items shouldn't be actively managed at all.
+  if(!item)return false;
+  if(item.discontinued||isDev(item))return false;
+  if(item.is_subassembly||isHWPack(item.pn))return false;
+  if((item.category||'')==='Pre-Order')return false;
+  return true;
+}
 function cascadeShopifySync(childPn){
   // Buildability is a DERIVED property — assembly B's max-buildable depends on component stock that
   // assembly A's packing can silently deplete. syncShopifyTemplate() only ever fires for whichever SKU
@@ -1112,7 +1123,7 @@ function cascadeShopifySync(childPn){
     if(!lines.some(l=>l.child_pn===childPn))return;
     const parent=S.assemblies.find(a=>a.pn===parentPn);
     if(!parent)return;
-    if(parent.discontinued||isDev(parent))return; // never auto-manage Shopify listings for retired or in-development items
+    if(!eligibleForBackorderSync(parent))return; // only genuine finished goods — never subassemblies, hardware packs, pre-order items, discontinued, or dev
     if((parent.total_on_hand||0)<=0)syncShopifyTemplate(parentPn,parent.total_on_hand||0);
   });
 }
@@ -1120,7 +1131,7 @@ function syncShopifyTemplate(pn,newOh){
   if(!pn||!S.shopify||!S.shopify.store)return; // key now lives in edge function secrets
   if(S.settings.shopify_backorder_sync_enabled===false){console.log('[Shopify template] sync disabled — skipped for',pn);return;}
   var _item=S.assemblies.find(function(a){return a.pn===pn;})||S.parts.find(function(p){return p.pn===pn;});
-  if(_item&&(_item.discontinued||isDev(_item))){console.log('[Shopify template] skipped — discontinued/dev item:',pn);return;} // never auto-manage Shopify listings for retired or in-development items
+  if(_item&&!eligibleForBackorderSync(_item)){console.log('[Shopify template] skipped — not eligible (subassembly/hardware pack/pre-order/discontinued/dev):',pn);return;}
   var isBackorder=false;
   if(newOh<=0){
     var b=buildabilityForBackorder(pn);
@@ -1188,7 +1199,7 @@ function backorderBadge(pn){
   const bo=pn&&S.currentBackorders&&S.currentBackorders[pn];
   if(!bo)return'';
   const item=S.assemblies.find(a=>a.pn===pn)||S.parts.find(p=>p.pn===pn);
-  if(item&&(item.discontinued||isDev(item)))return''; // stale backorder state from before retirement — don't show it
+  if(item&&!eligibleForBackorderSync(item))return''; // stale backorder state from before it became ineligible (retired, dev, subassembly, hardware pack, or pre-order) — don't show it
   const since=bo.since?new Date(bo.since).toLocaleDateString():'';
   const title='On backorder on Shopify'+(bo.restock_date?' — restock date '+bo.restock_date:'')+(since?' (since '+since+')':'');
   return '<span class="pill pill-red" style="font-size:8.5px;vertical-align:middle;margin-left:4px" title="'+escHtml(title)+'">&#8987; BACKORDERED</span>';
@@ -4925,6 +4936,21 @@ async function bomMaxBuild(pn: string, depth = 0): Promise<{ hasBOM: boolean, ma
   }
   return { hasBOM: true, maxBuild: maxBuild === Infinity ? 0 : Math.max(0, maxBuild) }
 }
+function isHWPackServer(pn: string): boolean {
+  return /^TGK-P\d/i.test(pn || '')
+}
+function isEligibleForBackorderSync(item: any): boolean {
+  // Server-side mirror of the ERP's client-side eligibleForBackorderSync — only genuine finished
+  // goods should ever have their Shopify listing touched by this automation. Subassemblies and
+  // hardware packs aren't standalone Shopify products; Pre-Order items use their own separate
+  // Shopify template that must never be overwritten by the backorder automation; discontinued and
+  // dev-stage items shouldn't be actively managed at all.
+  if (!item) return false
+  if (item.discontinued || item.stage === 'dev') return false
+  if (item.is_subassembly || isHWPackServer(item.pn)) return false
+  if ((item.category || '') === 'Pre-Order') return false
+  return true
+}
 async function cascadeShopifyBackorder(childPn: string): Promise<void> {
   // Server-side equivalent of the ERP's client-side cascadeShopifySync. Only matters when the
   // directly-shipped item was a PART — parts can be shared components across several assemblies,
@@ -4934,18 +4960,18 @@ async function cascadeShopifyBackorder(childPn: string): Promise<void> {
   const { data: boms } = await db.from('bom_items').select('parent_pn').eq('child_pn', childPn)
   const parentPns = [...new Set((boms || []).map((b: any) => b.parent_pn))]
   if (!parentPns.length) return
-  const { data: parents } = await db.from('assemblies').select('pn,total_on_hand,discontinued,stage').in('pn', parentPns)
+  const { data: parents } = await db.from('assemblies').select('pn,total_on_hand,discontinued,stage,is_subassembly,category').in('pn', parentPns)
   for (const parent of (parents || [])) {
-    if (parent.discontinued || parent.stage === 'dev') continue // never auto-manage Shopify listings for retired or in-development items
+    if (!isEligibleForBackorderSync(parent)) continue
     if ((parent.total_on_hand || 0) <= 0) await syncShopifyBackorder(parent.pn, parent.total_on_hand || 0)
   }
 }
 async function syncShopifyBackorder(pn: string, newOh: number): Promise<void> {
-  const { data: asmCheck } = await db.from('assemblies').select('discontinued,stage').eq('pn', pn).limit(1)
-  const { data: partCheck } = asmCheck?.length ? { data: null } : await db.from('parts').select('discontinued').eq('pn', pn).limit(1)
+  const { data: asmCheck } = await db.from('assemblies').select('pn,discontinued,stage,is_subassembly,category').eq('pn', pn).limit(1)
+  const { data: partCheck } = asmCheck?.length ? { data: null } : await db.from('parts').select('pn,discontinued,category').eq('pn', pn).limit(1)
   const item = asmCheck?.[0] || partCheck?.[0]
-  if (item && (item.discontinued || item.stage === 'dev')) {
-    console.log('[SS->Shopify] skipped — discontinued/dev item:', pn)
+  if (item && !isEligibleForBackorderSync(item)) {
+    console.log('[SS->Shopify] skipped — not eligible (subassembly/hardware pack/pre-order/discontinued/dev):', pn)
     return
   }
   const { data: toggleRow } = await db.from('settings').select('value').eq('key', 'shopify_backorder_sync_enabled').limit(1)
@@ -5832,7 +5858,7 @@ async function loadInvBackorderLog(){
     var rows=data.filter(function(r){
       if(search&&!(r.pn||'').toLowerCase().includes(search))return false;
       var item=S.assemblies.find(function(a){return a.pn===r.pn;})||S.parts.find(function(p){return p.pn===r.pn;});
-      if(item&&(item.discontinued||isDev(item)))return false; // retired/dev items shouldn't clutter a log about active inventory
+      if(item&&!eligibleForBackorderSync(item))return false; // ineligible items (retired, dev, subassembly, hardware pack, pre-order) shouldn't clutter a log about active finished-goods inventory
       return true;
     });
     var countEl=document.getElementById('ibo-count');
