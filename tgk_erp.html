@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v17.5';
+const TGK_ERP_VERSION = 'v17.6';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1187,6 +1187,8 @@ function dispPn(a){return(a&&a.use_new_sku&&a.new_sku)?a.new_sku:((a&&a.pn)||'')
 function backorderBadge(pn){
   const bo=pn&&S.currentBackorders&&S.currentBackorders[pn];
   if(!bo)return'';
+  const item=S.assemblies.find(a=>a.pn===pn)||S.parts.find(p=>p.pn===pn);
+  if(item&&(item.discontinued||isDev(item)))return''; // stale backorder state from before retirement — don't show it
   const since=bo.since?new Date(bo.since).toLocaleDateString():'';
   const title='On backorder on Shopify'+(bo.restock_date?' — restock date '+bo.restock_date:'')+(since?' (since '+since+')':'');
   return '<span class="pill pill-red" style="font-size:8.5px;vertical-align:middle;margin-left:4px" title="'+escHtml(title)+'">&#8987; BACKORDERED</span>';
@@ -1773,9 +1775,9 @@ function renderAssemblies(){
       <option value="">All Status</option>
       <option value="critical">Critical</option><option value="low">Low</option><option value="ok">In Stock</option>
     </select>
-    <button class="filter-chip ${sf.kind==='fg'?'on-teal':''}" onclick="setFilter('asm','kind',${sf.kind==='fg'?"''":"'fg'"})">Finished Goods (${S.assemblies.filter(a=>!a.is_subassembly&&!isHWPack(a.pn)&&!a.discontinued).length})</button>
-    <button class="filter-chip ${sf.kind==='sub'?'on-teal':''}" onclick="setFilter('asm','kind',${sf.kind==='sub'?"''":"'sub'"})">Subassemblies (${S.assemblies.filter(a=>a.is_subassembly&&!isHWPack(a.pn)&&!a.discontinued).length})</button>
-    <button class="filter-chip ${sf.kind==='hwp'?'on-teal':''}" onclick="setFilter('asm','kind',${sf.kind==='hwp'?"''":"'hwp'"})">Hardware Packs (${S.assemblies.filter(a=>isHWPack(a.pn)&&!a.discontinued).length})</button>
+    <button class="filter-chip ${sf.kind==='fg'?'on-teal':''}" onclick="setFilter('asm','kind',${sf.kind==='fg'?"''":"'fg'"})">Finished Goods (${S.assemblies.filter(a=>!a.is_subassembly&&!isHWPack(a.pn)&&!a.discontinued&&!isDev(a)).length})</button>
+    <button class="filter-chip ${sf.kind==='sub'?'on-teal':''}" onclick="setFilter('asm','kind',${sf.kind==='sub'?"''":"'sub'"})">Subassemblies (${S.assemblies.filter(a=>a.is_subassembly&&!isHWPack(a.pn)&&!a.discontinued&&!isDev(a)).length})</button>
+    <button class="filter-chip ${sf.kind==='hwp'?'on-teal':''}" onclick="setFilter('asm','kind',${sf.kind==='hwp'?"''":"'hwp'"})">Hardware Packs (${S.assemblies.filter(a=>isHWPack(a.pn)&&!a.discontinued&&!isDev(a)).length})</button>
     <button class="filter-chip ${sf.kind==='dev'?'on-teal':''}" style="${sf.kind==='dev'?'':'color:var(--purple)'}" onclick="setFilter('asm','kind',${sf.kind==='dev'?"''":"'dev'"})">&#128300; Dev Pipeline (${S.assemblies.filter(a=>!a.discontinued&&isDev(a)).length})</button>
     <button class="filter-chip ${sf.showDisc?'on-teal':''}" onclick="setFilter('asm','showDisc',${sf.showDisc?'false':'true'})">🗄 Discontinued (${S.assemblies.filter(a=>a.discontinued).length})</button>
     ${hasFilter?`<button class="btn btn-sm" style="color:var(--text3)" onclick="S.filters.asm={};S.searchQ='';render()">✕ Clear filters</button>`:''}
@@ -5827,7 +5829,12 @@ async function loadInvBackorderLog(){
       wrap.innerHTML='<div style="font-size:11px;color:var(--red);padding:12px 0">'+(error?'Error: '+error.message:'No data.')+'</div>';
       return;
     }
-    var rows=data.filter(function(r){return !search||((r.pn||'').toLowerCase().includes(search));});
+    var rows=data.filter(function(r){
+      if(search&&!(r.pn||'').toLowerCase().includes(search))return false;
+      var item=S.assemblies.find(function(a){return a.pn===r.pn;})||S.parts.find(function(p){return p.pn===r.pn;});
+      if(item&&(item.discontinued||isDev(item)))return false; // retired/dev items shouldn't clutter a log about active inventory
+      return true;
+    });
     var countEl=document.getElementById('ibo-count');
     if(countEl)countEl.textContent=filter==='current'?(rows.length+' SKU'+(rows.length!==1?'s':'')+' currently backordered'):(rows.length+' event'+(rows.length!==1?'s':''));
     if(!rows.length){
@@ -7385,7 +7392,7 @@ async function sendAI(){
   S.aiLoading=true;render();
   const c=$('ai-chat');if(c)c.scrollTop=c.scrollHeight;
   const lowParts=S.parts.filter(p=>avgWk(p)>0&&wks(p)!==null&&wks(p)<4).map(p=>`${dispPn(p)}(${wks(p)}wk)`).join(', ');
-  const critAsm=S.assemblies.filter(a=>!a.discontinued&&liveStatus(a)==='critical').map(a=>`${dispPn(a)}(${a.total_on_hand||0}oh)`).join(', ');
+  const critAsm=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&liveStatus(a)==='critical').map(a=>`${dispPn(a)}(${a.total_on_hand||0}oh)`).join(', ');
   const openPOs=S.purchases.filter(p=>p.status!=='Received').map(p=>{const _li=S.parts.find(x=>x.pn===p.pn)||S.assemblies.find(x=>x.pn===p.pn);return `${_li?dispPn(_li):p.pn}@${p.vendor}(${p.status})`;}).join(', ');
   const ctx=`You are the AI assistant for TGK Motorsport ERP. TGK builds performance Audi/Tesla parts. Live Supabase data: ${S.parts.length} parts, ${S.assemblies.length} assemblies. Low stock (under 4wks): ${lowParts||'none'}. Critical (zero/negative stock): ${critAsm||'none'}. Open POs: ${openPOs||'none'}. 7-day orders: ${S.sales.filter(s=>s.sale_date>=daysAgo(7)).length}. Be specific, actionable, concise.`;
   try{
@@ -11430,7 +11437,7 @@ function buildReportRows(id, preset, customFrom, customTo){
 
     case 'assemblies_stock':{
       const cols=['Assembly','Description','Type','On Hand','Sold 30d','Sold 90d','MSRP ($)','BOM Cost ($)'];
-      const data=S.assemblies.filter(a=>!a.discontinued).map(a=>{
+      const data=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)).map(a=>{
         const s30=S.sales.filter(s=>s.pn===a.pn&&s.sale_date>=daysAgo(30)).reduce((t,s)=>t+(s.qty||1),0);
         const s90=S.sales.filter(s=>s.pn===a.pn&&s.sale_date>=daysAgo(90)).reduce((t,s)=>t+(s.qty||1),0);
         return{'Assembly':a.pn,'Description':a.description||'','Type':a.is_subassembly?'Subassembly':'Finished Good','On Hand':a.total_on_hand||0,'Sold 30d':s30,'Sold 90d':s90,'MSRP ($)':a.msrp||0,'BOM Cost ($)':+bomCostOf(a.pn,0).toFixed(2)};
@@ -11532,7 +11539,7 @@ function buildReportRows(id, preset, customFrom, customTo){
 
     case 'bom_cost_rollup':{
       const cols=['Assembly','Description','Type','On Hand','MSRP ($)','BOM Cost ($)','Gross Margin ($)','Gross Margin %'];
-      const data=S.assemblies.filter(a=>!a.discontinued&&S.boms[a.pn]?.length).map(a=>{
+      const data=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&S.boms[a.pn]?.length).map(a=>{
         const bc=bomCostOf(a.pn,0);const msrp=a.msrp||0;const gm=msrp-bc;const gmp=msrp>0?(gm/msrp*100):0;
         return{'Assembly':a.pn,'Description':a.description||'','Type':a.is_subassembly?'Subassembly':'Finished Good','On Hand':a.total_on_hand||0,'MSRP ($)':msrp,'BOM Cost ($)':+bc.toFixed(2),'Gross Margin ($)':+gm.toFixed(2),'Gross Margin %':+gmp.toFixed(1)};
       }).sort((a,b)=>b['Gross Margin %']-a['Gross Margin %']);
@@ -14246,7 +14253,7 @@ function printAllBOMs(pns){
 function startWorkOrder(){
   S.workOrderBuilds=S.workOrderBuilds||{};
   const cov=S.buildCoverage||4;
-  S.assemblies.filter(a=>!a.discontinued).forEach(a=>{
+  S.assemblies.filter(a=>!a.discontinued&&!isDev(a)).forEach(a=>{
     const demand=openOrderDemand(a.pn);
     const fcDemand=a.build_to_order?0:Math.ceil(asmAvgWk(a)*cov);
     const suggested=Math.max(0,Math.max(demand,fcDemand)-(a.total_on_hand||0));
@@ -14774,7 +14781,7 @@ function renderBOMCountSearch(q){
   if(!el)return;
   if(!q||q.length<2){el.innerHTML='<span class="t3s">Type a product name or SKU…</span>';return;}
   const ql=q.toLowerCase();
-  const matches=S.assemblies.filter(a=>!a.discontinued&&!a.is_subassembly&&(a.pn.toLowerCase().includes(ql)||(a.description||'').toLowerCase().includes(ql))).slice(0,10);
+  const matches=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&!a.is_subassembly&&(a.pn.toLowerCase().includes(ql)||(a.description||'').toLowerCase().includes(ql))).slice(0,10);
   if(!matches.length){el.innerHTML='<span class="t3s">No products found</span>';return;}
   el.innerHTML=matches.map(a=>{
     const bomCount=(S.boms[a.pn]||[]).length;
@@ -14785,7 +14792,7 @@ function renderBOMCountSearch(q){
 async function createCycleCount(cat) {
   let items=[];
   const liveParts=S.parts.filter(p=>!p.discontinued);
-  const liveAsm=S.assemblies.filter(a=>!a.discontinued);
+  const liveAsm=S.assemblies.filter(a=>!a.discontinued&&!isDev(a));
   if(cat==='all') items=liveParts.map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}));
   else if(cat==='fg') items=liveAsm.filter(a=>!a.is_subassembly&&!isHWPack(a.pn)).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
   else if(cat==='sub') items=liveAsm.filter(a=>a.is_subassembly).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
@@ -14796,12 +14803,12 @@ async function createCycleCount(cat) {
   ];
   else if(cat&&cat.startsWith('bom:')){
     const bomPn=cat.slice(4);
-    const fgAsm=S.assemblies.find(a=>a.pn===bomPn&&!a.discontinued);
+    const fgAsm=S.assemblies.find(a=>a.pn===bomPn&&!a.discontinued&&!isDev(a));
     if(fgAsm) items.push({pn:bomPn,desc:fgAsm.description||'',exp:fgAsm.total_on_hand||0,type:'assembly',section:'Finished Good'});
     const bomLines=S.boms[bomPn]||[];
     bomLines.forEach(line=>{
       if(line.item_type==='assembly'){
-        const sa=S.assemblies.find(a=>a.pn===line.child_pn&&!a.discontinued);
+        const sa=S.assemblies.find(a=>a.pn===line.child_pn&&!a.discontinued&&!isDev(a));
         if(sa) items.push({pn:line.child_pn,desc:sa.description||'',exp:sa.total_on_hand||0,type:'assembly',section:'Subassemblies',bomQty:line.qty});
       } else {
         const p=S.parts.find(x=>x.pn===line.child_pn);
@@ -14941,11 +14948,11 @@ function renderSheetModePicker(){
     <div style="font-size:14px;font-weight:700">📋 Sheet Count — Choose Scope</div>
   </div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:600px">
-    <button class="btn btn-primary" onclick="createCycleCount('everything')">Count Everything (${S.parts.filter(p=>!p.discontinued).length+S.assemblies.filter(a=>!a.discontinued).length} SKUs)</button>
-    <button class="btn btn-teal" onclick="createCycleCount('fg')">🏁 Finished Goods (${S.assemblies.filter(a=>!a.is_subassembly&&!a.discontinued).length})</button>
-    <button class="btn btn-teal" onclick="createCycleCount('sub')">🟠 Subassemblies (${S.assemblies.filter(a=>a.is_subassembly&&!a.discontinued).length})</button>
+    <button class="btn btn-primary" onclick="createCycleCount('everything')">Count Everything (${S.parts.filter(p=>!p.discontinued).length+S.assemblies.filter(a=>!a.discontinued&&!isDev(a)).length} SKUs)</button>
+    <button class="btn btn-teal" onclick="createCycleCount('fg')">🏁 Finished Goods (${S.assemblies.filter(a=>!a.is_subassembly&&!a.discontinued&&!isDev(a)).length})</button>
+    <button class="btn btn-teal" onclick="createCycleCount('sub')">🟠 Subassemblies (${S.assemblies.filter(a=>a.is_subassembly&&!a.discontinued&&!isDev(a)).length})</button>
     <button class="btn" onclick="createCycleCount('all')">Raw Parts Only (${S.parts.filter(p=>!p.discontinued).length})</button>
-    <button class="btn" style="border-color:var(--purple);color:var(--purple)" onclick="createCycleCount('hwp')">🟣 Hardware Packs (${S.assemblies.filter(a=>isHWPack(a.pn)&&!a.discontinued).length})</button>
+    <button class="btn" style="border-color:var(--purple);color:var(--purple)" onclick="createCycleCount('hwp')">🟣 Hardware Packs (${S.assemblies.filter(a=>isHWPack(a.pn)&&!a.discontinued&&!isDev(a)).length})</button>
   </div>
   <div class="divider"></div>
   <div style="font-size:11px;font-weight:700;color:var(--text2);margin-bottom:8px">Count by Product + All Its BOM Components</div>
@@ -15045,7 +15052,7 @@ async function applySpotCount(){
 function startWalkCount(){
   const _wcDisp=(pn,type)=>{const li=type==='assembly'?S.assemblies.find(a=>a.pn===pn):S.parts.find(p=>p.pn===pn);return li?dispPn(li):pn;};
   const items=[
-    ...S.assemblies.filter(a=>!a.discontinued).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly',loc:a.location||''})),
+    ...S.assemblies.filter(a=>!a.discontinued&&!isDev(a)).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly',loc:a.location||''})),
     ...S.parts.filter(p=>!p.discontinued).map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part',loc:p.location||''}))
   ].sort((a,b)=>(a.loc||'zzz').localeCompare(b.loc||'zzz')||_wcDisp(a.pn,a.type).localeCompare(_wcDisp(b.pn,b.type)));
   S.walkItems=items.map(i=>({...i,counted:null,skip:false}));
