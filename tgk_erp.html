@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v17.2';
+const TGK_ERP_VERSION = 'v17.4';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -258,6 +258,7 @@ const S = {
   warrantyClaims:[],
   shipmentErrors:[],
   partFiles:{}, labelFiles:null, _filesLoading:new Set(),
+  currentBackorders:{}, // pn -> {restock_date, since} for every SKU currently flagged backordered on Shopify
   wtyTab:'claims',
   activeBuild:null, buildQty:null, buildCoverage:4,
   buildStack:[], // [{pn,qty}] — full drill-down trail for sub-assembly builds
@@ -572,7 +573,7 @@ function normalizeAssemblies(rows){
 
 async function loadAll(){
   try{
-    const[parts,assemblies,sales,purchases,dealers,vendors,settings,bomItems,warrantyClaims,shipmentErrors,corrections,cycleCounts,poLinesAll,poTrackingAll,labelFilesResult]=await Promise.all([
+    const[parts,assemblies,sales,purchases,dealers,vendors,settings,bomItems,warrantyClaims,shipmentErrors,corrections,cycleCounts,poLinesAll,poTrackingAll,labelFilesResult,shopifySyncLog]=await Promise.all([
       db.from('parts').select('*').order('pn'),
       db.from('assemblies').select('*').order('pn'),
       db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000),
@@ -588,6 +589,7 @@ async function loadAll(){
       db.from('po_lines').select('*').order('po_id'),
       db.from('po_tracking').select('*').order('created_at'),
       db.from('part_files').select('*').eq('category','Label'),
+      db.from('shopify_sync_log').select('pn,action,restock_date,created_at').order('created_at',{ascending:false}).limit(3000),
     ]);
     if(parts.error)throw parts.error;
     S.parts=parts.data||[];
@@ -625,6 +627,18 @@ async function loadAll(){
     S.fitments=null; // loaded on-demand when Fitments page opens
     if(labelFilesResult.error){console.warn('loadAll: part_files label query failed —',labelFilesResult.error.message,'— label buttons will load on demand');}
     else{S.labelFiles={};(labelFilesResult.data||[]).forEach(function(lf){if(!S.labelFiles[lf.entity_pn])S.labelFiles[lf.entity_pn]=[];S.labelFiles[lf.entity_pn].push(lf);});}
+    // Current backorder state per SKU, derived from the sync log — it's a running history of every
+    // backorder/reverted event, not a live status field, so the MOST RECENT row per SKU (already
+    // sorted newest-first by the query) is the source of truth for whether it's backordered right now.
+    S.currentBackorders={};
+    if(!shopifySyncLog.error){
+      const seen=new Set();
+      (shopifySyncLog.data||[]).forEach(function(r){
+        if(seen.has(r.pn))return; // already saw a newer row for this pn — skip
+        seen.add(r.pn);
+        if(r.action==='backorder')S.currentBackorders[r.pn]={restock_date:r.restock_date||null,since:r.created_at};
+      });
+    }
     S.liveActivity=[];
     S.corrections.slice(0,20).forEach(c=>{
       const icon={po_receipt:'📦',pack:'🔧',unpack:'↩',cycle_count:'📋',shipment:'🚚',manual:'✎'}[c.source]||'✎';
@@ -1098,12 +1112,15 @@ function cascadeShopifySync(childPn){
     if(!lines.some(l=>l.child_pn===childPn))return;
     const parent=S.assemblies.find(a=>a.pn===parentPn);
     if(!parent)return;
+    if(parent.discontinued||isDev(parent))return; // never auto-manage Shopify listings for retired or in-development items
     if((parent.total_on_hand||0)<=0)syncShopifyTemplate(parentPn,parent.total_on_hand||0);
   });
 }
 function syncShopifyTemplate(pn,newOh){
   if(!pn||!S.shopify||!S.shopify.store)return; // key now lives in edge function secrets
   if(S.settings.shopify_backorder_sync_enabled===false){console.log('[Shopify template] sync disabled — skipped for',pn);return;}
+  var _item=S.assemblies.find(function(a){return a.pn===pn;})||S.parts.find(function(p){return p.pn===pn;});
+  if(_item&&(_item.discontinued||isDev(_item))){console.log('[Shopify template] skipped — discontinued/dev item:',pn);return;} // never auto-manage Shopify listings for retired or in-development items
   var isBackorder=false;
   if(newOh<=0){
     var b=buildabilityForBackorder(pn);
@@ -1167,6 +1184,13 @@ function carrierLabel(code){
 function escHtml(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function jsEsc(s){return String(s??'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r');}
 function dispPn(a){return(a&&a.use_new_sku&&a.new_sku)?a.new_sku:((a&&a.pn)||'');}
+function backorderBadge(pn){
+  const bo=pn&&S.currentBackorders&&S.currentBackorders[pn];
+  if(!bo)return'';
+  const since=bo.since?new Date(bo.since).toLocaleDateString():'';
+  const title='On backorder on Shopify'+(bo.restock_date?' — restock date '+bo.restock_date:'')+(since?' (since '+since+')':'');
+  return '<span class="pill pill-red" style="font-size:8.5px;vertical-align:middle;margin-left:4px" title="'+escHtml(title)+'">&#8987; BACKORDERED</span>';
+}
 function findAsm(pn){
   if(!pn)return undefined;
   var a=S.assemblies.find(function(x){return x.pn===pn;});
@@ -1781,7 +1805,7 @@ function renderAssemblies(){
     <td onclick="event.stopPropagation()"><input type="checkbox" ${asmSel?'checked':''} onchange="toggleAsmSel('${a.id}',this.checked)"></td>
     <td style="padding:4px 6px;width:40px" onclick="event.stopPropagation()">${a.image_url?`<img src="${escHtml(a.image_url)}" style="width:34px;height:34px;object-fit:cover;border-radius:4px;border:1px solid var(--border);cursor:zoom-in;transition:transform .15s" onmouseenter="this.style.transform='scale(1.15)'" onmouseleave="this.style.transform='scale(1)'" onclick="event.stopPropagation();openImageLightbox('${escHtml(a.image_url)}','${escHtml(a.pn)}')" loading="lazy" onerror="this.style.display='none'">`:'<div style="width:34px;height:34px;background:var(--bg3);border-radius:4px;border:1px solid var(--border)"></div>'}</td>
     <td class="pn" style="color:${isDev(a)?'var(--purple)':'var(--teal)'}">
-      ${dispPn(a)}${a.new_sku?`<span title="${a.use_new_sku?'Legacy: '+escHtml(a.pn):'Pending: '+escHtml(a.new_sku)}" style="margin-left:4px;font-size:9px;padding:1px 4px;border-radius:3px;vertical-align:middle;${a.use_new_sku?'background:rgba(13,148,136,.12);color:var(--teal)':'background:var(--bg3);color:var(--text3)'}">${a.use_new_sku?escHtml(a.pn):'&#8594;'+escHtml(a.new_sku)}</span>`:''}
+      ${dispPn(a)}${a.new_sku?`<span title="${a.use_new_sku?'Legacy: '+escHtml(a.pn):'Pending: '+escHtml(a.new_sku)}" style="margin-left:4px;font-size:9px;padding:1px 4px;border-radius:3px;vertical-align:middle;${a.use_new_sku?'background:rgba(13,148,136,.12);color:var(--teal)':'background:var(--bg3);color:var(--text3)'}">${a.use_new_sku?escHtml(a.pn):'&#8594;'+escHtml(a.new_sku)}</span>`:''}${backorderBadge(a.pn)}
     </td>
     <td class="main-col" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(a.description||'')}</td>
     <td style="padding:4px 6px"><span class="bomtag ${catBomClass(a.category||'')}">${escHtml(a.category||'—')}</span></td>
@@ -4906,12 +4930,20 @@ async function cascadeShopifyBackorder(childPn: string): Promise<void> {
   const { data: boms } = await db.from('bom_items').select('parent_pn').eq('child_pn', childPn)
   const parentPns = [...new Set((boms || []).map((b: any) => b.parent_pn))]
   if (!parentPns.length) return
-  const { data: parents } = await db.from('assemblies').select('pn,total_on_hand').in('pn', parentPns)
+  const { data: parents } = await db.from('assemblies').select('pn,total_on_hand,discontinued,stage').in('pn', parentPns)
   for (const parent of (parents || [])) {
+    if (parent.discontinued || parent.stage === 'dev') continue // never auto-manage Shopify listings for retired or in-development items
     if ((parent.total_on_hand || 0) <= 0) await syncShopifyBackorder(parent.pn, parent.total_on_hand || 0)
   }
 }
 async function syncShopifyBackorder(pn: string, newOh: number): Promise<void> {
+  const { data: asmCheck } = await db.from('assemblies').select('discontinued,stage').eq('pn', pn).limit(1)
+  const { data: partCheck } = asmCheck?.length ? { data: null } : await db.from('parts').select('discontinued').eq('pn', pn).limit(1)
+  const item = asmCheck?.[0] || partCheck?.[0]
+  if (item && (item.discontinued || item.stage === 'dev')) {
+    console.log('[SS->Shopify] skipped — discontinued/dev item:', pn)
+    return
+  }
   const { data: toggleRow } = await db.from('settings').select('value').eq('key', 'shopify_backorder_sync_enabled').limit(1)
   const syncEnabled = toggleRow?.[0]?.value
   if (syncEnabled === false || syncEnabled === 'false') {
@@ -5745,8 +5777,9 @@ function renderInventoryBackorderLog(){
       <input id="ibo-search" placeholder="Search SKU…" oninput="loadInvBackorderLog()" style="width:160px">
     </div>
     <button class="filter-chip" id="ibo-f-all" onclick="window._iboFilter='all';loadInvBackorderLog()">All</button>
-    <button class="filter-chip" id="ibo-f-backorder" onclick="window._iboFilter='backorder';loadInvBackorderLog()">Backorder</button>
-    <button class="filter-chip" id="ibo-f-reverted" onclick="window._iboFilter='reverted';loadInvBackorderLog()">Reverted</button>
+    <button class="filter-chip" id="ibo-f-current" style="color:var(--red)" onclick="window._iboFilter='current';loadInvBackorderLog()">🔴 Currently Backordered</button>
+    <button class="filter-chip" id="ibo-f-backorder" onclick="window._iboFilter='backorder';loadInvBackorderLog()">Backorder Events</button>
+    <button class="filter-chip" id="ibo-f-reverted" onclick="window._iboFilter='reverted';loadInvBackorderLog()">Reverted Events</button>
     <span id="ibo-count" style="font-size:11px;color:var(--text3);margin-left:4px"></span>
   </div>
   <div id="inv-bo-log-wrap">
@@ -5758,23 +5791,43 @@ async function loadInvBackorderLog(){
   if(!wrap)return;
   var filter=window._iboFilter||'all';
   var search=(document.getElementById('ibo-search')?.value||'').toLowerCase();
-  ['all','backorder','reverted'].forEach(function(f){
+  ['all','current','backorder','reverted'].forEach(function(f){
     var chip=document.getElementById('ibo-f-'+f);
     if(chip)chip.classList.toggle('on-teal',f===filter);
   });
   wrap.innerHTML='<div style="font-size:11px;color:var(--text3);padding:12px 0">Loading…</div>';
   try{
-    var q=db.from('shopify_sync_log').select('*').order('created_at',{ascending:false}).limit(250);
-    if(filter==='backorder')q=q.eq('action','backorder');
-    if(filter==='reverted')q=q.eq('action','reverted');
-    var{data,error}=await q;
+    var data,error;
+    if(filter==='current'){
+      // "Currently backordered" isn't a single action value — a SKU could have a backorder row
+      // within any naive limit/filter window while ALSO having a later reverted row that got
+      // excluded from that same window. The only correct way to know current state is to look at
+      // enough history to find each SKU's true most-recent event, then keep only the ones where
+      // that latest event is a backorder.
+      var res=await db.from('shopify_sync_log').select('*').order('created_at',{ascending:false}).limit(3000);
+      error=res.error;
+      if(!error){
+        var seen=new Set();
+        data=(res.data||[]).filter(function(r){
+          if(seen.has(r.pn))return false; // keep only the first (=latest, since sorted desc) row per SKU
+          seen.add(r.pn);
+          return r.action==='backorder';
+        });
+      }
+    }else{
+      var q=db.from('shopify_sync_log').select('*').order('created_at',{ascending:false}).limit(250);
+      if(filter==='backorder')q=q.eq('action','backorder');
+      if(filter==='reverted')q=q.eq('action','reverted');
+      var r2=await q;
+      data=r2.data;error=r2.error;
+    }
     if(error||!data){
       wrap.innerHTML='<div style="font-size:11px;color:var(--red);padding:12px 0">'+(error?'Error: '+error.message:'No data.')+'</div>';
       return;
     }
     var rows=data.filter(function(r){return !search||((r.pn||'').toLowerCase().includes(search));});
     var countEl=document.getElementById('ibo-count');
-    if(countEl)countEl.textContent=rows.length+' event'+(rows.length!==1?'s':'');
+    if(countEl)countEl.textContent=filter==='current'?(rows.length+' SKU'+(rows.length!==1?'s':'')+' currently backordered'):(rows.length+' event'+(rows.length!==1?'s':''));
     if(!rows.length){
       wrap.innerHTML='<div style="font-size:11px;color:var(--text3);padding:12px 0">No events match the current filter.</div>';
       return;
@@ -11775,7 +11828,7 @@ function assemblyDossier(pn){
   return `
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
     ${a.image_url?`<img src="${escHtml(a.image_url)}" style="width:68px;height:68px;object-fit:cover;border-radius:8px;border:1px solid var(--border);flex-shrink:0;cursor:zoom-in" onclick="openImageLightbox('${escHtml(a.image_url)}','${escHtml(a.pn)}')" onerror="this.style.display='none'" loading="lazy">`:`<button class="btn btn-sm" style="flex-shrink:0;width:68px;height:68px;border-radius:8px;border:1.5px dashed var(--border2);color:var(--text3);font-size:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;cursor:pointer" onclick="setAsmImageUrl('${escHtml(a.pn)}')"><div style="font-size:20px">&#128247;</div>Add Photo</button>`}
-    <div style="flex:1"><div style="font-size:16px;font-weight:700;color:var(--teal)">${dispPn(a)}${a.new_sku&&a.use_new_sku?` <span style="font-size:10px;color:var(--text3);font-weight:400">(${escHtml(a.pn)})</span>`:''}  ${a.is_subassembly?'<span class="pill pill-orange" style="font-size:9px;vertical-align:middle">SUBASSEMBLY</span>':''} ${a.build_to_order?'<span class="pill" style="font-size:9px;vertical-align:middle;background:rgba(124,58,237,.1);color:var(--purple);border-color:rgba(124,58,237,.25)" title="Never stocked ahead of demand — built exactly when a finished good needs it">BUILD TO ORDER</span>':''} ${a.discontinued?'<span class="pill pill-red" style="font-size:9px;vertical-align:middle">DISCONTINUED</span>':''}</div>
+    <div style="flex:1"><div style="font-size:16px;font-weight:700;color:var(--teal)">${dispPn(a)}${a.new_sku&&a.use_new_sku?` <span style="font-size:10px;color:var(--text3);font-weight:400">(${escHtml(a.pn)})</span>`:''}  ${a.is_subassembly?'<span class="pill pill-orange" style="font-size:9px;vertical-align:middle">SUBASSEMBLY</span>':''} ${a.build_to_order?'<span class="pill" style="font-size:9px;vertical-align:middle;background:rgba(124,58,237,.1);color:var(--purple);border-color:rgba(124,58,237,.25)" title="Never stocked ahead of demand — built exactly when a finished good needs it">BUILD TO ORDER</span>':''} ${a.discontinued?'<span class="pill pill-red" style="font-size:9px;vertical-align:middle">DISCONTINUED</span>':''}${backorderBadge(a.pn)}</div>
     <div style="font-size:12px;color:var(--text2)">${a.description||''}</div></div>
     ${a.drawing_url?`<a href="${a.drawing_url}" target="_blank" class="btn btn-sm">📐 Drawing</a>`:''}
     <button class="btn btn-teal btn-sm" onclick="openBuild('${pn}')">Build Planner</button>
@@ -15024,7 +15077,7 @@ function renderWalkCount(){
 
   <div class="panel" style="max-width:520px;padding:20px;border:2px solid var(--teal)">
     <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.1em;margin-bottom:4px">${current?.type==='assembly'?'Assembly':'Part'} ${current?.loc?'· Bin: '+current.loc:''}</div>
-    <div style="font-size:20px;font-weight:800;font-family:var(--mono);color:var(--teal);margin-bottom:4px">${current?.pn||'Done'}</div>
+    <div style="font-size:20px;font-weight:800;font-family:var(--mono);color:var(--teal);margin-bottom:4px">${current?(current.type==='assembly'?dispPn(S.assemblies.find(a=>a.pn===current.pn)||current):dispPn(S.parts.find(p=>p.pn===current.pn)||current)):'Done'}</div>
     <div style="font-size:13px;color:var(--text2);margin-bottom:16px">${current?.desc||''}</div>
     <div style="display:flex;gap:12px;align-items:flex-end;margin-bottom:16px">
       <div style="flex:1">
@@ -15138,7 +15191,7 @@ function printCycleCount(countId){
   const amPrint={};S.assemblies.forEach(function(a){amPrint[a.pn]=a;});
   const linesEnriched=lines.map(function(l){
     var src=l.item_type==='assembly'?amPrint[l.pn]:pmPrint[l.pn];
-    return Object.assign({},l,{_cat:(src&&src.category)||'Uncategorized'});
+    return Object.assign({},l,{_cat:(src&&src.category)||'Uncategorized',_disp:src?dispPn(src):l.pn});
   });
 
   // Build grouped rows sorted by category then part number
@@ -15153,7 +15206,7 @@ function printCycleCount(countId){
     return '<tr class="section-row"><td colspan="6">'+cat.toUpperCase()+'</td></tr>'
       +ls.map(function(l){
         return '<tr>'
-          +'<td class="pn-cell">'+l.pn+'</td>'
+          +'<td class="pn-cell">'+l._disp+'</td>'
           +'<td class="desc-cell">'+(l.description||'')+'</td>'
           +(l.bomQty?'<td class="num-cell">'+l.bomQty+'/unit</td>':'<td></td>')
           +'<td class="num-cell">'+(l.expected_qty||0)+'</td>'
@@ -15237,7 +15290,7 @@ function renderCountDetail(count) {
   const linesCat=lines.map(function(l){
     const isAsm=l.item_type==='assembly';
     const src=isAsm?S.assemblies.find(function(a){return a.pn===l.pn;}):S.parts.find(function(p){return p.pn===l.pn;});
-    return Object.assign({},l,{_cat:src?.category||'Uncategorized'});
+    return Object.assign({},l,{_cat:src?.category||'Uncategorized',_disp:src?dispPn(src):l.pn});
   });
 
   // Sort + filter state
@@ -15310,7 +15363,7 @@ function renderCountDetail(count) {
       var varClass=variance===null?'':variance>0?'variance-pos':variance<0?'variance-neg':'variance-zero';
       var haveCell=isDone?('<span class="money-neutral">'+(line.actual_qty!==null&&line.actual_qty!==undefined?line.actual_qty:'\u2014')+'</span>'):('<input class="qty-input cc-count-input" type="number" placeholder="\u2014" value="'+(line.actual_qty!==null&&line.actual_qty!==undefined?line.actual_qty:'')+'" data-lid="'+line.id+'" onblur="if(this.dataset.dirty){this.dataset.dirty=\'\';updateCountLine(this.dataset.lid,+this.value);}" oninput="this.dataset.dirty=\'1\';" onkeydown="ccCountKeydown(event,this)" style="width:80px;font-size:14px;font-weight:600;text-align:center">');
       var noteCell=isDone?('<span class="t3xs">'+(line.notes||'')+'</span>'):('<input class="inline-edit" value="'+(line.notes||'')+'" placeholder="Note" onchange="updateCountLineNote(\''+line.id+'\',this.value)" style="max-width:140px">');
-      rows.push('<tr data-lid="'+line.id+'"><td class="pn">'+line.pn+(line.item_type==='assembly'?'<br>'+bomTag(line.pn,'assembly'):'')+'</td>'+'<td style="font-size:10px;color:var(--text3);white-space:nowrap">'+escHtml(line._cat||'')+'</td>'+'<td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(line.description||'')+'</td>'+'<td class="money-neutral">'+(line.expected_qty||0)+'</td>'+'<td>'+haveCell+'</td>'+'<td><span class="var-cell '+varClass+'">'+(variance===null?'\u2014':(variance>=0?'+':'')+variance)+'</span></td>'+'<td>'+noteCell+'</td></tr>');
+      rows.push('<tr data-lid="'+line.id+'"><td class="pn">'+line._disp+(line.item_type==='assembly'?'<br>'+bomTag(line.pn,'assembly'):'')+'</td>'+'<td style="font-size:10px;color:var(--text3);white-space:nowrap">'+escHtml(line._cat||'')+'</td>'+'<td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(line.description||'')+'</td>'+'<td class="money-neutral">'+(line.expected_qty||0)+'</td>'+'<td>'+haveCell+'</td>'+'<td><span class="var-cell '+varClass+'">'+(variance===null?'\u2014':(variance>=0?'+':'')+variance)+'</span></td>'+'<td>'+noteCell+'</td></tr>');
     });
     return rows.join('');
   })()}
