@@ -225,7 +225,7 @@ if(window.top!==window.self){try{if(window.top.location.origin!==window.self.loc
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v16.5';
+const TGK_ERP_VERSION = 'v16.6';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -7215,7 +7215,7 @@ async function masterTrackingSync(customRange){
       return;
     }
     await refreshSales();
-    render();
+    if(!isUserActivelyWorking())render();
     toast('✓ Tracking synced — '+(data.synced||0)+' shipment'+(data.synced!==1?'s':'')+' applied'+(data.notFound?', '+data.notFound+' order(s) not found in ERP':''),6000);
   }catch(e){
     if(e.name==='AbortError')toast('⏱ Sync timed out after 90s — try a shorter range from Integrations → Bulk Sync',6000);
@@ -9525,20 +9525,34 @@ async function saveBulkEdit(table){
   window.addEventListener('beforeunload',_beforeUnloadWarn);
 
   try{
-    // STEP 3: Write everything as a single batch upsert instead of N sequential round-trips. This
-    // shrinks the "vulnerable window" where closing the tab could interrupt anything from potentially
-    // minutes (one row at a time, awaited) down to a single network request — either the whole batch
-    // lands or it doesn't, there's no longer a partial-completion state to worry about.
-    const{error}=await db.from(isParts?'parts':'assemblies').upsert(rows,{onConflict:'id'});
-    if(error){
-      toast('⚠ Save failed — nothing was written: '+error.message,8000);
-      return;
+    // STEP 3: Fire all row updates in parallel via Promise.allSettled, instead of a single upsert()
+    // call. upsert() constructs an INSERT..ON CONFLICT DO UPDATE under the hood, which means the
+    // INSERT candidate row must satisfy every NOT-NULL column (like `pn`) even for rows that already
+    // exist and are only being partially updated — that's what caused every bulk save to fail outright
+    // since v15.3. update() only ever touches the columns actually included in the payload, so it
+    // can't hit this class of constraint violation. Running them in parallel rather than sequentially
+    // keeps the original goal intact — minimizing how long the operation is vulnerable to interruption
+    // — without requiring the full-row-shape that upsert demands.
+    const results=await Promise.allSettled(rows.map(function(r){
+      const{id,...fields}=r;
+      return db.from(isParts?'parts':'assemblies').update(fields).eq('id',id).then(function(res){
+        if(res.error)throw new Error(r.id+': '+res.error.message);
+        return r;
+      });
+    }));
+    const failed=results.filter(function(x){return x.status==='rejected';});
+    const succeeded=results.filter(function(x){return x.status==='fulfilled';}).map(function(x){return x.value;});
+    const saved=succeeded.length;
+    if(isParts)S.parts=S.parts.map(x=>{const r=succeeded.find(r=>r.id===x.id);return r?{...x,...r}:x;});
+    else S.assemblies=S.assemblies.map(x=>{const r=succeeded.find(r=>r.id===x.id);return r?{...x,...r}:x;});
+    if(saved)logAction('Bulk edited '+saved+' '+table,''+table,null,null,null).catch(()=>{});
+    if(failed.length){
+      const sample=failed.slice(0,3).map(function(x){return x.reason.message;}).join('; ');
+      toast((saved?'⚠ '+saved+' saved, ':'⚠ Nothing saved — ')+failed.length+' failed: '+sample+(failed.length>3?' …':''),9000);
+      if(!saved)return;
+    }else{
+      toast('\u2713 '+saved+' '+(isParts?'parts':'assemblies')+' updated');
     }
-    const saved=rows.length;
-    if(isParts)S.parts=S.parts.map(x=>{const r=rows.find(r=>r.id===x.id);return r?{...x,...r}:x;});
-    else S.assemblies=S.assemblies.map(x=>{const r=rows.find(r=>r.id===x.id);return r?{...x,...r}:x;});
-    logAction('Bulk edited '+saved+' '+table,''+table,null,null,null).catch(()=>{});
-    toast('\u2713 '+saved+' '+(isParts?'parts':'assemblies')+' updated');
     S.bulkEditMode=null;
     if(isParts)S.selectedParts=new Set();
     else S.selectedAsms=new Set();
