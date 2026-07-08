@@ -239,7 +239,7 @@ const S = {
   shipstation:{connected:false,key:'',secret:''},
   aiHistory:[{role:'assistant',text:'Hi — I\'m your TGK ERP assistant. Ask me about inventory levels, what needs reordering, BOM analysis, or pack planning.'}],
   aiLoading:false,
-  undoStack:[], backups:[], lastBackup:null, autoBackupTimer:null, autoRefreshTimer:null, autoHoldSyncTimer:null, lastActivity:Date.now(), packSkipMissing:false,
+  undoStack:[], backups:[], lastBackup:null, autoBackupTimer:null, autoRefreshTimer:null, autoHoldSyncTimer:null, autoDeliverySyncTimer:null, lastActivity:Date.now(), packSkipMissing:false,
   backupTableOk:null, // null=unknown, true=exists, false=missing
   backupError:null,   // last error string if backup failed
   forecastWeeks:4,
@@ -5236,7 +5236,7 @@ Deno.serve(async (req) => {
   if (body.action === 'delivery_sync') {
     const auth = ssAuth()
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
-    const since = body.since || new Date(Date.now() - 45*24*60*60*1000).toISOString().slice(0,10)
+    const since = body.since || new Date(Date.now() - 90*24*60*60*1000).toISOString().slice(0,10)
     const { data: shipped } = await db.from('sales')
       .select('id,order_number,tracking_number')
       .eq('fulfillment_status', 'Shipped')
@@ -11099,6 +11099,35 @@ function startAutoRefresh(){
       }
     }catch(e){console.warn('[TGK] Auto hold sync failed:',e.message);}
   },5*60*1000);
+  if(S.autoDeliverySyncTimer)clearInterval(S.autoDeliverySyncTimer);
+  // Auto delivery sync — ShipStation has no real-time "delivered" webhook the way it does for
+  // shipping/holds/cancellations; delivery status only exists by polling carrier tracking data.
+  // This was previously 100% manual (the "Deliveries" button), meaning orders sat as "Shipped"
+  // indefinitely unless someone remembered to click it. Runs far less often than hold sync since
+  // delivery status changes slowly and each run checks up to 2000 shipments against ShipStation.
+  S.autoDeliverySyncTimer=setInterval(async()=>{
+    if(!S.currentUserId)return;
+    if(!(S.shopify?.store&&S.shopify?.key))return;
+    try{
+      const res=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
+        body:JSON.stringify({action:'delivery_sync'})
+      });
+      if(!res.ok)return;
+      const data=await res.json().catch(()=>({}));
+      const d=data.delivered||0;
+      if(d>0){
+        await refreshSales();
+        if(!isUserActivelyWorking()){
+          render();
+          toast('🚚 Auto delivery sync — '+d+' order'+(d!==1?'s':'')+' marked Delivered',4000);
+        }else{
+          console.warn('[TGK] Auto delivery sync: active edit session in progress — data updated silently, re-render deferred');
+        }
+      }
+    }catch(e){console.warn('[TGK] Auto delivery sync failed:',e.message);}
+  },2*60*60*1000);
   const resetIdle=()=>S.lastActivity=Date.now();
   ['mousedown','keydown','touchstart','scroll'].forEach(e=>document.addEventListener(e,resetIdle,{passive:true}));
   const IDLE_MS=5*60*1000; // 5 min — background refresh trigger
