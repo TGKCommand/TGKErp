@@ -224,7 +224,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v19.3';
+const TGK_ERP_VERSION = 'v19.5';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -348,22 +348,42 @@ function computeDemand(){
     if(weeksOfSupply<=6)return 0.5;    // moderately buffered — partial demand, some replenishment still sensible
     return 0;                          // well-buffered — no near-term production planned, don't pull components in
   }
+  // [DAG] Propagate finished-goods demand DOWN the BOM tree in topological order (parents before their
+  // subassemblies) so multi-level demand carries fully regardless of the order BOMs are stored in.
+  // Handles BOTH 'assembly' and 'subassembly' item_types (the old single pass only did 'assembly').
+  // Urgency is computed once per parent from its finalized demand and reused for its parts.
+  const _asmSet=new Set(S.assemblies.map(a=>a.pn));
+  const _kids={},_indeg={};
+  S.assemblies.forEach(a=>{_indeg[a.pn]=0;});
   Object.entries(S.boms).forEach(([parent,items])=>{
-    if(devPnSet.has(parent))return;
-    const ad=asmCalc[parent];if(!ad)return;
-    const urgency=_productionUrgency(parent);
+    if(!_asmSet.has(parent)||devPnSet.has(parent))return;
     items.forEach(i=>{
-      if(i.item_type==='assembly'&&asmCalc[i.child_pn]){
-        asmCalc[i.child_pn].wk4+=ad.wk4*(i.qty||1)*urgency;
-        asmCalc[i.child_pn].wk12+=ad.wk12*(i.qty||1)*urgency;
+      if((i.item_type==='assembly'||i.item_type==='subassembly')&&_asmSet.has(i.child_pn)){
+        (_kids[parent]=_kids[parent]||[]).push(i);
+        _indeg[i.child_pn]=(_indeg[i.child_pn]||0)+1;
       }
+    });
+  });
+  const _q=S.assemblies.map(a=>a.pn).filter(pn=>(_indeg[pn]||0)===0);
+  const _topo=[],_seen=new Set();
+  while(_q.length){const n=_q.shift();if(_seen.has(n))continue;_seen.add(n);_topo.push(n);
+    (_kids[n]||[]).forEach(i=>{if(--_indeg[i.child_pn]===0)_q.push(i.child_pn);});}
+  S.assemblies.forEach(a=>{if(!_seen.has(a.pn)){_seen.add(a.pn);_topo.push(a.pn);}}); // any BOM cycle remnants still keep their own demand
+  const _urg={};
+  _topo.forEach(parent=>{
+    const ad=asmCalc[parent];if(!ad||devPnSet.has(parent))return;
+    const u=_productionUrgency(parent);_urg[parent]=u;
+    (_kids[parent]||[]).forEach(i=>{
+      const c=asmCalc[i.child_pn];if(!c)return;
+      c.wk4+=ad.wk4*(i.qty||1)*u;
+      c.wk12+=ad.wk12*(i.qty||1)*u;
     });
   });
   S.parts.forEach(p=>{partCalc[p.pn]={wk4:(wk4[p.pn]||0)/4,wk12:(wk12[p.pn]||0)/12};});
   Object.entries(S.boms).forEach(([parent,items])=>{
     if(devPnSet.has(parent))return;
     const ad=asmCalc[parent];if(!ad)return;
-    const urgency=_productionUrgency(parent);
+    const urgency=_urg[parent]!==undefined?_urg[parent]:_productionUrgency(parent);
     items.forEach(i=>{
       if(i.item_type==='assembly'||i.item_type==='subassembly')return; // skip sub-assemblies (handled separately); include 'part', 'packaging', null, etc.
       if(!partCalc[i.child_pn])partCalc[i.child_pn]={wk4:0,wk12:0};
@@ -1129,11 +1149,17 @@ function cascadeShopifySync(childPn){
 function syncShopifyTemplate(pn,newOh){
   if(!pn||!S.shopify||!S.shopify.store)return; // key now lives in edge function secrets
   if(S.settings.shopify_backorder_sync_enabled===false){console.log('[Shopify template] sync disabled — skipped for',pn);return;}
-  var _item=S.assemblies.find(function(a){return a.pn===pn;})||S.parts.find(function(p){return p.pn===pn;});
+  var _item=S.assemblies.find(function(a){return a.pn===pn||a.new_sku===pn;})||S.parts.find(function(p){return p.pn===pn||p.new_sku===pn;});
   if(_item&&!eligibleForBackorderSync(_item)){console.log('[Shopify template] skipped — not eligible (subassembly/hardware pack/pre-order/discontinued/dev):',pn);return;}
+  // [SKU] Shopify variant SKUs are the customer-facing SKU (new_sku when use_new_sku). Callers hand us the
+  // internal/canonical pn, so resolve BOTH: canonPn for buildability (BOM keys are canonical) and shopSku
+  // (dispPn) for what we actually send to Shopify -- otherwise the edge update_template lookup misses the
+  // variant for every new_sku item and the flag never lands. This matches what the bulk sync already does.
+  var canonPn=_item?_item.pn:pn;
+  var shopSku=_item?dispPn(_item):pn;
   var isBackorder=false;
   if(newOh<=0){
-    var b=buildabilityForBackorder(pn);
+    var b=buildabilityForBackorder(canonPn);
     if(b.hasBOM){
       isBackorder=(b.maxBuild<=0);
     }else{
@@ -1163,11 +1189,11 @@ function syncShopifyTemplate(pn,newOh){
   fetch(SUPA_URL+'/functions/v1/shopify-orders',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({action:'update_template',pn,template,restock_date:restockDate})
+    body:JSON.stringify({action:'update_template',pn:shopSku,template,restock_date:restockDate})
   }).then(function(r){
     if(!r.ok)r.json().then(function(e){console.warn('[Shopify template]',pn,e.error||r.status);});
     else{
-      var b2=buildability(pn);
+      var b2=buildability(canonPn);
       db.from('shopify_sync_log').insert({
         pn,
         action:isBackorder?'backorder':'reverted',
@@ -14043,13 +14069,65 @@ function renderPurchasesEnhanced() {
   return _origRenderPurchases();
 }
 
+// [SHARED] Valid OVER-estimate of buildable units (sub avail = on-hand + independent build capacity,
+// ignoring cross-line sharing). Bounds the feasibility search in _maxBuildShared.
+function _ubMax(pn,pm,am,includeItem,_d){
+  _d=_d||0; if(_d>6)return 0;
+  var bom=S.boms[pn]||[]; if(!bom.length)return Infinity;
+  var per=[];
+  for(var k=0;k<bom.length;k++){var i=bom[k];
+    if(includeItem&&!includeItem(i))continue;
+    var isSub=i.item_type==='assembly'||i.item_type==='subassembly'||!!am[i.child_pn];
+    var avail;
+    if(isSub){var s=am[i.child_pn];var oh=s?Math.max(0,s.total_on_hand||0):0;var cap=_ubMax(i.child_pn,pm,am,includeItem,_d+1);avail=oh+(cap===Infinity?0:cap);}
+    else{var p=pm[i.child_pn];avail=p?Math.max(0,p.total_unpckgd||0):0;}
+    per.push(i.qty>0?Math.floor(avail/i.qty):Infinity);
+  }
+  if(!per.length)return Infinity;
+  return Math.max(0,Math.min.apply(null,per));
+}
+// [SHARED] True max buildable respecting SHARED pools: subassembly on-hand is consumed before building
+// from raw parts, and a part used in multiple places draws from ONE stock pool. Feasibility is monotonic
+// in N, so binary-search the largest feasible N. includeItem lets the backorder path drop packaging/supply.
+function _maxBuildShared(pn,pm,am,includeItem){
+  var ub=_ubMax(pn,pm,am,includeItem,0);
+  if(ub===Infinity)return Infinity;
+  if(!(ub>0))return 0;
+  function feasible(N){
+    var partUsed={},subLeft={},ok=true;
+    (function explode(node,count,depth){
+      if(!ok||count<=0)return;
+      if(depth>8){ok=false;return;}
+      var bom=S.boms[node]||[];
+      for(var k=0;k<bom.length&&ok;k++){var i=bom[k];
+        if(includeItem&&!includeItem(i))continue;
+        var need=count*(i.qty||1); if(need<=0)continue;
+        var isSub=i.item_type==='assembly'||i.item_type==='subassembly'||!!am[i.child_pn];
+        if(isSub){
+          if(subLeft[i.child_pn]===undefined){var sa=am[i.child_pn];subLeft[i.child_pn]=sa?Math.max(0,sa.total_on_hand||0):0;}
+          var fromStock=Math.min(need,subLeft[i.child_pn]); subLeft[i.child_pn]-=fromStock;
+          var toBuild=need-fromStock;
+          if(toBuild>0){ if((S.boms[i.child_pn]||[]).length===0){ok=false;return;} explode(i.child_pn,toBuild,depth+1); }
+        } else {
+          partUsed[i.child_pn]=(partUsed[i.child_pn]||0)+need;
+          var p=pm[i.child_pn]; var stock=p?(p.total_unpckgd||0):0;
+          if(partUsed[i.child_pn]>stock){ok=false;return;}
+        }
+      }
+    })(pn,N,0);
+    return ok;
+  }
+  var lo=0,hi=ub;
+  while(lo<hi){var mid=lo+Math.ceil((hi-lo)/2); if(feasible(mid))lo=mid; else hi=mid-1;}
+  return lo;
+}
 function buildability(pn,_depth){
   _depth=_depth||0;
   if(_depth>6)return{maxBuild:0,checks:[],hasBOM:false}; // guard infinite recursion
   const bom=(S.boms[pn]||[]);
   if(!bom.length)return{maxBuild:Infinity,checks:[],hasBOM:false};
-  const pm={};S.parts.forEach(p=>pm[p.pn]=p);
-  const am={};S.assemblies.forEach(a=>am[a.pn]=a);
+  if(!S._partIdx||!S._asmIdx)buildLookupMaps(); // [PERF] use the global O(1) index instead of rebuilding part/assembly maps on every (recursive) call
+  const pm=S._partIdx,am=S._asmIdx;
   const checks=bom.map(i=>{
     const inAsm=!!am[i.child_pn],inPart=!!pm[i.child_pn];
     const isSub=i.item_type==='assembly'||i.item_type==='subassembly'||inAsm; // inAsm alone: assembly table is authoritative
@@ -14073,47 +14151,31 @@ function buildability(pn,_depth){
       maxFromThis:i.qty>0?Math.floor(avail/i.qty):Infinity,ok:avail>=i.qty,
       loc:isSub?'SUB-ASSY':(src?.location||'')};
   });
-  const maxBuild=checks.length?Math.max(0,Math.min(...checks.map(c=>c.maxFromThis))):0;
+  // [SHARED] checks[] above stay per-line for display; the authoritative maxBuild respects shared pools.
+  const maxBuild=_maxBuildShared(pn,pm,am,null);
   return{maxBuild,checks,hasBOM:true};
 }
 
-function buildabilityForBackorder(pn,_depth){
-  _depth=_depth||0;
+function buildabilityForBackorder(pn){
   var bom=S.boms[pn]||[];
   if(!bom.length)return buildability(pn); // no BOM — fall through to standard logic
-
+  if(!S._partIdx||!S._asmIdx)buildLookupMaps();
+  var pm=S._partIdx,am=S._asmIdx;
   var supplyLower=(SUPPLY_CATS||[]).map(function(s){return s.toLowerCase();});
-  var realBOM=bom.filter(function(i){
+  function inc(i){ // ignore packaging/supply so a FG isn't called un-buildable over a box or bulk consumable
     if(i.item_type==='packaging')return false;
-    var cp=S.parts.find(function(p){return p.pn===i.child_pn;});
+    var cp=pm[i.child_pn];
     if(cp){
       var cat=(cp.category||'').toLowerCase();
       if(supplyLower.some(function(s){return cat===s;}))return false;
       if(cat.includes('box')||cat.includes('packaging')||cat.includes('shipping'))return false;
     }
     return true;
-  });
-
-  if(!realBOM.length)return{maxBuild:1,hasBOM:true};
-
-  var pm={},am={};
-  S.parts.forEach(function(p){pm[p.pn]=p;});
-  S.assemblies.forEach(function(a){am[a.pn]=a;});
-  var maxBuilds=realBOM.map(function(i){
-    var inAsm=!!am[i.child_pn];
-    var src=inAsm?am[i.child_pn]:pm[i.child_pn];
-    var avail=src?(inAsm?(src.total_on_hand||0):(src.total_unpckgd||0)):0;
-    if(inAsm&&avail<=0&&_depth<6){
-      // [BUILDABLE] A zero-on-hand subassembly is NOT a hard blocker if it can be built from its own
-      // parts -- otherwise a finished good gets wrongly flagged as backordered on Shopify just because a
-      // build-to-order subassembly isn't pre-stocked. Mirrors the recursion in buildability().
-      var subB=buildabilityForBackorder(i.child_pn,_depth+1);
-      avail=(subB&&subB.hasBOM)?Math.max(0,subB.maxBuild):0;
-    }
-    return i.qty>0?Math.floor(avail/i.qty):Infinity;
-  });
-  var maxBuild=Math.max(0,Math.min.apply(null,maxBuilds));
-  return{maxBuild:maxBuild,hasBOM:true};
+  }
+  if(!bom.some(inc))return{maxBuild:1,hasBOM:true}; // nothing but packaging/supply -> trivially buildable
+  // [SHARED] recurses into build-to-order subassemblies AND respects shared part pools
+  var mb=_maxBuildShared(pn,pm,am,inc);
+  return{maxBuild:mb===Infinity?1:mb,hasBOM:true};
 }
 
 function openOrderDemand(pn){
