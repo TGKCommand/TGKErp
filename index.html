@@ -114,6 +114,7 @@
     <button class="nav-item" id="nav-packqueue" onclick="nav('packqueue')"><span class="nav-dot"></span>Production</button>
     <button class="nav-item" id="nav-cyclecounts" onclick="nav('cyclecounts')"><span class="nav-dot"></span>Cycle Counts</button>
     <button class="nav-item" id="nav-corrections" onclick="nav('corrections')"><span class="nav-dot"></span>Activity Log</button>
+    <button class="nav-item" id="nav-dataintegrity" onclick="nav('dataintegrity')"><span class="nav-dot"></span>Data Integrity</button>
 
     <div class="sidebar-section">Purchasing</div>
     <button class="nav-item" id="nav-planning" onclick="nav('planning')"><span class="nav-dot"></span>Purchasing</button>
@@ -223,7 +224,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v18.8';
+const TGK_ERP_VERSION = 'v19.1';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -10070,15 +10071,14 @@ function wtyAsmFilter(q){
   const pool=lq?[...active,...disc]:[...active,...disc]; // show all when searching
   const filtered=lq?pool.filter(function(k){
     const a=S.assemblies.find(function(x){return x.pn===k;});
-    return k.toLowerCase().includes(lq)||(a?.new_sku||'').toLowerCase().includes(lq)||(a?.description||'').toLowerCase().includes(lq);
+    return k.toLowerCase().includes(lq)||(a?.description||'').toLowerCase().includes(lq);
   }):active; // only active when no search
   if(!filtered.length){dd.innerHTML='<div style="padding:10px;font-size:12px;color:var(--text3)">No assemblies found</div>';return;}
   dd.innerHTML=filtered.map(function(k){
     const a=S.assemblies.find(function(x){return x.pn===k;});
     const isDisc=a?.discontinued;
-    const shown=dispPn(a);
     return '<div class="_wty-asm-opt" onclick="wtyAsmPick(\''+k+'\')" style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);opacity:'+(isDisc?'.5':'1')+'" onmouseenter="this.style.background=\'var(--bg3)\'" onmouseleave="this.style.background=\'transparent\'">'
-      +'<div style="font-family:var(--mono);font-size:12px;color:'+(isDisc?'var(--text3)':'var(--teal)')+'">'+escHtml(shown)+(isDisc?' <span style="font-size:9px">🗄</span>':'')+(a?.use_new_sku&&a.new_sku?' <span style="font-size:9px;color:var(--text3)">('+escHtml(a.pn)+')</span>':'')+'</div>'
+      +'<div style="font-family:var(--mono);font-size:12px;color:'+(isDisc?'var(--text3)':'var(--teal)')+'">'+k+(isDisc?' <span style="font-size:9px">🗄</span>':'')+'</div>'
       +(a?.description?'<div style="font-size:10px;color:var(--text3);margin-top:1px">'+escHtml(a.description)+'</div>':'')
     +'</div>';
   }).join('');
@@ -11941,6 +11941,31 @@ function renderDossier(sel){
   if(sel.type==='assembly')return assemblyDossier(sel.pn);
   return partDossier(sel.pn);
 }
+async function loadItemCorrections(pn){
+  // The global S.corrections cache only ever holds the 1000 most recent corrections across the
+  // ENTIRE business — with enough daily shipping/packing/counting volume, that window can be
+  // exhausted within a day or two, silently hiding a specific item's real, correctly-logged history
+  // even though nothing is actually wrong with the underlying data. Querying directly for just this
+  // one PN sidesteps that limit entirely, since the query itself is scoped instead of relying on
+  // whatever happened to still be in a shared, business-wide cache.
+  if(!S._itemCorrCache)S._itemCorrCache={};
+  if(S._itemCorrCache[pn]&&S._itemCorrCache[pn].loading)return;
+  S._itemCorrCache[pn]={loading:true,rows:S._itemCorrCache[pn]?.rows||null};
+  try{
+    const{data,error}=await db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,user_email,created_at').eq('pn',pn).order('created_at',{ascending:false}).limit(40);
+    S._itemCorrCache[pn]={loading:false,rows:error?null:(data||[])};
+  }catch(e){
+    S._itemCorrCache[pn]={loading:false,rows:null};
+  }
+  if(S.lookupSel&&S.lookupSel.pn===pn)render();
+}
+function itemCorrections(pn,fallbackLimit){
+  if(!S._itemCorrCache)S._itemCorrCache={};
+  const cached=S._itemCorrCache[pn];
+  if(!cached)loadItemCorrections(pn); // fire and forget — falls back to the (possibly incomplete) global cache below until this resolves
+  if(cached&&cached.rows)return cached.rows;
+  return S.corrections.filter(c=>c.pn===pn).slice(0,fallbackLimit||8);
+}
 
 function tierPrices(a){
   const bomEstimate = !a.msrp ? bomCostOf(a.pn,0)*1.6 : 0;
@@ -11962,7 +11987,7 @@ function assemblyDossier(pn){
   const sold90=S.sales.filter(s=>s.pn===pn&&s.sale_date>=daysAgo(90)).reduce((t,s)=>t+(s.qty||1),0);
   const claims=S.warrantyClaims.filter(w=>w.pn===pn);
   const recentSales=S.sales.filter(s=>s.pn===pn).slice(0,8);
-  const corr=S.corrections.filter(c=>c.pn===pn).slice(0,6);
+  const corr=itemCorrections(pn,6);
   const bomCost=bomCostOf(pn,0);
   const margin=a.msrp>0?((a.msrp-bomCost)/a.msrp*100):null;
   return `
@@ -12086,8 +12111,9 @@ function partDossier(pn){
   if(!p)return'<div class="panel section-empty">Not found</div>';
   const whereUsed=Object.entries(S.boms).filter(([parent,items])=>{const _wa=S.assemblies.find(a=>a.pn===parent);return _wa&&!_wa.discontinued&&items.some(i=>i.child_pn===pn);}).map(([parent,items])=>({parent,qty:items.find(i=>i.child_pn===pn)?.qty||0}));
   const rp=calcReorderPoint(p);
-  const corr=S.corrections.filter(c=>c.pn===pn).slice(0,8);
-  const receipts=S.corrections.filter(c=>c.pn===pn&&c.source==='po_receipt').slice(0,10);
+  const _itemCorr=itemCorrections(pn,40);
+  const corr=_itemCorr.slice(0,8);
+  const receipts=_itemCorr.filter(c=>c.source==='po_receipt').slice(0,10);
   const openLines=[];Object.values(S.poLines).forEach(ls=>ls.forEach(l=>{if(l.pn===pn&&l.qty_received<l.qty_ordered)openLines.push(l);}));
   const openPOs=S.purchases.filter(po=>po.pn===pn&&po.status!=='Received');
   const partClaims=S.warrantyClaims.filter(w=>w.pn===pn);
@@ -14131,7 +14157,7 @@ function renderPackQueue(){
     </div>
   </div>
   <div class="tbl-wrap">
-  <table><thead class="sticky-header"><tr><th>SKU</th><th>Description</th><th>On Hand</th><th>Open Orders</th><th>${cov}-Wk Fcst</th><th>Suggested</th><th>Max Buildable</th><th>Status</th><th>Quick Pack</th></tr></thead><tbody>
+  <table><thead class="sticky-header"><tr><th>SKU</th><th>Description</th><th>Bin</th><th>On Hand</th><th>Open Orders</th><th>${cov}-Wk Fcst</th><th>Suggested</th><th>Max Buildable</th><th>Status</th><th>Quick Pack</th></tr></thead><tbody>
   ${rows.map(r=>{
     let st,stCls;
     if(r.suggested<=0){st='Covered';stCls='pill-teal';}
@@ -14142,6 +14168,7 @@ function renderPackQueue(){
     return `<tr class="rowlink" onclick="rowClick(event,function(){openBuild('${r.pn}')})">
       <td class="pn" style="color:var(--teal)">${dispPn(r)}${!sf.type?typeBadge(r.type):''}</td>
       <td style="max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${r.description||''}${r.b.hasBOM?'':' <span style="font-size:8px;color:var(--text3)">(no BOM)</span>'}</td>
+      <td style="font-size:10px;font-family:var(--mono);color:var(--text3)">${r.location||'—'}</td>
       <td class="money" style="color:${(r.total_on_hand||0)<=0?'var(--red)':'var(--text)'};font-weight:700">${dispOH(r.total_on_hand)}</td>
       <td class="money-neutral">${r.demand||'—'}</td>
       <td class="money-neutral">${r.fcDemand||'—'}</td>
@@ -14168,6 +14195,7 @@ function renderCustomPackList(){
     return `<tr>
       <td style="font-family:var(--mono);font-size:12px;font-weight:700;color:${valid?'var(--teal)':'var(--red)'}">${escHtml(line.pn)}</td>
       <td style="font-size:12px;color:var(--text2)">${escHtml(desc)}</td>
+      <td style="font-size:10px;font-family:var(--mono);color:var(--text3);text-align:center">${asm?.location||'—'}</td>
       <td style="font-size:12px;text-align:center">${oh!==null?oh:'—'}</td>
       <td style="text-align:center"><input type="number" min="1" value="${line.qty}" style="width:60px;text-align:center;font-size:12px;padding:3px 6px;background:var(--bg3);border:1px solid var(--border2);border-radius:4px;color:var(--text1)" onchange="S.customPackLines[${i}].qty=Math.max(1,parseInt(this.value)||1);render()"></td>
       <td style="text-align:center;font-weight:700;color:var(--teal);font-size:12px">${oh!==null?oh+line.qty:'—'}</td>
@@ -14206,7 +14234,7 @@ function renderCustomPackList(){
       <button class="btn btn-sm" style="margin-left:auto;color:var(--red);font-size:11px" onclick="if(confirm('Clear all lines?')){S.customPackLines=[];render();}">✕ Clear All</button>
     </div>
     <div class="tbl-wrap"><table><thead class="sticky-header"><tr>
-      <th>SKU</th><th>Description</th><th>Current On Hand</th><th>Qty to Pack</th><th>New On Hand</th><th>BOM</th><th></th>
+      <th>SKU</th><th>Description</th><th>Bin</th><th>Current On Hand</th><th>Qty to Pack</th><th>New On Hand</th><th>BOM</th><th></th>
     </tr></thead><tbody>${rows}</tbody></table></div>
   </div>
   <div style="display:flex;justify-content:flex-end;gap:8px">
@@ -15332,7 +15360,7 @@ function printCycleCount(countId){
   const amPrint={};S.assemblies.forEach(function(a){amPrint[a.pn]=a;});
   const linesEnriched=lines.map(function(l){
     var src=l.item_type==='assembly'?amPrint[l.pn]:pmPrint[l.pn];
-    return Object.assign({},l,{_cat:(src&&src.category)||'Uncategorized',_disp:src?dispPn(src):l.pn});
+    return Object.assign({},l,{_cat:(src&&src.category)||'Uncategorized',_disp:src?dispPn(src):l.pn,_loc:src?.location||''});
   });
 
   // Build grouped rows sorted by category then part number
@@ -15344,11 +15372,12 @@ function printCycleCount(countId){
 
   const rows=sortedCats.map(function(cat){
     const ls=catGroups[cat].sort(function(a,b){return (a._disp||'').localeCompare(b._disp||'');});
-    return '<tr class="section-row"><td colspan="6">'+cat.toUpperCase()+'</td></tr>'
+    return '<tr class="section-row"><td colspan="7">'+cat.toUpperCase()+'</td></tr>'
       +ls.map(function(l){
         return '<tr>'
           +'<td class="pn-cell">'+l._disp+'</td>'
           +'<td class="desc-cell">'+(l.description||'')+'</td>'
+          +'<td class="bin-cell">'+(l._loc||'\u2014')+'</td>'
           +(l.bomQty?'<td class="num-cell">'+l.bomQty+'/unit</td>':'<td></td>')
           +'<td class="num-cell">'+(l.expected_qty||0)+'</td>'
           +'<td class="count-cell"></td>'
@@ -15359,7 +15388,7 @@ function printCycleCount(countId){
 
   const win=window.open('','_blank','width=900,height=700');
   win.document.write(`<!DOCTYPE html><html><head><title>Cycle Count — ${label}</title>
-  <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Segoe UI',Arial,sans-serif;font-size:11px;color:#111;background:#fff;padding:20px}.header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:18px;padding-bottom:12px;border-bottom:2px solid #111}.header-left h1{font-size:18px;font-weight:800;letter-spacing:.05em;color:#0d9488}.header-left h2{font-size:13px;font-weight:600;margin-top:2px}.header-right{text-align:right;font-size:11px;color:#555}.meta{display:flex;gap:24px;margin-bottom:14px;font-size:11px}.meta-box{border:1px solid #ddd;border-radius:4px;padding:6px 12px;min-width:100px}.meta-box label{font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:#888;display:block}.meta-box span{font-size:14px;font-weight:700}table{width:100%;border-collapse:collapse;font-size:11px}th{background:#f0f0f0;border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.07em;font-weight:700}td{border:1px solid #ddd;padding:6px 8px;vertical-align:middle}tr:nth-child(even) td{background:#fafafa}.section-row td{background:#0d9488;color:#fff;font-weight:700;font-size:10px;letter-spacing:.1em;padding:4px 8px}.pn-cell{font-family:monospace;font-size:11px;font-weight:600;white-space:nowrap;width:140px}.desc-cell{max-width:220px}.num-cell{width:70px;text-align:center;font-weight:600}.count-cell{width:90px;background:#fffde7;border:1px dashed #aaa}.notes-cell{width:140px;background:#f9f9f9}.footer{margin-top:16px;font-size:10px;color:#888;border-top:1px solid #ddd;padding-top:8px;display:flex;justify-content:space-between}@media print{body{padding:10px}.no-print{display:none}thead{display:table-header-group}tr{page-break-inside:avoid}}</style></head><body>
+  <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Segoe UI',Arial,sans-serif;font-size:11px;color:#111;background:#fff;padding:20px}.header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:18px;padding-bottom:12px;border-bottom:2px solid #111}.header-left h1{font-size:18px;font-weight:800;letter-spacing:.05em;color:#0d9488}.header-left h2{font-size:13px;font-weight:600;margin-top:2px}.header-right{text-align:right;font-size:11px;color:#555}.meta{display:flex;gap:24px;margin-bottom:14px;font-size:11px}.meta-box{border:1px solid #ddd;border-radius:4px;padding:6px 12px;min-width:100px}.meta-box label{font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:#888;display:block}.meta-box span{font-size:14px;font-weight:700}table{width:100%;border-collapse:collapse;font-size:11px}th{background:#f0f0f0;border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.07em;font-weight:700}td{border:1px solid #ddd;padding:6px 8px;vertical-align:middle}tr:nth-child(even) td{background:#fafafa}.section-row td{background:#0d9488;color:#fff;font-weight:700;font-size:10px;letter-spacing:.1em;padding:4px 8px}.pn-cell{font-family:monospace;font-size:11px;font-weight:600;white-space:nowrap;width:140px}.bin-cell{font-family:monospace;font-size:10px;color:#555;width:70px;text-align:center}.desc-cell{max-width:220px}.num-cell{width:70px;text-align:center;font-weight:600}.count-cell{width:90px;background:#fffde7;border:1px dashed #aaa}.notes-cell{width:140px;background:#f9f9f9}.footer{margin-top:16px;font-size:10px;color:#888;border-top:1px solid #ddd;padding-top:8px;display:flex;justify-content:space-between}@media print{body{padding:10px}.no-print{display:none}thead{display:table-header-group}tr{page-break-inside:avoid}}</style></head><body>
   <div class="header">
     <div class="header-left">
       <h1>TGK MOTORSPORT</h1>
@@ -15377,7 +15406,7 @@ function printCycleCount(countId){
     <div class="meta-box"><label>Count ID</label><span style="font-size:10px;font-family:monospace">${countId.slice(0,8)}</span></div>
   </div>
   <table>
-    <thead><tr><th>Part / SKU #</th><th>Description</th><th>BOM Qty/Unit</th><th>System Qty</th><th>Counted Qty ✏</th><th>Notes</th></tr></thead>
+    <thead><tr><th>Part / SKU #</th><th>Description</th><th>Bin</th><th>BOM Qty/Unit</th><th>System Qty</th><th>Counted Qty ✏</th><th>Notes</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>
   <div class="footer">
@@ -15431,7 +15460,7 @@ function renderCountDetail(count) {
   const linesCat=lines.map(function(l){
     const isAsm=l.item_type==='assembly';
     const src=isAsm?S.assemblies.find(function(a){return a.pn===l.pn;}):S.parts.find(function(p){return p.pn===l.pn;});
-    return Object.assign({},l,{_cat:src?.category||'Uncategorized',_disp:src?dispPn(src):l.pn});
+    return Object.assign({},l,{_cat:src?.category||'Uncategorized',_disp:src?dispPn(src):l.pn,_loc:src?.location||''});
   });
 
   // Sort + filter state
@@ -15487,6 +15516,7 @@ function renderCountDetail(count) {
     ${sortTh('Part #','pn')}
     ${sortTh('Category','cat')}
     <th>Description</th>
+    <th>Bin</th>
     ${sortTh('Expected','expected')}
     <th>Actual Count</th>
     ${sortTh('Variance','variance')}
@@ -15504,7 +15534,7 @@ function renderCountDetail(count) {
       var varClass=variance===null?'':variance>0?'variance-pos':variance<0?'variance-neg':'variance-zero';
       var haveCell=isDone?('<span class="money-neutral">'+(line.actual_qty!==null&&line.actual_qty!==undefined?line.actual_qty:'\u2014')+'</span>'):('<input class="qty-input cc-count-input" type="number" placeholder="\u2014" value="'+(line.actual_qty!==null&&line.actual_qty!==undefined?line.actual_qty:'')+'" data-lid="'+line.id+'" onblur="if(this.dataset.dirty){this.dataset.dirty=\'\';updateCountLine(this.dataset.lid,+this.value);}" oninput="this.dataset.dirty=\'1\';" onkeydown="ccCountKeydown(event,this)" style="width:80px;font-size:14px;font-weight:600;text-align:center">');
       var noteCell=isDone?('<span class="t3xs">'+(line.notes||'')+'</span>'):('<input class="inline-edit" value="'+(line.notes||'')+'" placeholder="Note" onchange="updateCountLineNote(\''+line.id+'\',this.value)" style="max-width:140px">');
-      rows.push('<tr data-lid="'+line.id+'"><td class="pn">'+line._disp+(line.item_type==='assembly'?'<br>'+bomTag(line.pn,'assembly'):'')+'</td>'+'<td style="font-size:10px;color:var(--text3);white-space:nowrap">'+escHtml(line._cat||'')+'</td>'+'<td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(line.description||'')+'</td>'+'<td class="money-neutral">'+(line.expected_qty||0)+'</td>'+'<td>'+haveCell+'</td>'+'<td><span class="var-cell '+varClass+'">'+(variance===null?'\u2014':(variance>=0?'+':'')+variance)+'</span></td>'+'<td>'+noteCell+'</td></tr>');
+      rows.push('<tr data-lid="'+line.id+'"><td class="pn">'+line._disp+(line.item_type==='assembly'?'<br>'+bomTag(line.pn,'assembly'):'')+'</td>'+'<td style="font-size:10px;color:var(--text3);white-space:nowrap">'+escHtml(line._cat||'')+'</td>'+'<td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(line.description||'')+'</td>'+'<td style="font-size:10px;font-family:var(--mono);color:var(--text3)">'+escHtml(line._loc||'\u2014')+'</td>'+'<td class="money-neutral">'+(line.expected_qty||0)+'</td>'+'<td>'+haveCell+'</td>'+'<td><span class="var-cell '+varClass+'">'+(variance===null?'\u2014':(variance>=0?'+':'')+variance)+'</span></td>'+'<td>'+noteCell+'</td></tr>');
     });
     return rows.join('');
   })()}
@@ -15656,6 +15686,106 @@ function renderAuditLog(){
   </tr></thead><tbody>${rows}</tbody></table></div>`}`;
 }
 
+function renderDataIntegrity(){
+  if(!S._diResults)S._diResults=null;
+  if(!S._diLoading)S._diLoading=false;
+  return `
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+    <div>
+      <div style="font-size:13px;color:var(--text2);margin-bottom:4px">Automated checks for the specific failure patterns found in this system historically — not a general health check, a targeted one. Run any time you want to verify nothing has silently drifted.</div>
+    </div>
+    <button class="btn btn-primary btn-sm" id="di-run-btn" onclick="runDataIntegrityChecks()" ${S._diLoading?'disabled':''}>${S._diLoading?'⏳ Running…':'▶ Run All Checks'}</button>
+  </div>
+  <div id="di-results">${S._diResults?renderDIResults(S._diResults):'<div class="panel section-empty">Click "Run All Checks" to scan for known issue patterns — duplicate shipment processing, stale Shopify backorder status, stuck ticket/claim status, orders with no recent progress, and orphaned sync data.</div>'}</div>
+  `;
+}
+
+async function runDataIntegrityChecks(){
+  S._diLoading=true;render();
+  const results={};
+  try{
+    // CHECK 1: Duplicate shipment processing — same tracking number logged more than once as a
+    // shipment-sourced correction. This is the exact signature of the ShipStation duplicate-webhook
+    // bug found this session — every extra occurrence means stock was deducted again for a shipment
+    // already accounted for.
+    const{data:shipCorr}=await db.from('inv_corrections').select('pn,reason,created_at').eq('source','shipment').order('created_at',{ascending:false}).limit(2000);
+    const trackingCounts={};
+    (shipCorr||[]).forEach(c=>{
+      const m=(c.reason||'').match(/\b(1Z[0-9A-Z]{16}|\d{12,22})\b/); // UPS-style or generic long tracking numbers
+      if(!m)return;
+      const key=m[1];
+      if(!trackingCounts[key])trackingCounts[key]=[];
+      trackingCounts[key].push(c);
+    });
+    results.duplicateShipments=Object.entries(trackingCounts).filter(([,rows])=>rows.length>1).map(([tracking,rows])=>({tracking,count:rows.length,pn:rows[0].pn,dates:rows.map(r=>r.created_at)}));
+
+    // CHECK 2: Stale Shopify backorder badges — item shows as backordered per the sync log, but
+    // current on-hand and buildability say it's genuinely fine. Same pattern as TGK-SIL-01 and
+    // TGK-BOV-01 found this session — something restocked it without ever telling Shopify.
+    const staleBackorders=[];
+    Object.entries(S.currentBackorders||{}).forEach(([pn,bo])=>{
+      const asm=S.assemblies.find(a=>a.pn===pn);
+      const prt=asm?null:S.parts.find(p=>p.pn===pn);
+      const item=asm||prt;
+      if(!item)return; // orphaned entries are caught separately below
+      if(item.discontinued||isDev(item))return; // not eligible for backorder sync at all — not a real anomaly
+      const oh=asm?(asm.total_on_hand||0):(prt.total_unpckgd||0);
+      if(oh>0)staleBackorders.push({pn,onHand:oh,since:bo.since,type:asm?'assembly':'part'});
+    });
+    results.staleBackorders=staleBackorders;
+
+    // CHECK 3: Shipment errors / warranty claims stuck mid-flow — has a ShipStation order created
+    // (ss_order_id set) but status never advanced past the initial stage. Exact signature of the
+    // silent status-update-failure bug found in confirmShipShipmentError / confirmShipWarranty.
+    const stuckShipErrors=(S.shipmentErrors||[]).filter(e=>e.ss_order_id&&e.status!=='Reshipping'&&e.status!=='Resolved');
+    const stuckWarranty=(S.warrantyClaims||[]).filter(w=>w.ss_order_id&&w.status!=='Shipped'&&w.status!=='Resolved');
+    results.stuckTickets=[...stuckShipErrors.map(e=>({id:e.id,type:'Shipment Error',status:e.status,ssOrderId:e.ss_order_id})),...stuckWarranty.map(w=>({id:w.id,type:'Warranty Claim',status:w.status,ssOrderId:w.ss_order_id}))];
+
+    // CHECK 4: Orders with no progress in an unusually long time — could indicate a webhook that
+    // never fired, or a status stuck for any other reason worth a manual look.
+    const staleCutoff=new Date(Date.now()-14*24*3600*1000).toISOString();
+    const{data:staleOrders}=await db.from('sales').select('order_number,pn,fulfillment_status,updated_at').in('fulfillment_status',['Open','Packed','Partial']).lt('updated_at',staleCutoff).order('updated_at',{ascending:true}).limit(50);
+    results.staleOrders=staleOrders||[];
+
+    // CHECK 5: Orphaned sync log entries — a PN in the backorder sync log that doesn't match any
+    // current part or assembly. Usually the residue of a SKU rename from before rename-propagation
+    // into shopify_sync_log was fixed this session.
+    const{data:allSyncPns}=await db.from('shopify_sync_log').select('pn').order('created_at',{ascending:false}).limit(3000);
+    const uniquePns=[...new Set((allSyncPns||[]).map(r=>r.pn))];
+    results.orphanedSyncEntries=uniquePns.filter(pn=>!S.assemblies.some(a=>a.pn===pn)&&!S.parts.some(p=>p.pn===pn));
+
+    results.ranAt=new Date().toISOString();
+  }catch(e){
+    toast('⚠ Data integrity check failed: '+e.message,6000);
+  }
+  S._diLoading=false;
+  S._diResults=results;
+  render();
+}
+window.runDataIntegrityChecks=runDataIntegrityChecks;
+
+function renderDIResults(r){
+  const section=(title,items,renderItem,emptyMsg)=>{
+    const bad=items.length>0;
+    return `<div class="panel" style="margin-bottom:12px;border-left:3px solid ${bad?'var(--red)':'var(--green)'}">
+      <div style="display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--border)">
+        <span style="font-size:16px">${bad?'⚠':'✓'}</span>
+        <span style="font-weight:700;font-size:12.5px">${title}</span>
+        <span class="pill ${bad?'pill-red':'pill-teal'}" style="font-size:9px">${items.length}</span>
+      </div>
+      ${bad?items.slice(0,20).map(renderItem).join(''):`<div style="padding:12px 14px;font-size:11.5px;color:var(--text3)">${emptyMsg}</div>`}
+      ${items.length>20?`<div style="padding:8px 14px;font-size:10.5px;color:var(--text3)">…and ${items.length-20} more</div>`:''}
+    </div>`;
+  };
+  return `
+  <div style="font-size:10.5px;color:var(--text3);margin-bottom:10px">Last run: ${new Date(r.ranAt).toLocaleString()}</div>
+  ${section('Duplicate Shipment Processing',r.duplicateShipments,d=>`<div class="check-row"><span style="font-family:var(--mono);font-size:11px">${escHtml(d.tracking)}</span><span style="flex:1;font-size:11px;color:var(--text2)">${escHtml(d.pn)}</span><span class="pill pill-red" style="font-size:9px">${d.count}× processed</span></div>`,'No tracking numbers found with more than one shipment deduction — duplicate webhook processing is not currently occurring.')}
+  ${section('Stale Shopify Backorder Status',r.staleBackorders,d=>`<div class="check-row" onclick="lookupGo('${d.type}','${escHtml(d.pn)}')" style="cursor:pointer"><span style="font-family:var(--mono);font-size:11px;color:var(--teal)">${escHtml(d.pn)}</span><span style="flex:1;font-size:11px;color:var(--text2)">On hand: ${d.onHand}</span><span class="pill pill-yellow" style="font-size:9px">Shopify says backordered</span></div>`,'Every item currently flagged as backordered genuinely has zero or negative stock — nothing is stale.')}
+  ${section('Tickets/Claims Stuck Mid-Flow',r.stuckTickets,d=>`<div class="check-row"><span style="font-size:11px;color:var(--text2)">${d.type}</span><span style="flex:1;font-size:11px;font-family:var(--mono)">SS#${escHtml(d.ssOrderId)}</span><span class="pill pill-red" style="font-size:9px">stuck at "${escHtml(d.status)}"</span></div>`,'Every ticket/claim with a ShipStation order created has correctly advanced past its initial status.')}
+  ${section('Orders With No Progress (14+ Days)',r.staleOrders,d=>`<div class="check-row"><span style="font-family:var(--mono);font-size:11px">${escHtml(d.order_number||'')}</span><span style="flex:1;font-size:11px;color:var(--text2)">${escHtml(d.pn||'')}</span><span class="pill pill-yellow" style="font-size:9px">${escHtml(d.fulfillment_status)} since ${new Date(d.updated_at).toLocaleDateString()}</span></div>`,'No open/packed/partial orders have gone 14+ days without an update.')}
+  ${section('Orphaned Sync Log Entries',r.orphanedSyncEntries,pn=>`<div class="check-row"><span style="font-family:var(--mono);font-size:11px;color:var(--text3)">${escHtml(pn)}</span><span style="flex:1;font-size:11px;color:var(--text3)">No matching current part or assembly</span></div>`,'Every SKU in the recent sync log matches a real, current part or assembly.')}
+  `;
+}
 function renderCorrections() {
   const actTab=S.filters.corrections?._tab||'stock';
   const tabBar=`<div class="tabs-row" style="margin-bottom:0">
@@ -16602,20 +16732,15 @@ function shipShipmentError(id){
   if(!e){toast('Record not found');return;}
   S.seShipItems=[];
 
-  const sd=e.shipping_details||{};
   const salesLines=S.sales.filter(function(s){return s.order_number===e.order_number;});
   const saleAddr=salesLines.length?salesLines[0]:null;
-  // Prefer the address captured on the ticket (shipping_details) — it's
-  // often more complete/current than the original sales record, and is
-  // what the Support Center explicitly saved for this exact issue. Fall
-  // back to the sales record only if the ticket didn't have one.
-  const preName=sd.name||saleAddr?.customer_name||e.customer_name||'';
-  const preAddr1=sd.street1||saleAddr?.shipping_address1||'';
-  const preAddr2=sd.street2||saleAddr?.shipping_address2||'';
-  const preCity=sd.city||saleAddr?.shipping_city||'';
-  const preState=sd.state||saleAddr?.shipping_province||'';
-  const preZip=sd.postal_code||saleAddr?.shipping_zip||'';
-  const preCountry=sd.country||saleAddr?.shipping_country||'US';
+  const preName=saleAddr?.customer_name||e.customer_name||'';
+  const preAddr1=saleAddr?.shipping_address1||'';
+  const preAddr2=saleAddr?.shipping_address2||'';
+  const preCity=saleAddr?.shipping_city||'';
+  const preState=saleAddr?.shipping_province||'';
+  const preZip=saleAddr?.shipping_zip||'';
+  const preCountry=saleAddr?.shipping_country||'US';
   const preEmail=saleAddr?.customer_email||e.customer_email||'';
 
   const asm=S.assemblies.find(function(a){return a.pn===e.expected_pn;});
@@ -16676,12 +16801,11 @@ function shipShipmentError(id){
 function seAsmFilter(q){
   const dd=document.getElementById('se-asm-dd');if(!dd)return;
   const ql=q.toLowerCase();
-  const matches=S.assemblies.filter(function(a){return !a.discontinued&&(a.pn.toLowerCase().includes(ql)||(a.new_sku||'').toLowerCase().includes(ql)||(a.description||'').toLowerCase().includes(ql));}).slice(0,12);
+  const matches=S.assemblies.filter(function(a){return !a.discontinued&&(a.pn.toLowerCase().includes(ql)||(a.description||'').toLowerCase().includes(ql));}).slice(0,12);
   if(!matches.length){dd.style.display='none';return;}
   dd.innerHTML=matches.map(function(a){
     return '<div class="_se-asm-opt" onclick="seAsmPick(\''+escHtml(a.pn)+'\')" style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border)" onmouseenter="this.style.background=\'var(--bg3)\'" onmouseleave="this.style.background=\'transparent\'">'+
-      '<span style="font-family:var(--mono);font-size:11px;color:var(--teal)">'+escHtml(dispPn(a))+'</span>'+
-      (a.use_new_sku&&a.new_sku?'<span style="font-size:9px;color:var(--text3);margin-left:6px">('+escHtml(a.pn)+')</span>':'')+
+      '<span style="font-family:var(--mono);font-size:11px;color:var(--teal)">'+escHtml(a.pn)+'</span>'+
       '<span style="font-size:11px;color:var(--text2);margin-left:8px">'+escHtml(a.description||'')+'</span>'+
     '</div>';
   }).join('');
@@ -18436,7 +18560,7 @@ function scheduleRender(){
 }
 function render(){
   S._onOrderMap=null; // invalidate per-render caches; renderPlanning re-primes when needed
-  const views={dashboard:renderDashboard,users:renderUsers,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,fitments:renderFitments,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder,reports:renderReports,pricelist:renderPriceList};
+  const views={dashboard:renderDashboard,users:renderUsers,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,fitments:renderFitments,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder,reports:renderReports,pricelist:renderPriceList,dataintegrity:renderDataIntegrity};
   if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length||S.calc.forecastWks!==(S.forecastWeeks||8))computeDemand();
   const active=document.activeElement;
   let fkey=null,selS=0,selE=0;
