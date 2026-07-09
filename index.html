@@ -3515,6 +3515,11 @@ async function submitShipment(saleId,pn,qty){
   const prt=asm?null:S.parts.find(p=>p.pn===pn);
   const asmPrev=asm?{...asm}:null;
   const prtPrev=prt?{...prt}:null;
+  // [FIX A2] Defense-in-depth: never deduct a line that is already Shipped/Delivered/Cancelled/Refunded.
+  // The Ship button is UI-gated to open lines, but the ShipStation edge function may have shipped this
+  // line first; without this guard a manual Ship here would deduct the same shipment a second time.
+  const _shipChk=S.sales.find(s=>s.id===saleId);
+  if(_shipChk&&['Shipped','Delivered','Cancelled','Refunded'].includes(_shipChk.fulfillment_status||'Open')){toast(pn+' is already '+_shipChk.fulfillment_status+' — not shipping/deducting again');return;}
   if(asm){
     const prev=asm.total_on_hand||0;
     const newOh=prev-qty; // may go negative = backorder
@@ -3805,7 +3810,14 @@ async function submitEditOrder(originalOrderNumOrId){
         const wasERP=!!S.assemblies.find(function(a){return a.pn===orig.pn;});
         const isERP=!!S.assemblies.find(function(a){return a.pn===pn;});
         const isShipped=['Shipped','Delivered','Packed'].includes(status)||['Shipped','Delivered','Packed'].includes(orig.status);
-        if(wasERP!==isERP&&isShipped)
+        // [FIX F2] Fire whenever the SKU changed on a shipped line and either side exists in inventory
+        // -- not only when it flips between part and assembly. Previously an assembly->assembly (or
+        // part->part) correction registered no inventory change at all, leaving the wrong SKU deducted
+        // and the right one never deducted. _applyPendingInv restocks old + deducts new regardless of
+        // type, so this correctly handles every combination.
+        const _oldInInv=wasERP||!!S.parts.find(function(p){return p.pn===orig.pn;});
+        const _newInInv=isERP||!!S.parts.find(function(p){return p.pn===pn;});
+        if(isShipped&&(_oldInInv||_newInInv))
           invChanges.push({type:wasERP?'restore':'deduct',oldPn:orig.pn,newPn:pn,qty,status});
       }
       const payload=Object.assign({},basePayload,{pn,qty,fulfillment_status:status,tracking_number:tracking,carrier:carrier||null});
@@ -3820,38 +3832,11 @@ async function submitEditOrder(originalOrderNumOrId){
     }
   }
 
-  for(const chg of invChanges){
-    const targetPn=chg.type==='deduct'?chg.newPn:chg.oldPn;
-    const delta=chg.type==='deduct'?-chg.qty:+chg.qty;
-    const reason=chg.type==='deduct'
-      ?'PN corrected: '+chg.oldPn+' to '+chg.newPn+' on '+newOrderNum+' (retroactive deduct)'
-      :'PN corrected: '+chg.oldPn+' to '+chg.newPn+' on '+newOrderNum+' (stock restored)';
-    const asm=S.assemblies.find(function(a){return a.pn===targetPn;});
-    if(asm){
-      const prev=asm.total_on_hand||0;
-      const newOh=prev+delta; // no floor at 0 — a retroactive deduct can legitimately create a backorder, same as a live shipment would
-      const{error:ie}=await db.from('assemblies').update({total_on_hand:newOh,updated_at:now}).eq('id',asm.id);
-      if(!ie){
-        S.assemblies=S.assemblies.map(function(a){return a.id===asm.id?Object.assign({},a,{total_on_hand:newOh}):a;});
-        await db.from('inv_corrections').insert({pn:targetPn,previous_qty:prev,new_qty:newOh,adjustment:delta,reason,user_email:S.currentUser||null,source:'order_edit'});
-        syncShopifyTemplate(targetPn,newOh);
-      }
-      continue;
-    }
-    const prt=S.parts.find(function(p){return p.pn===targetPn;});
-    if(prt){
-      const prev=prt.total_unpckgd||0;
-      const newQty=prev+delta;
-      const{error:ie}=await db.from('parts').update({total_unpckgd:newQty,updated_at:now}).eq('id',prt.id);
-      if(!ie){
-        S.parts=S.parts.map(function(p){return p.id===prt.id?Object.assign({},p,{total_unpckgd:newQty}):p;});
-        await db.from('inv_corrections').insert({pn:targetPn,previous_qty:prev,new_qty:newQty,adjustment:delta,reason,user_email:S.currentUser||null,source:'order_edit'});
-        cascadeShopifySync(targetPn);
-      }
-    }
-  }
-
-  document.getElementById('edit-order-overlay')?.remove();
+  // [FIX F] The inline inventory loop that used to live here has been removed. It applied only ONE side
+  // of a SKU swap (deduct new OR restore old), while _promptInvChanges()/_applyPendingInv() below applies
+  // BOTH sides. Running both meant clicking "Yes" double-applied one side and "Skip" left the swap half
+  // applied. _promptInvChanges is now the single source of truth for order-edit inventory changes.
+    document.getElementById('edit-order-overlay')?.remove();
 
   if(invChanges.length)_promptInvChanges(invChanges,newOrderNum,now);
 
@@ -7242,6 +7227,11 @@ async function ssManualSync(orderNum,tracking,carrier){
     undoOps.push({action:'update',table:'sales',data:{...sale,fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier},prev:{...sale}});
     await db.from('sales').update({fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier||'',shipped_at:new Date().toISOString()}).eq('id',sale.id);
     S.sales=S.sales.map(s=>s.id===sale.id?{...s,fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier||''}:s);
+    // [FIX A] Only deduct if this line was NOT already Shipped/Delivered/Cancelled/Refunded before this
+    // manual sync ran. Without this, re-running manual sync on an order the ShipStation edge function (or
+    // a prior sync) already shipped deducts the same physical shipment a second time -- and un-ship only
+    // restores once, so the drift is permanent. Status/tracking are still updated above for all rows.
+    if(!['Shipped','Delivered','Cancelled','Refunded'].includes(sale.fulfillment_status||'Open')){
     const{data:asms}=await db.from('assemblies').select('*').eq('pn',sale.pn);
     if(asms?.[0]){
       const newOh=(asms[0].total_on_hand||0)-(sale.qty||1); // allow negative = backorder
@@ -7258,6 +7248,7 @@ async function ssManualSync(orderNum,tracking,carrier){
         await db.from('inv_corrections').insert({pn:sale.pn,previous_qty:prts[0].total_unpckgd||0,new_qty:newQty,adjustment:-(sale.qty||1),reason:'Manual ship — order '+orderNum+' tracking '+tracking,user_email:S.currentUser||null,source:'shipment'});
         cascadeShopifySync(sale.pn);
       }
+    }
     }
   }
   if(!rows.length){toast('No lines updated — check order number');return;}
@@ -8545,25 +8536,7 @@ async function saveBOMItem(){
   _clearBomCostCache();
   toast('BOM item added');render();
 }
-async function recordPack(pn,asmId){
-  const{error}=await db.from('pack_log').insert({pn,qty:1,pack_date:new Date().toISOString()});
-  if(error){toast('Error: '+error.message);return;}
-  const asm=findAsm(pn);
-  const prt=asm?null:S.parts.find(p=>p.pn===pn);
-  if(asm){
-    const oh=(asm.total_on_hand||0)+1;
-    await db.from('assemblies').update({total_on_hand:oh,total_assembled:(asm.total_assembled||0)+1,updated_at:new Date().toISOString()}).eq('id',asm.id);
-    S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:oh,total_assembled:(asm.total_assembled||0)+1}:a);
-    syncShopifyTemplate(pn,oh);
-  } else if(prt){
-    const newQty=(prt.total_unpckgd||0)+1;
-    await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',prt.id);
-    S.parts=S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
-    cascadeShopifySync(pn);
-  }
-  toast(`Packed 1 \u00d7 ${asm?dispPn(asm):prt?dispPn(prt):pn}`);buildLookupMaps();render();
-  var _lf3=(S.labelFiles&&S.labelFiles[pn])||[];if(_lf3.length)showLabelPrintPrompt(pn,1,_lf3);else checkAndPromptLabel(pn,1);
-}
+/* [FIX I] recordPack() removed: it added a finished assembly to total_on_hand AND total_assembled without consuming any BOM components or logging an inv_corrections entry -- a free build. It was not wired to any button. Use the pack/build flow (submitCustomPackList / the pack fn) instead. */
 async function saveShopify(){
   const store=$('sh-store').value.trim(),key=$('sh-key').value.trim(),webhook=$('sh-wh').value.trim();
   const clientId=($('sh-client-id')?.value||'').trim();
@@ -9153,8 +9126,8 @@ async function submitPart(eid){
     }
     ({error}=await db.from('parts').update(payload).eq('id',eid));
     if(!error&&prev)pushUndo('update','parts',{...prev,...payload},prev,'Edit part: '+payload.pn);
-    // Same gap as the assembly edit form — On Hand can be changed directly here, bypassing the
-    // audit trail and Shopify sync that every other stock-changing path in the app goes through.
+    // [FIX C] On Hand can be changed directly on this form. Both this and the Edit Assembly form now
+    // log an inv_corrections entry and trigger Shopify sync when the direct edit changes stock (below).
     if(!error&&prev&&(prev.total_unpckgd||0)!==(payload.total_unpckgd||0)){
       const _adj=(payload.total_unpckgd||0)-(prev.total_unpckgd||0);
       await db.from('inv_corrections').insert({pn:payload.pn,previous_qty:prev.total_unpckgd||0,new_qty:payload.total_unpckgd||0,adjustment:_adj,reason:'Direct edit via Edit Part form',user_email:S.currentUser||null,source:'manual_edit'});
@@ -13805,6 +13778,23 @@ async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
     S.corrections = [{pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,source:'po_receipt',created_at:new Date().toISOString()},...S.corrections];
     syncShopifyTemplate(pn,newQty);
     cascadeShopifySync(pn);
+  } else {
+    // [FIX E] Assembly received on a PO. Receiving was parts-only, so buying a finished sub-assembly
+    // from a vendor updated PO status but never added to total_on_hand.
+    const _rasm=findAsm(pn);
+    if(_rasm){
+      const _newOh=(_rasm.total_on_hand||0)+qty;
+      undoOps.push({action:'update',table:'assemblies',data:{..._rasm,total_on_hand:_newOh},prev:{..._rasm}});
+      await db.from('assemblies').update({total_on_hand:_newOh,updated_at:new Date().toISOString()}).eq('id',_rasm.id);
+      S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:_newOh}:a);
+      const _po=S.purchases.find(p=>p.id===poId);
+      const _poRef=_po?(' ['+_po.vendor+(_po.order_date?' '+_po.order_date:'')+']'):'';
+      const _reason='PO Receipt'+_poRef+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial — '+remaining+' outstanding)':'')+(note?' — '+note:'');
+      const {data:_corrA}=await db.from('inv_corrections').insert({pn,previous_qty:_rasm.total_on_hand||0,new_qty:_newOh,adjustment:qty,reason:_reason,user_email:S.currentUser||null,source:'po_receipt'}).select().single();
+      if(_corrA)undoOps.push({action:'insert',table:'inv_corrections',data:_corrA});
+      S.corrections=[{pn,previous_qty:_rasm.total_on_hand||0,new_qty:_newOh,adjustment:qty,reason:_reason,source:'po_receipt',created_at:new Date().toISOString()},...S.corrections];
+      syncShopifyTemplate(pn,_newOh);
+    }
   }
 
   if(remaining>0){
@@ -13847,6 +13837,16 @@ async function closeShortBackorder(lineId, poId, pn, qtyOrdered, qtyAlreadyRecei
       await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:recvNow,reason:'PO Receipt (closed short, '+remaining+' backordered)',user_email:S.currentUser||null,source:'po_receipt'});
       syncShopifyTemplate(pn,newQty);
       cascadeShopifySync(pn);
+    } else {
+      // [FIX E] assembly received on a closed-short PO line
+      const _rasm=findAsm(pn);
+      if(_rasm){
+        const _newOh=(_rasm.total_on_hand||0)+recvNow;
+        await db.from('assemblies').update({total_on_hand:_newOh,updated_at:new Date().toISOString()}).eq('id',_rasm.id);
+        S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:_newOh}:a);
+        await db.from('inv_corrections').insert({pn,previous_qty:_rasm.total_on_hand||0,new_qty:_newOh,adjustment:recvNow,reason:'PO Receipt (closed short, '+remaining+' backordered)',user_email:S.currentUser||null,source:'po_receipt'});
+        syncShopifyTemplate(pn,_newOh);
+      }
     }
   }
   await db.from('po_lines').update({qty_received:totalReceived,status:'Backordered',notes:remaining+' backordered',updated_at:new Date().toISOString()}).eq('id',lineId);
@@ -13899,6 +13899,18 @@ async function unreceiveLine(lineId, poId){
     if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
     syncShopifyTemplate(line.pn,newQty);
     cascadeShopifySync(line.pn);
+  } else {
+    // [FIX E] reverse an assembly receipt
+    const _rasm=findAsm(line.pn);
+    if(_rasm){
+      const _newOh=(_rasm.total_on_hand||0)-line.qty_received;
+      undoOps.push({action:'update',table:'assemblies',data:{..._rasm,total_on_hand:_newOh},prev:{..._rasm}});
+      await db.from('assemblies').update({total_on_hand:_newOh,updated_at:new Date().toISOString()}).eq('id',_rasm.id);
+      S.assemblies=S.assemblies.map(a=>a.pn===line.pn?{...a,total_on_hand:_newOh}:a);
+      const {data:_corrA}=await db.from('inv_corrections').insert({pn:line.pn,previous_qty:_rasm.total_on_hand||0,new_qty:_newOh,adjustment:-line.qty_received,reason:'Receipt reversed (received in error)',user_email:S.currentUser||null,source:'po_receipt'}).select().single();
+      if(_corrA)undoOps.push({action:'insert',table:'inv_corrections',data:_corrA});
+      syncShopifyTemplate(line.pn,_newOh);
+    }
   }
   undoOps.push({action:'update',table:'po_lines',data:{id:lineId},prev:{...stripMeta(line)}});
   await db.from('po_lines').update({qty_received:0,status:'Pending',notes:null,updated_at:new Date().toISOString()}).eq('id',lineId);
@@ -13928,6 +13940,18 @@ async function checkInLineQuick(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived
     await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason:'PO Receipt — Bulk'+poRef,user_email:S.currentUser||null,source:'po_receipt'});
     syncShopifyTemplate(pn,newQty);
     cascadeShopifySync(pn);
+  } else {
+    // [FIX E] assembly received via bulk receive-all
+    const _rasm=findAsm(pn);
+    if(_rasm){
+      const _newOh=(_rasm.total_on_hand||0)+qty;
+      await db.from('assemblies').update({total_on_hand:_newOh,updated_at:new Date().toISOString()}).eq('id',_rasm.id);
+      S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:_newOh}:a);
+      const _po=S.purchases.find(p=>p.id===poId);
+      const _poRef=_po?(' ['+_po.vendor+(_po.order_date?' '+_po.order_date:'')+']'):'';
+      await db.from('inv_corrections').insert({pn,previous_qty:_rasm.total_on_hand||0,new_qty:_newOh,adjustment:qty,reason:'PO Receipt — Bulk'+_poRef,user_email:S.currentUser||null,source:'po_receipt'});
+      syncShopifyTemplate(pn,_newOh);
+    }
   }
   if(S.poLines[poId]) S.poLines[poId]=S.poLines[poId].map(l=>l.id===lineId?{...l,qty_received:newReceived,status:'Complete'}:l);
 }
@@ -15340,9 +15364,8 @@ async function applyWalkCount(){
       S.parts=S.parts.map(x=>x.pn===item.pn?{...x,total_unpckgd:item.counted}:x);
       await db.from('inv_corrections').insert({pn:item.pn,previous_qty:item.exp,new_qty:item.counted,adjustment:item.counted-item.exp,reason:'Walk Count',user_email:S.currentUser||null,source:'walk_count'});
       cascadeShopifySync(item.pn);
-      applied++;
     }
-    applied++;
+    applied++; // [FIX D] removed duplicate applied++ that over-counted parts corrections
   }
   S.walkItems=[]; S.walkIdx=0; S.countMode='home';
   toast(applied+' corrections applied'+(errors?' ('+errors+' errors)':''));
