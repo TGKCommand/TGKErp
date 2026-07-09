@@ -224,7 +224,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v19.5';
+const TGK_ERP_VERSION = 'v19.7';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -653,9 +653,16 @@ async function loadAll(){
     if(!shopifySyncLog.error){
       const seen=new Set();
       (shopifySyncLog.data||[]).forEach(function(r){
-        if(seen.has(r.pn))return; // already saw a newer row for this pn — skip
-        seen.add(r.pn);
-        if(r.action==='backorder')S.currentBackorders[r.pn]={restock_date:r.restock_date||null,since:r.created_at};
+        // Resolve each row to the ONE underlying item and key by its canonical .pn. The log historically
+        // recorded events under whichever SKU the trigger used -- a legacy .pn from a client-side sync, a
+        // new_sku from a bulk sync or a Shopify webhook -- so keying by the raw row pn would let a backorder
+        // logged under one SKU and its later revert logged under another live as two separate timelines,
+        // leaving a stale badge. Resolving collapses them into one newest-row-wins timeline.
+        var _it=findAsm(r.pn)||_findPart(r.pn);
+        var key=_it?_it.pn:r.pn;
+        if(seen.has(key))return;
+        seen.add(key);
+        if(r.action==='backorder')S.currentBackorders[key]={restock_date:r.restock_date||null,since:r.created_at};
       });
     }
     S.liveActivity=[];
@@ -1176,7 +1183,7 @@ function syncShopifyTemplate(pn,newOh){
     // (or any repeat sync) would make the countdown perpetually reset and never actually count down.
     // Only compute a fresh date when this is a genuinely new backorder event (it wasn't backordered
     // a moment ago).
-    var _existing=S.currentBackorders&&S.currentBackorders[pn];
+    var _existing=currentBackorderOf(pn);
     if(_existing&&_existing.restock_date){
       restockDate=_existing.restock_date;
       console.log('[Shopify backorder] '+pn+': already backordered — keeping original restock_date='+restockDate);
@@ -1239,10 +1246,18 @@ function dispSku(pn){if(!pn)return pn||'';var li=findAsm(pn)||(S._partIdx&&S._pa
 // orders often carry the name on only ONE line -- several call sites read line[0] only and showed blank.
 // This scans every line of the same order_number and returns the first non-empty value for each.
 function resolveOrderCustomer(sale){var name=sale&&sale.customer_name||'';var email=sale&&sale.customer_email||'';var on=sale&&sale.order_number;if(on&&(!name||!email)){var lines=S.sales.filter(function(x){return x.order_number===on;});if(!name){var wn=lines.find(function(x){return x.customer_name;});if(wn)name=wn.customer_name;}if(!email){var we=lines.find(function(x){return x.customer_email;});if(we)email=we.customer_email;}}return{name:name||'',email:email||''};}
+// Look up current backorder state by any SKU form (legacy .pn, new_sku, or display SKU) -- currentBackorders
+// is keyed by canonical .pn, so resolve before reading.
+function currentBackorderOf(pn){
+  if(!pn||!S.currentBackorders)return null;
+  if(S.currentBackorders[pn])return S.currentBackorders[pn];
+  var _it=findAsm(pn)||_findPart(pn);
+  return(_it&&S.currentBackorders[_it.pn])||null;
+}
 function backorderBadge(pn){
-  const bo=pn&&S.currentBackorders&&S.currentBackorders[pn];
+  const bo=currentBackorderOf(pn);
   if(!bo)return'';
-  const item=S.assemblies.find(a=>a.pn===pn)||S.parts.find(p=>p.pn===pn);
+  const item=findAsm(pn)||_findPart(pn);
   if(item&&!eligibleForBackorderSync(item))return''; // stale backorder state from before it became ineligible (retired, dev, subassembly, hardware pack, or pre-order) — don't show it
   const since=bo.since?new Date(bo.since).toLocaleDateString():'';
   const title='On backorder on Shopify'+(bo.restock_date?' — restock date '+bo.restock_date:'')+(since?' (since '+since+')':'');
@@ -5891,14 +5906,15 @@ async function loadInvBackorderLog(){
       if(!error){
         var seen=new Set();
         data=(res.data||[]).filter(function(r){
-          if(seen.has(r.pn))return false; // keep only the first (=latest, since sorted desc) row per SKU
-          seen.add(r.pn);
+          var _it=findAsm(r.pn)||_findPart(r.pn);
+          var key=_it?_it.pn:r.pn; // resolve legacy pn / new_sku to one canonical identity (matches the badge)
+          if(seen.has(key))return false; // keep only the first (=latest, since sorted desc) row per item
+          seen.add(key);
           if(r.action!=='backorder')return false;
           // A PN with no current match is almost always a stale entry left behind by a SKU rename
           // that happened before rename-propagation into this log existed — it no longer corresponds
           // to anything real, so it can't be trusted as a genuine "currently backordered" item.
-          var stillExists=S.assemblies.some(function(a){return a.pn===r.pn;})||S.parts.some(function(p){return p.pn===r.pn;});
-          return stillExists;
+          return !!_it; // must resolve to a real current part/assembly; stale renamed-PN orphans excluded
         });
       }
     }else{
@@ -6001,7 +6017,7 @@ async function bulkSyncShopifyBackorder(){
     // reset every run instead of actually counting down toward a real date.
     let restockDate='';
     if(isBackorder){
-      const _existing=S.currentBackorders&&S.currentBackorders[pn];
+      const _existing=currentBackorderOf(pn);
       restockDate=(_existing&&_existing.restock_date)?_existing.restock_date:new Date(Date.now()+restockDays*86400000).toISOString().slice(0,10);
     }
     try{
@@ -13301,6 +13317,7 @@ async function quickAdjustStock(partId,pn,delta){
   if(error){toast('Error: '+error.message);return;}
   await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newQty,adjustment:delta,reason:'Quick adjust (±1)',user_email:S.currentUser||null,source:'quick_adjust'});
   S.parts=S.parts.map(p=>p.id===partId?{...p,total_unpckgd:newQty}:p);
+  cascadeShopifySync(pn); // a manual top-up can make a dependent finished good buildable again — re-check its backorder flag
   pushUndo('update','parts',{...part,total_unpckgd:newQty},part,(delta>0?'+':'')+delta+'× '+pn);
   render();
 }
@@ -15815,11 +15832,14 @@ async function runDataIntegrityChecks(){
     (shipCorr||[]).forEach(c=>{
       const m=(c.reason||'').match(/\b(1Z[0-9A-Z]{16}|\d{12,22})\b/); // UPS-style or generic long tracking numbers
       if(!m)return;
-      const key=m[1];
+      // Key by tracking + SKU. A multi-item order ships under ONE tracking number and produces one
+      // shipment correction per line, so grouping by tracking alone would flag a normal multi-line order
+      // as a duplicate. Only the SAME tracking AND the SAME pn appearing twice is a real double-deduction.
+      const key=m[1]+'|'+(c.pn||'');
       if(!trackingCounts[key])trackingCounts[key]=[];
       trackingCounts[key].push(c);
     });
-    results.duplicateShipments=Object.entries(trackingCounts).filter(([,rows])=>rows.length>1).map(([tracking,rows])=>({tracking,count:rows.length,pn:rows[0].pn,dates:rows.map(r=>r.created_at)}));
+    results.duplicateShipments=Object.entries(trackingCounts).filter(([,rows])=>rows.length>1).map(([key,rows])=>({tracking:key.split('|')[0],count:rows.length,pn:rows[0].pn,dates:rows.map(r=>r.created_at)}));
 
     // CHECK 2: Stale Shopify backorder badges — item shows as backordered per the sync log, but
     // current on-hand and buildability say it's genuinely fine. Same pattern as TGK-SIL-01 and
@@ -15830,7 +15850,7 @@ async function runDataIntegrityChecks(){
       const prt=asm?null:S.parts.find(p=>p.pn===pn);
       const item=asm||prt;
       if(!item)return; // orphaned entries are caught separately below
-      if(item.discontinued||isDev(item))return; // not eligible for backorder sync at all — not a real anomaly
+      if(!eligibleForBackorderSync(item))return; // subassemblies / hardware packs / pre-order / discontinued / dev aren't Shopify-synced products, so a stale log row here isn't a real anomaly
       const oh=asm?(asm.total_on_hand||0):(prt.total_unpckgd||0);
       if(oh>0)staleBackorders.push({pn,onHand:oh,since:bo.since,type:asm?'assembly':'part'});
     });
@@ -15854,7 +15874,7 @@ async function runDataIntegrityChecks(){
     // into shopify_sync_log was fixed this session.
     const{data:allSyncPns}=await db.from('shopify_sync_log').select('pn').order('created_at',{ascending:false}).limit(3000);
     const uniquePns=[...new Set((allSyncPns||[]).map(r=>r.pn))];
-    results.orphanedSyncEntries=uniquePns.filter(pn=>!S.assemblies.some(a=>a.pn===pn)&&!S.parts.some(p=>p.pn===pn));
+    results.orphanedSyncEntries=uniquePns.filter(pn=>!S.assemblies.some(a=>a.pn===pn||a.new_sku===pn)&&!S.parts.some(p=>p.pn===pn||p.new_sku===pn));
 
     results.ranAt=new Date().toISOString();
   }catch(e){
