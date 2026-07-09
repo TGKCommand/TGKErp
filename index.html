@@ -224,7 +224,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v19.8';
+const TGK_ERP_VERSION = 'v19.9';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -320,14 +320,18 @@ function buildLookupMaps(){
 function computeDemand(){
   const wk4={},wk12={};
   const now=new Date();
+  if(!S._asmIdx||!S._partIdx)buildLookupMaps(); // [CANON] O(1) resolver maps for SKU consolidation below
   S.sales.forEach(s=>{
     if(!s.pn||!s.sale_date)return;
     if(s.fulfillment_status==='Cancelled')return;
     const w=Math.floor((now-new Date(s.sale_date))/(7*24*3600*1000));
     if(w<0||w>=12)return;
     const q=s.qty||1;
-    wk12[s.pn]=(wk12[s.pn]||0)+q;
-    if(w<4)wk4[s.pn]=(wk4[s.pn]||0)+q;
+    // [CANON] Consolidate under the item's canonical .pn so sales placed under an old/renamed SKU (stored
+    // on the line as a legacy/new_sku value) still count toward the right item's demand.
+    const _k=(_canonItem(s.pn)||{}).pn||s.pn;
+    wk12[_k]=(wk12[_k]||0)+q;
+    if(w<4)wk4[_k]=(wk4[_k]||0)+q;
   });
   const asmCalc={},partCalc={};
   const devPnSet=new Set(S.assemblies.filter(a=>isDev(a)).map(a=>a.pn));
@@ -419,7 +423,7 @@ function computeDemand(){
   const fCounts={};
   S.sales.forEach(function(s){
     if(!s.pn||!s.sale_date||s.fulfillment_status==='Cancelled')return;
-    if(s.sale_date>=fCutStr)fCounts[s.pn]=(fCounts[s.pn]||0)+(s.qty||1);
+    if(s.sale_date>=fCutStr){var _fk=(_canonItem(s.pn)||{}).pn||s.pn;fCounts[_fk]=(fCounts[_fk]||0)+(s.qty||1);} // [CANON]
   });
   const forecastMap={};
   S.parts.forEach(function(p){forecastMap[p.pn]=(fCounts[p.pn]||0)/fwks;});
@@ -12637,7 +12641,12 @@ function calcForecast(pn){
   const weeks=S.forecastWeeks||8;
   const cutoff=new Date();cutoff.setDate(cutoff.getDate()-weeks*7);
   const cutStr=cutoff.toISOString().slice(0,10);
-  return S.sales.filter(s=>s.pn===pn&&s.sale_date>=cutStr).reduce((a,s)=>a+(s.qty||1),0)/weeks;
+  var _canon=(_canonItem(pn)||{}).pn||pn; // [CANON]
+  return S.sales.filter(function(s){
+    if(s.sale_date<cutStr)return false;
+    if(s.pn===_canon)return true;
+    return((_canonItem(s.pn)||{}).pn||s.pn)===_canon;
+  }).reduce((a,s)=>a+(s.qty||1),0)/weeks;
 }
 
 const HW_CATS=['Bolts/Washers/Nuts','Orings','Fittings','Heims & Sphericals','Suspension Hardware','Hardware'];
@@ -14196,7 +14205,12 @@ function buildabilityForBackorder(pn){
 }
 
 function openOrderDemand(pn){
-  return S.sales.filter(s=>s.pn===pn&&(!s.fulfillment_status||s.fulfillment_status==='Open')).reduce((t,s)=>t+(s.qty||1),0);
+  var _canon=(_canonItem(pn)||{}).pn||pn; // [CANON] count sales placed under any SKU form for this item
+  return S.sales.filter(function(s){
+    if(s.fulfillment_status&&s.fulfillment_status!=='Open')return false;
+    if(s.pn===_canon)return true;
+    return((_canonItem(s.pn)||{}).pn||s.pn)===_canon;
+  }).reduce((t,s)=>t+(s.qty||1),0);
 }
 
 function renderPackQueue(){
