@@ -224,7 +224,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v19.1';
+const TGK_ERP_VERSION = 'v19.2';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -707,7 +707,7 @@ function setupRealtime(){
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'assemblies'},p=>{
       const norm=a=>{const p=/^\d{2}-\d{4}/.test(a.pn||'')&&!isHWPack(a.pn);const d=a.is_subassembly;return{...a,is_subassembly:(d===true||d===false)?d:p};};
-      if(p.eventType==='INSERT')S.assemblies=[...S.assemblies,norm(p.new)].sort((a,b)=>a.pn.localeCompare(b.pn));
+      if(p.eventType==='INSERT')S.assemblies=[...S.assemblies,norm(p.new)].sort((a,b)=>dispPn(a).localeCompare(dispPn(b)));/* [FIX B] sort by display SKU */
       else if(p.eventType==='UPDATE')S.assemblies=S.assemblies.map(x=>x.id===p.new.id?norm(p.new):x);
       else if(p.eventType==='DELETE')S.assemblies=S.assemblies.filter(x=>x.id!==p.old.id);
       buildLookupMaps();
@@ -7232,22 +7232,22 @@ async function ssManualSync(orderNum,tracking,carrier){
     // a prior sync) already shipped deducts the same physical shipment a second time -- and un-ship only
     // restores once, so the drift is permanent. Status/tracking are still updated above for all rows.
     if(!['Shipped','Delivered','Cancelled','Refunded'].includes(sale.fulfillment_status||'Open')){
-    const{data:asms}=await db.from('assemblies').select('*').eq('pn',sale.pn);
-    if(asms?.[0]){
-      const newOh=(asms[0].total_on_hand||0)-(sale.qty||1); // allow negative = backorder
-      await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asms[0].id);
-      S.assemblies=S.assemblies.map(a=>a.pn===sale.pn?{...a,total_on_hand:newOh}:a);
-      await db.from('inv_corrections').insert({pn:sale.pn,previous_qty:asms[0].total_on_hand||0,new_qty:newOh,adjustment:-(sale.qty||1),reason:'Manual ship — order '+orderNum+' tracking '+tracking,user_email:S.currentUser||null,source:'shipment'});
+    // [FIX B] Resolve via findAsm (new_sku-aware). sale.pn may hold a new_sku for a migrated product,
+    // which a raw .eq('pn',sale.pn) query would never match -- silently skipping the deduction.
+    const _msAsm=findAsm(sale.pn);
+    const _msPrt=_msAsm?null:((S._partIdx&&S._partIdx[sale.pn])||S.parts.find(p=>p.pn===sale.pn||(p.new_sku&&p.new_sku===sale.pn)));
+    if(_msAsm){
+      const newOh=(_msAsm.total_on_hand||0)-(sale.qty||1); // allow negative = backorder
+      await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',_msAsm.id);
+      S.assemblies=S.assemblies.map(a=>a.id===_msAsm.id?{...a,total_on_hand:newOh}:a);
+      await db.from('inv_corrections').insert({pn:sale.pn,previous_qty:_msAsm.total_on_hand||0,new_qty:newOh,adjustment:-(sale.qty||1),reason:'Manual ship — order '+orderNum+' tracking '+tracking,user_email:S.currentUser||null,source:'shipment'});
       syncShopifyTemplate(sale.pn,newOh);
-    } else {
-      const{data:prts}=await db.from('parts').select('*').eq('pn',sale.pn);
-      if(prts?.[0]){
-        const newQty=(prts[0].total_unpckgd||0)-(sale.qty||1); // directly-sold part — same deduction, different table
-        await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',prts[0].id);
-        S.parts=S.parts.map(p=>p.pn===sale.pn?{...p,total_unpckgd:newQty}:p);
-        await db.from('inv_corrections').insert({pn:sale.pn,previous_qty:prts[0].total_unpckgd||0,new_qty:newQty,adjustment:-(sale.qty||1),reason:'Manual ship — order '+orderNum+' tracking '+tracking,user_email:S.currentUser||null,source:'shipment'});
-        cascadeShopifySync(sale.pn);
-      }
+    } else if(_msPrt){
+      const newQty=(_msPrt.total_unpckgd||0)-(sale.qty||1); // directly-sold part — same deduction, different table
+      await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',_msPrt.id);
+      S.parts=S.parts.map(p=>p.id===_msPrt.id?{...p,total_unpckgd:newQty}:p);
+      await db.from('inv_corrections').insert({pn:sale.pn,previous_qty:_msPrt.total_unpckgd||0,new_qty:newQty,adjustment:-(sale.qty||1),reason:'Manual ship — order '+orderNum+' tracking '+tracking,user_email:S.currentUser||null,source:'shipment'});
+      cascadeShopifySync(sale.pn);
     }
     }
   }
@@ -10278,7 +10278,7 @@ async function submitAsm(eid){
   }
   else{({data,error}=await db.from('assemblies').insert(payload).select().single());}
   if(error){toast('Error: '+error.message);return;}
-  if(data)S.assemblies=[...S.assemblies,data].sort((a,b)=>a.pn.localeCompare(b.pn));
+  if(data)S.assemblies=[...S.assemblies,data].sort((a,b)=>dispPn(a).localeCompare(dispPn(b)));/* [FIX B] sort by display SKU */
   else S.assemblies=S.assemblies.map(a=>a.id===eid?{...a,...payload}:a);
   const pending=(S.pendingBOMLines||[]).filter(Boolean);
   if(pending.length>0){
@@ -11394,7 +11394,7 @@ function buildReportRows(id, preset, customFrom, customTo){
       const rows=fd(S.sales,'sale_date');
       const cols=['Order #','Date','Customer','SKU','Description','Qty','Status','Tracking','Carrier','Source'];
       const data=rows.map(s=>{
-        const asm=S.assemblies.find(a=>a.pn===s.pn);
+        const asm=findAsm(s.pn);
         return {'Order #':s.order_number||'','Date':(s.sale_date||'').slice(0,10),'Customer':s.customer_name||'','SKU':s.pn,'Description':asm?.description||'','Qty':s.qty||1,'Status':s.fulfillment_status||'Open','Tracking':s.tracking_number||'','Carrier':s.carrier||'','Source':s.source||''};
       });
       return{cols,data};
@@ -11412,7 +11412,7 @@ function buildReportRows(id, preset, customFrom, customTo){
       const map={};
       rows.forEach(s=>{
         if(!map[s.pn])map[s.pn]={SKU:s.pn,Description:'',Units:0,'Revenue ($)':0,Orders:new Set()};
-        const asm=S.assemblies.find(a=>a.pn===s.pn);
+        const asm=findAsm(s.pn);
         map[s.pn].Description=asm?.description||'';
         map[s.pn].Units+=(s.qty||1);
         map[s.pn]['Revenue ($)']+=(s.qty||1)*(asm?.msrp||0);
@@ -11431,7 +11431,7 @@ function buildReportRows(id, preset, customFrom, customTo){
         if(!map[mo])map[mo]={Month:mo,Orders:new Set(),Units:0,'Revenue ($)':0};
         map[mo].Orders.add(s.order_number||s.id);
         map[mo].Units+=(s.qty||1);
-        const asm=S.assemblies.find(a=>a.pn===s.pn);
+        const asm=findAsm(s.pn);
         map[mo]['Revenue ($)']+=(s.qty||1)*(asm?.msrp||0);
       });
       const cols=['Month','Order Count','Units Sold','Revenue ($)'];
@@ -11447,7 +11447,7 @@ function buildReportRows(id, preset, customFrom, customTo){
         if(!map[k])map[k]={Customer:k,Orders:new Set(),Units:0,'Revenue ($)':0,'First Order':'','Last Order':''};
         map[k].Orders.add(s.order_number||s.id);
         map[k].Units+=(s.qty||1);
-        const asm=S.assemblies.find(a=>a.pn===s.pn);
+        const asm=findAsm(s.pn);
         map[k]['Revenue ($)']+=(s.qty||1)*(asm?.msrp||0);
         const d=(s.sale_date||'').slice(0,10);
         if(d){if(!map[k]['First Order']||d<map[k]['First Order'])map[k]['First Order']=d;if(!map[k]['Last Order']||d>map[k]['Last Order'])map[k]['Last Order']=d;}
@@ -20488,14 +20488,14 @@ async function processReturn(saleId,action){
       else errors.push(pn+': '+rc.error.message);
 
     }else if(action==='returned'){
-      var asm=S.assemblies.find(function(a){return a.pn===pn;});
-      var prt=S.parts.find(function(p){return p.pn===pn;});
+      var asm=findAsm(pn); // [FIX B] new_sku-aware (line.pn may be a new_sku)
+      var prt=asm?null:S.parts.find(function(p){return p.pn===pn||(p.new_sku&&p.new_sku===pn);});
       var invOk=false;
       if(asm){
         var prev=asm.total_on_hand||0;var noh=prev+qty;
         var ra=await db.from('assemblies').update({total_on_hand:noh,updated_at:new Date().toISOString()}).eq('id',asm.id);
         if(!ra.error){
-          S.assemblies=S.assemblies.map(function(a){return a.pn===pn?Object.assign({},a,{total_on_hand:noh}):a;});
+          S.assemblies=S.assemblies.map(function(a){return a.id===asm.id?Object.assign({},a,{total_on_hand:noh}):a;});
           await db.from('inv_corrections').insert({pn:pn,previous_qty:prev,new_qty:noh,adjustment:qty,
             reason:'Return to stock \u2014 order '+orderNum+(notes?' \u2014 '+notes:''),
             user_email:S.currentUser||null,source:'return'});
@@ -20506,7 +20506,7 @@ async function processReturn(saleId,action){
         var prev2=prt.total_unpckgd||0;var noh2=prev2+qty;
         var rb=await db.from('parts').update({total_unpckgd:noh2,updated_at:new Date().toISOString()}).eq('id',prt.id);
         if(!rb.error){
-          S.parts=S.parts.map(function(p){return p.pn===pn?Object.assign({},p,{total_unpckgd:noh2}):p;});
+          S.parts=S.parts.map(function(p){return p.id===prt.id?Object.assign({},p,{total_unpckgd:noh2}):p;});
           await db.from('inv_corrections').insert({pn:pn,previous_qty:prev2,new_qty:noh2,adjustment:qty,
             reason:'Return to stock \u2014 order '+orderNum+(notes?' \u2014 '+notes:''),
             user_email:S.currentUser||null,source:'return'});
@@ -20959,14 +20959,14 @@ async function reverseReturn(saleId){
     var pn=line.pn;var qty=line.qty||1;
 
     if(line.return_status==='returned'){
-      var asm=S.assemblies.find(function(a){return a.pn===pn;});
-      var prt=S.parts.find(function(p){return p.pn===pn;});
+      var asm=findAsm(pn); // [FIX B] new_sku-aware (line.pn may be a new_sku)
+      var prt=asm?null:S.parts.find(function(p){return p.pn===pn||(p.new_sku&&p.new_sku===pn);});
       if(asm){
         var prev=asm.total_on_hand||0;
         var newOh=prev-qty; // allow negative — same backorder convention used everywhere else; clamping to 0 here would silently hide a genuine deficit if the returned units were already consumed again
         var r=await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
         if(!r.error){
-          S.assemblies=S.assemblies.map(function(a){return a.pn===pn?Object.assign({},a,{total_on_hand:newOh}):a;});
+          S.assemblies=S.assemblies.map(function(a){return a.id===asm.id?Object.assign({},a,{total_on_hand:newOh}):a;});
           await db.from('inv_corrections').insert({pn:pn,previous_qty:prev,new_qty:newOh,adjustment:-qty,
             reason:'Reversed return — order '+orderNum,user_email:S.currentUser||null,source:'reverse_return'});
           syncShopifyTemplate(pn,newOh);
@@ -20977,7 +20977,7 @@ async function reverseReturn(saleId){
         var newOh2=prev2-qty; // allow negative — see note above
         var r2=await db.from('parts').update({total_unpckgd:newOh2,updated_at:new Date().toISOString()}).eq('id',prt.id);
         if(!r2.error){
-          S.parts=S.parts.map(function(p){return p.pn===pn?Object.assign({},p,{total_unpckgd:newOh2}):p;});
+          S.parts=S.parts.map(function(p){return p.id===prt.id?Object.assign({},p,{total_unpckgd:newOh2}):p;});
           await db.from('inv_corrections').insert({pn:pn,previous_qty:prev2,new_qty:newOh2,adjustment:-qty,
             reason:'Reversed return — order '+orderNum,user_email:S.currentUser||null,source:'reverse_return'});
           cascadeShopifySync(pn);
