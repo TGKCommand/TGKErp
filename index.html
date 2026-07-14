@@ -224,7 +224,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.5';
+const TGK_ERP_VERSION = 'v20.6';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -13043,12 +13043,13 @@ function getPlanningStatus(p) {
   const wksStock=wkDemand>0?effectiveOh/wkDemand:null;
   const fw=S.forecastWeeks||8;
   const lt=ltWeeks(p);
-  if(effectiveOh<=0&&onOrder===0)return 'Out of Stock';
+  const hasDemand=wkDemand>0||reserved>0;
+  if(effectiveOh<=0&&onOrder===0)return hasDemand?'Out of Stock':'No Demand';
   if(effectiveOh<=rp&&onOrder>0&&effectiveStock>rp){
     if(wkDemand>0&&(effectiveOh+onOrder)<Math.ceil(wkDemand*(fw+lt)))return 'On Order – Short';
     return 'On Order';
   }
-  if(effectiveOh<=rp)return sq>0?'Order Now':'Watch'; // Only Order Now when there's actually something to order
+  if(effectiveOh<=rp)return hasDemand?(sq>0?'Order Now':'Watch'):'No Demand'; // no velocity/backorder -> not truly demanded
   if(p.max_qty>0&&oh>p.max_qty)return 'Overstock';
   if(wkDemand>0&&wksStock!==null&&wksStock<(fw+lt))return 'Watch';
   if(wkDemand<=0&&rp<=0)return 'No Data'; // no demand signal and no manual floor
@@ -13073,12 +13074,12 @@ function renderPlanning() {
   const pStatus=p=>_stByPn[p.pn]!==undefined?_stByPn[p.pn]:getPlanningStatus(p);
   const pSq=p=>_sqByPn[p.pn]!==undefined?_sqByPn[p.pn]:calcSuggestedQty(p);
   const trackedCount=allTracked.filter(p=>effectiveWkDemand(p)>0).length;
-  let kpiCritical=0,kpiReorder=0,kpiShort=0,kpiWatch=0,kpiOnOrder=0,kpiOverstock=0,kpiNoData=0;
+  let kpiCritical=0,kpiReorder=0,kpiShort=0,kpiWatch=0,kpiOnOrder=0,kpiOverstock=0,kpiNoData=0,kpiNoDemand=0;
   allTracked.forEach(p=>{const st=_stByPn[p.pn];
     if(st==='Out of Stock')kpiCritical++;else if(st==='Order Now')kpiReorder++;
     else if(st==='On Order – Short')kpiShort++;else if(st==='Watch')kpiWatch++;
     else if(st==='On Order')kpiOnOrder++;else if(st==='Overstock')kpiOverstock++;
-    else if(st==='No Data')kpiNoData++;});
+    else if(st==='No Data')kpiNoData++;else if(st==='No Demand')kpiNoDemand++;});
 
   let parts=[...allTracked];
   const vendors=[...new Set(parts.map(p=>p.vendor||'').filter(Boolean))].sort();
@@ -13089,7 +13090,7 @@ function renderPlanning() {
   if(sf.cat)    parts=parts.filter(p=>(p.category||'')===sf.cat);
   if(sf.status) parts=parts.filter(p=> sf.status==='Needs Ordering' ? (_stByPn[p.pn]==='Out of Stock'||_stByPn[p.pn]==='Order Now') : _stByPn[p.pn]===sf.status);
 
-  const STATUS_PRI={'Out of Stock':0,'Order Now':1,'On Order – Short':2,'Watch':3,'No Data':4,Overstock:5,'On Order':6,OK:7,'Build to Order':8};
+  const STATUS_PRI={'Out of Stock':0,'Order Now':1,'On Order – Short':2,'Watch':3,'No Data':4,'No Demand':4,Overstock:5,'On Order':6,OK:7,'Build to Order':8};
   const trendRatio=p=>{const w12=avgWk(p),w4=avgWk4(p);return(w12>0&&w4>0)?w4/w12:1;};
   parts.sort((a,b)=>{
     let cmp=0;
@@ -13101,6 +13102,10 @@ function renderPlanning() {
       case 'weeks':{const wa=avgWk(a)>0?Math.max(0,(a.total_unpckgd||0)-boReserved(a.pn))/avgWk(a):9999,wb=avgWk(b)>0?Math.max(0,(b.total_unpckgd||0)-boReserved(b.pn))/avgWk(b):9999;cmp=wa-wb;break;}
       case 'trend': cmp=trendRatio(a)-trendRatio(b);break;
       case 'status':cmp=(STATUS_PRI[pStatus(a)]||5)-(STATUS_PRI[pStatus(b)]||5);break;
+      case 'desc':  cmp=(a.description||'').localeCompare(b.description||'');break;
+      case 'vendor':cmp=(a.vendor||'').localeCompare(b.vendor||'');break;
+      case 'boresv':cmp=boReserved(a.pn)-boReserved(b.pn);break;
+      case 'inasm': cmp=unitsInAssemblies(a.pn)-unitsInAssemblies(b.pn);break;
       case 'orderqty':cmp=pSq(a)-pSq(b);break;
       default:{const _wa=avgWk(a)>0?Math.max(0,(a.total_unpckgd||0)-boReserved(a.pn))/avgWk(a):99999,_wb=avgWk(b)>0?Math.max(0,(b.total_unpckgd||0)-boReserved(b.pn))/avgWk(b):99999;cmp=_wa-_wb;break;}
     }
@@ -13114,13 +13119,14 @@ function renderPlanning() {
   const sSort=(val,label)=>{const arr=sortField===val?(sortDir==='asc'?'↑':'↓'):'';return`<button class="filter-chip ${sortField===val?'on-teal':''}" onclick="(()=>{const _sf=S.filters.planning||{};const nd=_sf.sort==='${val}'&&_sf.dir==='asc'?'desc':'asc';setFilter('planning','sort','${val}');setFilter('planning','dir',nd);})()"> ${label}${arr?' '+arr:''}</button>`;};
 
   return `
-  <div class="kpi-grid" style="grid-template-columns:repeat(6,1fr)">
+  <div class="kpi-grid" style="grid-template-columns:repeat(7,1fr)">
     <div class="kpi" style="cursor:pointer" onclick="setFilter('planning','status','')"><div class="kpi-label">All Parts</div><div class="kpi-value">${allTracked.length}</div><div class="kpi-sub">${trackedCount} with velocity</div></div>
     <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('planning','status','${sf.status==='Needs Ordering'?'':'Needs Ordering'}')"><div class="kpi-label">Needs Ordering</div><div class="kpi-value">${kpiCritical+kpiReorder}</div><div class="kpi-sub">${kpiCritical} out of stock &middot; ${kpiReorder} reorder</div></div>
     <div class="kpi kpi-orange" style="cursor:pointer" onclick="setFilter('planning','status','${sf.status==='On Order – Short'?'':'On Order – Short'}')"><div class="kpi-label">On Order – Short</div><div class="kpi-value">${kpiShort}</div><div class="kpi-sub">PO won't cover horizon</div></div>
     <div class="kpi kpi-yellow" style="cursor:pointer" onclick="setFilter('planning','status','${sf.status==='Watch'?'':'Watch'}')"><div class="kpi-label">Watch</div><div class="kpi-value">${kpiWatch}</div><div class="kpi-sub">getting close</div></div>
     <div class="kpi kpi-teal" style="cursor:pointer" onclick="setFilter('planning','status','${sf.status==='On Order'?'':'On Order'}')"><div class="kpi-label">On Order</div><div class="kpi-value">${kpiOnOrder}</div><div class="kpi-sub">PO covers horizon</div></div>
     <div class="kpi kpi-yellow" style="cursor:pointer" onclick="setFilter('planning','status','${sf.status==='Overstock'?'':'Overstock'}')"><div class="kpi-label">Overstock</div><div class="kpi-value">${kpiOverstock}</div><div class="kpi-sub">above max</div></div>
+    <div class="kpi" style="cursor:pointer" title="Zero/low stock but no sales velocity and no backorders - not currently demanded" onclick="setFilter('planning','status','${sf.status==='No Demand'?'':'No Demand'}')"><div class="kpi-label">No Demand</div><div class="kpi-value">${kpiNoDemand}</div><div class="kpi-sub">no stock, no velocity</div></div>
   </div>
   <div class="tabs-row" style="margin-bottom:0">
     <div class="tab ${(!S.planTab||S.planTab==='purchasing')?'active':''}" onclick="S.planTab='purchasing';render()">&#128462; Purchasing</div>
@@ -13153,6 +13159,7 @@ function renderPlanning() {
       ${sSt('On Order','🟢 On Order ('+kpiOnOrder+')')}
       ${sSt('Overstock','🟡 Overstock ('+kpiOverstock+')')}
       ${sSt('No Data','⚪ No Data ('+kpiNoData+')')}
+      ${sSt('No Demand','No Demand ('+kpiNoDemand+')')}
       ${sSt('OK','✓ OK')}
     </div>
     <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
@@ -13173,10 +13180,10 @@ function renderPlanning() {
   <div class="tbl-wrap">
   <table data-tid="planning" style="font-size:12px"><thead class="sticky-header"><tr>
     <th style="cursor:pointer;padding:6px 8px" onclick="(()=>{const d=sortField==='pn'&&sortDir==='asc'?'desc':'asc';setFilter('planning','sort','pn');setFilter('planning','dir',d)})()">Part # ${sortField==='pn'?(sortDir==='asc'?'↑':'↓'):''}</th>
-    <th>Description</th><th>Vendor</th>
+    <th style="cursor:pointer" onclick="(()=>{const d=sortField==='desc'&&sortDir==='asc'?'desc':'asc';setFilter('planning','sort','desc');setFilter('planning','dir',d)})()">Description ${sortField==='desc'?(sortDir==='asc'?'↑':'↓'):''}</th><th style="cursor:pointer" onclick="(()=>{const d=sortField==='vendor'&&sortDir==='asc'?'desc':'asc';setFilter('planning','sort','vendor');setFilter('planning','dir',d)})()">Vendor ${sortField==='vendor'?(sortDir==='asc'?'↑':'↓'):''}</th>
     <th style="cursor:pointer" onclick="(()=>{const d=sortField==='oh'&&sortDir==='asc'?'desc':'asc';setFilter('planning','sort','oh');setFilter('planning','dir',d)})()">Stock ${sortField==='oh'?(sortDir==='asc'?'↑':'↓'):''}</th>
-    <th title="Units reserved for backordered assemblies" style="white-space:nowrap">BO Rsv</th>
-    <th title="Units of this part currently packed into finished goods on hand" style="white-space:nowrap">In Asm</th>
+    <th title="Units reserved for backordered assemblies" style="white-space:nowrap;cursor:pointer" onclick="(()=>{const d=sortField==='boresv'&&sortDir==='desc'?'asc':'desc';setFilter('planning','sort','boresv');setFilter('planning','dir',d)})()">BO Rsv ${sortField==='boresv'?(sortDir==='asc'?'↑':'↓'):''}</th>
+    <th title="Units of this part currently packed into finished goods on hand" style="white-space:nowrap;cursor:pointer" onclick="(()=>{const d=sortField==='inasm'&&sortDir==='desc'?'asc':'desc';setFilter('planning','sort','inasm');setFilter('planning','dir',d)})()">In Asm ${sortField==='inasm'?(sortDir==='asc'?'↑':'↓'):''}</th>
     <th style="cursor:pointer" onclick="(()=>{const d=sortField==='demand'&&sortDir==='asc'?'desc':'asc';setFilter('planning','sort','demand');setFilter('planning','dir',d)})()">Demand ${sortField==='demand'?(sortDir==='asc'?'↑':'↓'):sortField==='trend'?'(trend sorted)':''}</th>
     <th style="cursor:pointer" onclick="(()=>{const d=sortField==='weeks'&&sortDir==='asc'?'desc':'asc';setFilter('planning','sort','weeks');setFilter('planning','dir',d)})()">Wks ${sortField==='weeks'?(sortDir==='asc'?'↑':'↓'):''}</th>
     <th style="cursor:pointer" title="Qty to order: net need rounded up to MOQ. Grey/dash = at target. Teal = already on order." onclick="(()=>{const d=sortField==='orderqty'&&sortDir==='desc'?'asc':'desc';setFilter('planning','sort','orderqty');setFilter('planning','dir',d)})()">Order Qty ${sortField==='orderqty'?(sortDir==='asc'?'↑':'↓'):''}</th>
@@ -13237,7 +13244,7 @@ function renderPlanning() {
     const pbHint=nextBreakHint(p,orderQty);
 
     const status=pStatus(p);
-    const statusCls={'Out of Stock':'pill-red','Order Now':'pill-orange','Build to Order':'pill-muted','On Order – Short':'pill-orange','Watch':'pill-yellow','On Order':'pill-teal','No Data':'pill-muted',Overstock:'pill-yellow',OK:'pill-teal'}[status]||'pill-muted';
+    const statusCls={'Out of Stock':'pill-red','Order Now':'pill-orange','Build to Order':'pill-muted','No Demand':'pill-muted','On Order – Short':'pill-orange','Watch':'pill-yellow','On Order':'pill-teal','No Data':'pill-muted',Overstock:'pill-yellow',OK:'pill-teal'}[status]||'pill-muted';
 
     const _urgentStatus=status==='Order Now'||status==='Out of Stock'||status==='On Order \u2013 Short';
     const alreadyCovered=sq<=0&&onOrder>0&&!_urgentStatus; // never show Covered when status demands action
@@ -13415,7 +13422,7 @@ function renderMinMaxTab(parts){
     const rp=calcReorderPoint(p);
     const oh=p.total_unpckgd||0;
     const status=getPlanningStatus(p);
-    const statusCls={'Out of Stock':'pill-red','Order Now':'pill-orange','Build to Order':'pill-muted','On Order – Short':'pill-orange','Watch':'pill-yellow','On Order':'pill-teal','No Data':'pill-muted',Overstock:'pill-yellow',OK:'pill-teal'}[status]||'pill-muted';
+    const statusCls={'Out of Stock':'pill-red','Order Now':'pill-orange','Build to Order':'pill-muted','No Demand':'pill-muted','On Order – Short':'pill-orange','Watch':'pill-yellow','On Order':'pill-teal','No Data':'pill-muted',Overstock:'pill-yellow',OK:'pill-teal'}[status]||'pill-muted';
     const wkd=effectiveWkDemand(p);
     const sel=S.mmSelectedPns.has(p.pn);
     const pending=S.mmSuggest&&S.mmSuggest.find(s=>s.pn===p.pn);
