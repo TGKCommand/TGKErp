@@ -224,7 +224,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.3';
+const TGK_ERP_VERSION = 'v20.5';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -12766,6 +12766,18 @@ function linePrice(item){return lineUnitPrice(item)*(item.qty||1);}
 
 function isDev(a){return !!(a&&a.stage==='dev');}
 function isDevPn(pn){return isDev(S.assemblies.find(x=>x.pn===pn));}
+function devOnlyPartSet(){
+  // Parts that appear ONLY in the BOMs of dev-stage assemblies (and no active assembly).
+  // Shared by the Purchasing main tab and the Stale report so dev parts are excluded identically.
+  const dev=new Set(), active=new Set();
+  Object.entries(S.boms).forEach(([parent,items])=>{
+    const bucket=isDevPn(parent)?dev:active;
+    items.forEach(i=>{const t=i.item_type||'part';if(t!=='assembly'&&t!=='subassembly')bucket.add(i.child_pn);});
+  });
+  const out=new Set();
+  dev.forEach(pn=>{ if(!active.has(pn)) out.add(pn); });
+  return out;
+}
 function isHWPack(pn){ return /^TGK-P\d/i.test(pn||''); }
 
 function isAsmBOMItem(t){ return t==='assembly'||t==='subassembly'; }
@@ -12873,7 +12885,38 @@ function calcReorderPoint(p) {
   return Math.ceil(Math.max(demandRP, floorRP) + safety); // min_qty is a floor, demand can raise it
 }
 
+function btoPullNeed(p){
+  // Build-to-order pull: units of this component needed RIGHT NOW to build the finished goods that
+  // use it back up to their coverage target. Stays 0 while those finished goods are well-stocked, so
+  // the part stays dormant ('Build to Order') until a finished good it feeds actually runs low.
+  const cov=S.buildCoverage||4;
+  let need=0;
+  const boms=S.boms||{};
+  for(const parent in boms){
+    const items=boms[parent]; let line=null;
+    for(const i of items){ const t=i.item_type||'part'; if(i.child_pn===p.pn && t!=='assembly' && t!=='subassembly'){ line=i; break; } }
+    if(!line)continue;
+    const fg=(S._asmIdx&&S._asmIdx[parent])||S.assemblies.find(a=>a.pn===parent);
+    if(!fg||fg.discontinued||fg.stage==='dev'||fg.build_to_order)continue;
+    const st=liveStatus(fg);
+    if(st!=='low'&&st!=='critical')continue;      // finished good is fine -> component not needed yet
+    const wk=asmAvgWk(fg);
+    const target=Math.max(1,Math.ceil(wk*cov));    // build back up to coverage weeks
+    const short=Math.max(0, target-(fg.total_on_hand||0)-(openOrderedQty(fg.pn)||0));
+    if(short<=0)continue;
+    need += short*(line.qty||1);
+  }
+  return need;
+}
 function calcSuggestedQty(p) {
+  if(p.build_to_order){
+    const pull=btoPullNeed(p);
+    const avail=Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn));
+    const oo=openOrderedQty(p.pn);
+    let sq=Math.max(0, pull-avail-oo);
+    const moq=p.moq||0; if(sq>0&&moq>0&&sq<moq)sq=moq;
+    return sq;
+  }
   const max = p.max_qty || 0;
   const curr = p.total_unpckgd || 0;
   const reserved = boReserved(p.pn);
@@ -12912,7 +12955,8 @@ function _buildLastMoveMap(){
 function findStaleParts(days){
   const cutoff=Date.now()-days*86400000;
   const mm=_buildLastMoveMap();
-  return S.parts.filter(p=>!p.discontinued && !isDevPn(p.pn) && !p.build_to_order)
+  const devOnly=devOnlyPartSet();
+  return S.parts.filter(p=>!p.discontinued && !devOnly.has(p.pn) && !p.build_to_order)
     .map(p=>({p, last: Math.max(mm[p.pn]||0, p.new_sku?(mm[p.new_sku]||0):0)}))
     .filter(x=>x.last<cutoff)
     .sort((a,b)=>a.last-b.last);
@@ -12981,7 +13025,12 @@ async function discontinueStaleSelected(){
   else toast('🗄 '+ids.length+' stale part'+(ids.length===1?'':'s')+' discontinued.',4000);
 }
 function getPlanningStatus(p) {
-  if(p.build_to_order)return 'Build to Order'; // demand-driven only; never buffer-flagged
+  if(p.build_to_order){
+    const _pull=btoPullNeed(p);
+    const _avail=Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn));
+    const _oo=openOrderedQty(p.pn);
+    return (_pull>0 && (_avail+_oo)<_pull) ? 'Order Now' : 'Build to Order'; // orange only when a finished good it feeds needs building and stock can't cover it
+  }
   const oh=p.total_unpckgd||0;
   const rp=calcReorderPoint(p);
   const sq=calcSuggestedQty(p);
@@ -13013,17 +13062,8 @@ function renderPlanning() {
   const sortDir   = sf.dir||'asc';
   const q=(sf.search||'').toLowerCase();
 
-  const _devBomPns=new Set();
-  const _activeBomPns=new Set();
-  Object.entries(S.boms).forEach(([parent,items])=>{
-    const bucket=isDevPn(parent)?_devBomPns:_activeBomPns;
-    items.forEach(i=>{const _t=i.item_type||'part';if(_t!=='assembly'&&_t!=='subassembly')bucket.add(i.child_pn);});
-  });
-  function isDevOnlyPart(p){
-    if(!_devBomPns.has(p.pn))return false;   // not in any dev BOM at all
-    if(_activeBomPns.has(p.pn))return false;  // also used in an active assembly → keep in main tab
-    return true;                               // exclusively in dev BOMs → filter out of main tab
-  }
+  const _devOnly=devOnlyPartSet();
+  function isDevOnlyPart(p){return _devOnly.has(p.pn);}
   const devOnlyParts=S.parts.filter(p=>!p.discontinued&&isDevOnlyPart(p));
   const allTracked=S.parts.filter(p=>!p.discontinued&&!isDevOnlyPart(p));
   // ── Per-render memoization: prime on-order map, compute status + suggested qty ONCE per part ──
