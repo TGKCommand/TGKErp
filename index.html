@@ -224,7 +224,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.1';
+const TGK_ERP_VERSION = 'v20.3';
 const TGK_ERP_BUILD_DATE = '2026-06-29';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -316,6 +316,22 @@ function buildLookupMaps(){
   });
   S._asmIdx=ai;S._partIdx=pi;
 }
+
+/* [LIVE-INDEX] The O(1) resolver maps (_partIdx/_asmIdx) hold references to part/assembly objects.
+   Inventory is updated immutably (e.g. S.parts = S.parts.map(p=>({...p,total_unpckgd:x}))), which
+   creates NEW objects while the maps still pointed at the OLD ones -- so buildability, BOM viewers and
+   every component list read stale on-hand and could wrongly report "can't package" right after a
+   quantity change. Intercept reassignment of S.parts / S.assemblies and rebuild the maps in lockstep
+   so all dependent views fire live from a single point (instead of 60+ call sites). */
+(function(){
+  var _liveParts=S.parts, _liveAsms=S.assemblies;
+  Object.defineProperty(S,'parts',{configurable:true,enumerable:true,
+    get:function(){return _liveParts;},
+    set:function(v){_liveParts=v; if(S._partIdx||S._asmIdx){ try{ buildLookupMaps(); }catch(e){} }}});
+  Object.defineProperty(S,'assemblies',{configurable:true,enumerable:true,
+    get:function(){return _liveAsms;},
+    set:function(v){_liveAsms=v; if(S._partIdx||S._asmIdx){ try{ buildLookupMaps(); }catch(e){} }}});
+})();
 
 function computeDemand(){
   const wk4={},wk12={};
@@ -8776,6 +8792,12 @@ function openModal(type,data){
     <div class="form-row cols-2">${fi('m-unpckgd','On Hand (Unpacked)',data.total_unpckgd||0,'type="number"')} ${fi('m-min','Min Stock (Reorder Point)',data.min_qty||0,'type="number" step="1"')}</div>
     <div class="form-row cols-2">${fi('m-max','Max Stock Target',data.max_qty||0,'type="number" step="1" min="0" title="Target stock level. Used for suggested order quantity."')} ${fi('m-moq','Min Order Qty (MOQ)',data.moq||0,'type="number" step="1" min="0" title="Leave 0 to ignore. Prompts a warning when PO qty is below this."')}</div>
     <div class="form-row cols-2">${fi('m-loc','Bin Location',data.location||'')} ${fi('m-safety','Safety Stock',data.safety_stock||0,'type="number" step="1" min="0" title="Extra buffer stock to maintain above the reorder point"')}</div>
+    <div class="form-row">
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text2);cursor:pointer;padding:8px 10px;background:${data.build_to_order?'var(--orange-dim)':'var(--bg3)'};border:1px solid ${data.build_to_order?'rgba(234,88,12,.3)':'var(--border)'};border-radius:6px">
+        <input type="checkbox" id="m-build-to-order" ${data.build_to_order?'checked':''}>
+        <span><b>Build to order — never stock ahead of demand.</b> <span style="color:var(--text3);font-weight:400">Only ordered when a finished good needs it — won\'t be flagged in Purchasing or Production as needing its own buffer stock on the shelf.</span></span>
+      </label>
+    </div>
     <div class="form-row cols-2">${fi('m-drawing','Drawing URL',data.drawing_url||'','placeholder="https://…"')} ${fi('m-image','Image URL',data.image_url||'','placeholder="https://cdn.shopify.com/…"')}</div>
     <div class="form-row"><label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text2);cursor:pointer"><input type="checkbox" id="m-disc" ${data.discontinued?'checked':''}> 🗄 Discontinued — hide from Inventory, Planning &amp; Production</label></div>
     <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px">
@@ -9167,7 +9189,7 @@ async function submitDealer(eid){
 async function submitPart(eid){
   const newPn=$('m-pn').value.trim();if(!newPn){toast('Part # required');return;}
   const breaks=(S.pendingPriceBreaks||[]).filter(Boolean).sort(function(a,b){return a.qty-b.qty;}).map(function(b){return{qty:b.qty,price:b.price};});
-  const payload={pn:newPn,vendor:$('m-vendor').value.trim(),description:$('m-desc').value.trim(),category:$('m-cat').value.trim(),unit_cost:parseFloat($('m-cost').value)||0,lead_time_weeks:parseInt($('m-lead').value)||1,avg_sales_wk:parseFloat($('m-avg').value)||0,total_unpckgd:parseInt($('m-unpckgd').value)||0,min_qty:parseFloat($('m-min').value)||0,max_qty:parseFloat($('m-max')?.value)||0,moq:parseFloat($('m-moq').value)||0,safety_stock:parseFloat($('m-safety')?.value)||0,price_breaks:breaks,location:$('m-loc').value.trim(),drawing_url:$('m-drawing').value.trim(),image_url:($('m-image')?.value||'').trim()||null,discontinued:$('m-disc').checked,updated_at:new Date().toISOString()};
+  const payload={pn:newPn,vendor:$('m-vendor').value.trim(),description:$('m-desc').value.trim(),category:$('m-cat').value.trim(),unit_cost:parseFloat($('m-cost').value)||0,lead_time_weeks:parseInt($('m-lead').value)||1,avg_sales_wk:parseFloat($('m-avg').value)||0,total_unpckgd:parseInt($('m-unpckgd').value)||0,min_qty:parseFloat($('m-min').value)||0,max_qty:parseFloat($('m-max')?.value)||0,moq:parseFloat($('m-moq').value)||0,safety_stock:parseFloat($('m-safety')?.value)||0,price_breaks:breaks,location:$('m-loc').value.trim(),drawing_url:$('m-drawing').value.trim(),image_url:($('m-image')?.value||'').trim()||null,build_to_order:!!($('m-build-to-order')?.checked),discontinued:$('m-disc').checked,updated_at:new Date().toISOString()};
   let error,data;
   if(eid){
     const prev=S.parts.find(p=>p.id===eid);
@@ -12842,6 +12864,7 @@ function openOrderedQty(pn) {
 }
 
 function calcReorderPoint(p) {
+  if(p&&p.build_to_order)return 0; // build-to-order: ordered only when a finished good needs it, never buffered
   const demand = effectiveWkDemand(p);
   const lt = ltWeeks(p);
   const safety = p.safety_stock || 0;
@@ -12879,7 +12902,86 @@ function calcSuggestedQty(p) {
   return sq;
 }
 
+function _buildLastMoveMap(){
+  const m={};
+  const upd=(pn,d)=>{ if(!pn||!d)return; const t=Date.parse(d); if(t&&(!m[pn]||t>m[pn]))m[pn]=t; };
+  for(const sale of S.sales){ upd(sale.pn, sale.sale_date||sale.order_date); }
+  for(const c of (S.corrections||[])){ upd(c.pn, c.created_at); }
+  return m;
+}
+function findStaleParts(days){
+  const cutoff=Date.now()-days*86400000;
+  const mm=_buildLastMoveMap();
+  return S.parts.filter(p=>!p.discontinued && !isDevPn(p.pn) && !p.build_to_order)
+    .map(p=>({p, last: Math.max(mm[p.pn]||0, p.new_sku?(mm[p.new_sku]||0):0)}))
+    .filter(x=>x.last<cutoff)
+    .sort((a,b)=>a.last-b.last);
+}
+function openStaleReport(){
+  const days=90;
+  const rows=findStaleParts(days); window._staleRows=rows;
+  const fmt=t=>t?new Date(t).toLocaleDateString():'never';
+  document.getElementById('stale-modal')?.remove();
+  const body = rows.length ? rows.map(r=>{
+    const oh=r.p.total_unpckgd||0;
+    return '<tr>'
+      +'<td style="padding:6px 8px"><input type="checkbox" class="stale-cb" value="'+r.p.id+'" checked></td>'
+      +'<td style="padding:6px 8px;font-family:var(--mono);color:var(--teal)">'+escHtml(dispPn(r.p))+'</td>'
+      +'<td style="padding:6px 8px">'+escHtml(r.p.description||'')+'</td>'
+      +'<td style="padding:6px 8px;color:var(--text3)">'+escHtml(r.p.vendor||'')+'</td>'
+      +'<td style="padding:6px 8px;text-align:right">'+oh+'</td>'
+      +'<td style="padding:6px 8px;color:var(--text3);white-space:nowrap">'+fmt(r.last)+'</td>'
+      +'</tr>';
+  }).join('') : '<tr><td colspan="6" style="padding:22px;text-align:center;color:var(--text3)">No stale parts — everything has moved in the last '+days+' days.</td></tr>';
+  const modal=document.createElement('div'); modal.id='stale-modal';
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px';
+  modal.innerHTML='<div style="background:var(--bg2);border:1px solid var(--border2);border-radius:10px;max-width:840px;width:100%;max-height:82vh;display:flex;flex-direction:column">'
+    +'<div style="padding:18px 22px;border-bottom:1px solid var(--border)">'
+      +'<div style="font-size:16px;font-weight:700;color:var(--text)">🧹 Stale Parts — no movement in '+days+' days</div>'
+      +'<div style="font-size:12px;color:var(--text3);margin-top:4px">No sales and no inventory adjustments since '+fmt(Date.now()-days*86400000)+'. Build-to-order and dev parts are excluded. Discontinuing hides them from Inventory, Planning &amp; Production and is reversible.</div>'
+    +'</div>'
+    +'<div style="overflow:auto;flex:1"><table style="width:100%;border-collapse:collapse;font-size:12px">'
+      +'<thead><tr style="position:sticky;top:0;background:var(--bg3);text-align:left;color:var(--text3)">'
+        +'<th style="padding:8px"><input type="checkbox" id="stale-all" checked onclick="document.querySelectorAll(\'.stale-cb\').forEach(cb=>cb.checked=this.checked)"></th>'
+        +'<th style="padding:8px">SKU</th><th style="padding:8px">Description</th><th style="padding:8px">Vendor</th><th style="padding:8px;text-align:right">On Hand</th><th style="padding:8px">Last Movement</th>'
+      +'</tr></thead><tbody>'+body+'</tbody></table></div>'
+    +'<div style="padding:14px 22px;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">'
+      +'<div style="font-size:12px;color:var(--text3)">'+rows.length+' stale part'+(rows.length===1?'':'s')+'</div>'
+      +'<div style="display:flex;gap:10px">'
+        +'<button class="btn btn-sm" onclick="exportStaleCsv()">Export CSV</button>'
+        +'<button class="btn btn-sm" onclick="document.getElementById(\'stale-modal\').remove()">Close</button>'
+        +(rows.length?'<button class="btn btn-sm" style="background:var(--red);color:#fff;border-color:var(--red)" onclick="discontinueStaleSelected()">🗄 Discontinue Selected</button>':'')
+      +'</div>'
+    +'</div></div>';
+  document.body.appendChild(modal);
+}
+function exportStaleCsv(){
+  const rows=window._staleRows||[];
+  const fmt=t=>t?new Date(t).toISOString().slice(0,10):'never';
+  const data=[['SKU','Description','Vendor','On Hand','Last Movement']].concat(rows.map(r=>[dispPn(r.p),(r.p.description||''),r.p.vendor||'',r.p.total_unpckgd||0,fmt(r.last)]));
+  const csv=data.map(row=>row.map(c=>'"'+String(c).replace(/"/g,'""')+'"').join(',')).join('\n');
+  const blob=new Blob([csv],{type:'text/csv'}); const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download='stale-parts-90d.csv'; a.click();
+}
+async function discontinueStaleSelected(){
+  const ids=[...document.querySelectorAll('.stale-cb')].filter(cb=>cb.checked).map(cb=>cb.value);
+  if(!ids.length){toast('Nothing selected');return;}
+  if(!confirm('Discontinue '+ids.length+' stale part'+(ids.length===1?'':'s')+'? They will be hidden from Inventory, Planning and Production. You can restore them later from the parts list.'))return;
+  document.getElementById('stale-modal')?.remove();
+  toast('Discontinuing '+ids.length+' stale part'+(ids.length===1?'':'s')+'…');
+  let failed=0;
+  for(let i=0;i<ids.length;i+=100){
+    const chunk=ids.slice(i,i+100);
+    const{error}=await db.from('parts').update({discontinued:true,updated_at:new Date().toISOString()}).in('id',chunk);
+    if(error){failed+=chunk.length;console.error('discontinueStale error:',error);}
+  }
+  S.parts=S.parts.map(p=>ids.includes(p.id)?{...p,discontinued:true}:p);
+  render();
+  if(failed)toast('⚠ '+failed+' failed — check console',5000);
+  else toast('🗄 '+ids.length+' stale part'+(ids.length===1?'':'s')+' discontinued.',4000);
+}
 function getPlanningStatus(p) {
+  if(p.build_to_order)return 'Build to Order'; // demand-driven only; never buffer-flagged
   const oh=p.total_unpckgd||0;
   const rp=calcReorderPoint(p);
   const sq=calcSuggestedQty(p);
@@ -12945,9 +13047,9 @@ function renderPlanning() {
   if(q) parts=parts.filter(p=>p.pn.toLowerCase().includes(q)||(p.new_sku||'').toLowerCase().includes(q)||(p.description||'').toLowerCase().includes(q)||(p.vendor||'').toLowerCase().includes(q));
   if(sf.vendor) parts=parts.filter(p=>(p.vendor||'')===sf.vendor);
   if(sf.cat)    parts=parts.filter(p=>(p.category||'')===sf.cat);
-  if(sf.status) parts=parts.filter(p=>_stByPn[p.pn]===sf.status);
+  if(sf.status) parts=parts.filter(p=> sf.status==='Needs Ordering' ? (_stByPn[p.pn]==='Out of Stock'||_stByPn[p.pn]==='Order Now') : _stByPn[p.pn]===sf.status);
 
-  const STATUS_PRI={'Out of Stock':0,'Order Now':1,'On Order – Short':2,'Watch':3,'No Data':4,Overstock:5,'On Order':6,OK:7};
+  const STATUS_PRI={'Out of Stock':0,'Order Now':1,'On Order – Short':2,'Watch':3,'No Data':4,Overstock:5,'On Order':6,OK:7,'Build to Order':8};
   const trendRatio=p=>{const w12=avgWk(p),w4=avgWk4(p);return(w12>0&&w4>0)?w4/w12:1;};
   parts.sort((a,b)=>{
     let cmp=0;
@@ -12972,10 +13074,9 @@ function renderPlanning() {
   const sSort=(val,label)=>{const arr=sortField===val?(sortDir==='asc'?'↑':'↓'):'';return`<button class="filter-chip ${sortField===val?'on-teal':''}" onclick="(()=>{const _sf=S.filters.planning||{};const nd=_sf.sort==='${val}'&&_sf.dir==='asc'?'desc':'asc';setFilter('planning','sort','${val}');setFilter('planning','dir',nd);})()"> ${label}${arr?' '+arr:''}</button>`;};
 
   return `
-  <div class="kpi-grid" style="grid-template-columns:repeat(7,1fr)">
+  <div class="kpi-grid" style="grid-template-columns:repeat(6,1fr)">
     <div class="kpi" style="cursor:pointer" onclick="setFilter('planning','status','')"><div class="kpi-label">All Parts</div><div class="kpi-value">${allTracked.length}</div><div class="kpi-sub">${trackedCount} with velocity</div></div>
-    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('planning','status','${sf.status==='Out of Stock'?'':'Out of Stock'}')"><div class="kpi-label">Out of Stock</div><div class="kpi-value">${kpiCritical}</div><div class="kpi-sub">zero stock, no PO</div></div>
-    <div class="kpi kpi-orange" style="cursor:pointer" onclick="setFilter('planning','status','${sf.status==='Order Now'?'':'Order Now'}')"><div class="kpi-label">Order Now</div><div class="kpi-value">${kpiReorder}</div><div class="kpi-sub">below reorder point</div></div>
+    <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('planning','status','${sf.status==='Needs Ordering'?'':'Needs Ordering'}')"><div class="kpi-label">Needs Ordering</div><div class="kpi-value">${kpiCritical+kpiReorder}</div><div class="kpi-sub">${kpiCritical} out of stock &middot; ${kpiReorder} reorder</div></div>
     <div class="kpi kpi-orange" style="cursor:pointer" onclick="setFilter('planning','status','${sf.status==='On Order – Short'?'':'On Order – Short'}')"><div class="kpi-label">On Order – Short</div><div class="kpi-value">${kpiShort}</div><div class="kpi-sub">PO won't cover horizon</div></div>
     <div class="kpi kpi-yellow" style="cursor:pointer" onclick="setFilter('planning','status','${sf.status==='Watch'?'':'Watch'}')"><div class="kpi-label">Watch</div><div class="kpi-value">${kpiWatch}</div><div class="kpi-sub">getting close</div></div>
     <div class="kpi kpi-teal" style="cursor:pointer" onclick="setFilter('planning','status','${sf.status==='On Order'?'':'On Order'}')"><div class="kpi-label">On Order</div><div class="kpi-value">${kpiOnOrder}</div><div class="kpi-sub">PO covers horizon</div></div>
@@ -13000,13 +13101,13 @@ function renderPlanning() {
       </select>
       ${sf.vendor?`<button class="btn btn-teal btn-sm" onclick="createVendorPO('${sf.vendor}')">📄 One PO — ${sf.vendor}</button>`:''}
       <button class="btn btn-sm" onclick="nav('pobuilder')">🛒 PO Builder</button>
+      <button class="btn btn-sm" onclick="openStaleReport()" title="Find parts with no sales or stock adjustments in the last 90 days">🧹 Stale (90d)</button>
       <button class="btn btn-primary btn-sm" onclick="createSuggestedPOs()">+ Create Suggested POs (${needsReorder.length})</button>
     </div>
     <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--border)">
       <span style="font-size:11px;color:var(--text3);flex-shrink:0;width:44px">Status:</span>
       <button class="filter-chip ${!sf.status?'on-teal':''}" onclick="setFilter('planning','status','')">All (${allTracked.length})</button>
-      ${sSt('Out of Stock','🔴 Out of Stock ('+kpiCritical+')')}
-      ${sSt('Order Now','🟠 Order Now ('+kpiReorder+')')}
+      ${sSt('Needs Ordering','🔴 Needs Ordering ('+(kpiCritical+kpiReorder)+')')}
       ${sSt('On Order – Short','🟠 On Order–Short ('+kpiShort+')')}
       ${sSt('Watch','🟡 Watch ('+kpiWatch+')')}
       ${sSt('On Order','🟢 On Order ('+kpiOnOrder+')')}
@@ -13096,7 +13197,7 @@ function renderPlanning() {
     const pbHint=nextBreakHint(p,orderQty);
 
     const status=pStatus(p);
-    const statusCls={'Out of Stock':'pill-red','Order Now':'pill-orange','On Order – Short':'pill-orange','Watch':'pill-yellow','On Order':'pill-teal','No Data':'pill-muted',Overstock:'pill-yellow',OK:'pill-teal'}[status]||'pill-muted';
+    const statusCls={'Out of Stock':'pill-red','Order Now':'pill-orange','Build to Order':'pill-muted','On Order – Short':'pill-orange','Watch':'pill-yellow','On Order':'pill-teal','No Data':'pill-muted',Overstock:'pill-yellow',OK:'pill-teal'}[status]||'pill-muted';
 
     const _urgentStatus=status==='Order Now'||status==='Out of Stock'||status==='On Order \u2013 Short';
     const alreadyCovered=sq<=0&&onOrder>0&&!_urgentStatus; // never show Covered when status demands action
@@ -13274,7 +13375,7 @@ function renderMinMaxTab(parts){
     const rp=calcReorderPoint(p);
     const oh=p.total_unpckgd||0;
     const status=getPlanningStatus(p);
-    const statusCls={'Out of Stock':'pill-red','Order Now':'pill-orange','On Order – Short':'pill-orange','Watch':'pill-yellow','On Order':'pill-teal','No Data':'pill-muted',Overstock:'pill-yellow',OK:'pill-teal'}[status]||'pill-muted';
+    const statusCls={'Out of Stock':'pill-red','Order Now':'pill-orange','Build to Order':'pill-muted','On Order – Short':'pill-orange','Watch':'pill-yellow','On Order':'pill-teal','No Data':'pill-muted',Overstock:'pill-yellow',OK:'pill-teal'}[status]||'pill-muted';
     const wkd=effectiveWkDemand(p);
     const sel=S.mmSelectedPns.has(p.pn);
     const pending=S.mmSuggest&&S.mmSuggest.find(s=>s.pn===p.pn);
@@ -17823,6 +17924,7 @@ async function importCSV() {
       if(!error&&data){S.parts.push(data);imported++;}
     }
     S.parts.sort((a,b)=>a.pn.localeCompare(b.pn));
+    buildLookupMaps(); // push()/sort() mutate in place without reassigning S.parts, so refresh the maps
     toast(imported+' imported, '+skipped+' skipped (existing)');
     document.getElementById('import-preview').style.display='none';
     render();
