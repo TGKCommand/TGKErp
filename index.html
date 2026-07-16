@@ -119,6 +119,7 @@
     <div class="sidebar-section">Purchasing</div>
     <button class="nav-item" id="nav-planning" onclick="nav('planning')"><span class="nav-dot"></span>Purchasing</button>
     <button class="nav-item" id="nav-purchases" onclick="nav('purchases')"><span class="nav-dot"></span>Purchase Orders</button>
+    <button class="nav-item" id="nav-losses" onclick="nav('losses')"><span class="nav-dot"></span>Losses</button>
 
 
     <div class="sidebar-section">Sales</div>
@@ -224,7 +225,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.16';
+const TGK_ERP_VERSION = 'v20.17';
 const TGK_ERP_BUILD_DATE = '2026-07-15';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -19250,9 +19251,147 @@ function scheduleRender(){
   _renderPending=true;
   requestAnimationFrame(()=>{_renderPending=false;render();});
 }
+/* ===== Damaged / Scrap loss logging (atomic RPCs) ===== */
+var LOSS_REASONS = {
+  receiving: ['Shipping damage','Manufacturing defect','Wrong part sent','Packaging damage','Short/count mismatch','Other'],
+  scrap: ['Damaged during assembly','Defective component','Machining/fitment error','Cosmetic defect','QC/test failure','Other']
+};
+function _lossUser(){ return (typeof S!=='undefined'&&S.currentUser)?S.currentUser:'erp'; }
+function _lossUUID(){ try{ return crypto.randomUUID(); }catch(e){ return 'loss-'+Date.now()+'-'+Math.random().toString(36).slice(2); } }
+function openReceivingDamage(poId){ _lossModal('receiving', poId||'', '', ''); }
+function openAssemblyScrap(pn, itemType){ _lossModal('scrap', '', pn||'', itemType||''); }
+function _lossModal(kind, poId, presetPn, presetType){
+  var ex=document.getElementById('loss-ov'); if(ex) ex.remove();
+  var ov=document.createElement('div'); ov.id='loss-ov';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
+  var title = kind==='receiving' ? 'Log Damaged Part (Receiving)' : 'Log Scrap';
+  var reasons = LOSS_REASONS[kind==='receiving'?'receiving':'scrap'];
+  var reasonOpts = reasons.map(function(r){return '<option>'+escHtml(r)+'</option>';}).join('');
+  var itemSelector='';
+  if(kind==='receiving'){
+    var pos=(S.purchases||[]).slice().sort(function(a,b){return String(b.order_date||'').localeCompare(String(a.order_date||''));});
+    var poOpts=pos.map(function(p){return '<option value="'+escHtml(String(p.id))+'"'+(String(p.id)===String(poId)?' selected':'')+'>'+escHtml((p.po_number||p.id)+' - '+(p.vendor||''))+'</option>';}).join('');
+    itemSelector='<div class="form-group" style="margin-bottom:12px"><label class="form-label">Purchase Order</label>'
+      +'<select id="loss-po" class="form-input" onchange="_lossPoLines()"><option value="">Select PO...</option>'+poOpts+'</select></div>'
+      +'<div class="form-group" style="margin-bottom:12px"><label class="form-label">Damaged Part (PO line)</label>'
+      +'<select id="loss-line" class="form-input"><option value="">Select PO first...</option></select></div>';
+  } else {
+    itemSelector='<div class="form-group" style="margin-bottom:12px"><label class="form-label">Item Type</label>'
+      +'<select id="loss-type" class="form-input" onchange="_lossItems()"><option value="part"'+(presetType==='assembly'?'':' selected')+'>Part</option><option value="assembly"'+(presetType==='assembly'?' selected':'')+'>Assembly</option></select></div>'
+      +'<div class="form-group" style="margin-bottom:12px"><label class="form-label">Item</label>'
+      +'<select id="loss-item" class="form-input"></select></div>';
+  }
+  ov.innerHTML='<div style="background:var(--bg2);border:1px solid var(--border2);border-radius:12px;width:min(520px,96vw);max-height:92vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.25)">'
+    +'<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px"><div style="flex:1;font-size:15px;font-weight:700;color:var(--text)">'+title+'</div>'
+    +'<button class="btn btn-sm" onclick="document.getElementById(\'loss-ov\').remove()">Close</button></div>'
+    +'<div style="overflow-y:auto;padding:16px 20px;flex:1">'
+    +itemSelector
+    +'<div class="form-group" style="margin-bottom:12px"><label class="form-label">Quantity</label><input id="loss-qty" type="number" min="1" step="1" class="form-input" value="1"></div>'
+    +'<div class="form-group" style="margin-bottom:12px"><label class="form-label">Reason</label><select id="loss-reason" class="form-input">'+reasonOpts+'</select></div>'
+    +'<div class="form-group" style="margin-bottom:12px"><label class="form-label">Note (optional)</label><textarea id="loss-note" class="form-input" rows="2"></textarea></div>'
+    +'<div class="form-group"><label class="form-label">Photo (optional)</label><input id="loss-photo" type="file" accept="image/*" class="form-input"></div>'
+    +'<div id="loss-status" style="display:none;margin-top:10px;padding:8px 10px;border-radius:6px;font-size:12px"></div>'
+    +'</div>'
+    +'<div style="padding:14px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px">'
+    +'<button class="btn" onclick="document.getElementById(\'loss-ov\').remove()">Cancel</button>'
+    +'<button class="btn btn-primary" id="loss-submit" onclick="submitLoss(\''+kind+'\')">Log '+(kind==='receiving'?'Damage':'Scrap')+'</button></div>'
+    +'</div>';
+  document.body.appendChild(ov);
+  ov.addEventListener('click',function(e){ if(e.target===ov) ov.remove(); });
+  if(kind==='receiving'){ if(poId) _lossPoLines(); }
+  else { _lossItems(); if(presetPn){ var sel=document.getElementById('loss-item'); if(sel) sel.value=presetPn; } }
+}
+function _lossPoLines(){
+  var poId=(document.getElementById('loss-po')||{}).value||'';
+  var sel=document.getElementById('loss-line'); if(!sel) return;
+  var lines=(S.poLines&&S.poLines[poId])||[];
+  sel.innerHTML='<option value="">Select part...</option>'+lines.map(function(l){var pn=l.pn||''; return '<option value="'+escHtml(pn)+'" data-line="'+escHtml(String(l.id||''))+'">'+escHtml(pn+' - '+String(l.description||'').slice(0,40))+'</option>';}).join('');
+}
+function _lossItems(){
+  var t=(document.getElementById('loss-type')||{}).value||'part';
+  var sel=document.getElementById('loss-item'); if(!sel) return;
+  var list = t==='assembly' ? (S.assemblies||[]) : (S.parts||[]);
+  sel.innerHTML=list.slice().sort(function(a,b){return String(a.pn||'').localeCompare(String(b.pn||''));}).map(function(x){var d=(typeof dispPn==='function')?dispPn(x):(x.pn||''); return '<option value="'+escHtml(x.pn||'')+'">'+escHtml(d+' - '+String(x.description||'').slice(0,40))+'</option>';}).join('');
+}
+async function submitLoss(kind){
+  var btn=document.getElementById('loss-submit'); var lbl=btn?btn.textContent:'';
+  function status(m,ok){var e=document.getElementById('loss-status'); if(e){e.style.display='';e.style.background=ok?'rgba(13,148,136,.12)':'rgba(220,38,38,.12)';e.style.color=ok?'#0d9488':'#dc2626';e.textContent=m;}}
+  var qty=parseFloat((document.getElementById('loss-qty')||{}).value||'0');
+  if(!(qty>0)){ status('Quantity must be greater than 0',false); return; }
+  var reason=(document.getElementById('loss-reason')||{}).value||'';
+  var note=((document.getElementById('loss-note')||{}).value||'').trim()||null;
+  var pn='', itemType='part', poId='', lineId='';
+  if(kind==='receiving'){
+    poId=(document.getElementById('loss-po')||{}).value||'';
+    var lineSel=document.getElementById('loss-line'); pn=lineSel?lineSel.value:'';
+    if(lineSel&&lineSel.selectedOptions&&lineSel.selectedOptions[0]) lineId=lineSel.selectedOptions[0].getAttribute('data-line')||'';
+    if(!poId){ status('Select a PO',false); return; }
+    if(!pn){ status('Select the damaged part',false); return; }
+  } else {
+    itemType=(document.getElementById('loss-type')||{}).value||'part';
+    pn=(document.getElementById('loss-item')||{}).value||'';
+    if(!pn){ status('Select an item',false); return; }
+  }
+  if(btn){ btn.disabled=true; btn.textContent='Saving...'; }
+  try{
+    var photoUrl=null; var fileEl=document.getElementById('loss-photo');
+    if(fileEl&&fileEl.files&&fileEl.files[0]){
+      var f=fileEl.files[0]; status('Uploading photo...',true);
+      var safe=f.name.replace(/[^a-zA-Z0-9._\-]/g,'_');
+      var path=kind+'/'+pn+'/'+Date.now()+'_'+safe;
+      var up=await db.storage.from('loss-photos').upload(path,f,{upsert:false});
+      if(up.error){ status('Photo upload failed: '+up.error.message,false); if(btn){btn.disabled=false;btn.textContent=lbl;} return; }
+      var pub=db.storage.from('loss-photos').getPublicUrl(path); photoUrl=(pub.data&&pub.data.publicUrl)||null;
+    }
+    var key=_lossUUID(); var res;
+    if(kind==='receiving'){
+      res=await db.rpc('log_receiving_damage',{p_po_id:poId,p_po_line_id:lineId,p_pn:pn,p_qty:qty,p_reason:reason,p_note:note,p_photo_url:photoUrl,p_idempotency_key:key,p_user:_lossUser()});
+    } else {
+      res=await db.rpc('log_assembly_scrap',{p_item_type:itemType,p_pn:pn,p_qty:qty,p_reason:reason,p_note:note,p_photo_url:photoUrl,p_build_id:null,p_idempotency_key:key,p_user:_lossUser()});
+    }
+    if(res.error){ status('Error: '+res.error.message,false); if(btn){btn.disabled=false;btn.textContent=lbl;} return; }
+    var data=res.data||{};
+    if(data.ok===false){ status('Error: '+(data.error||'failed'),false); if(btn){btn.disabled=false;btn.textContent=lbl;} return; }
+    if(data.new_qty!=null){
+      if(kind==='receiving'||itemType==='part'){ var pp=(S.parts||[]).find(function(x){return x.pn===pn;}); if(pp) pp.total_unpckgd=data.new_qty; }
+      else { var aa=(S.assemblies||[]).find(function(x){return x.pn===pn;}); if(aa) aa.total_on_hand=data.new_qty; }
+    }
+    toast(data.idempotent?'Already logged (no double-deduct)':((kind==='receiving'?'Damage':'Scrap')+' logged - '+pn+' x'+qty));
+    var ov=document.getElementById('loss-ov'); if(ov) ov.remove();
+    if(typeof loadLosses==='function' && S.view==='losses') loadLosses();
+    if(typeof scheduleRender==='function') scheduleRender();
+  }catch(e){ status('Error: '+((e&&e.message)||e),false); if(btn){btn.disabled=false;btn.textContent=lbl;} }
+}
+function renderLosses(){
+  var rd=(S.receivingDamage||[]); var sc=(S.assemblyScrap||[]);
+  var rows=[];
+  rd.forEach(function(r){rows.push({t:'Receiving Damage',pn:r.pn,qty:r.qty,reason:r.reason,note:r.note,photo:r.photo_url,when:r.created_at,who:r.created_by});});
+  sc.forEach(function(r){rows.push({t:'Assembly Scrap ('+(r.item_type||'part')+')',pn:r.pn,qty:r.qty,reason:r.reason,note:r.note,photo:r.photo_url,when:r.created_at,who:r.created_by});});
+  rows.sort(function(a,b){return String(b.when||'').localeCompare(String(a.when||''));});
+  var body=rows.map(function(r){
+    return '<tr><td>'+escHtml(String(r.when||'').slice(0,10))+'</td><td>'+escHtml(r.t)+'</td><td style="font-family:var(--mono)">'+escHtml(r.pn||'')+'</td>'
+      +'<td style="text-align:right;color:var(--red);font-weight:700">-'+escHtml(String(r.qty))+'</td><td>'+escHtml(r.reason||'')+'</td>'
+      +'<td>'+escHtml(r.note||'')+'</td><td>'+(r.photo?'<a href="'+escHtml(r.photo)+'" target="_blank" rel="noopener">photo</a>':'')+'</td><td>'+escHtml(r.who||'')+'</td></tr>';
+  }).join('');
+  return '<div class="panel" style="margin:20px;padding:20px">'
+    +'<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px"><div class="panel-title" style="flex:1;margin:0;border:0;padding:0">Losses</div>'
+    +'<button class="btn btn-sm" onclick="openReceivingDamage()">+ Log Damage (Receiving)</button>'
+    +'<button class="btn btn-sm" onclick="openAssemblyScrap()">+ Log Scrap</button></div>'
+    +'<table style="width:100%"><thead><tr><th>Date</th><th>Type</th><th>Item</th><th style="text-align:right">Qty</th><th>Reason</th><th>Note</th><th>Photo</th><th>By</th></tr></thead>'
+    +'<tbody>'+(rows.length?body:'<tr><td colspan="8" style="color:var(--text3);padding:16px">No losses logged yet.</td></tr>')+'</tbody></table></div>';
+}
+async function loadLosses(){
+  try{
+    var rd=await db.from('receiving_damage').select('*').order('created_at',{ascending:false}).limit(500);
+    var sc=await db.from('assembly_scrap').select('*').order('created_at',{ascending:false}).limit(500);
+    S.receivingDamage=rd.data||[]; S.assemblyScrap=sc.data||[];
+    if(S.view==='losses'&&typeof scheduleRender==='function') scheduleRender();
+  }catch(e){ console.warn('loadLosses failed',e); }
+}
+
 function render(){
   S._onOrderMap=null; // invalidate per-render caches; renderPlanning re-primes when needed
-  const views={dashboard:renderDashboard,users:renderUsers,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,fitments:renderFitments,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder,reports:renderReports,pricelist:renderPriceList,dataintegrity:renderDataIntegrity};
+  const views={losses:renderLosses,dashboard:renderDashboard,users:renderUsers,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,fitments:renderFitments,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder,reports:renderReports,pricelist:renderPriceList,dataintegrity:renderDataIntegrity};
   if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length||S.calc.forecastWks!==(S.forecastWeeks||8))computeDemand();
   const active=document.activeElement;
   let fkey=null,selS=0,selE=0;
@@ -19268,6 +19407,7 @@ function render(){
   }
   requestAnimationFrame(initResizableTables);
   if(S.view==='reports'&&S.rptState?.chartView)requestAnimationFrame(_initReportChart);
+  if(S.view==='losses')requestAnimationFrame(loadLosses);
   if(S.view==='inventory'&&S.invTab==='backorderlog')requestAnimationFrame(loadInvBackorderLog);
   if(S.view==='dashboard')requestAnimationFrame(loadDashBackorderNotice);
   if(fkey){
