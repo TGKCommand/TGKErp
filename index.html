@@ -226,7 +226,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.26';
+const TGK_ERP_VERSION = 'v20.27';
 const TGK_ERP_BUILD_DATE = '2026-07-15';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -8953,9 +8953,21 @@ function openModal(type,data){
   }
   else if(type==='addSale'){
     title='Record Sale';
-    body=`<div class="form-row cols-2">${fi('m-date','Date',new Date().toISOString().slice(0,10),'type="date"')} ${fi('m-order','Order #','')}</div>
-    <div class="form-row cols-2">${fi('m-pn','SKU','','placeholder="TGK-XXX-XX"')} ${fi('m-qty','Qty',1,'type="number" min="1"')}</div>
+    const _asmOpts=S.assemblies.filter(function(a){return !a.discontinued&&!(typeof isDev==='function'&&isDev(a));}).sort(function(a,b){return String(dispPn(a)).localeCompare(String(dispPn(b)));}).map(function(a){return `<option value="${escHtml(dispPn(a))}">${escHtml(String(a.description||'').slice(0,55))}</option>`;}).join('');
+    body=`<div class="form-row cols-2">${fi('m-date','Date',new Date().toISOString().slice(0,10),'type="date"')} ${fi('m-order','Order #',nextErpOrderNumberSync(),'')}</div>
+    <datalist id="sale-sku-list">${_asmOpts}</datalist>
+    <div class="form-group"><label class="form-label">Items</label><div id="sale-lines">${saleLineRow()}</div>
+    <button type="button" class="btn btn-sm" style="margin-top:6px" onclick="saleAddLine()">+ Add SKU</button></div>
     <div class="form-row">${fi('m-source','Source','TGK Motorsport')}</div>
+    <div style="border-top:1px solid var(--border);margin:10px 0 12px;padding-top:12px">
+      <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--text3);margin-bottom:8px">Customer &amp; ShipStation</div>
+      <div class="form-row cols-2">${fi('m-cname','Customer Name','','placeholder="Jane Smith"')} ${fi('m-email','Email (optional)','','type="email"')}</div>
+      <details style="margin-top:6px"><summary style="font-size:11px;color:var(--text3);cursor:pointer;user-select:none">Shipping address (optional)</summary>
+        <div style="margin-top:8px"><div class="form-row">${fi('m-addr1','Street','')}</div>
+        <div class="form-row cols-3">${fi('m-city','City','')} ${fi('m-state','State','','maxlength=2')} ${fi('m-zip','ZIP','')}</div></div>
+      </details>
+      <div style="font-size:10px;color:var(--text3);margin-top:8px"><label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="m-create-ss" ${S.settings?.shipstation?.key?'checked':''}> Create order in ShipStation (staff print label)</label></div>
+    </div>
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitSale()">Record Sale</button></div>`;
   }
   else if(type==='addDealer'||type==='editDealer'){
@@ -9398,11 +9410,46 @@ async function submitPO(eid){
   }
   closeModal();toast('PO saved');render();
 }
+function saleLineRow(){ return '<div class="form-row cols-2 sale-line" style="margin-bottom:6px"><input class="form-input sale-pn" list="sale-sku-list" placeholder="TGK-XXX-XX" autocomplete="off"><div style="display:flex;gap:6px"><input class="form-input sale-qty" type="number" min="1" value="1" style="flex:1"><button type="button" class="btn sale-rm" style="width:auto;padding:0 12px" onclick="saleRemoveLine(this)">&times;</button></div></div>'; }
+function saleAddLine(){ var c=document.getElementById('sale-lines'); if(c) c.insertAdjacentHTML('beforeend', saleLineRow()); }
+function saleRemoveLine(btn){ var c=document.getElementById('sale-lines'); if(c&&c.querySelectorAll('.sale-line').length>1){ var row=btn.closest('.sale-line'); if(row) row.remove(); } }
+function _resolveSaleItem(val){ val=String(val||'').trim().toLowerCase(); if(!val) return null; var L=S.assemblies||[]; for(var i=0;i<L.length;i++){ var a=L[i]; var d=dispPn(a); if(String(a.pn||'').toLowerCase()===val||String(d||'').toLowerCase()===val){ return a; } } return null; }
 async function submitSale(){
-  const pn=$('m-pn').value.trim();if(!pn){toast('SKU required');return;}
-  const{data,error}=await db.from('sales').insert({sale_date:$('m-date').value,order_number:$('m-order').value.trim(),pn,qty:parseInt($('m-qty').value)||1,source:$('m-source').value.trim(),status:'Fulfilled'}).select().single();
-  if(error){toast('Error: '+error.message);return;}
-  S.sales=[data,...S.sales];closeModal();toast('Sale recorded');render();
+  var orderNum=$('m-order').value.trim()||nextErpOrderNumberSync();
+  var date=$('m-date').value; var source=($('m-source').value||'').trim();
+  var cname=($('m-cname')?.value||'').trim(); var email=($('m-email')?.value||'').trim();
+  var createSS=document.getElementById('m-create-ss')?.checked;
+  var addr1=($('m-addr1')?.value||'').trim(), city=($('m-city')?.value||'').trim(), state=($('m-state')?.value||'').trim(), zip=($('m-zip')?.value||'').trim();
+  var rows=[].slice.call(document.querySelectorAll('#sale-lines .sale-line'));
+  var items=[];
+  for(var i=0;i<rows.length;i++){
+    var raw=(rows[i].querySelector('.sale-pn')?.value||'').trim(); if(!raw) continue;
+    var qy=parseInt(rows[i].querySelector('.sale-qty')?.value)||1;
+    var asm=_resolveSaleItem(raw); if(!asm){ toast('SKU not found: '+raw); return; }
+    items.push({pn:asm.pn,disp:dispPn(asm),description:asm.description||asm.pn,qty:qy});
+  }
+  if(!items.length){ toast('Add at least one SKU'); return; }
+  var base={order_number:orderNum,sale_date:date||null,source:source,customer_name:cname||null,customer_email:email||null,status:'Open',fulfillment_status:'Open',updated_at:new Date().toISOString()};
+  for(var j=0;j<items.length;j++){
+    var it=items[j];
+    var ins=await db.from('sales').insert(Object.assign({},base,{pn:it.pn,qty:it.qty})).select().single();
+    if(ins.error){ toast('Error: '+ins.error.message); return; }
+    S.sales=[ins.data,...S.sales];
+    try{ var asm2=S.assemblies.find(function(a){return a.pn===it.pn;}); if(asm2){ var newOh=(asm2.total_on_hand||0)-it.qty; await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm2.id); S.assemblies=S.assemblies.map(function(x){return x.pn===it.pn?Object.assign({},x,{total_on_hand:newOh}):x;}); await db.from('inv_corrections').insert({pn:it.pn,previous_qty:asm2.total_on_hand||0,new_qty:newOh,adjustment:-it.qty,reason:'Manual ERP order '+orderNum,created_at:new Date().toISOString()}); } }catch(_e){ console.warn('deduct failed',_e); }
+  }
+  try{ if(typeof lockOrderFromSync==='function') await lockOrderFromSync(orderNum); }catch(_e){}
+  closeModal(); render();
+  toast('Order '+orderNum+' recorded'+(createSS?' - creating in ShipStation':''));
+  if(createSS){
+    var shipTo={name:cname||'Customer',street1:addr1,city:city,state:state,postal_code:zip,country:'US'};
+    var ssItems=items.map(function(it2,k){return{lineItemKey:String(k+1),sku:it2.pn,name:it2.description||it2.pn,quantity:it2.qty,unitPrice:0};});
+    try{
+      var resp=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({action:'create_order',orderNumber:'Manual_'+orderNum,customerName:cname||'Customer',customerEmail:email||undefined,pn:items[0].pn,description:items[0].description,qty:items[0].qty,ssItems:ssItems,shipTo:shipTo,internalNotes:'Manual ERP order '+orderNum+(cname?' - '+cname:'')})});
+      var json=await resp.json().catch(function(){return{};});
+      if(resp.ok&&(json.orderId||json.orderNumber)) toast('ShipStation order created: Manual_'+orderNum,4000);
+      else toast('Order saved, ShipStation failed: '+(json.error||'check SS credentials'),5000);
+    }catch(e){ toast('Order saved, SS unreachable: '+e.message,5000); }
+  }
 }
 async function submitDealer(eid){
   const name=$('m-name').value.trim();if(!name){toast('Name required');return;}
