@@ -279,7 +279,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.38';
+const TGK_ERP_VERSION = 'v20.39';
 const TGK_ERP_BUILD_DATE = '2026-07-15';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -2598,7 +2598,35 @@ function renderSales(){
   }
 
   const allGrouped=groupSales(S.sales);
-  const splitNeededOrders=allGrouped.filter(s=>s._grouped&&computeOrderShipReadiness(s._allLines||[])?.level==='split');
+  // ---- perf: O(1) SKU lookup maps (mirror findAsm: pn wins, then new_sku) + memoized ship-readiness.
+  // Rebuilt each render; replaces the per-row/per-line linear .find() scans that made this view crawl on mobile.
+  const asmByPn=new Map();
+  S.assemblies.forEach(a=>{ if(a.pn&&!asmByPn.has(a.pn))asmByPn.set(a.pn,a); });
+  S.assemblies.forEach(a=>{ if(a.new_sku&&!asmByPn.has(a.new_sku))asmByPn.set(a.new_sku,a); });
+  const partByPn=new Map();
+  S.parts.forEach(p=>{ if(p.pn&&!partByPn.has(p.pn))partByPn.set(p.pn,p); });
+  function fastReadiness(lines){
+    const pend=(lines||[]).filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
+    if(!pend.length)return null;
+    let ready=0,blocked=0;
+    pend.forEach(l=>{
+      const a=asmByPn.get(l.pn);
+      const p=a?null:partByPn.get(l.pn);
+      const st=a?(a.total_on_hand||0):p?(p.total_unpckgd||0):null;
+      if(st===null||st>=(l.qty||1))ready++;else blocked++;
+    });
+    return blocked===0?{level:'ready',ready,blocked,total:pend.length}
+      :ready===0?{level:'blocked',ready,blocked,total:pend.length}
+      :{level:'split',ready,blocked,total:pend.length};
+  }
+  const _readyMemo=new Map();
+  function readinessFor(order){
+    if(_readyMemo.has(order))return _readyMemo.get(order);
+    const r=fastReadiness(order._allLines||[]);
+    _readyMemo.set(order,r);
+    return r;
+  }
+  const splitNeededOrders=allGrouped.filter(s=>s._grouped&&readinessFor(s)?.level==='split');
 
   const sf=S.filters.sales||{};
   const q=(sf.search||S.searchQ||'').toLowerCase();
@@ -2617,7 +2645,7 @@ function renderSales(){
       return false;
     });
   }
-  if(sf.readiness==='split')list=list.filter(s=>s._grouped&&computeOrderShipReadiness(s._allLines||[])?.level==='split');
+  if(sf.readiness==='split')list=list.filter(s=>s._grouped&&readinessFor(s)?.level==='split');
 
   const openOrders   =allGrouped.filter(s=>(s.fulfillment_status||'Open')==='Open');
   const partialOrders=allGrouped.filter(s=>s.fulfillment_status==='Partial');
@@ -2714,14 +2742,14 @@ function renderSales(){
   ${(()=>{S._salesNavCtx=list.map(s=>s.id);return'';})()}
   ${list.map((s,_rowIdx)=>{
     const fs=s.fulfillment_status||'Open';
-    const asm=findAsm(s.pn);
-    const prt=asm?null:S.parts.find(p=>p.pn===s.pn)||null;
+    const asm=asmByPn.get(s.pn);
+    const prt=asm?null:(partByPn.get(s.pn)||null);
     const stock=asm?(asm.total_on_hand||0):prt?(prt.total_unpckgd||0):null;
     const canFill=stock!==null&&stock>=(s.qty||1);
     const allOrderLines=s._grouped?(s._allLines||[]):[];
-    const dsLineCount=s._grouped?allOrderLines.filter(l=>!findAsm(l.pn)&&!(S._partIdx?S._partIdx[l.pn]:S.parts.find(p=>p.pn===l.pn))).length:0;
+    const dsLineCount=s._grouped?allOrderLines.filter(l=>!asmByPn.get(l.pn)&&!partByPn.get(l.pn)).length:0;
     const allDropShip=s._grouped&&allOrderLines.length>0&&dsLineCount===allOrderLines.length;
-    const _readiness=s._grouped?computeOrderShipReadiness(allOrderLines):null;
+    const _readiness=s._grouped?readinessFor(s):null;
     const repTracking=s.tracking_number||(allOrderLines.find(x=>x.tracking_number)?.tracking_number)||'';
     const repCarrier=s.carrier||(allOrderLines.find(x=>x.tracking_number)?.carrier)||'';
     const multiTrack=s._grouped&&allOrderLines.filter(x=>x.tracking_number).map(x=>x.tracking_number).filter((v,i,a)=>a.indexOf(v)===i).length>1;
@@ -2735,7 +2763,7 @@ function renderSales(){
     <td style="font-size:10px;color:var(--text3);font-family:var(--mono);white-space:nowrap">${(()=>{const ts=s.sale_date||s.created_at;if(!ts)return'—';const d=new Date(ts);const dt=d.toLocaleDateString('en-US',{month:'2-digit',day:'2-digit',year:'2-digit'});const tm=(!s.sale_date&&s.created_at)?d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}):'';return dt+(tm?`<div style="font-size:9px;opacity:.65">${tm}</div>`:'');})()}</td>
     <td class="pn">${(function(){const norm=(s.order_number||'').replace(/^#/,'');const lkd=S.syncLocked&&S.syncLocked.has(norm);return(s.order_number||'')+(s._grouped?` <span style="font-size:9px;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 5px;border-radius:8px;font-family:var(--mono);font-weight:600">${s._lineCount} items</span>`:'')+(lkd?` <span title="Locked from Shopify sync. Click to unlock." style="font-size:9px;color:var(--orange);cursor:pointer" onclick="event.stopPropagation();if(confirm('Unlock order ${escHtml(s.order_number||'')} from sync?'))unlockOrderFromSync('${escHtml(s.order_number||'')}')">&#128274;</span>` : '');})()}</td>
     <td style="font-size:11px;color:var(--text2);max-width:130px"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(custName||'—')}</div>${_dealerTag}</td>
-    <td class="pn" style="color:${s._grouped?'var(--text3)':'var(--teal)'}" title="${s._grouped?'':(()=>{var _r=resolveCanonicalPn(s.pn);var _src=_r?(S.assemblies.find(x=>x.pn===_r.pn)||S.parts.find(x=>x.pn===_r.pn)):null;return(_src?.description||'').replace(/"/g,'&quot;');})()}">${s._grouped?'Multiple SKUs':s.pn}</td>
+    <td class="pn" style="color:${s._grouped?'var(--text3)':'var(--teal)'}" title="${s._grouped?'':(()=>{var _src=asmByPn.get(s.pn)||partByPn.get(s.pn);return((_src&&_src.description)||'').replace(/"/g,'&quot;');})()}">${s._grouped?'Multiple SKUs':s.pn}</td>
     <td class="money-neutral" style="font-weight:700">${s._grouped?s.qty+' total':(s.qty||1)}</td>
     <td>${s._grouped?(_readiness?(_readiness.level==='ready'?`<span style="font-size:10px;color:var(--green);font-weight:700" title="All ${_readiness.total} pending line(s) have enough stock to ship together right now">✓ Ready to ship</span>`:_readiness.level==='blocked'?`<span style="font-size:10px;color:var(--red);font-weight:700" title="None of the ${_readiness.total} pending line(s) have enough stock">✗ Nothing in stock</span>`:`<span style="font-size:10px;color:var(--orange);font-weight:700" title="${_readiness.ready} of ${_readiness.total} pending line(s) are in stock — consider splitting this shipment">⚠ Split — ${_readiness.ready}/${_readiness.total} ready</span>`):(allDropShip?`<span style="font-size:10px;color:var(--purple);font-weight:600">↓ Drop-ship</span>`:`<span style="color:var(--text3)">—</span>`)):stock===null?`<span style="font-size:10px;color:var(--purple);font-weight:600">↓ Drop-ship</span>`:`<span class="money" style="color:${canFill?'var(--green)':'var(--red)'};font-weight:700">${stock}</span>`}</td>
     <td>${fsPill(s.fulfillment_status||'Open')}${s._grouped&&['Shipped','Delivered'].includes(s.fulfillment_status||'')&&!hasBoxLog(s.order_number||s.id)?'<span title="Shipping box not yet logged" style="font-size:10px;margin-left:4px;cursor:pointer;opacity:.7" onclick="event.stopPropagation();openShippingBoxModal(\'\'${escHtml(s.order_number||s.id)}\'\')">&#128230;</span>':''}${s._isPartialShip?` <span style="font-size:9px;color:${s._allPendingOnHold?'var(--orange)':'var(--yellow)'};font-weight:700">✂ ${s._shippedCount} shipped · ${s._pendingCount} ${s._allPendingOnHold?'on hold':'pending'}</span>`:''}${s.on_hold&&!s._isPartialShip?` <span style="font-size:9px;color:var(--orange);font-weight:700">⏸ Hold</span>`:''}</td>
