@@ -216,8 +216,8 @@
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.8</span>
-      <span class="t3xxs" id="erp-build-date">2026-06-26</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.45</span>
+      <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
 </div>
@@ -279,8 +279,8 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.44';
-const TGK_ERP_BUILD_DATE = '2026-07-15';
+const TGK_ERP_VERSION = 'v20.45';
+const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
   var vb=document.getElementById('erp-version-badge');if(vb)vb.textContent=TGK_ERP_VERSION;
@@ -10435,8 +10435,8 @@ function _wtyRenderItems(){
   const el=document.getElementById('wty-item-rows');if(!el)return;
   if(!S.wtyItems||!S.wtyItems.length){el.innerHTML='<div style="font-size:11px;color:var(--text3);padding:4px 0">No items yet — add from the assembly BOM above or enter manually below.</div>';return;}
   el.innerHTML=S.wtyItems.map(function(item){
-    const typeClr=item.type==='assembly'?'var(--teal)':'var(--text2)';
-    const typeLbl=item.type==='assembly'?'assembly':'part';
+    const typeClr=(item.type==='assembly'||item.type==='finished_good')?'var(--teal)':'var(--text2)';
+    const typeLbl=item.type==='finished_good'?'finished good':(item.type==='assembly'?'assembly':'part');
     return '<div id="wtyitem-'+item.idx+'" style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:6px">'
       +'<span style="font-family:var(--mono);font-size:11px;color:'+typeClr+';min-width:80px">'+escHtml(item.pn)+'</span>'
       +'<span style="font-size:10px;background:var(--bg4);color:var(--text3);border-radius:4px;padding:1px 5px">'+typeLbl+'</span>'
@@ -17928,26 +17928,27 @@ async function confirmShipShipmentError(id){
     let _seCost=0;
     for(const item of items){
       const qty=item.qty||1;
-      if(item.type==='assembly'){_seCost+=qty*((typeof bomCostOf==='function'?bomCostOf(item.pn,0):0)||0);}
-      else{const _p2=_findPart(item.pn);_seCost+=qty*((_p2&&_p2.unit_cost)||0);}
-      if(item.type==='assembly'){
-        const a=findAsm(item.pn);
-        if(a){
-          const newOh=(a.total_on_hand||0)-qty;
-          await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',a.id);
-          S.assemblies=S.assemblies.map(function(x){return x.pn===item.pn?{...x,total_on_hand:newOh}:x;});
-          await db.from('inv_corrections').insert({pn:item.pn,previous_qty:a.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Shipment error correction shipped (SS#'+ssOrderId+')',user_email:S.currentUser||null,source:'shipment'});
-          syncShopifyTemplate(item.pn,newOh);
-        }
+      // Same table-membership resolution as warranty shipping: finished goods deduct from assemblies,
+      // parts from parts, untracked SKUs ship without a deduction. See resolveShipTarget().
+      const tgt=resolveShipTarget(item.pn);
+      if(tgt.kind==='assembly'){
+        const a=tgt.asm;
+        _seCost+=qty*((typeof bomCostOf==='function'?bomCostOf(a.pn,0):0)||0);
+        const newOh=(a.total_on_hand||0)-qty;
+        await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',a.id);
+        S.assemblies=S.assemblies.map(function(x){return x.pn===a.pn?{...x,total_on_hand:newOh}:x;});
+        await db.from('inv_corrections').insert({pn:a.pn,previous_qty:a.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Shipment error correction shipped (SS#'+ssOrderId+')',user_email:S.currentUser||null,source:'shipment'});
+        syncShopifyTemplate(a.pn,newOh);
+      } else if(tgt.kind==='part'){
+        const p=tgt.part;
+        _seCost+=qty*((p&&p.unit_cost)||0);
+        const newQty=(p.total_unpckgd||0)-qty;
+        await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
+        S.parts=S.parts.map(function(x){return x.pn===p.pn?{...x,total_unpckgd:newQty}:x;});
+        await db.from('inv_corrections').insert({pn:p.pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:-qty,reason:'Shipment error correction part shipped (SS#'+ssOrderId+')',user_email:S.currentUser||null,source:'shipment'});
+        cascadeShopifySync(p.pn);
       } else {
-        const p=S.parts.find(function(x){return x.pn===item.pn;});
-        if(p){
-          const newQty=(p.total_unpckgd||0)-qty;
-          await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
-          S.parts=S.parts.map(function(x){return x.pn===item.pn?{...x,total_unpckgd:newQty}:x;});
-          await db.from('inv_corrections').insert({pn:item.pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:-qty,reason:'Shipment error correction part shipped (SS#'+ssOrderId+')',user_email:S.currentUser||null,source:'shipment'});
-          cascadeShopifySync(item.pn);
-        }
+        console.warn('Shipment error ship: '+item.pn+' not found in parts/assemblies -- shipped without inventory deduction');
       }
     }
 
@@ -18021,6 +18022,20 @@ function shipWarrantyReplacement(id){
   setTimeout(function(){document.getElementById('ws-name')?.focus();},50);
 }
 
+/* Resolve where a shipped line's inventory lives by TABLE MEMBERSHIP, not by trusting the incoming
+   type label. The Support Center can now send type:'finished_good' (staff have full control to ship
+   anything a customer needs) -- but finished goods are just assemblies here, so we deduct from
+   whichever table actually holds the SKU. findAsm/_findPart both resolve by canonical pn OR new_sku.
+   A SKU that is neither a tracked part nor assembly still ships (it's already in ssItems) -- we only
+   skip the stock deduction we have no row to make. Returns {kind:'assembly'|'part'|'untracked',asm,part}. */
+function resolveShipTarget(pn){
+  const asm=(typeof findAsm==='function'?findAsm(pn):null)||S.assemblies.find(function(a){return a.pn===pn;});
+  if(asm)return{kind:'assembly',asm:asm,part:null};
+  const part=(typeof _findPart==='function'?_findPart(pn):null)||S.parts.find(function(p){return p.pn===pn;});
+  if(part)return{kind:'part',asm:null,part:part};
+  return{kind:'untracked',asm:null,part:null};
+}
+
 async function confirmShipWarranty(claimId, pn){
   const name=(document.getElementById('ws-name')?.value||'').trim();
   const addr1=(document.getElementById('ws-addr1')?.value||'').trim();
@@ -18085,26 +18100,28 @@ async function confirmShipWarranty(claimId, pn){
     let _claimCost=0; // parts value of everything shipped (assemblies at BOM cost, parts at unit cost)
     for(const item of claimItems){
       const qty=item.qty||1;
-      if(item.type==='assembly'){_claimCost+=qty*((typeof bomCostOf==='function'?bomCostOf(item.pn,0):0)||0);}
-      else{const _p=_findPart(item.pn);_claimCost+=qty*((_p&&_p.unit_cost)||0);}
-      if(item.type==='assembly'){
-        const a=findAsm(item.pn);
-        if(a){
-          const newOh=(a.total_on_hand||0)-qty; // allow negative = backorder
-          await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',a.id);
-          S.assemblies=S.assemblies.map(function(x){return x.pn===item.pn?{...x,total_on_hand:newOh}:x;});
-          await db.from('inv_corrections').insert({pn:item.pn,previous_qty:a.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Warranty replacement shipped (SS#'+ssOrderId+')',user_email:S.currentUser||null,source:'warranty'});
-          syncShopifyTemplate(item.pn,newOh);
-        }
+      // Deduct from whichever table actually holds this SKU, not from item.type. Finished goods are
+      // assemblies here, so a Support 'finished_good' resolves the same as 'assembly'. An untracked SKU
+      // still ships (already in ssItems) -- we just have no stock row to adjust.
+      const tgt=resolveShipTarget(item.pn);
+      if(tgt.kind==='assembly'){
+        const a=tgt.asm;
+        _claimCost+=qty*((typeof bomCostOf==='function'?bomCostOf(a.pn,0):0)||0);
+        const newOh=(a.total_on_hand||0)-qty; // allow negative = backorder
+        await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',a.id);
+        S.assemblies=S.assemblies.map(function(x){return x.pn===a.pn?{...x,total_on_hand:newOh}:x;});
+        await db.from('inv_corrections').insert({pn:a.pn,previous_qty:a.total_on_hand||0,new_qty:newOh,adjustment:-qty,reason:'Warranty replacement shipped (SS#'+ssOrderId+')',user_email:S.currentUser||null,source:'warranty'});
+        syncShopifyTemplate(a.pn,newOh);
+      } else if(tgt.kind==='part'){
+        const p=tgt.part;
+        _claimCost+=qty*((p&&p.unit_cost)||0);
+        const newQty=(p.total_unpckgd||0)-qty; // allow negative = backorder
+        await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
+        S.parts=S.parts.map(function(x){return x.pn===p.pn?{...x,total_unpckgd:newQty}:x;});
+        await db.from('inv_corrections').insert({pn:p.pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:-qty,reason:'Warranty part shipped (SS#'+ssOrderId+')',user_email:S.currentUser||null,source:'warranty'});
+        cascadeShopifySync(p.pn);
       } else {
-        const p=S.parts.find(function(x){return x.pn===item.pn;});
-        if(p){
-          const newQty=(p.total_unpckgd||0)-qty; // allow negative = backorder
-          await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
-          S.parts=S.parts.map(function(x){return x.pn===item.pn?{...x,total_unpckgd:newQty}:x;});
-          await db.from('inv_corrections').insert({pn:item.pn,previous_qty:p.total_unpckgd||0,new_qty:newQty,adjustment:-qty,reason:'Warranty part shipped (SS#'+ssOrderId+')',user_email:S.currentUser||null,source:'warranty'});
-          cascadeShopifySync(item.pn);
-        }
+        console.warn('Warranty ship: '+item.pn+' not found in parts/assemblies -- shipped without inventory deduction');
       }
     }
 
