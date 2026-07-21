@@ -49,6 +49,18 @@
    ============================================================ */
 #erp-menu-btn{display:none}
 #erp-drawer-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:90}
+/* Production mobile pack cards */
+.prod-cards{display:none}
+.prod-card{border:1px solid var(--border);border-radius:9px;padding:11px 12px;background:var(--panel);cursor:pointer}
+.prod-card-top{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:9px}
+.prod-card-sku{font-family:var(--mono);color:var(--teal);font-weight:700;font-size:13px}
+.prod-card-desc{font-size:11px;color:var(--text3);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.prod-card-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px}
+.prod-card-stats>div{display:flex;flex-direction:column;min-width:0}
+.prod-card-stats span{font-size:8px;text-transform:uppercase;letter-spacing:.04em;color:var(--text3)}
+.prod-card-stats b{font-size:14px}
+.prod-card-pack{display:flex;align-items:center;gap:6px}
+@media(max-width:768px){.prod-desktop-tbl{display:none!important}.prod-cards{display:flex;flex-direction:column;gap:8px}}
 @media(max-width:1024px){
   .kpi-grid-5,.kpi-grid-4{grid-template-columns:repeat(2,1fr)}
   .grid-dealers,.grid-2-lg{grid-template-columns:1fr}
@@ -279,7 +291,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.46';
+const TGK_ERP_VERSION = 'v20.47';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -14703,9 +14715,10 @@ function _maxBuildShared(pn,pm,am,includeItem){
 }
 function buildability(pn,_depth){
   _depth=_depth||0;
-  if(_depth>6)return{maxBuild:0,checks:[],hasBOM:false}; // guard infinite recursion
+  if(S._buildabilityCache&&S._buildabilityCache[pn]!==undefined)return S._buildabilityCache[pn]; // [PERF] render-scoped memo: skip repeated shared-pool searches for the same SKU
+  if(_depth>6)return{maxBuild:0,checks:[],hasBOM:false}; // guard infinite recursion (never cached: depth-dependent)
   const bom=(S.boms[pn]||[]);
-  if(!bom.length)return{maxBuild:Infinity,checks:[],hasBOM:false};
+  if(!bom.length){const _r={maxBuild:Infinity,checks:[],hasBOM:false};if(S._buildabilityCache)S._buildabilityCache[pn]=_r;return _r;}
   if(!S._partIdx||!S._asmIdx)buildLookupMaps(); // [PERF] use the global O(1) index instead of rebuilding part/assembly maps on every (recursive) call
   const pm=S._partIdx,am=S._asmIdx;
   const checks=bom.map(i=>{
@@ -14733,7 +14746,9 @@ function buildability(pn,_depth){
   });
   // [SHARED] checks[] above stay per-line for display; the authoritative maxBuild respects shared pools.
   const maxBuild=_maxBuildShared(pn,pm,am,null);
-  return{maxBuild,checks,hasBOM:true};
+  const _r={maxBuild,checks,hasBOM:true};
+  if(S._buildabilityCache)S._buildabilityCache[pn]=_r;
+  return _r;
 }
 
 function buildabilityForBackorder(pn){
@@ -14845,7 +14860,7 @@ function renderPackQueue(){
       ${sf.type||sf.status?`<button class="btn btn-sm" style="margin-left:auto;font-size:10px" onclick="setFilter('production','type','');setFilter('production','status','')">✕ Clear filters</button>`:''}
     </div>
   </div>
-  <div class="tbl-wrap">
+  <div class="tbl-wrap prod-desktop-tbl">
   <table><thead class="sticky-header"><tr><th>SKU</th><th>Description</th><th>Bin</th><th>On Hand</th><th>Open Orders</th><th>${cov}-Wk Fcst</th><th>Suggested</th><th>Max Buildable</th><th>Status</th><th>Quick Pack</th></tr></thead><tbody>
   ${rows.map(r=>{
     let st,stCls;
@@ -14869,7 +14884,32 @@ function renderPackQueue(){
         <button class="btn btn-teal btn-sm" style="margin-left:4px" onclick="packUnits('${r.pn}','${r.id}',false)">Pack</button>${labelBtn(r.pn,1)}
       </td>
     </tr>`;}).join('')}
-  </tbody></table></div>`;
+  </tbody></table></div>
+  <div class="prod-cards">${rows.map(r=>{
+    let st,stCls;
+    if(r.suggested<=0){st='Covered';stCls='pill-teal';}
+    else if(!r.b.hasBOM){st='Build '+r.suggested;stCls='pill-green';}
+    else if(r.b.maxBuild>=r.suggested){st='Build '+r.suggested;stCls='pill-green';}
+    else if(r.b.maxBuild>0){st='Partial \u2014 max '+r.b.maxBuild;stCls='pill-yellow';}
+    else{st='Blocked';stCls='pill-red';}
+    const _pd=r.suggested>0?Math.min(r.suggested,r.b.maxBuild===Infinity?r.suggested:r.b.maxBuild)||1:1;
+    const _mb=r.b.hasBOM?(r.b.maxBuild===Infinity?'\u221e':r.b.maxBuild):'\u221e';
+    return `<div class="prod-card" onclick="rowClick(event,function(){openBuild('${r.pn}')})">
+      <div class="prod-card-top">
+        <div style="min-width:0"><div class="prod-card-sku">${dispPn(r)} ${typeBadge(r.type)}</div><div class="prod-card-desc">${r.description||''}</div></div>
+        <span class="pill ${stCls}">${st}</span>
+      </div>
+      <div class="prod-card-stats">
+        <div><span>On hand</span><b style="color:${(r.total_on_hand||0)<=0?'var(--red)':'var(--text)'}">${dispOH(r.total_on_hand)}</b></div>
+        <div><span>Orders</span><b style="color:${r.demand>0?'var(--orange)':'var(--text3)'}">${r.demand||'\u2014'}</b></div>
+        <div><span>Buildable</span><b style="color:${r.b.maxBuild>0?'var(--green)':'var(--red)'}">${_mb}</b></div>
+        <div><span>Suggested</span><b style="color:${r.suggested>0?'var(--orange)':'var(--text3)'}">${r.suggested||'\u2014'}</b></div>
+      </div>
+      <div class="prod-card-pack" onclick="event.stopPropagation()">
+        <input class="qty-input" id="mpack-qty-${r.id}" type="number" min="1" value="${_pd}" style="width:70px">
+        <button class="btn btn-teal btn-sm" onclick="event.stopPropagation();packUnits('${r.pn}','${r.id}',false,document.getElementById('mpack-qty-${r.id}').value)">Pack</button>${labelBtn(r.pn,1)}
+      </div>
+    </div>`;}).join('')}</div>`;
 }
 
 function renderCustomPackList(){
@@ -15628,6 +15668,8 @@ async function orderShortages(pn,want){
 }
 
 async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
+  if(S._packInFlight){toast('A pack/unpack is already in progress \u2014 please wait');return;} // idempotency: block double-taps that would double-apply inventory
+  S._packInFlight=true;
   const inpId = isUnpack ? 'unpack-qty-'+asmId : 'pack-qty-'+asmId;
   const inp = document.getElementById(inpId);
   const qty = _qtyOverride!=null ? (parseInt(_qtyOverride)||1) : (parseInt(inp?.value)||1);
@@ -15721,6 +15763,7 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
     console.error('[TGK] packUnits error:',e);
     toast('Error during '+(isUnpack?'unpack':'pack')+': '+(e.message||String(e)),6000);
   } finally {
+    S._packInFlight=false;
     buildLookupMaps();
     render();
   }
@@ -19913,6 +19956,7 @@ window.fitCopyRun=async function(){
 
 function render(){
   S._onOrderMap=null; // invalidate per-render caches; renderPlanning re-primes when needed
+  S._buildabilityCache={}; // [PERF] fresh per-render memo for buildability(); nulled after this pass so post-render calls recompute against live stock
   const views={losses:renderLosses,dashboard:renderDashboard,users:renderUsers,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,fitments:renderFitments,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder,reports:renderReports,pricelist:renderPriceList,dataintegrity:renderDataIntegrity};
   if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length||S.calc.forecastWks!==(S.forecastWeeks||8))computeDemand();
   const active=document.activeElement;
@@ -19927,6 +19971,7 @@ function render(){
     console.error('[TGK] render error in view='+S.view+':',e);
     $('content').innerHTML='<div class="panel" style="margin:20px;padding:20px;border-left:4px solid var(--red)"><div style="font-size:14px;font-weight:700;color:var(--red);margin-bottom:6px">&#9888; Render Error</div><div style="font-size:12px;color:var(--text2);margin-bottom:10px">'+escHtml(e.message)+'</div><button class="btn btn-sm" onclick="S.view=\'dashboard\';render()">&#8962; Back to Dashboard</button></div>';
   }
+  S._buildabilityCache=null; // end of synchronous render; deferred/post-render callers recompute fresh
   requestAnimationFrame(initResizableTables);
   if(S.view==='reports'&&S.rptState?.chartView)requestAnimationFrame(_initReportChart);
   if(S.view==='losses'&&!S._lossesLoaded)requestAnimationFrame(loadLosses);
