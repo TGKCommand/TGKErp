@@ -228,7 +228,7 @@
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.52</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.51</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -291,7 +291,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.52';
+const TGK_ERP_VERSION = 'v20.51';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -15149,81 +15149,67 @@ function printAllBOMs(pns){
 function startWorkOrder(){
   if(!S._partIdx||!S._asmIdx)buildLookupMaps();
   const cov=S.buildCoverage||4;
-  const act=S.assemblies.filter(a=>!a.discontinued&&!isDev(a));
-  const rAsm=function(cp){return (typeof _findAsm2==='function'?_findAsm2(cp):null)||S._asmIdx[cp]||null;};
-  const rPart=function(cp){return (typeof _findPart==='function'?_findPart(cp):null)||S._partIdx[cp]||null;};
-
-  const onHand={},ownGross={},demandOf={},capOwn={},childrenAsm={},isAsmChild={};
-  act.forEach(function(a){
-    onHand[a.pn]=a.total_on_hand||0;
-    const d=openOrderDemand(a.pn);
-    const f=a.build_to_order?0:Math.ceil(asmAvgWk(a)*cov);
-    ownGross[a.pn]=Math.max(d,f);   // own demand incl. forecast buffer (gross, before netting)
-    demandOf[a.pn]=d;
-    capOwn[a.pn]=ownGross[a.pn];     // reducible own-demand cap (trimmed lowest-demand-first if raw-short)
-    childrenAsm[a.pn]=[];
-    (S.boms[a.pn]||[]).forEach(function(l){const c=rAsm(l.child_pn); if(c){childrenAsm[a.pn].push({pn:c.pn,qty:Number(l.qty)||1}); isAsmChild[c.pn]=true;}});
+  // Candidate assemblies that actually need building, each capped at its own independent max.
+  const cands=[];
+  S.assemblies.filter(a=>!a.discontinued&&!isDev(a)).forEach(a=>{
+    const demand=openOrderDemand(a.pn);
+    const fcDemand=a.build_to_order?0:Math.ceil(asmAvgWk(a)*cov);
+    const suggested=Math.max(0,Math.max(demand,fcDemand)-(a.total_on_hand||0));
+    if(suggested<=0)return;
+    const b=buildability(a.pn);
+    const cap=b.maxBuild===Infinity?suggested:Math.min(suggested,b.maxBuild);
+    if(cap<=0)return;
+    cands.push({pn:a.pn,want:cap,demand:demand,bom:(S.boms[a.pn]||[])});
   });
-  // BOM level: 0 = finished good (not a component of any assembly); deeper = subassembly. Relax to longest path.
-  const level={}; act.forEach(function(a){level[a.pn]=isAsmChild[a.pn]?1:0;});
-  for(let it=0;it<60;it++){let changed=false;act.forEach(function(a){childrenAsm[a.pn].forEach(function(ch){if(level[ch.pn]!==undefined&&level[ch.pn]<level[a.pn]+1){level[ch.pn]=level[a.pn]+1;changed=true;}});});if(!changed)break;}
-  const byLevelAsc=act.map(function(a){return a.pn;}).sort(function(x,y){return (level[x]||0)-(level[y]||0);});
-
-  // Explode top-down: gross = own cap + dependent demand from parents' builds; net against on-hand.
-  function explode(){
-    const dep={},net={}; act.forEach(function(a){dep[a.pn]=0;});
-    byLevelAsc.forEach(function(pn){
-      const gross=(capOwn[pn]||0)+(dep[pn]||0);
-      const nb=Math.max(0,gross-(onHand[pn]||0));
-      net[pn]=nb;
-      childrenAsm[pn].forEach(function(ch){dep[ch.pn]=(dep[ch.pn]||0)+nb*ch.qty;});
-    });
-    return net;
-  }
-  // Raw-part shortage of a plan: sum of each build's DIRECT raw-part usage vs on-hand (subs handled by their own builds).
-  function rawShort(net){
-    const need={};
-    act.forEach(function(a){const nb=net[a.pn]; if(!nb)return;
-      (S.boms[a.pn]||[]).forEach(function(l){ if(rAsm(l.child_pn))return; const p=rPart(l.child_pn); if(!p)return; need[p.pn]=(need[p.pn]||0)+nb*(Number(l.qty)||1); });
-    });
-    let short=false;
-    Object.keys(need).forEach(function(pp){const p=S._partIdx[pp]; const have=p?(p.total_unpckgd||0):0; if(need[pp]>have)short=true;});
-    return short;
-  }
-  // Trim lowest-demand own-cap first until raw-feasible (finished-good open orders survive longest).
-  let net=explode(),guard=0;
-  while(rawShort(net)&&guard++<20000){
-    const cut=act.map(function(a){return a.pn;}).filter(function(pn){return capOwn[pn]>0;})
-      .sort(function(x,y){return (demandOf[x]-demandOf[y])||(ownGross[x]-ownGross[y])||(x<y?-1:1);});
-    if(!cut.length)break;
-    capOwn[cut[0]]-=1;
-    net=explode();
+  // Shared on-hand pool per direct component. Untracked items (e.g. some packaging) are treated as
+  // unlimited so they never block; real parts/subassemblies are the scarce resource we ration so that
+  // the combined work order never draws more of any shared component than is physically on hand.
+  const pool={};
+  cands.forEach(c=>c.bom.forEach(l=>{
+    if(pool[l.child_pn]!==undefined)return;
+    const sub=S._asmIdx[l.child_pn], part=S._partIdx[l.child_pn];
+    pool[l.child_pn]= sub?(sub.total_on_hand||0) : (part?(part.total_unpckgd||0) : Infinity);
+  }));
+  // Allocate one unit at a time, highest open-order demand first, only when every component for that
+  // unit is still available. Guarantees a no-shortage plan and shares scarce parts across finished goods.
+  cands.sort((a,b)=>(b.demand-a.demand)||(a.pn<b.pn?-1:1));
+  const alloc={};
+  let progressed=true, guard=0;
+  while(progressed && guard++<200000){
+    progressed=false;
+    for(const c of cands){
+      if((alloc[c.pn]||0)>=c.want)continue;
+      let ok=true;
+      for(const l of c.bom){ const q=Number(l.qty)||1; if(pool[l.child_pn] < q){ ok=false; break; } }
+      if(!ok)continue;
+      for(const l of c.bom){ const q=Number(l.qty)||1; pool[l.child_pn]-=q; }
+      alloc[c.pn]=(alloc[c.pn]||0)+1;
+      progressed=true;
+    }
   }
   S.workOrderBuilds={};
-  Object.keys(net).forEach(function(pn){ if(net[pn]>0)S.workOrderBuilds[pn]=net[pn]; });
+  Object.keys(alloc).forEach(pn=>{ if(alloc[pn]>0)S.workOrderBuilds[pn]=alloc[pn]; });
   S.workOrderMode=true;
   render();
 }
 
 function consolidateComponents(builds){
-  // Raw-part pick list: fully account for in-house subassembly builds by listing only actual parts to PULL.
-  // Subassemblies in the plan are their own build lines, not picked stock, so they are not listed here.
-  const rAsm=function(cp){return (typeof _findAsm2==='function'?_findAsm2(cp):null)||S._asmIdx[cp]||null;};
-  const rPart=function(cp){return (typeof _findPart==='function'?_findPart(cp):null)||S._partIdx[cp]||null;};
   const comps={};
-  for(const b of builds){
-    const bom=S.boms[b.pn]||[];
+  for(const{pn,qty}of builds){
+    const bom=S.boms[pn]||[];
     for(const line of bom){
-      if(rAsm(line.child_pn))continue; // subassembly component -> built in-house, not a picked part
-      const p=rPart(line.child_pn);
-      const key=p?p.pn:line.child_pn;
-      const need=(Number(line.qty)||1)*b.qty;
-      if(!comps[key])comps[key]={pn:key,dispPn:p?dispPn(p):line.child_pn,desc:(p&&p.description)||'',bin:(p&&p.location)||'',have:p?(p.total_unpckgd||0):Infinity,need:0,isSub:false};
-      comps[key].need+=need;
+      const need=line.qty*qty;
+      if(!comps[line.child_pn]){
+        const part=S.parts.find(p=>p.pn===line.child_pn);
+        const sub=S.assemblies.find(a=>a.pn===line.child_pn);
+        const item=part||sub;
+        comps[line.child_pn]={pn:line.child_pn,dispPn:item?dispPn(item):line.child_pn,desc:item?.description||'',bin:part?.location||'',have:part?(part.total_unpckgd||0):(sub?.total_on_hand||0),need:0,isSub:!!sub};
+      }
+      comps[line.child_pn].need+=need;
     }
   }
-  return Object.values(comps).map(function(c){return Object.assign({},c,{short:c.have===Infinity?0:Math.max(0,c.need-c.have)});})
-    .sort(function(a,b){return b.short-a.short||(a.bin||'').localeCompare(b.bin||'')||(a.dispPn||'').localeCompare(b.dispPn||'');});
+  return Object.values(comps).map(c=>({...c,short:Math.max(0,c.need-c.have)}))
+    .sort((a,b)=>b.short-a.short||a.bin.localeCompare(b.bin)||a.dispPn.localeCompare(b.dispPn));
 }
 
 function renderWorkOrder(){
@@ -15335,23 +15321,9 @@ async function woPackAll(){
   const builds=Object.entries(S.workOrderBuilds||{}).map(([pn,qty])=>({pn,qty:parseInt(qty)||1}));
   if(!builds.length){toast('No assemblies in work order');return;}
   if(!confirm('Pack all '+builds.length+' assemblies?\n\n'+builds.map(b=>b.pn+' × '+b.qty).join('\n')))return;
-  // Pack bottom-up: an assembly that is a component of another build must be packed first, so the
-  // finished-good pack consumes the freshly-built subassemblies instead of pre-existing stock.
-  const _rAsm=function(cp){return (typeof _findAsm2==='function'?_findAsm2(cp):null)||(S._asmIdx&&S._asmIdx[cp])||null;};
-  const _inSet={}; builds.forEach(function(b){_inSet[b.pn]=true;});
-  const _ordered=[],_done={}; let _safety=0;
-  while(_ordered.length<builds.length&&_safety++<5000){
-    let _moved=false;
-    for(const b of builds){ if(_done[b.pn])continue;
-      const _pending=(S.boms[b.pn]||[]).some(function(l){const c=_rAsm(l.child_pn);return c&&_inSet[c.pn]&&!_done[c.pn];});
-      if(!_pending){_ordered.push(b);_done[b.pn]=true;_moved=true;}
-    }
-    if(!_moved)break;
-  }
-  builds.forEach(function(b){if(!_done[b.pn])_ordered.push(b);});
-  for(const{pn,qty}of _ordered){
-    const asm=(typeof findAsm==='function'?findAsm(pn):null)||S.assemblies.find(a=>a.pn===pn);
-    if(asm)await packUnits(asm.pn,asm.id,false,qty);
+  for(const{pn,qty}of builds){
+    const asm=S.assemblies.find(a=>a.pn===pn);
+    if(asm)await packUnits(pn,asm.id,false,qty);
   }
   S.workOrderBuilds={};
   S.workOrderMode=false;
