@@ -228,7 +228,7 @@
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.56</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.57</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -291,7 +291,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.56';
+const TGK_ERP_VERSION = 'v20.57';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -11686,6 +11686,7 @@ const REPORT_DEFS = [
   {id:'inv_receipts',     cat:'Inventory', label:'PO Receipts',            icon:'📦', desc:'Parts received from purchase orders'},
   {id:'inv_velocity',     cat:'Inventory', label:'Inventory Velocity',     icon:'⚡', desc:'Parts ranked by weekly demand rate'},
   {id:'assemblies_stock', cat:'Inventory', label:'Assemblies On-Hand',     icon:'🔧', desc:'Finished goods and subassembly stock levels'},
+  {id:'dead_parts',       cat:'Inventory', label:'Dead Parts',            icon:'💀', desc:'Parts not used in any BOM and with no sales in the selected period'},
   {id:'po_all',           cat:'Purchasing',label:'All Purchase Orders',    icon:'📄', desc:'Complete PO history with status, vendor, total'},
   {id:'po_open',          cat:'Purchasing',label:'Open Purchase Orders',   icon:'🔓', desc:'POs not yet fully received'},
   {id:'po_draft',         cat:'Purchasing',label:'Draft POs',              icon:'📝', desc:'Drafts awaiting approval'},
@@ -11771,7 +11772,7 @@ function renderReports(){
     {key:'custom',label:'Custom Range'},
   ];
   const salesCats=['Sales','Inventory','Counts','Warranty'];
-  const hasDates=['sales_orders','sales_shipped','sales_by_sku','sales_by_month','sales_by_customer','sales_by_dealer','sales_open','sales_on_hold','inv_movements','inv_receipts','cycle_counts','corrections_log','warranty_claims','po_all','po_open','po_draft','po_received','po_by_vendor','po_lines'].includes(def.id);
+  const hasDates=['sales_orders','sales_shipped','sales_by_sku','sales_by_month','sales_by_customer','sales_by_dealer','sales_open','sales_on_hold','inv_movements','inv_receipts','cycle_counts','corrections_log','warranty_claims','po_all','po_open','po_draft','po_received','po_by_vendor','po_lines','dead_parts'].includes(def.id);
 
   const preview=rs.preview;
   const rows=preview||buildReportRows(def.id,dr,customFrom,customTo);
@@ -11871,6 +11872,35 @@ function buildReportRows(id, preset, customFrom, customTo){
   const fd=(rows,field)=>filterByDate(rows,field,from,to);
 
   switch(id){
+
+    case 'dead_parts':{
+      // "Dead" = a part NOT used as a component in ANY assembly BOM, AND with no sales in the selected
+      // date window. Sorted by on-hand value so the biggest write-off/liquidation candidates surface first.
+      const usedInBom=new Set();
+      Object.keys(S.boms||{}).forEach(function(parent){
+        (S.boms[parent]||[]).forEach(function(l){
+          if(!l.child_pn)return;
+          usedInBom.add(l.child_pn);
+          const it=(typeof _findPart==='function'?_findPart(l.child_pn):null)||(typeof findAsm==='function'?findAsm(l.child_pn):null);
+          if(it){usedInBom.add(it.pn); if(it.new_sku)usedInBom.add(it.new_sku);}
+        });
+      });
+      const soldRows=fd((S.sales||[]).filter(function(s){return s.fulfillment_status!=='Cancelled';}),'sale_date');
+      const soldInRange=new Set();
+      soldRows.forEach(function(s){ if(!s.pn)return; soldInRange.add(s.pn); const it=(typeof findAsm==='function'?findAsm(s.pn):null)||(typeof _findPart==='function'?_findPart(s.pn):null); if(it){soldInRange.add(it.pn); if(it.new_sku)soldInRange.add(it.new_sku);} });
+      const lastSale={};
+      (S.sales||[]).forEach(function(s){ if(!s.pn||!s.sale_date)return; if(!lastSale[s.pn]||s.sale_date>lastSale[s.pn])lastSale[s.pn]=s.sale_date; });
+      const isUsed=function(p){return usedInBom.has(p.pn)||(p.new_sku&&usedInBom.has(p.new_sku));};
+      const isSold=function(p){return soldInRange.has(p.pn)||(p.new_sku&&soldInRange.has(p.new_sku));};
+      const dead=(S.parts||[]).filter(function(p){return !isUsed(p)&&!isSold(p);});
+      const cols=['SKU','Description','Category','On Hand','Unit Cost','On-Hand Value','Last Sale (ever)','Discontinued'];
+      const data=dead.map(function(p){
+        const oh=p.total_unpckgd||0, uc=p.unit_cost||0;
+        const ls=lastSale[p.pn]||(p.new_sku?lastSale[p.new_sku]:'')||'';
+        return {'SKU':dispPn(p),'Description':p.description||'','Category':p.category||'','On Hand':oh,'Unit Cost':uc,'On-Hand Value':+(oh*uc).toFixed(2),'Last Sale (ever)':ls?ls.slice(0,10):'never','Discontinued':p.discontinued?'Yes':''};
+      }).sort(function(a,b){return b['On-Hand Value']-a['On-Hand Value'];});
+      return{cols,data};
+    }
 
     case 'sales_orders':{
       const rows=fd(S.sales,'sale_date');
