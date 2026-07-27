@@ -228,7 +228,7 @@
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.58</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.59</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -291,7 +291,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.58';
+const TGK_ERP_VERSION = 'v20.59';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -923,7 +923,7 @@ function setupRealtime(){
       else if(p.eventType==='UPDATE'){
         const prev=S.shipmentErrors.find(e=>e.id===p.new.id);
         S.shipmentErrors=S.shipmentErrors.map(e=>e.id===p.new.id?p.new:e);
-        if(!prev?.tracking_number&&p.new.tracking_number)toast('📦 Correction shipped — #'+(p.new.order_number||p.new.id)+': '+(p.new.carrier||'')+' '+p.new.tracking_number,6000);
+        if(!prev?.tracking_number&&p.new.tracking_number){toast('📦 Correction shipped — #'+(p.new.order_number||p.new.id)+': '+(p.new.carrier||'')+' '+p.new.tracking_number,6000); if(p.new.status!=='Resolved'&&p.new.status!=='Denied')_autoResolveOnTracking('shipment_errors',p.new.id);}
       }
       else if(p.eventType==='DELETE')S.shipmentErrors=S.shipmentErrors.filter(e=>e.id!==p.old.id);
       updateBadge();
@@ -934,7 +934,7 @@ function setupRealtime(){
       else if(p.eventType==='UPDATE'){
         const prev=S.warrantyClaims.find(w=>w.id===p.new.id);
         S.warrantyClaims=S.warrantyClaims.map(w=>w.id===p.new.id?p.new:w);
-        if(!prev?.tracking_number&&p.new.tracking_number)toast('🔄 Warranty shipped — '+(p.new.pn||p.new.id)+': '+(p.new.carrier||'')+' '+p.new.tracking_number,6000);
+        if(!prev?.tracking_number&&p.new.tracking_number){toast('🔄 Warranty shipped — '+(p.new.pn||p.new.id)+': '+(p.new.carrier||'')+' '+p.new.tracking_number,6000); if(p.new.status!=='Resolved'&&p.new.status!=='Denied')_autoResolveOnTracking('warranty_claims',p.new.id);}
       }
       else if(p.eventType==='DELETE')S.warrantyClaims=S.warrantyClaims.filter(w=>w.id!==p.old.id);
       updateBadge();
@@ -7559,7 +7559,7 @@ async function importOrdersFromShopify(){
       toast(`Importing… ${imported} orders pulled so far (page ${page-1})`);
     }catch(e){toast('Error: '+e.message);keepGoing=false;}
   }
-  await loadAll();render();
+  await loadAll();autoResolveTrackedTickets();render();
   toast(`✓ Shopify import done — ${imported} new orders, ${skipped} already existed`);
 }
 
@@ -17393,6 +17393,7 @@ function renderWarranty() {
         <button class="action-btn" title="Edit this claim" onclick="openModal('addWarranty',{editId:'${w.id}'})">✎</button>
         ${(w.status==='Shipped'||w.tracking_number)?`<button class="action-btn" title="Unship — clear tracking and revert status" onclick="unshipWarranty('${w.id}')">↩ Unship</button>`:''}
         <button class="action-btn" title="${w.tracking_number?'Update tracking':'Enter tracking manually'}" onclick="openManualTrackingModal('warranty','${w.id}')">${w.tracking_number?'📦 Track':'📦 Track'}</button>
+        ${w.status!=='Resolved'&&w.status!=='Denied'?`<button class="action-btn" style="color:var(--green)" title="Mark this claim resolved" onclick="advanceWarranty('${w.id}','Resolved')">&#10003; Resolve</button>`:''}
         <button class="action-btn del" onclick="deleteWarranty('${w.id}')">×</button>
       </td>
     </tr>`;
@@ -17479,12 +17480,29 @@ function renderShipmentErrors(){
         ${e.tracking_number?`<button class="action-btn" title="Unship — clear tracking and revert to Open" onclick="unshipShipmentError('${e.id}')">↩ Unship</button>`:''}
         ${e.resolution==='return_required'&&!e.return_received_at?`<button class="action-btn" style="color:var(--orange)" title="${e.return_tracking?'Mark the return as received':'Enter inbound return tracking'}" onclick="openReturnTrackingModal('${e.id}')">↩ Return</button>`:''}
         <button class="action-btn" title="${e.tracking_number?'Update tracking':'Enter tracking manually'}" onclick="openManualTrackingModal('shiperror','${e.id}')">📦 Track</button>
+        ${e.status!=='Resolved'?`<button class="action-btn" style="color:var(--green)" title="Mark this error resolved" onclick="advanceShipmentError('${e.id}','Resolved')">&#10003; Resolve</button>`:''}
         <button class="action-btn del" onclick="deleteShipmentError('${e.id}')">×</button>
       </td>
     </tr>`;
   }).join('')}
   </tbody></table></div>`;
 }
+
+async function _autoResolveOnTracking(table,id){
+  // ShipStation tracking has pinged back -> the replacement physically shipped, so close the ticket.
+  try{
+    await db.from(table).update({status:'Resolved',updated_at:new Date().toISOString()}).eq('id',id);
+    if(table==='warranty_claims')S.warrantyClaims=(S.warrantyClaims||[]).map(w=>w.id===id?{...w,status:'Resolved'}:w);
+    else S.shipmentErrors=(S.shipmentErrors||[]).map(e=>e.id===id?{...e,status:'Resolved'}:e);
+    if(S.view==='warranty'&&typeof scheduleRender==='function')scheduleRender();
+  }catch(e){console.warn('auto-resolve failed',e);}
+}
+function autoResolveTrackedTickets(){
+  // Catch-up on load: any ticket that already has tracking but is not closed becomes Resolved.
+  (S.warrantyClaims||[]).forEach(function(w){ if(w.tracking_number&&w.status!=='Resolved'&&w.status!=='Denied')_autoResolveOnTracking('warranty_claims',w.id); });
+  (S.shipmentErrors||[]).forEach(function(e){ if(e.tracking_number&&e.status!=='Resolved'&&e.status!=='Denied')_autoResolveOnTracking('shipment_errors',e.id); });
+}
+window._autoResolveOnTracking=_autoResolveOnTracking;window.autoResolveTrackedTickets=autoResolveTrackedTickets;
 
 async function advanceWarranty(id, newStatus) {
   const {error}=await db.from('warranty_claims').update({status:newStatus,resolved_at:['Resolved','Denied','Shipped'].includes(newStatus)?new Date().toISOString():null}).eq('id',id);
