@@ -242,7 +242,7 @@
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.70</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.72</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -305,7 +305,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.70';
+const TGK_ERP_VERSION = 'v20.72';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -7870,9 +7870,15 @@ async function sendAI(){
   try{
     let data=null;
     for(let attempt=0;attempt<3;attempt++){
-      const res=await fetch(SUPA_URL+'/functions/v1/anthropic-proxy',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:800,system:ctx,messages:S.aiHistory.map(m=>({role:m.role==='user'?'user':'assistant',content:m.text}))})});
+      // [AUTH] send the live user session token (the proxy rate-limits per user); fall back to anon key
+      let _tok=SUPA_KEY;
+      try{const{data:{session:_s}}=await db.auth.getSession();if(_s&&_s.access_token)_tok=_s.access_token;}catch(_){}
+      const res=await fetch(SUPA_URL+'/functions/v1/anthropic-proxy',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+_tok},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:800,system:ctx,messages:S.aiHistory.map(m=>({role:m.role==='user'?'user':'assistant',content:m.text}))})});
       if(res.status===503){data={error:{type:'proxy_not_configured',message:'AI proxy not configured — add ANTHROPIC_API_KEY to your Supabase edge function secrets (Dashboard → Edge Functions → anthropic-proxy → Secrets).'}}; break;}
-      if(res.status===401){data={error:{type:'auth_error',message:'Session expired — please sign out and back in.'}}; break;}
+      if(res.status===401){
+        if(attempt<2){ try{await db.auth.refreshSession();}catch(_){} continue; } // [AUTH] refresh silently and retry
+        data={error:{type:'auth_error',message:'Sign-in session could not be refreshed \u2014 sign out and back in, then ask again.'}}; break;
+      }
       data=await res.json();
       if(data.error&&(data.error.type==='overloaded_error'||res.status===529||res.status===429)){
         if(attempt<2){await new Promise(r=>setTimeout(r,(attempt+1)*2000));continue;}
@@ -11070,7 +11076,7 @@ async function adminInviteUser(){
     if(!session)throw new Error('Not authenticated');
     const res=await fetch('https://piamamighqiielfztgic.supabase.co/functions/v1/invite-user',{
       method:'POST',
-      headers:{'Content-Type':'application/json','Authorization':'Bearer '+session.access_token},
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+((session&&session.access_token)||SUPA_KEY)},
       body:JSON.stringify({action:'invite',email,role,redirectTo:window.location.origin+window.location.pathname})
     });
     const json=await res.json();
@@ -11130,7 +11136,7 @@ async function adminDeleteUser(userId){
     if(!session)throw new Error('Not authenticated');
     const res=await fetch('https://piamamighqiielfztgic.supabase.co/functions/v1/invite-user',{
       method:'POST',
-      headers:{'Content-Type':'application/json','Authorization':'Bearer '+session.access_token},
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+((session&&session.access_token)||SUPA_KEY)},
       body:JSON.stringify({action:'delete',userId})
     });
     const json=await res.json();
@@ -17508,12 +17514,38 @@ function renderShipmentErrors(){
   </tbody></table></div>`;
 }
 
+async function _resolveLinkedTicket(kind, recId, tracking, carrier){
+  // [TICKETS] When the replacement ships, close the linked Support Center ticket too.
+  // Server-of-record: this works even when no Support tab is open. The Support Center has its own
+  // realtime mirror of this behavior; the conditional update below keeps the two writers idempotent
+  // (only whichever gets there first flips the status and posts the system note).
+  try{
+    var col = kind==='warranty' ? 'warranty_claim_id' : 'shipment_error_id';
+    var q = await db.from('tickets').select('id,ticket_number,status').eq(col, recId).limit(1);
+    var t = q && q.data && q.data[0];
+    if(!t || t.status==='resolved' || t.status==='closed') return;
+    var upd = await db.from('tickets')
+      .update({status:'resolved', resolved_at:new Date().toISOString(), has_unread:true, updated_at:new Date().toISOString()})
+      .eq('id', t.id).neq('status','resolved').neq('status','closed').select();
+    if(upd && !upd.error && upd.data && upd.data.length){
+      await dbq(db.from('ticket_messages').insert({
+        ticket_id: t.id, sender_type:'system', sender_name:'System', is_internal_note:true,
+        body: '\ud83d\udce6 ERP update: '+(kind==='warranty'?'Warranty claim':'Shipment error')+' shipped'
+          + (carrier?' via '+carrier:'') + (tracking?' \u2014 tracking: '+tracking:'')
+          + '. Ticket marked resolved automatically \u2014 if the customer replies, it will reopen. (Synced from the ERP.)'
+      }), 'ticket:autoResolveNote');
+      console.log('[tickets] auto-resolved #'+(t.ticket_number||t.id)+' ('+kind+')');
+    }
+  }catch(e){console.warn('ticket auto-resolve skipped', e);}
+}
 async function _autoResolveOnTracking(table,id){
   // ShipStation tracking has pinged back -> the replacement physically shipped, so close the ticket.
   try{
     await db.from(table).update({status:'Resolved',updated_at:new Date().toISOString()}).eq('id',id);
     if(table==='warranty_claims')S.warrantyClaims=(S.warrantyClaims||[]).map(w=>w.id===id?{...w,status:'Resolved'}:w);
     else S.shipmentErrors=(S.shipmentErrors||[]).map(e=>e.id===id?{...e,status:'Resolved'}:e);
+    var _lr = table==='warranty_claims' ? (S.warrantyClaims||[]).find(w=>w.id===id) : (S.shipmentErrors||[]).find(e=>e.id===id);
+    _resolveLinkedTicket(table==='warranty_claims'?'warranty':'shiperror', id, _lr&&_lr.tracking_number, _lr&&_lr.carrier);
     if(S.view==='warranty'&&typeof scheduleRender==='function')scheduleRender();
   }catch(e){console.warn('auto-resolve failed',e);}
 }
