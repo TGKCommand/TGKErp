@@ -242,7 +242,7 @@
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.60</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.61</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -305,7 +305,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.60';
+const TGK_ERP_VERSION = 'v20.61';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -18192,6 +18192,58 @@ function resolveShipTarget(pn){
    we sum every warranty/shipment/unship correction tagged with this record; a net-negative balance means
    stock is currently deducted for it, so we skip re-deducting. Unship writes offsetting positive rows
    (source 'unship') that bring the net back to 0, which also re-arms a future legitimate re-ship. */
+/* ============================================================
+   [STAGE1] Hardened stock core (v20.61)
+   - dbq(): surfaces silent Supabase errors (v2 returns {error}, never throws)
+   - adjustStock(): the ONE way to change stock. Atomic server-side increment
+     via the adjust_stock RPC (run sql/adjust_stock.sql once); if the RPC is
+     not installed yet it falls back to the legacy read-modify-write, so the
+     app works identically before and after the migration.
+   ============================================================ */
+async function dbq(promise, ctx){
+  var res = await promise;
+  if(res && res.error){
+    console.error('[DB:'+(ctx||'?')+']', res.error);
+    try{ toast('\u26a0 DB error ('+(ctx||'db')+'): '+(res.error.message||'unknown')); }catch(_){}
+  }
+  return res;
+}
+var _adjustRpcMissing=false; // set true after first "function not found" so we stop retrying per call
+async function adjustStock(kind, rec, delta, meta){
+  /* kind 'part'|'assembly'; rec = live row (needs id, pn); delta +/- units;
+     meta {reason, source, reference_id, user_email, skipSync}. Returns new qty or null. */
+  if(!rec || !rec.id || !delta) return null;
+  var isAsm = kind==='assembly';
+  var table = isAsm ? 'assemblies' : 'parts';
+  var field = isAsm ? 'total_on_hand' : 'total_unpckgd';
+  var prevQty = isAsm ? (rec.total_on_hand||0) : (rec.total_unpckgd||0);
+  var newQty = null;
+  if(!_adjustRpcMissing){
+    try{
+      var r = await db.rpc('adjust_stock', {p_table:table, p_id:String(rec.id), p_delta:delta});
+      if(!r.error && r.data!=null){ newQty=Number(r.data); prevQty=newQty-delta; }
+      else if(r.error){
+        var m=String(r.error.message||'');
+        if(m.indexOf('adjust_stock')!==-1 && (m.indexOf('not')!==-1 || m.indexOf('find')!==-1)){ _adjustRpcMissing=true; }
+        else { console.warn('[adjustStock] rpc error, using fallback:', r.error); }
+      }
+    }catch(e){ console.warn('[adjustStock] rpc threw, using fallback', e); }
+  }
+  if(newQty===null){ // legacy fallback (pre-migration or rpc failure)
+    newQty = prevQty + delta;
+    var upd = {}; upd[field]=newQty; upd.updated_at=new Date().toISOString();
+    var w = await dbq(db.from(table).update(upd).eq('id', rec.id), 'adjustStock:'+table);
+    if(w && w.error) return null;
+  }
+  if(isAsm) S.assemblies=S.assemblies.map(function(x){return x.id===rec.id?Object.assign({},x,{total_on_hand:newQty}):x;});
+  else S.parts=S.parts.map(function(x){return x.id===rec.id?Object.assign({},x,{total_unpckgd:newQty}):x;});
+  meta=meta||{};
+  await dbq(db.from('inv_corrections').insert({pn:rec.pn, previous_qty:prevQty, new_qty:newQty, adjustment:delta,
+    reason:meta.reason||'', user_email:meta.user_email||S.currentUser||null, source:meta.source||'manual',
+    reference_id:meta.reference_id||null}), 'adjustStock:audit');
+  if(!meta.skipSync){ try{ if(isAsm) syncShopifyTemplate(rec.pn,newQty); else cascadeShopifySync(rec.pn); }catch(_){}}
+  return newQty;
+}
 async function _recordNetDeducted(recordId){
   try{
     const{data}=await db.from('inv_corrections').select('adjustment').eq('reference_id',recordId).in('source',['warranty','shipment','unship']);
@@ -18207,19 +18259,15 @@ async function deductShipItemsOnce(recordId, source, items, ssRef){
     const qty=item.qty||1;
     const tgt=resolveShipTarget(item.pn);
     if(tgt.kind==='assembly'){
-      const a=tgt.asm;const prev=a.total_on_hand||0;const newOh=prev-qty; // allow negative = backorder
+      const a=tgt.asm; // negative allowed = backorder
       cost+=qty*((typeof bomCostOf==='function'?bomCostOf(a.pn,0):0)||0);
-      await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',a.id);
-      S.assemblies=S.assemblies.map(function(x){return x.pn===a.pn?{...x,total_on_hand:newOh}:x;});
-      await db.from('inv_corrections').insert({pn:a.pn,previous_qty:prev,new_qty:newOh,adjustment:-qty,reason:(source==='warranty'?'Warranty replacement shipped':'Shipment error correction shipped')+(ssRef?' (SS#'+ssRef+')':''),user_email:S.currentUser||null,source:source,reference_id:recordId});
-      syncShopifyTemplate(a.pn,newOh);count++;
+      await adjustStock('assembly',a,-qty,{reason:(source==='warranty'?'Warranty replacement shipped':'Shipment error correction shipped')+(ssRef?' (SS#'+ssRef+')':''),source:source,reference_id:recordId});
+      count++;
     } else if(tgt.kind==='part'){
-      const p=tgt.part;const prev=p.total_unpckgd||0;const newQty=prev-qty;
+      const p=tgt.part;
       cost+=qty*((p&&p.unit_cost)||0);
-      await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
-      S.parts=S.parts.map(function(x){return x.pn===p.pn?{...x,total_unpckgd:newQty}:x;});
-      await db.from('inv_corrections').insert({pn:p.pn,previous_qty:prev,new_qty:newQty,adjustment:-qty,reason:(source==='warranty'?'Warranty part shipped':'Shipment error part shipped')+(ssRef?' (SS#'+ssRef+')':''),user_email:S.currentUser||null,source:source,reference_id:recordId});
-      cascadeShopifySync(p.pn);count++;
+      await adjustStock('part',p,-qty,{reason:(source==='warranty'?'Warranty part shipped':'Shipment error part shipped')+(ssRef?' (SS#'+ssRef+')':''),source:source,reference_id:recordId});
+      count++;
     } else {
       console.warn('['+source+' ship] '+item.pn+' not found in parts/assemblies -- shipped without inventory deduction');
     }
@@ -18237,17 +18285,13 @@ async function restoreShipItemsForRecord(recordId){
       const addBack=-outstanding;
       const tgt=resolveShipTarget(pn);
       if(tgt.kind==='assembly'){
-        const a=tgt.asm;const prev=a.total_on_hand||0;const nv=prev+addBack;
-        await db.from('assemblies').update({total_on_hand:nv,updated_at:new Date().toISOString()}).eq('id',a.id);
-        S.assemblies=S.assemblies.map(function(x){return x.pn===a.pn?{...x,total_on_hand:nv}:x;});
-        await db.from('inv_corrections').insert({pn:a.pn,previous_qty:prev,new_qty:nv,adjustment:addBack,reason:'Unship -- restored warranty/error deduction',user_email:S.currentUser||null,source:'unship',reference_id:recordId});
-        syncShopifyTemplate(a.pn,nv);restored++;
+        const a=tgt.asm;
+        await adjustStock('assembly',a,addBack,{reason:'Unship -- restored warranty/error deduction',source:'unship',reference_id:recordId});
+        restored++;
       } else if(tgt.kind==='part'){
-        const p=tgt.part;const prev=p.total_unpckgd||0;const nv=prev+addBack;
-        await db.from('parts').update({total_unpckgd:nv,updated_at:new Date().toISOString()}).eq('id',p.id);
-        S.parts=S.parts.map(function(x){return x.pn===p.pn?{...x,total_unpckgd:nv}:x;});
-        await db.from('inv_corrections').insert({pn:p.pn,previous_qty:prev,new_qty:nv,adjustment:addBack,reason:'Unship -- restored warranty/error deduction',user_email:S.currentUser||null,source:'unship',reference_id:recordId});
-        cascadeShopifySync(p.pn);restored++;
+        const p=tgt.part;
+        await adjustStock('part',p,addBack,{reason:'Unship -- restored warranty/error deduction',source:'unship',reference_id:recordId});
+        restored++;
       }
     }
   }catch(e){console.warn('restoreShipItemsForRecord failed',e);}
