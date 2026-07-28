@@ -242,7 +242,7 @@
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.62</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.63</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -305,7 +305,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.62';
+const TGK_ERP_VERSION = 'v20.63';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -3221,16 +3221,10 @@ async function deductShippingBox(pn,orderNum){
   var part=S.parts.find(function(p){return p.pn===pn;});
   if(!part){toast('Part '+pn+' not found');return;}
   var prev=part.total_unpckgd||0;
-  var newQty=prev-1;
-  var r=await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
-  if(r.error){toast('\u26a0 '+r.error.message);return;}
-  S.parts=S.parts.map(function(p){return p.id===part.id?Object.assign({},p,{total_unpckgd:newQty}):p;});
   var _reason='Shipping box \u2014 multi-SKU order '+orderNum;
-  await db.from('inv_corrections').insert({
-    pn:pn,previous_qty:prev,new_qty:newQty,adjustment:-1,
-    reason:_reason,user_email:S.currentUser||null,source:'pack'
-  });
-  S.corrections=[{pn:pn,previous_qty:prev,new_qty:newQty,adjustment:-1,reason:_reason,source:'pack',created_at:new Date().toISOString()},...S.corrections];
+  var newQty=await adjustStock('part',part,-1,{reason:_reason,source:'pack',skipSync:true});
+  if(newQty===null){return;}
+  if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
   logAction('Shipping box '+pn+' deducted for order '+orderNum,'parts',pn,{total_unpckgd:prev},{total_unpckgd:newQty}).catch(function(){});
   document.getElementById('shpbox-ov')?.remove();
   toast('\u2713 '+pn+' logged \u2014 '+newQty+' remaining');
@@ -3495,19 +3489,11 @@ async function submitReturnV2(orderNum){
       const asm=S.assemblies.find(a=>a.pn===pn);
       const prt=S.parts.find(p=>p.pn===pn);
       if(asm){
-        const prev=asm.total_on_hand||0;const newOh=prev+qty2;
-        await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
-        S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
-        await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newOh,adjustment:qty2,reason:'Return — '+reason+' (order '+orderNum+')',user_email:S.currentUser||null,source:'return'});
-        syncShopifyTemplate(pn,newOh);
-        results.push('+'+qty2+' '+pn);
+        const newOh=await adjustStock('assembly',asm,qty2,{reason:'Return \u2014 '+reason+' (order '+orderNum+')',source:'return'});
+        if(newOh!==null)results.push('+'+qty2+' '+pn);
       } else if(prt){
-        const prev=prt.total_unpckgd||0;const newOh=prev+qty2;
-        await db.from('parts').update({total_unpckgd:newOh,updated_at:new Date().toISOString()}).eq('id',prt.id);
-        S.parts=S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newOh}:p);
-        await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newOh,adjustment:qty2,reason:'Return — '+reason+' (order '+orderNum+')',user_email:S.currentUser||null,source:'return'});
-        cascadeShopifySync(pn);
-        results.push('+'+qty2+' '+pn);
+        const newOh=await adjustStock('part',prt,qty2,{reason:'Return \u2014 '+reason+' (order '+orderNum+')',source:'return'});
+        if(newOh!==null)results.push('+'+qty2+' '+pn);
       }
     }
     const _newStatus=condition==='PreERP'?l.fulfillment_status||'Delivered':'Returned';
@@ -3596,31 +3582,17 @@ async function unshipLine(saleId, pn, qty){
   const undoOps=[];
 
   if(asm){
-    const prev=asm.total_on_hand||0;
-    const newOh=prev+qty;
-    undoOps.push({action:'update',table:'assemblies',data:{...asm,total_on_hand:newOh},prev:{...asm}});
-    await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
-    S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
-    const{data:corr}=await db.from('inv_corrections').insert({
-      pn,previous_qty:prev,new_qty:newOh,adjustment:qty,
-      reason:`Un-ship — order ${line.order_number||saleId} reverted to ${targetStatus}`,
-      user_email:S.currentUser||null,source:'unship'
-    }).select().single();
+    undoOps.push({action:'update',table:'assemblies',data:{...asm,total_on_hand:(asm.total_on_hand||0)+qty},prev:{...asm}});
+    const newOh=await adjustStock('assembly',asm,qty,{reason:'Un-ship \u2014 order '+(line.order_number||saleId)+' reverted to '+targetStatus,source:'unship',skipSync:true});
+    const corr=adjustStock.lastCorrection;
     if(corr){S.corrections=[corr,...S.corrections];undoOps.push({action:'insert',table:'inv_corrections',data:corr});}
-    syncShopifyTemplate(pn,newOh);
+    if(newOh!==null)syncShopifyTemplate(pn,newOh);
   } else if(prt){
-    const prev=prt.total_unpckgd||0;
-    const newQty=prev+qty;
-    undoOps.push({action:'update',table:'parts',data:{...prt,total_unpckgd:newQty},prev:{...prt}});
-    await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',prt.id);
-    S.parts=S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
-    const{data:corr}=await db.from('inv_corrections').insert({
-      pn,previous_qty:prev,new_qty:newQty,adjustment:qty,
-      reason:`Un-ship — order ${line.order_number||saleId} reverted to ${targetStatus}`,
-      user_email:S.currentUser||null,source:'unship'
-    }).select().single();
+    undoOps.push({action:'update',table:'parts',data:{...prt,total_unpckgd:(prt.total_unpckgd||0)+qty},prev:{...prt}});
+    const newQty=await adjustStock('part',prt,qty,{reason:'Un-ship \u2014 order '+(line.order_number||saleId)+' reverted to '+targetStatus,source:'unship',skipSync:true});
+    const corr=adjustStock.lastCorrection;
     if(corr){S.corrections=[corr,...S.corrections];undoOps.push({action:'insert',table:'inv_corrections',data:corr});}
-    cascadeShopifySync(pn);
+    if(newQty!==null)cascadeShopifySync(pn);
   }
 
   undoOps.push({action:'update',table:'sales',
@@ -3830,21 +3802,11 @@ async function submitShipment(saleId,pn,qty){
   const _shipChk=S.sales.find(s=>s.id===saleId);
   if(_shipChk&&['Shipped','Delivered','Cancelled','Refunded'].includes(_shipChk.fulfillment_status||'Open')){toast(pn+' is already '+_shipChk.fulfillment_status+' — not shipping/deducting again');return;}
   if(asm){
-    const prev=asm.total_on_hand||0;
-    const newOh=prev-qty; // may go negative = backorder
-    await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
-    S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:newOh}:a);
-    await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newOh,adjustment:-qty,reason:'Shipped order'+(tracking?' — '+tracking:''),user_email:S.currentUser||null,source:'shipment'});
-    S.corrections=[{pn,previous_qty:prev,new_qty:newOh,adjustment:-qty,reason:'Shipped order',source:'shipment',created_at:new Date().toISOString()},...S.corrections];
-    syncShopifyTemplate(pn,newOh);
+    await adjustStock('assembly',asm,-qty,{reason:'Shipped order'+(tracking?' \u2014 '+tracking:''),source:'shipment'}); // may go negative = backorder
+    if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
   } else if(prt){
-    const prev=prt.total_unpckgd||0;
-    const newQty=prev-qty; // directly-sold part — same deduction logic as an assembly, just a different table
-    await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',prt.id);
-    S.parts=S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
-    await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newQty,adjustment:-qty,reason:'Shipped order'+(tracking?' — '+tracking:''),user_email:S.currentUser||null,source:'shipment'});
-    S.corrections=[{pn,previous_qty:prev,new_qty:newQty,adjustment:-qty,reason:'Shipped order',source:'shipment',created_at:new Date().toISOString()},...S.corrections];
-    cascadeShopifySync(pn);
+    await adjustStock('part',prt,-qty,{reason:'Shipped order'+(tracking?' \u2014 '+tracking:''),source:'shipment'}); // directly-sold part \u2014 same deduction, different table
+    if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
   }
   const preSale=S.sales.find(s=>s.id===saleId);
   await db.from('sales').update({fulfillment_status:'Shipped',tracking_number:tracking,carrier,shipped_at:new Date().toISOString()}).eq('id',saleId);
@@ -7674,17 +7636,9 @@ async function ssManualSync(orderNum,tracking,carrier){
     const _msAsm=findAsm(sale.pn);
     const _msPrt=_msAsm?null:((S._partIdx&&S._partIdx[sale.pn])||S.parts.find(p=>p.pn===sale.pn||(p.new_sku&&p.new_sku===sale.pn)));
     if(_msAsm){
-      const newOh=(_msAsm.total_on_hand||0)-(sale.qty||1); // allow negative = backorder
-      await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',_msAsm.id);
-      S.assemblies=S.assemblies.map(a=>a.id===_msAsm.id?{...a,total_on_hand:newOh}:a);
-      await db.from('inv_corrections').insert({pn:sale.pn,previous_qty:_msAsm.total_on_hand||0,new_qty:newOh,adjustment:-(sale.qty||1),reason:'Manual ship — order '+orderNum+' tracking '+tracking,user_email:S.currentUser||null,source:'shipment'});
-      syncShopifyTemplate(sale.pn,newOh);
+      await adjustStock('assembly',_msAsm,-(sale.qty||1),{reason:'Manual ship \u2014 order '+orderNum+' tracking '+tracking,source:'shipment'}); // allow negative = backorder
     } else if(_msPrt){
-      const newQty=(_msPrt.total_unpckgd||0)-(sale.qty||1); // directly-sold part — same deduction, different table
-      await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',_msPrt.id);
-      S.parts=S.parts.map(p=>p.id===_msPrt.id?{...p,total_unpckgd:newQty}:p);
-      await db.from('inv_corrections').insert({pn:sale.pn,previous_qty:_msPrt.total_unpckgd||0,new_qty:newQty,adjustment:-(sale.qty||1),reason:'Manual ship — order '+orderNum+' tracking '+tracking,user_email:S.currentUser||null,source:'shipment'});
-      cascadeShopifySync(sale.pn);
+      await adjustStock('part',_msPrt,-(sale.qty||1),{reason:'Manual ship \u2014 order '+orderNum+' tracking '+tracking,source:'shipment'});
     }
     }
   }
@@ -9573,7 +9527,7 @@ async function submitSale(){
     var ins=await db.from('sales').insert(Object.assign({},base,{pn:it.pn,qty:it.qty})).select().single();
     if(ins.error){ toast('Error: '+ins.error.message); return; }
     S.sales=[ins.data,...S.sales];
-    try{ if(it.type==='assembly'){ var asm2=S.assemblies.find(function(a){return a.pn===it.pn;}); if(asm2){ var newOh=(asm2.total_on_hand||0)-it.qty; await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm2.id); S.assemblies=S.assemblies.map(function(x){return x.pn===it.pn?Object.assign({},x,{total_on_hand:newOh}):x;}); await db.from('inv_corrections').insert({pn:it.pn,previous_qty:asm2.total_on_hand||0,new_qty:newOh,adjustment:-it.qty,reason:'Manual ERP order '+orderNum,created_at:new Date().toISOString()}); } } else { var prt=S.parts.find(function(p){return p.pn===it.pn;}); if(prt){ var newQ=(prt.total_unpckgd||0)-it.qty; await db.from('parts').update({total_unpckgd:newQ,updated_at:new Date().toISOString()}).eq('id',prt.id); S.parts=S.parts.map(function(x){return x.pn===it.pn?Object.assign({},x,{total_unpckgd:newQ}):x;}); await db.from('inv_corrections').insert({pn:it.pn,previous_qty:prt.total_unpckgd||0,new_qty:newQ,adjustment:-it.qty,reason:'Manual ERP order '+orderNum,created_at:new Date().toISOString()}); } } }catch(_e){ console.warn('deduct failed',_e); }
+    try{ if(it.type==='assembly'){ var asm2=S.assemblies.find(function(a){return a.pn===it.pn;}); if(asm2){ await adjustStock('assembly',asm2,-it.qty,{reason:'Manual ERP order '+orderNum,source:'manual',skipSync:true}); } } else { var prt=S.parts.find(function(p){return p.pn===it.pn;}); if(prt){ await adjustStock('part',prt,-it.qty,{reason:'Manual ERP order '+orderNum,source:'manual',skipSync:true}); } } }catch(_e){ console.warn('deduct failed',_e); }
   }
   try{ if(typeof lockOrderFromSync==='function') await lockOrderFromSync(orderNum); }catch(_e){}
   closeModal(); render();
@@ -10371,7 +10325,7 @@ async function submitManualSale(){
   }).select().single();
   if(error){toast('Error: '+error.message);return;}
   S.sales=[data,...S.sales];
-  try{ var _asm=S.assemblies.find(function(a){return a.pn===pn;}); if(_asm){ var _newOh=(_asm.total_on_hand||0)-qty; await db.from('assemblies').update({total_on_hand:_newOh,updated_at:new Date().toISOString()}).eq('id',_asm.id); S.assemblies=S.assemblies.map(function(x){return x.pn===pn?Object.assign({},x,{total_on_hand:_newOh}):x;}); await db.from('inv_corrections').insert({pn:pn,previous_qty:_asm.total_on_hand||0,new_qty:_newOh,adjustment:-qty,reason:'Manual ERP order '+orderNum,created_at:new Date().toISOString()}); } }catch(_e){ console.warn('manual order deduct failed',_e); }
+  try{ var _asm=S.assemblies.find(function(a){return a.pn===pn;}); if(_asm){ await adjustStock('assembly',_asm,-qty,{reason:'Manual ERP order '+orderNum,source:'manual',skipSync:true}); } }catch(_e){ console.warn('manual order deduct failed',_e); }
   try{ if(typeof lockOrderFromSync==='function') await lockOrderFromSync(orderNum); }catch(_e){}
   closeModal();
   toast('Order '+orderNum+' created'+(createSS?' — creating in ShipStation…':''));
@@ -18233,9 +18187,10 @@ async function adjustStock(kind, rec, delta, meta){
   if(isAsm) S.assemblies=S.assemblies.map(function(x){return x.id===rec.id?Object.assign({},x,{total_on_hand:newQty}):x;});
   else S.parts=S.parts.map(function(x){return x.id===rec.id?Object.assign({},x,{total_unpckgd:newQty}):x;});
   meta=meta||{};
-  await dbq(db.from('inv_corrections').insert({pn:rec.pn, previous_qty:prevQty, new_qty:newQty, adjustment:delta,
+  var _ins=await dbq(db.from('inv_corrections').insert({pn:rec.pn, previous_qty:prevQty, new_qty:newQty, adjustment:delta,
     reason:meta.reason||'', user_email:meta.user_email||S.currentUser||null, source:meta.source||'manual',
-    reference_id:meta.reference_id||null}), 'adjustStock:audit');
+    reference_id:meta.reference_id||null}).select().single(), 'adjustStock:audit');
+  adjustStock.lastCorrection=(_ins&&!_ins.error&&_ins.data)?_ins.data:null;
   if(!meta.skipSync){ try{ if(isAsm) syncShopifyTemplate(rec.pn,newQty); else cascadeShopifySync(rec.pn); }catch(_){}}
   return newQty;
 }
@@ -22065,27 +22020,11 @@ async function processReturn(saleId,action){
       var prt=asm?null:S.parts.find(function(p){return p.pn===pn||(p.new_sku&&p.new_sku===pn);});
       var invOk=false;
       if(asm){
-        var prev=asm.total_on_hand||0;var noh=prev+qty;
-        var ra=await db.from('assemblies').update({total_on_hand:noh,updated_at:new Date().toISOString()}).eq('id',asm.id);
-        if(!ra.error){
-          S.assemblies=S.assemblies.map(function(a){return a.id===asm.id?Object.assign({},a,{total_on_hand:noh}):a;});
-          await db.from('inv_corrections').insert({pn:pn,previous_qty:prev,new_qty:noh,adjustment:qty,
-            reason:'Return to stock \u2014 order '+orderNum+(notes?' \u2014 '+notes:''),
-            user_email:S.currentUser||null,source:'return'});
-          syncShopifyTemplate(pn,noh);
-          invOk=true;results.push('+'+qty+' '+pn);
-        }else errors.push(pn+': '+ra.error.message);
+        var noh=await adjustStock('assembly',asm,qty,{reason:'Return to stock \u2014 order '+orderNum+(notes?' \u2014 '+notes:''),source:'return'});
+        if(noh!==null){invOk=true;results.push('+'+qty+' '+pn);}else errors.push(pn+': stock update failed');
       }else if(prt){
-        var prev2=prt.total_unpckgd||0;var noh2=prev2+qty;
-        var rb=await db.from('parts').update({total_unpckgd:noh2,updated_at:new Date().toISOString()}).eq('id',prt.id);
-        if(!rb.error){
-          S.parts=S.parts.map(function(p){return p.id===prt.id?Object.assign({},p,{total_unpckgd:noh2}):p;});
-          await db.from('inv_corrections').insert({pn:pn,previous_qty:prev2,new_qty:noh2,adjustment:qty,
-            reason:'Return to stock \u2014 order '+orderNum+(notes?' \u2014 '+notes:''),
-            user_email:S.currentUser||null,source:'return'});
-          cascadeShopifySync(pn);
-          invOk=true;results.push('+'+qty+' '+pn);
-        }else errors.push(pn+': '+rb.error.message);
+        var noh2=await adjustStock('part',prt,qty,{reason:'Return to stock \u2014 order '+orderNum+(notes?' \u2014 '+notes:''),source:'return'});
+        if(noh2!==null){invOk=true;results.push('+'+qty+' '+pn);}else errors.push(pn+': stock update failed');
       }
       if(invOk||!asm&&!prt){
         await db.from('sales').update({return_status:'returned',updated_at:new Date().toISOString()}).eq('id',line.id);
@@ -22535,27 +22474,11 @@ async function reverseReturn(saleId){
       var asm=findAsm(pn); // [FIX B] new_sku-aware (line.pn may be a new_sku)
       var prt=asm?null:S.parts.find(function(p){return p.pn===pn||(p.new_sku&&p.new_sku===pn);});
       if(asm){
-        var prev=asm.total_on_hand||0;
-        var newOh=prev-qty; // allow negative — same backorder convention used everywhere else; clamping to 0 here would silently hide a genuine deficit if the returned units were already consumed again
-        var r=await db.from('assemblies').update({total_on_hand:newOh,updated_at:new Date().toISOString()}).eq('id',asm.id);
-        if(!r.error){
-          S.assemblies=S.assemblies.map(function(a){return a.id===asm.id?Object.assign({},a,{total_on_hand:newOh}):a;});
-          await db.from('inv_corrections').insert({pn:pn,previous_qty:prev,new_qty:newOh,adjustment:-qty,
-            reason:'Reversed return — order '+orderNum,user_email:S.currentUser||null,source:'reverse_return'});
-          syncShopifyTemplate(pn,newOh);
-          results.push('-'+qty+' '+pn+' (reversed)');
-        } else errors.push(pn+': '+r.error.message);
+        var newOh=await adjustStock('assembly',asm,-qty,{reason:'Reversed return \u2014 order '+orderNum,source:'reverse_return'}); // allow negative \u2014 backorder convention
+        if(newOh!==null)results.push('-'+qty+' '+pn+' (reversed)');else errors.push(pn+': stock update failed');
       } else if(prt){
-        var prev2=prt.total_unpckgd||0;
-        var newOh2=prev2-qty; // allow negative — see note above
-        var r2=await db.from('parts').update({total_unpckgd:newOh2,updated_at:new Date().toISOString()}).eq('id',prt.id);
-        if(!r2.error){
-          S.parts=S.parts.map(function(p){return p.id===prt.id?Object.assign({},p,{total_unpckgd:newOh2}):p;});
-          await db.from('inv_corrections').insert({pn:pn,previous_qty:prev2,new_qty:newOh2,adjustment:-qty,
-            reason:'Reversed return — order '+orderNum,user_email:S.currentUser||null,source:'reverse_return'});
-          cascadeShopifySync(pn);
-          results.push('-'+qty+' '+pn+' (reversed)');
-        } else errors.push(pn+': '+r2.error.message);
+        var newOh2=await adjustStock('part',prt,-qty,{reason:'Reversed return \u2014 order '+orderNum,source:'reverse_return'});
+        if(newOh2!==null)results.push('-'+qty+' '+pn+' (reversed)');else errors.push(pn+': stock update failed');
       }
     }
 
