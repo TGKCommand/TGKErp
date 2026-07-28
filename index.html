@@ -242,7 +242,7 @@
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.66</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.67</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -305,7 +305,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.66';
+const TGK_ERP_VERSION = 'v20.67';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -16565,6 +16565,45 @@ function renderDataIntegrity(){
   `;
 }
 
+/* [STAGE7] Ledger-based integrity helpers (v20.67) — pure functions so they are testable in isolation. */
+function _diLedgerDrift(corrRows){
+  // For each SKU, the NEWEST correction's new_qty must equal current on-hand. Any gap means stock
+  // changed without writing a ledger row since that correction (bypass or pre-RPC race) = real drift.
+  var newest={};
+  (corrRows||[]).forEach(function(c){ if(!c.pn)return; if(!newest[c.pn])newest[c.pn]=c; }); // rows arrive newest-first
+  var out=[];
+  Object.keys(newest).forEach(function(pn){
+    var c=newest[pn];
+    var it=_canonItem(pn); if(!it)return; // orphaned SKUs are covered by the orphan check
+    var isAsm=!!(S._asmIdx&&S._asmIdx[it.pn])||S.assemblies.some(function(a){return a.pn===it.pn;});
+    var actual=isAsm?(it.total_on_hand||0):(it.total_unpckgd||0);
+    var ledger=Number(c.new_qty);
+    if(isFinite(ledger)&&ledger!==actual)out.push({pn:it.pn,ledger:ledger,actual:actual,delta:actual-ledger,lastAt:c.created_at});
+  });
+  return out.sort(function(a,b){return Math.abs(b.delta)-Math.abs(a.delta);});
+}
+function _diNegativeStock(){
+  var out=[];
+  S.parts.forEach(function(p){ if((p.total_unpckgd||0)<0)out.push({pn:p.pn,type:'part',qty:p.total_unpckgd||0,disc:!!p.discontinued}); });
+  S.assemblies.forEach(function(a){ if((a.total_on_hand||0)<0)out.push({pn:a.pn,type:'assembly',qty:a.total_on_hand||0,disc:!!a.discontinued}); });
+  return out.sort(function(a,b){return a.qty-b.qty;});
+}
+function _diBomResolution(){
+  // Flag BOM lines whose child_pn is not the canonical .pn: 'fallback' = resolves only via
+  // new_sku/case tolerance (works today, but the recurring bug source), 'unresolved' = broken line.
+  var out=[];
+  Object.keys(S.boms||{}).forEach(function(parent){
+    (S.boms[parent]||[]).forEach(function(l){
+      var cp=l.child_pn; if(!cp)return;
+      var exact=S.parts.some(function(p){return p.pn===cp;})||S.assemblies.some(function(a){return a.pn===cp;});
+      if(exact)return;
+      var it=_canonItem(cp);
+      out.push({parent:parent,child:cp,status:it?'fallback':'unresolved',canonical:it?it.pn:null});
+    });
+  });
+  return out.sort(function(a,b){return (a.status==='unresolved'?0:1)-(b.status==='unresolved'?0:1)||(a.parent<b.parent?-1:1);});
+}
+
 async function runDataIntegrityChecks(){
   S._diLoading=true;render();
   const results={};
@@ -16633,6 +16672,17 @@ async function runDataIntegrityChecks(){
       if(_it){ if(!_nonCanon[sl.pn])_nonCanon[sl.pn]={count:0,canonical:_it.pn}; _nonCanon[sl.pn].count++; }
     });
     results.nonCanonicalSales=Object.entries(_nonCanon).map(function(e){return {pn:e[0],count:e[1].count,canonical:e[1].canonical};});
+
+    // CHECK 7: Ledger drift — newest correction per SKU (last 30 days) vs actual on-hand.
+    const _driftSince=new Date(Date.now()-30*24*3600*1000).toISOString();
+    const{data:_driftRows}=await db.from('inv_corrections').select('pn,new_qty,created_at').gte('created_at',_driftSince).order('created_at',{ascending:false}).limit(4000);
+    results.ledgerDrift=_diLedgerDrift(_driftRows||[]);
+
+    // CHECK 8: Negative on-hand — legitimate as a transient backorder signal, but each one deserves eyes.
+    results.negativeStock=_diNegativeStock();
+
+    // CHECK 9: BOM lines not referencing the canonical part number.
+    results.bomResolution=_diBomResolution();
     results.ranAt=new Date().toISOString();
   }catch(e){
     toast('⚠ Data integrity check failed: '+e.message,6000);
@@ -16669,6 +16719,9 @@ function renderDIResults(r){
   ${section('Orders With No Progress (14+ Days)',r.staleOrders,d=>`<div class="check-row"><span style="font-family:var(--mono);font-size:11px">${escHtml(d.order_number||'')}</span><span style="flex:1;font-size:11px;color:var(--text2)">${escHtml(d.pn||'')}</span><span class="pill pill-yellow" style="font-size:9px">${escHtml(d.fulfillment_status)} since ${new Date(d.updated_at).toLocaleDateString()}</span></div>`,'No open/packed/partial orders have gone 14+ days without an update.')}
   ${section('Orphaned Sync Log Entries',r.orphanedSyncEntries,pn=>`<div class="check-row"><span style="font-family:var(--mono);font-size:11px;color:var(--text3)">${escHtml(pn)}</span><span style="flex:1;font-size:11px;color:var(--text3)">No matching current part or assembly</span></div>`,'Every SKU in the recent sync log matches a real, current part or assembly.')}
   ${section('Sales Stored Under a Non-Canonical SKU',r.nonCanonicalSales||[],d=>`<div class="check-row" onclick="inspectSku('${escHtml(d.pn)}')" style="cursor:pointer"><span style="font-family:var(--mono);font-size:11px;color:var(--text2)">${escHtml(d.pn)}</span><span style="flex:1;font-size:11px;color:var(--text3)">${d.count} sale line${d.count!==1?'s':''} &mdash; canonical is ${escHtml(d.canonical)}</span><span class="pill pill-yellow" style="font-size:9px">non-canonical</span></div>`,'Every sale line references its item by canonical part number.')}
+  ${section('Ledger Drift (corrections vs actual stock)',r.ledgerDrift||[],d=>`<div class="check-row" onclick="inspectSku('${escHtml(d.pn)}')" style="cursor:pointer"><span style="font-family:var(--mono);font-size:11px;color:var(--teal)">${escHtml(d.pn)}</span><span style="flex:1;font-size:11px;color:var(--text2)">ledger says ${d.ledger}, actual ${d.actual}</span><span class="pill pill-red" style="font-size:9px">${d.delta>0?'+':''}${d.delta} unexplained</span></div>`,'Every SKU with recent corrections matches its ledger exactly — no stock has changed outside the audit trail in the last 30 days.')}
+  ${section('Negative On-Hand',r.negativeStock||[],d=>`<div class="check-row" onclick="inspectSku('${escHtml(d.pn)}')" style="cursor:pointer"><span style="font-family:var(--mono);font-size:11px;color:var(--text2)">${escHtml(d.pn)}</span><span style="flex:1;font-size:11px;color:var(--text3)">${d.type}${d.disc?' &middot; discontinued':''}</span><span class="pill pill-red" style="font-size:9px">${d.qty} on hand</span></div>`,'No parts or assemblies are currently negative.')}
+  ${section('BOM Lines Not on Canonical SKU',r.bomResolution||[],d=>`<div class="check-row"><span style="font-family:var(--mono);font-size:11px;color:var(--text2)">${escHtml(d.parent)}</span><span style="flex:1;font-size:11px;color:var(--text3)">child ${escHtml(d.child)}${d.canonical?' &mdash; canonical is '+escHtml(d.canonical):''}</span><span class="pill ${d.status==='unresolved'?'pill-red':'pill-yellow'}" style="font-size:9px">${d.status}</span></div>`,'Every BOM line references its component by exact canonical part number.')}
   `;
 }
 // ===================== v19.8: SKU inspector + integrity repairs =====================
