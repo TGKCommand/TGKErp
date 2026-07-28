@@ -242,7 +242,7 @@
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.63</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.64</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -305,7 +305,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.63';
+const TGK_ERP_VERSION = 'v20.64';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -13933,13 +13933,9 @@ async function savePlanField(id, field, value, pn) {
 
 async function quickAdjustStock(partId,pn,delta){
   const part=S.parts.find(p=>p.id===partId);if(!part)return;
-  const prev=part.total_unpckgd||0;const newQty=prev+delta;
-  const{error}=await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',partId);
-  if(error){toast('Error: '+error.message);return;}
-  await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newQty,adjustment:delta,reason:'Quick adjust (±1)',user_email:S.currentUser||null,source:'quick_adjust'});
-  S.parts=S.parts.map(p=>p.id===partId?{...p,total_unpckgd:newQty}:p);
-  cascadeShopifySync(pn); // a manual top-up can make a dependent finished good buildable again — re-check its backorder flag
-  pushUndo('update','parts',{...part,total_unpckgd:newQty},part,(delta>0?'+':'')+delta+'× '+pn);
+  const newQty=await adjustStock('part',part,delta,{reason:'Quick adjust (\u00b11)',source:'quick_adjust'}); // adjustStock cascades \u2014 re-checks dependent backorder flags
+  if(newQty===null)return;
+  pushUndo('update','parts',{...part,total_unpckgd:newQty},part,(delta>0?'+':'')+delta+'\u00d7 '+pn);
   render();
 }
 
@@ -14449,34 +14445,24 @@ async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
 
   const part = S.parts.find(p=>p.pn===pn);
   if(part){
-    const newQty = (part.total_unpckgd||0) + qty;
-    undoOps.push({action:'update',table:'parts',data:{...part,total_unpckgd:newQty},prev:{...part}});
-    await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
-    S.parts = S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
     const po=S.purchases.find(p=>p.id===poId);
     const poRef=po?(' ['+po.vendor+(po.order_date?' '+po.order_date:'')+']'):'';
-    const reason='PO Receipt'+poRef+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial — '+remaining+' outstanding)':'')+(note?' — '+note:'');
-    const {data:corrRow}=await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,user_email:S.currentUser||null,source:'po_receipt'}).select().single();
-    if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
-    S.corrections = [{pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason,source:'po_receipt',created_at:new Date().toISOString()},...S.corrections];
-    syncShopifyTemplate(pn,newQty);
-    cascadeShopifySync(pn);
+    const reason='PO Receipt'+poRef+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial \u2014 '+remaining+' outstanding)':'')+(note?' \u2014 '+note:'');
+    undoOps.push({action:'update',table:'parts',data:{...part,total_unpckgd:(part.total_unpckgd||0)+qty},prev:{...part}});
+    const newQty=await adjustStock('part',part,qty,{reason:reason,source:'po_receipt',skipSync:true});
+    if(adjustStock.lastCorrection){undoOps.push({action:'insert',table:'inv_corrections',data:adjustStock.lastCorrection});S.corrections=[adjustStock.lastCorrection,...S.corrections];}
+    if(newQty!==null){syncShopifyTemplate(pn,newQty);cascadeShopifySync(pn);}
   } else {
     // [FIX E] Assembly received on a PO. Receiving was parts-only, so buying a finished sub-assembly
     // from a vendor updated PO status but never added to total_on_hand.
     const _rasm=findAsm(pn);
     if(_rasm){
-      const _newOh=(_rasm.total_on_hand||0)+qty;
-      undoOps.push({action:'update',table:'assemblies',data:{..._rasm,total_on_hand:_newOh},prev:{..._rasm}});
-      await db.from('assemblies').update({total_on_hand:_newOh,updated_at:new Date().toISOString()}).eq('id',_rasm.id);
-      S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:_newOh}:a);
       const _po=S.purchases.find(p=>p.id===poId);
       const _poRef=_po?(' ['+_po.vendor+(_po.order_date?' '+_po.order_date:'')+']'):'';
-      const _reason='PO Receipt'+_poRef+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial — '+remaining+' outstanding)':'')+(note?' — '+note:'');
-      const {data:_corrA}=await db.from('inv_corrections').insert({pn,previous_qty:_rasm.total_on_hand||0,new_qty:_newOh,adjustment:qty,reason:_reason,user_email:S.currentUser||null,source:'po_receipt'}).select().single();
-      if(_corrA)undoOps.push({action:'insert',table:'inv_corrections',data:_corrA});
-      S.corrections=[{pn,previous_qty:_rasm.total_on_hand||0,new_qty:_newOh,adjustment:qty,reason:_reason,source:'po_receipt',created_at:new Date().toISOString()},...S.corrections];
-      syncShopifyTemplate(pn,_newOh);
+      const _reason='PO Receipt'+_poRef+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial \u2014 '+remaining+' outstanding)':'')+(note?' \u2014 '+note:'');
+      undoOps.push({action:'update',table:'assemblies',data:{..._rasm,total_on_hand:(_rasm.total_on_hand||0)+qty},prev:{..._rasm}});
+      await adjustStock('assembly',_rasm,qty,{reason:_reason,source:'po_receipt'});
+      if(adjustStock.lastCorrection){undoOps.push({action:'insert',table:'inv_corrections',data:adjustStock.lastCorrection});S.corrections=[adjustStock.lastCorrection,...S.corrections];}
     }
   }
 
@@ -14514,21 +14500,13 @@ async function closeShortBackorder(lineId, poId, pn, qtyOrdered, qtyAlreadyRecei
   if(recvNow>0){
     const part=S.parts.find(p=>p.pn===pn);
     if(part){
-      const newQty=(part.total_unpckgd||0)+recvNow;
-      await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
-      S.parts=S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
-      await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:recvNow,reason:'PO Receipt (closed short, '+remaining+' backordered)',user_email:S.currentUser||null,source:'po_receipt'});
-      syncShopifyTemplate(pn,newQty);
-      cascadeShopifySync(pn);
+      const newQty=await adjustStock('part',part,recvNow,{reason:'PO Receipt (closed short, '+remaining+' backordered)',source:'po_receipt',skipSync:true});
+      if(newQty!==null){syncShopifyTemplate(pn,newQty);cascadeShopifySync(pn);}
     } else {
       // [FIX E] assembly received on a closed-short PO line
       const _rasm=findAsm(pn);
       if(_rasm){
-        const _newOh=(_rasm.total_on_hand||0)+recvNow;
-        await db.from('assemblies').update({total_on_hand:_newOh,updated_at:new Date().toISOString()}).eq('id',_rasm.id);
-        S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:_newOh}:a);
-        await db.from('inv_corrections').insert({pn,previous_qty:_rasm.total_on_hand||0,new_qty:_newOh,adjustment:recvNow,reason:'PO Receipt (closed short, '+remaining+' backordered)',user_email:S.currentUser||null,source:'po_receipt'});
-        syncShopifyTemplate(pn,_newOh);
+        await adjustStock('assembly',_rasm,recvNow,{reason:'PO Receipt (closed short, '+remaining+' backordered)',source:'po_receipt'});
       }
     }
   }
@@ -14574,25 +14552,17 @@ async function unreceiveLine(lineId, poId){
   const undoOps=[];
   const part=S.parts.find(p=>p.pn===line.pn);
   if(part){
-    const newQty=(part.total_unpckgd||0)-line.qty_received;
-    undoOps.push({action:'update',table:'parts',data:{...part,total_unpckgd:newQty},prev:{...part}});
-    await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
-    S.parts=S.parts.map(p=>p.pn===line.pn?{...p,total_unpckgd:newQty}:p);
-    const {data:corrRow}=await db.from('inv_corrections').insert({pn:line.pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:-line.qty_received,reason:'Receipt reversed (received in error)',user_email:S.currentUser||null,source:'po_receipt'}).select().single();
-    if(corrRow)undoOps.push({action:'insert',table:'inv_corrections',data:corrRow});
-    syncShopifyTemplate(line.pn,newQty);
-    cascadeShopifySync(line.pn);
+    undoOps.push({action:'update',table:'parts',data:{...part,total_unpckgd:(part.total_unpckgd||0)-line.qty_received},prev:{...part}});
+    const newQty=await adjustStock('part',part,-line.qty_received,{reason:'Receipt reversed (received in error)',source:'po_receipt',skipSync:true});
+    if(adjustStock.lastCorrection)undoOps.push({action:'insert',table:'inv_corrections',data:adjustStock.lastCorrection});
+    if(newQty!==null){syncShopifyTemplate(line.pn,newQty);cascadeShopifySync(line.pn);}
   } else {
     // [FIX E] reverse an assembly receipt
     const _rasm=findAsm(line.pn);
     if(_rasm){
-      const _newOh=(_rasm.total_on_hand||0)-line.qty_received;
-      undoOps.push({action:'update',table:'assemblies',data:{..._rasm,total_on_hand:_newOh},prev:{..._rasm}});
-      await db.from('assemblies').update({total_on_hand:_newOh,updated_at:new Date().toISOString()}).eq('id',_rasm.id);
-      S.assemblies=S.assemblies.map(a=>a.pn===line.pn?{...a,total_on_hand:_newOh}:a);
-      const {data:_corrA}=await db.from('inv_corrections').insert({pn:line.pn,previous_qty:_rasm.total_on_hand||0,new_qty:_newOh,adjustment:-line.qty_received,reason:'Receipt reversed (received in error)',user_email:S.currentUser||null,source:'po_receipt'}).select().single();
-      if(_corrA)undoOps.push({action:'insert',table:'inv_corrections',data:_corrA});
-      syncShopifyTemplate(line.pn,_newOh);
+      undoOps.push({action:'update',table:'assemblies',data:{..._rasm,total_on_hand:(_rasm.total_on_hand||0)-line.qty_received},prev:{..._rasm}});
+      await adjustStock('assembly',_rasm,-line.qty_received,{reason:'Receipt reversed (received in error)',source:'po_receipt'});
+      if(adjustStock.lastCorrection)undoOps.push({action:'insert',table:'inv_corrections',data:adjustStock.lastCorrection});
     }
   }
   undoOps.push({action:'update',table:'po_lines',data:{id:lineId},prev:{...stripMeta(line)}});
@@ -14615,25 +14585,17 @@ async function checkInLineQuick(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived
   await db.from('po_lines').update({qty_received:newReceived,status:'Complete',updated_at:new Date().toISOString()}).eq('id',lineId);
   const part = S.parts.find(p=>p.pn===pn);
   if(part){
-    const newQty = (part.total_unpckgd||0)+qty;
-    await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
-    S.parts=S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
     const po=S.purchases.find(p=>p.id===poId);
     const poRef=po?(' ['+po.vendor+(po.order_date?' '+po.order_date:'')+']'):'';
-    await db.from('inv_corrections').insert({pn,previous_qty:part.total_unpckgd||0,new_qty:newQty,adjustment:qty,reason:'PO Receipt — Bulk'+poRef,user_email:S.currentUser||null,source:'po_receipt'});
-    syncShopifyTemplate(pn,newQty);
-    cascadeShopifySync(pn);
+    const newQty=await adjustStock('part',part,qty,{reason:'PO Receipt \u2014 Bulk'+poRef,source:'po_receipt',skipSync:true});
+    if(newQty!==null){syncShopifyTemplate(pn,newQty);cascadeShopifySync(pn);}
   } else {
     // [FIX E] assembly received via bulk receive-all
     const _rasm=findAsm(pn);
     if(_rasm){
-      const _newOh=(_rasm.total_on_hand||0)+qty;
-      await db.from('assemblies').update({total_on_hand:_newOh,updated_at:new Date().toISOString()}).eq('id',_rasm.id);
-      S.assemblies=S.assemblies.map(a=>a.pn===pn?{...a,total_on_hand:_newOh}:a);
       const _po=S.purchases.find(p=>p.id===poId);
       const _poRef=_po?(' ['+_po.vendor+(_po.order_date?' '+_po.order_date:'')+']'):'';
-      await db.from('inv_corrections').insert({pn,previous_qty:_rasm.total_on_hand||0,new_qty:_newOh,adjustment:qty,reason:'PO Receipt — Bulk'+_poRef,user_email:S.currentUser||null,source:'po_receipt'});
-      syncShopifyTemplate(pn,_newOh);
+      await adjustStock('assembly',_rasm,qty,{reason:'PO Receipt \u2014 Bulk'+_poRef,source:'po_receipt'});
     }
   }
   if(S.poLines[poId]) S.poLines[poId]=S.poLines[poId].map(l=>l.id===lineId?{...l,qty_received:newReceived,status:'Complete'}:l);
