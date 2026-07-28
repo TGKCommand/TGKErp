@@ -242,7 +242,7 @@
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.64</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.65</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -305,7 +305,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.64';
+const TGK_ERP_VERSION = 'v20.65';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -16040,10 +16040,13 @@ async function applySpotCount(){
   if(p){
     const prev=p.total_unpckgd||0;
     const adj=newQty-prev;
-    await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',p.id);
-    S.parts=S.parts.map(x=>x.pn===p.pn?{...x,total_unpckgd:newQty}:x);
-    await db.from('inv_corrections').insert({pn:p.pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason,user_email:S.currentUser||null,source:'spot_count'});
-    S.corrections=[{pn:p.pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason,source:'spot_count',created_at:new Date().toISOString()},...S.corrections];
+    if(adj===0){
+      await dbq(db.from('inv_corrections').insert({pn:p.pn,previous_qty:prev,new_qty:newQty,adjustment:0,reason,user_email:S.currentUser||null,source:'spot_count'}),'spotCount:nochange');
+    } else {
+      const _nq=await adjustStock('part',p,adj,{reason:reason,source:'spot_count',skipSync:true});
+      if(_nq===null)return;
+      if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
+    }
     const histEl=document.getElementById('spot-history');
     if(histEl){histEl.innerHTML=`<div class="panel" style="padding:10px 14px;border-left:3px solid ${adj===0?'var(--teal)':adj>0?'var(--green)':'var(--red)'}"><div style="font-size:12px;font-weight:600">${escHtml(p.pn||"")} — ${adj===0?'No change':adj>0?'+'+adj+' added':adj+' removed'}</div><div class="t3s">${prev} → ${newQty} · ${escHtml(reason||"")}</div></div>`;}
     toast(p.pn+': '+prev+' → '+newQty+(adj===0?' (no change)':(adj>0?' (+'+adj+')':' ('+adj+')')));
@@ -16051,10 +16054,12 @@ async function applySpotCount(){
   } else {
     const prev=a.total_on_hand||0;
     const adj=newQty-prev;
-    await db.from('assemblies').update({total_on_hand:newQty,updated_at:new Date().toISOString()}).eq('id',a.id);
-    S.assemblies=S.assemblies.map(x=>x.pn===a.pn?{...x,total_on_hand:newQty}:x);
-    await db.from('inv_corrections').insert({pn:a.pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason:reason+' (assembly)',user_email:S.currentUser||null,source:'spot_count'});
-    syncShopifyTemplate(a.pn,newQty);
+    if(adj===0){
+      await dbq(db.from('inv_corrections').insert({pn:a.pn,previous_qty:prev,new_qty:newQty,adjustment:0,reason:reason+' (assembly)',user_email:S.currentUser||null,source:'spot_count'}),'spotCount:nochange');
+    } else {
+      const _nq=await adjustStock('assembly',a,adj,{reason:reason+' (assembly)',source:'spot_count'});
+      if(_nq===null)return;
+    }
     toast(a.pn+': '+prev+' → '+newQty);
   }
   document.getElementById('spot-pn').value='';
@@ -16183,19 +16188,19 @@ async function applyWalkCount(){
     if(item.type==='assembly'){
       const a=S.assemblies.find(x=>x.pn===item.pn);
       if(!a){errors++;continue;}
-      const{error}=await db.from('assemblies').update({total_on_hand:item.counted,updated_at:new Date().toISOString()}).eq('id',a.id);
-      if(error){errors++;continue;}
-      S.assemblies=S.assemblies.map(x=>x.pn===item.pn?{...x,total_on_hand:item.counted}:x);
-      await db.from('inv_corrections').insert({pn:item.pn,previous_qty:item.exp,new_qty:item.counted,adjustment:item.counted-item.exp,reason:'Walk Count',user_email:S.currentUser||null,source:'walk_count'});
-      syncShopifyTemplate(item.pn,item.counted);
+      const _d=item.counted-(a.total_on_hand||0);
+      if(_d!==0){
+        const _nv=await adjustStock('assembly',a,_d,{reason:'Walk Count',source:'walk_count'});
+        if(_nv===null){errors++;continue;}
+      }
     } else {
       const p=S.parts.find(x=>x.pn===item.pn);
       if(!p){errors++;continue;}
-      const{error}=await db.from('parts').update({total_unpckgd:item.counted,updated_at:new Date().toISOString()}).eq('id',p.id);
-      if(error){errors++;continue;}
-      S.parts=S.parts.map(x=>x.pn===item.pn?{...x,total_unpckgd:item.counted}:x);
-      await db.from('inv_corrections').insert({pn:item.pn,previous_qty:item.exp,new_qty:item.counted,adjustment:item.counted-item.exp,reason:'Walk Count',user_email:S.currentUser||null,source:'walk_count'});
-      cascadeShopifySync(item.pn);
+      const _d=item.counted-(p.total_unpckgd||0);
+      if(_d!==0){
+        const _nv=await adjustStock('part',p,_d,{reason:'Walk Count',source:'walk_count'});
+        if(_nv===null){errors++;continue;}
+      }
     }
     applied++; // [FIX D] removed duplicate applied++ that over-counted parts corrections
   }
@@ -16435,22 +16440,21 @@ async function applyCountCorrections(countId) {
     if(line.item_type==='assembly'){
       const asm=S.assemblies.find(a=>a.pn===line.pn);
       if(!asm) continue;
-      const prev=asm.total_on_hand||0;
-      await db.from('assemblies').update({total_on_hand:newQty,updated_at:new Date().toISOString()}).eq('id',asm.id);
-      S.assemblies=S.assemblies.map(a=>a.pn===line.pn?{...a,total_on_hand:newQty}:a);
-      await db.from('inv_corrections').insert({pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count (finished/sub — components untouched)'+(line.notes?' — '+line.notes:''),user_email:S.currentUser||null,source:'cycle_count',reference_id:countId});
-      S.corrections=[{pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count',source:'cycle_count',created_at:new Date().toISOString()},...S.corrections];
-      syncShopifyTemplate(line.pn,newQty);
+      const _d=newQty-(asm.total_on_hand||0);
+      if(_d!==0){
+        const _nv=await adjustStock('assembly',asm,_d,{reason:'Cycle Count (finished/sub \u2014 components untouched)'+(line.notes?' \u2014 '+line.notes:''),source:'cycle_count',reference_id:countId});
+        if(_nv===null){_corrErrors++;continue;}
+        if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
+      }
     } else {
       const part=S.parts.find(p=>p.pn===line.pn);
       if(!part){_corrErrors++;continue;}
-      const prev=part.total_unpckgd||0;
-      const{error:_pe}=await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
-      if(_pe){_corrErrors++;continue;}
-      S.parts=S.parts.map(p=>p.pn===line.pn?{...p,total_unpckgd:newQty}:p);
-      await db.from('inv_corrections').insert({pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count '+(line.notes?'— '+line.notes:''),user_email:S.currentUser||null,source:'cycle_count',reference_id:countId});
-      S.corrections=[{pn:line.pn,previous_qty:prev,new_qty:newQty,adjustment:newQty-prev,reason:'Cycle Count',source:'cycle_count',created_at:new Date().toISOString()},...S.corrections];
-      cascadeShopifySync(line.pn);
+      const _d=newQty-(part.total_unpckgd||0);
+      if(_d!==0){
+        const _nv=await adjustStock('part',part,_d,{reason:'Cycle Count '+(line.notes?'\u2014 '+line.notes:''),source:'cycle_count',reference_id:countId});
+        if(_nv===null){_corrErrors++;continue;}
+        if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
+      }
     }
   }
   await db.from('cycle_counts').update({status:'Complete',completed_at:new Date().toISOString()}).eq('id',countId);
@@ -16742,19 +16746,15 @@ async function applyDupRepairs(){
   for(const c of picked){
     const asm=findAsm(c.pn);
     if(asm){
-      const prev=asm.total_on_hand||0;const nv=prev+c.addBack;
-      await db.from('assemblies').update({total_on_hand:nv,updated_at:new Date().toISOString()}).eq('id',asm.id);
-      S.assemblies=S.assemblies.map(a=>a.id===asm.id?{...a,total_on_hand:nv}:a);
-      await db.from('inv_corrections').insert({pn:asm.pn,previous_qty:prev,new_qty:nv,adjustment:c.addBack,reason:'Repair duplicate shipment deduction ('+c.dupCount+'x, tracking '+c.tracking+')',user_email:S.currentUser||null,source:'dedup_repair'});
-      syncShopifyTemplate(asm.pn,nv);fixed++;units+=c.addBack;
+      const nv=await adjustStock('assembly',asm,c.addBack,{reason:'Repair duplicate shipment deduction ('+c.dupCount+'x, tracking '+c.tracking+')',source:'dedup_repair'});
+      if(nv===null)continue;
+      fixed++;units+=c.addBack;
     }else{
       const prt=_findPart(c.pn);
       if(!prt)continue;
-      const prev=prt.total_unpckgd||0;const nv=prev+c.addBack;
-      await db.from('parts').update({total_unpckgd:nv,updated_at:new Date().toISOString()}).eq('id',prt.id);
-      S.parts=S.parts.map(p=>p.id===prt.id?{...p,total_unpckgd:nv}:p);
-      await db.from('inv_corrections').insert({pn:prt.pn,previous_qty:prev,new_qty:nv,adjustment:c.addBack,reason:'Repair duplicate shipment deduction ('+c.dupCount+'x, tracking '+c.tracking+')',user_email:S.currentUser||null,source:'dedup_repair'});
-      cascadeShopifySync(prt.pn);fixed++;units+=c.addBack;
+      const nv=await adjustStock('part',prt,c.addBack,{reason:'Repair duplicate shipment deduction ('+c.dupCount+'x, tracking '+c.tracking+')',source:'dedup_repair'});
+      if(nv===null)continue;
+      fixed++;units+=c.addBack;
     }
   }
   buildLookupMaps();
@@ -16921,10 +16921,13 @@ async function submitManualCorrection(pn, newQty, reason) {
   if(!part){toast('Part not found');return;}
   const prev=part.total_unpckgd||0;
   const adj=newQty-prev;
-  await db.from('parts').update({total_unpckgd:newQty,updated_at:new Date().toISOString()}).eq('id',part.id);
-  S.parts=S.parts.map(p=>p.pn===pn?{...p,total_unpckgd:newQty}:p);
-  await db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason:reason||'Manual adjustment',user_email:S.currentUser||null,source:'manual'});
-  S.corrections=[{pn,previous_qty:prev,new_qty:newQty,adjustment:adj,reason:reason||'Manual adjustment',source:'manual',created_at:new Date().toISOString()},...S.corrections];
+  if(adj===0){
+    await dbq(db.from('inv_corrections').insert({pn,previous_qty:prev,new_qty:newQty,adjustment:0,reason:reason||'Manual adjustment',user_email:S.currentUser||null,source:'manual'}),'manualCorrection:nochange');
+  } else {
+    const _nq=await adjustStock('part',part,adj,{reason:reason||'Manual adjustment',source:'manual',skipSync:true});
+    if(_nq===null)return;
+    if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
+  }
   pushUndo('update','parts',{...part,total_unpckgd:newQty},part,'Correction: '+pn+' → '+newQty);
   closeModal();updateBadge();toast('Correction applied');render();
 }
@@ -22932,44 +22935,20 @@ window._applyPendingInv=async function(){
     var oldAsm=findAsm(chg.oldPn);
     var oldPrt=oldAsm?null:S.parts.find(function(p){return p.pn===chg.oldPn;});
     if(oldAsm){
-      var prev=oldAsm.total_on_hand||0;var noh=prev+chg.qty;
-      var r=await db.from('assemblies').update({total_on_hand:noh,updated_at:new Date().toISOString()}).eq('id',oldAsm.id);
-      if(!r.error){
-        S.assemblies=S.assemblies.map(function(a){return a.id===oldAsm.id?Object.assign({},a,{total_on_hand:noh}):a;});
-        await db.from('inv_corrections').insert({pn:chg.oldPn,previous_qty:prev,new_qty:noh,adjustment:chg.qty,reason:'SKU swap on order '+orderNum+' ('+chg.oldPn+'\u2192'+chg.newPn+') \u2014 restocked',user_email:S.currentUser||null,source:'order_edit'});
-        syncShopifyTemplate(chg.oldPn,noh);
-        applied.push('+'+chg.qty+'\xd7'+chg.oldPn);
-      }else errs.push(chg.oldPn+': '+r.error.message);
+      var noh=await adjustStock('assembly',oldAsm,chg.qty,{reason:'SKU swap on order '+orderNum+' ('+chg.oldPn+'\u2192'+chg.newPn+') \u2014 restocked',source:'order_edit'});
+      if(noh!==null)applied.push('+'+chg.qty+'\xd7'+chg.oldPn);else errs.push(chg.oldPn+': stock update failed');
     } else if(oldPrt){
-      var prevP=oldPrt.total_unpckgd||0;var nohP=prevP+chg.qty;
-      var rP=await db.from('parts').update({total_unpckgd:nohP,updated_at:new Date().toISOString()}).eq('id',oldPrt.id);
-      if(!rP.error){
-        S.parts=S.parts.map(function(p){return p.id===oldPrt.id?Object.assign({},p,{total_unpckgd:nohP}):p;});
-        await db.from('inv_corrections').insert({pn:chg.oldPn,previous_qty:prevP,new_qty:nohP,adjustment:chg.qty,reason:'SKU swap on order '+orderNum+' ('+chg.oldPn+'\u2192'+chg.newPn+') \u2014 restocked',user_email:S.currentUser||null,source:'order_edit'});
-        cascadeShopifySync(chg.oldPn);
-        applied.push('+'+chg.qty+'\xd7'+chg.oldPn);
-      }else errs.push(chg.oldPn+': '+rP.error.message);
+      var nohP=await adjustStock('part',oldPrt,chg.qty,{reason:'SKU swap on order '+orderNum+' ('+chg.oldPn+'\u2192'+chg.newPn+') \u2014 restocked',source:'order_edit'});
+      if(nohP!==null)applied.push('+'+chg.qty+'\xd7'+chg.oldPn);else errs.push(chg.oldPn+': stock update failed');
     }
     var newAsm=findAsm(chg.newPn);
     var newPrt=newAsm?null:S.parts.find(function(p){return p.pn===chg.newPn;});
     if(newAsm){
-      var prev2=newAsm.total_on_hand||0;var noh2=prev2-chg.qty; // allow negative — a retroactive correction can legitimately reveal a backorder, same as a live shipment would; clamping to 0 would hide that
-      var r2=await db.from('assemblies').update({total_on_hand:noh2,updated_at:new Date().toISOString()}).eq('id',newAsm.id);
-      if(!r2.error){
-        S.assemblies=S.assemblies.map(function(a){return a.id===newAsm.id?Object.assign({},a,{total_on_hand:noh2}):a;});
-        await db.from('inv_corrections').insert({pn:chg.newPn,previous_qty:prev2,new_qty:noh2,adjustment:-chg.qty,reason:'SKU swap on order '+orderNum+' ('+chg.oldPn+'\u2192'+chg.newPn+') \u2014 deducted',user_email:S.currentUser||null,source:'order_edit'});
-        syncShopifyTemplate(chg.newPn,noh2);
-        applied.push('-'+chg.qty+'\xd7'+chg.newPn);
-      }else errs.push(chg.newPn+': '+r2.error.message);
+      var noh2=await adjustStock('assembly',newAsm,-chg.qty,{reason:'SKU swap on order '+orderNum+' ('+chg.oldPn+'\u2192'+chg.newPn+') \u2014 deducted',source:'order_edit'}); // allow negative \u2014 backorder convention
+      if(noh2!==null)applied.push('-'+chg.qty+'\xd7'+chg.newPn);else errs.push(chg.newPn+': stock update failed');
     } else if(newPrt){
-      var prev2P=newPrt.total_unpckgd||0;var noh2P=prev2P-chg.qty; // allow negative — see note above
-      var r2P=await db.from('parts').update({total_unpckgd:noh2P,updated_at:new Date().toISOString()}).eq('id',newPrt.id);
-      if(!r2P.error){
-        S.parts=S.parts.map(function(p){return p.id===newPrt.id?Object.assign({},p,{total_unpckgd:noh2P}):p;});
-        await db.from('inv_corrections').insert({pn:chg.newPn,previous_qty:prev2P,new_qty:noh2P,adjustment:-chg.qty,reason:'SKU swap on order '+orderNum+' ('+chg.oldPn+'\u2192'+chg.newPn+') \u2014 deducted',user_email:S.currentUser||null,source:'order_edit'});
-        cascadeShopifySync(chg.newPn);
-        applied.push('-'+chg.qty+'\xd7'+chg.newPn);
-      }else errs.push(chg.newPn+': '+r2P.error.message);
+      var noh2P=await adjustStock('part',newPrt,-chg.qty,{reason:'SKU swap on order '+orderNum+' ('+chg.oldPn+'\u2192'+chg.newPn+') \u2014 deducted',source:'order_edit'});
+      if(noh2P!==null)applied.push('-'+chg.qty+'\xd7'+chg.newPn);else errs.push(chg.newPn+': stock update failed');
     }
   }
   window._pendingInvChanges=null;
