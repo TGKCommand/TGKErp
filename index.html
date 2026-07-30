@@ -242,7 +242,7 @@
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.73</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.74</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -305,7 +305,7 @@
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.73';
+const TGK_ERP_VERSION = 'v20.74';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -13370,6 +13370,86 @@ function openOrderedQty(pn) {
   return qty;
 }
 
+// [DUPE-PO] Cross-PO duplicate-SKU guard for receiving.
+// Receiving stock against the WRONG purchase order is easy whenever the same SKU sits open on more than
+// one order: the box on the bench may actually belong to an older PO, and checking it in here silently
+// closes this line while the real one stays open forever -- inflating on-order qty, corrupting reorder
+// suggestions, and leaving a PO that never closes. One pass over every non-closed PO builds a map of
+// canonical SKU -> open lines so every receiving surface can warn before the stock is committed.
+// Invalidate with S._openPoSkuMap=null on any PO / po_line mutation (render() clears it per pass).
+var PO_PSEUDO_SKUS={SHIPPING:1,FREIGHT:1,'S&H':1,'S+H':1,TAX:1,VAT:1,DUTY:1,DUTIES:1,MISC:1,DISCOUNT:1,CREDIT:1,ADJUSTMENT:1};
+
+// Canonical grouping key for a po_line pn. Resolves BOTH the legacy .pn and an active new_sku to the one
+// underlying item so a PO written against the old SKU and a PO written against the new one still collide.
+function poSkuKey(pn){
+  if(!pn)return '';
+  var it=(typeof _canonItem==='function')?_canonItem(pn):null;
+  if(it&&it.pn)return it.pn;
+  return String(pn).trim().toUpperCase();
+}
+
+function buildOpenPoSkuMap(){
+  var m={};
+  function push(key,entry){ if(!m[key])m[key]=[]; m[key].push(entry); }
+  (S.purchases||[]).forEach(function(po){
+    if(!po)return;
+    if(po.status==='Received'||po.status==='Cancelled')return;
+    var lines=(S.poLines&&S.poLines[po.id])||[];
+    if(lines.length){
+      lines.forEach(function(l){
+        var rem=Math.max(0,(l.qty_ordered||0)-(l.qty_received||0));
+        if(rem<=0)return;
+        var key=poSkuKey(l.pn);
+        if(!key||PO_PSEUDO_SKUS[key])return;
+        push(key,{poId:po.id,vendor:po.vendor||'',status:po.status||'',orderDate:po.order_date||'',lineId:l.id,pn:l.pn,ordered:l.qty_ordered||0,received:l.qty_received||0,remaining:rem});
+      });
+    }else if(po.pn&&String(po.pn).indexOf('+')===-1&&(po.qty||0)>0){
+      // Legacy single-SKU PO with no po_lines rows yet (same fallback buildOnOrderMap uses).
+      var key2=poSkuKey(po.pn);
+      if(!key2||PO_PSEUDO_SKUS[key2])return;
+      push(key2,{poId:po.id,vendor:po.vendor||'',status:po.status||'',orderDate:po.order_date||'',lineId:null,pn:po.pn,ordered:po.qty||0,received:0,remaining:po.qty||0});
+    }
+  });
+  Object.keys(m).forEach(function(k){
+    m[k].sort(function(a,b){
+      var ad=a.orderDate||'9999-99-99',bd=b.orderDate||'9999-99-99';
+      if(ad!==bd)return ad<bd?-1:1;
+      return String(a.poId)<String(b.poId)?-1:1;
+    });
+  });
+  return m;
+}
+
+// Open lines for this SKU on OTHER POs, oldest order_date first. excludeLineId guards the legacy
+// fallback case where the current line and the header row describe the same order.
+function otherOpenPOsForSku(pn,excludePoId,excludeLineId){
+  if(!S._openPoSkuMap)S._openPoSkuMap=buildOpenPoSkuMap();
+  var key=poSkuKey(pn);
+  if(!key||PO_PSEUDO_SKUS[key])return [];
+  return (S._openPoSkuMap[key]||[]).filter(function(e){
+    if(String(e.poId)===String(excludePoId))return false;
+    if(excludeLineId&&String(e.lineId)===String(excludeLineId))return false;
+    return true;
+  });
+}
+
+// Shared blocking confirm used by every receiving surface. items: [{pn, dupes}].
+// Returns true to proceed, false if the user backed out.
+function confirmDupePOReceipt(items,actionLabel){
+  var flagged=(items||[]).filter(function(x){return x&&x.dupes&&x.dupes.length;});
+  if(!flagged.length)return true;
+  var msg='HEADS UP - '+(flagged.length===1?'this SKU is':flagged.length+' of these SKUs are')+' still open on other purchase orders:\n\n';
+  flagged.forEach(function(x){
+    msg+=(typeof dispSku==='function'?dispSku(x.pn):x.pn)+'\n';
+    x.dupes.forEach(function(d){
+      msg+='   - '+(d.vendor||'(no vendor)')+(d.orderDate?'  '+d.orderDate:'')+'  ['+(d.status||'Open')+']  '+d.received+'/'+d.ordered+' received, '+d.remaining+' outstanding\n';
+    });
+    msg+='\n';
+  });
+  msg+='Oldest PO is listed first. Confirm the stock in front of you belongs to THIS PO -- receiving it\nhere leaves the other PO open and keeps its quantity counted as still on order.\n\n'+(actionLabel||'Continue')+'?';
+  return confirm(msg);
+}
+
 function calcReorderPoint(p) {
   if(p&&p.build_to_order)return 0; // build-to-order: ordered only when a finished good needs it, never buffered
   const demand = effectiveWkDemand(p);
@@ -14256,7 +14336,13 @@ async function quickReceive(poId){
             <td style="padding:8px 6px;font-size:11px;color:var(--text2);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${l.description||''}</td>
             <td style="padding:8px 6px;text-align:right;font-size:11px;color:var(--text3)">${rem}</td>
             <td style="padding:8px 6px;text-align:right"><input id="qr-qty-${l.id}" type="number" min="0" value="${rem}" style="width:70px;text-align:right;background:var(--bg4);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:4px 6px;font-size:12px;font-family:var(--mono)"></td>
-          </tr>`;}).join('')}
+          </tr>${(function(){
+            const _d=otherOpenPOsForSku(l.pn,poId,l.id);
+            if(!_d.length)return '';
+            return '<tr><td colspan="5" style="padding:0 6px 8px"><div style="background:rgba(234,88,12,.08);border:1px solid rgba(234,88,12,.35);border-radius:6px;padding:5px 8px;font-size:10px;color:var(--orange);font-weight:600">Also open on '+_d.length+' other PO'+(_d.length!==1?'s':'')+': '
+              +_d.map(function(d){return escHtml(d.vendor||'(no vendor)')+(d.orderDate?' '+escHtml(String(d.orderDate)):'')+' ('+d.remaining+' outstanding)';}).join('; ')
+              +'</div></td></tr>';
+          })()}`;}).join('')}
           </tbody>
         </table>
       </div>
@@ -14292,6 +14378,8 @@ async function submitQuickReceive(poId){
     if(qty<=0)continue;
     toReceive.push({line,qty});
   }
+  // [DUPE-PO] One aggregate warning for every checked line whose SKU is still open on another PO.
+  if(!confirmDupePOReceipt(toReceive.map(function(x){return{pn:x.line.pn,dupes:otherOpenPOsForSku(x.line.pn,poId,x.line.id)};}),'Receive '+toReceive.length+' line'+(toReceive.length!==1?'s':'')+' against THIS PO anyway'))return;
   let received=0,skipped=lines.length-toReceive.length;
   for(const{line,qty}of toReceive){
     await checkInLineQuick(line.id,poId,line.pn,line.qty_ordered,line.qty_received||0,qty);
@@ -14461,6 +14549,20 @@ function renderPODetail(po) {
             <button class="action-btn del" onclick="deletePOLine('${line.id}','${po.id}')">×</button>
           </span>`
       }
+      ${done?'':(function(){
+        const _dupes=otherOpenPOsForSku(line.pn,po.id,line.id);
+        if(!_dupes.length)return '';
+        return '<div style="flex-basis:100%;margin-top:2px;background:rgba(234,88,12,.08);border:1px solid rgba(234,88,12,.35);border-radius:6px;padding:6px 9px">'
+          +'<div style="font-size:10px;font-weight:700;color:var(--orange);margin-bottom:4px">Also open on '+_dupes.length+' other PO'+(_dupes.length!==1?'s':'')+' - confirm this stock is not theirs before receiving</div>'
+          +'<div style="display:flex;flex-wrap:wrap;gap:6px">'
+          +_dupes.map(function(d){
+            return '<button class="btn btn-sm" style="font-size:9px;padding:2px 7px" title="Open this PO" onclick="goToPO(\''+escHtml(String(d.poId))+'\')">'
+              +escHtml(d.vendor||'(no vendor)')
+              +(d.orderDate?' '+escHtml(String(d.orderDate)):'')
+              +' - '+d.received+'/'+d.ordered+' rcvd, '+d.remaining+' out</button>';
+          }).join('')
+          +'</div></div>';
+      })()}
     </div>`;
   }).join('')}`;
 }
@@ -14470,6 +14572,8 @@ async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
   const noteInp = document.getElementById('checkin-note-'+lineId);
   const qty = parseFloat(inp.value)||0;
   if(qty<=0){toast('Enter a quantity');return;}
+  // [DUPE-PO] Same SKU still outstanding on another PO -- warn before any stock or line state moves.
+  if(!confirmDupePOReceipt([{pn:pn,dupes:otherOpenPOsForSku(pn,poId,lineId)}],'Receive '+qty+' against THIS PO anyway'))return;
   const note = noteInp?noteInp.value.trim():'';
   const newReceived = qtyAlreadyReceived + qty;
   const remaining = Math.max(0, qtyOrdered - newReceived);
@@ -14572,6 +14676,8 @@ async function receiveAllLines(poId) {
   const lines = S.poLines[poId]||[];
   const pending = lines.filter(l=>l.qty_received<l.qty_ordered);
   if(!pending.length){toast('All lines already received');return;}
+  // [DUPE-PO] Receive All commits every line at once -- warn up front for any SKU open on another PO.
+  if(!confirmDupePOReceipt(pending.map(function(l){return{pn:l.pn,dupes:otherOpenPOsForSku(l.pn,poId,l.id)};}),'Receive all '+pending.length+' line'+(pending.length!==1?'s':'')+' against THIS PO anyway'))return;
   for(const line of pending){
     const remaining = (line.qty_ordered||0)-(line.qty_received||0);
     if(remaining>0) await checkInLineQuick(line.id, poId, line.pn, line.qty_ordered, line.qty_received||0, remaining);
@@ -20184,6 +20290,7 @@ window.fitCopyRun=async function(){
 
 function render(){
   S._onOrderMap=null; // invalidate per-render caches; renderPlanning re-primes when needed
+  S._openPoSkuMap=null; // [DUPE-PO] rebuilt lazily by otherOpenPOsForSku() so warnings never read a stale PO snapshot
   S._buildabilityCache={}; // [PERF] fresh per-render memo for buildability(); nulled after this pass so post-render calls recompute against live stock
   const views={losses:renderLosses,dashboard:renderDashboard,users:renderUsers,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,fitments:renderFitments,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder,reports:renderReports,pricelist:renderPriceList,dataintegrity:renderDataIntegrity};
   if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length||S.calc.forecastWks!==(S.forecastWeeks||8))computeDemand();
