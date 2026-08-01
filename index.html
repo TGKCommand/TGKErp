@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.94</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.95</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.94';
+const TGK_ERP_VERSION = 'v20.95';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -13992,7 +13992,7 @@ function renderPlanning() {
     <div class="tab ${(!S.planTab||S.planTab==='purchasing')?'active':''}" onclick="S.planTab='purchasing';render()">&#128462; Purchasing</div>
     <div class="tab ${S.planTab==='minmax'?'active':''}" onclick="S.planTab='minmax';render()">&#128208; Min / Max &amp; Safety</div>
     <div class="tab ${S.planTab==='builder'?'active':''}" onclick="S.planTab='builder';render()">&#127959; Finished Goods</div>
-    <div class="tab ${S.planTab==='dev'?'active':''}" style="${S.planTab==='dev'?'':' color:var(--purple)'}" onclick="S.planTab='dev';render()">&#128300; DEV Parts (${devOnlyParts.length})</div>
+    <div class="tab ${S.planTab==='dev'?'active':''}" style="${S.planTab==='dev'?'':' color:var(--purple)'}" onclick="S.planTab='dev';render()" title="Plan and order the full build-out of each DEV assembly">&#128300; DEV Build-Out (${S.assemblies.filter(a=>isDev(a)&&(S.boms[a.pn]||[]).length>0).length})</div>
   </div>
   ${(S.planTab!=='builder'&&S.planTab!=='dev')?`  <div class="panel" style="padding:12px 16px">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
@@ -14168,55 +14168,158 @@ function renderPlanning() {
   `}`;
 }
 
-function renderDevPartsTab(devParts){
-  if(!devParts.length)return`<div class="panel" style="margin:16px;padding:24px;text-align:center;color:var(--text3)">
-    <div style="font-size:14px;margin-bottom:6px">No DEV-only parts</div>
-    <div style="font-size:11px">Parts appear here when they are in a Dev assembly BOM and have no active demand or sales history.</div>
-  </div>`;
-  const devAsmPns=[...new Set(
-    Object.keys(S.boms).filter(par=>isDevPn(par)&&S.boms[par].some(i=>i.item_type==='part'&&devParts.some(p=>p.pn===i.child_pn)))
-  )].sort();
-  const devPartSet=new Map(devParts.map(p=>[p.pn,p]));
-  let totalParts=0;
-  const sections=devAsmPns.map(asmPn=>{
-    const asm=S.assemblies.find(a=>a.pn===asmPn);
-    const asmDesc=asm?.description||'';
-    const asmParts=(S.boms[asmPn]||[])
-      .filter(i=>i.item_type==='part'&&devPartSet.has(i.child_pn))
-      .map(i=>({...devPartSet.get(i.child_pn),_bomQty:i.qty||1}));
-    if(!asmParts.length)return'';
-    totalParts+=asmParts.length;
-    const rows=asmParts.map(p=>{
-      const oh=p.total_unpckgd||0;
-      const onOrder=openOrderedQty(p.pn);
-      const ohColor=oh<=0?'var(--red)':oh<=(p.min_qty||0)?'var(--orange)':'var(--text)';
-      return`<tr class="rowlink" onclick="rowClick(event,function(){lookupGo('part','${p.pn}')})">
-        <td class="pn" style="color:var(--purple);padding-left:20px">${dispPn(p)}</td>
-        <td style="font-size:11px;color:var(--text2);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(p.description||'')}</td>
-        <td class="t3xs">${escHtml(p.vendor||'&#8212;')}</td>
-        <td style="font-size:11px;color:var(--text3);text-align:center">${p._bomQty}</td>
-        <td style="font-weight:700;color:${ohColor}">${oh}${onOrder>0?`<span style="font-size:9px;color:var(--teal);margin-left:3px">+${onOrder} on order</span>`:''}</td>
-        <td style="font-size:11px">${p.unit_cost>0?'$'+p.unit_cost.toFixed(2):'&#8212;'}</td>
-        <td onclick="event.stopPropagation()">
-          <button class="btn btn-sm" style="color:var(--purple);border-color:rgba(124,58,237,.3);font-size:10px" onclick="quickAddDevPO('${p.pn}')">+ Order</button>
-        </td>
-      </tr>`;
+/* ================= DEV BUILD-OUT PLANNER (v20.95) =================
+   The DEV Parts tab used to list only DEV-exclusive parts, one flat table, with
+   no way to buy a whole prototype. It now plans each dev assembly end to end:
+   the BOM is exploded through its subassemblies (netting off any sub stock that
+   already exists), every leaf part is shown with a DEV-ONLY / SHARED flag so it
+   is obvious when an order also touches production stock, and the whole
+   shortfall can go to the PO cart in one click. */
+function _devExplode(pn,qty,acc,depth,path){
+  depth=depth||0;
+  if(depth>6)return;
+  var bom=S.boms[pn]||[];
+  bom.forEach(function(line){
+    var child=line.child_pn;
+    var need=(Number(line.qty)||1)*qty;
+    if(need<=0)return;
+    var asmC=_findAsm2(child);
+    var isSub=(line.item_type==='assembly'||line.item_type==='subassembly'||!!asmC);
+    if(isSub&&asmC&&!path.has(child)){
+      var onHand=Math.max(0,asmC.total_on_hand||0);
+      var already=acc.subUsed[child]||0;
+      var avail=Math.max(0,onHand-already);
+      var fromStock=Math.min(avail,need);
+      var toBuild=need-fromStock;
+      acc.subUsed[child]=already+fromStock;
+      if(!acc.subs[child])acc.subs[child]={pn:child,disp:dispPn(asmC),desc:asmC.description||'',fromStock:0,toBuild:0,isDev:isDev(asmC)};
+      acc.subs[child].fromStock+=fromStock;
+      acc.subs[child].toBuild+=toBuild;
+      if(toBuild>0){
+        var np=new Set(path);np.add(child);
+        _devExplode(child,toBuild,acc,depth+1,np);
+      }
+      return;
+    }
+    if(!acc.parts[child])acc.parts[child]={pn:child,need:0};
+    acc.parts[child].need+=need;
+  });
+}
+function _devPlanFor(asmPn){
+  if(!S.devBuildQty)S.devBuildQty={};
+  var qty=Math.max(1,parseInt(S.devBuildQty[asmPn],10)||1);
+  var acc={parts:{},subs:{},subUsed:{}};
+  _devExplode(asmPn,qty,acc,0,new Set([asmPn]));
+  var devOnly=(typeof devOnlyPartSet==='function')?devOnlyPartSet():new Set();
+  var rows=Object.keys(acc.parts).map(function(k){
+    var e=acc.parts[k];
+    var p=_findPart(e.pn);
+    var have=p?(p.total_unpckgd||0):0;
+    var onOrd=(typeof openOrderedQty==='function')?(openOrderedQty(e.pn)||0):0;
+    var short=Math.max(0,e.need-have-onOrd);
+    var uc=p?costForQty(p,Math.max(1,short||e.need)):0;
+    return {pn:e.pn,part:p,disp:p?dispPn(p):e.pn,desc:p?(p.description||''):'',
+      vendor:p?(p.vendor||''):'',perBuild:e.need/qty,need:e.need,have:have,onOrder:onOrd,
+      short:short,unitCost:uc,ext:uc*short,devOnly:devOnly.has(e.pn),inCatalog:!!p};
+  }).sort(function(a,b){return (b.short-a.short)||a.disp.localeCompare(b.disp);});
+  var subs=Object.keys(acc.subs).map(function(k){return acc.subs[k];})
+    .sort(function(a,b){return a.disp.localeCompare(b.disp);});
+  return {qty:qty,rows:rows,subs:subs,
+    shortCost:rows.reduce(function(t,r){return t+r.ext;},0),
+    fullCost:rows.reduce(function(t,r){return t+r.unitCost*r.need;},0),
+    shortCount:rows.filter(function(r){return r.short>0;}).length,
+    sharedCount:rows.filter(function(r){return !r.devOnly;}).length};
+}
+window.devSetBuildQty=function(asmPn,val){
+  if(!S.devBuildQty)S.devBuildQty={};
+  S.devBuildQty[asmPn]=Math.max(1,parseInt(val,10)||1);
+  render();
+};
+window.devAddAllToCart=function(asmPn){
+  var plan=_devPlanFor(asmPn);
+  var added=0,skipped=0,units=0;
+  plan.rows.forEach(function(r){
+    if(r.short<=0)return;
+    if(!r.part){skipped++;return;}
+    var ex=S.poCart.find(function(c){return c.pn===r.pn;});
+    if(ex){ex.qty+=r.short;}
+    else{S.poCart.push({pn:r.pn,qty:r.short,unitCost:costForQty(r.part,r.short)});}
+    added++;units+=r.short;
+  });
+  if(!added){
+    toast(skipped?('Nothing added \u2014 '+skipped+' short part(s) are not in the parts catalog'):('Nothing short for '+asmPn+' \u2014 everything is on hand or already on order'));
+    return;
+  }
+  saveCart();
+  toast('\u2713 '+added+' part'+(added!==1?'s':'')+' ('+units+' units) added to the PO cart for '+asmPn+(skipped?(' \u00b7 '+skipped+' skipped, not in catalog'):''));
+  render();
+};
+window.devAddRowToCart=function(asmPn,pn){
+  var plan=_devPlanFor(asmPn);
+  var r=plan.rows.find(function(x){return x.pn===pn;});
+  if(!r){toast('Line not found - refresh');return;}
+  if(!r.part){toast(pn+' is not in the parts catalog - add it first');return;}
+  var q=r.short>0?r.short:r.need;
+  addToCart(r.pn,q);
+};
+function renderDevPartsTab(devOnlyParts){
+  var devAsms=S.assemblies.filter(function(a){return isDev(a)&&(S.boms[a.pn]||[]).length>0;})
+    .sort(function(a,b){return String(a.pn).localeCompare(String(b.pn));});
+  if(!devAsms.length)return'<div class="panel" style="margin:16px;padding:24px;text-align:center;color:var(--text3)">'
+    +'<div style="font-size:14px;margin-bottom:6px">No DEV assemblies with a BOM</div>'
+    +'<div style="font-size:11px">Set an assembly\'s stage to <b>dev</b> and give it a BOM to plan its build-out here.</div></div>';
+  var sections=devAsms.map(function(a){
+    var plan=_devPlanFor(a.pn);
+    var subInfo=plan.subs.filter(function(sb){return sb.fromStock>0;});
+    var rows=plan.rows.map(function(r){
+      var ohColor=r.have<=0?'var(--red)':(r.have<r.need?'var(--orange)':'var(--green)');
+      var flag=r.devOnly
+        ? '<span class="bomtag bomtag-hwp" title="Only used by DEV assemblies - ordering this does not affect production">DEV ONLY</span>'
+        : '<span class="bomtag bomtag-part" title="Also used by active production assemblies - this part draws from shared stock">SHARED</span>';
+      return '<tr class="rowlink" onclick="rowClick(event,function(){lookupGo(\'part\',\''+escHtml(r.pn)+'\')})">'
+        +'<td class="pn" style="color:'+(r.devOnly?'var(--purple)':'var(--teal)')+';white-space:nowrap">'+escHtml(r.disp)+(r.inCatalog?'':' <span class="t3xxs" style="color:var(--red)">not in catalog</span>')+'</td>'
+        +'<td style="font-size:11px;color:var(--text2);max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(r.desc)+'</td>'
+        +'<td>'+flag+'</td>'
+        +'<td class="t3xs">'+escHtml(r.vendor||'\u2014')+'</td>'
+        +'<td class="money-neutral" style="text-align:right">'+(Math.round(r.perBuild*1000)/1000)+'</td>'
+        +'<td class="money" style="text-align:right;font-weight:700">'+r.need+'</td>'
+        +'<td class="money" style="text-align:right;color:'+ohColor+'">'+r.have+'</td>'
+        +'<td class="money-neutral" style="text-align:right">'+(r.onOrder>0?('+'+r.onOrder):'\u2014')+'</td>'
+        +'<td class="money" style="text-align:right;font-weight:700;color:'+(r.short>0?'var(--red)':'var(--green)')+'">'+(r.short>0?r.short:'\u2014')+'</td>'
+        +'<td class="money-cost" style="text-align:right">'+(r.unitCost>0?fc(r.unitCost):'\u2014')+'</td>'
+        +'<td class="money-cost" style="text-align:right;font-weight:700">'+(r.ext>0?fc(r.ext):'\u2014')+'</td>'
+        +'<td onclick="event.stopPropagation()" style="text-align:right">'
+        +(r.short>0?'<button class="btn btn-sm" style="font-size:10px" onclick="devAddRowToCart(\''+escHtml(a.pn)+'\',\''+escHtml(r.pn)+'\')">+ Cart</button>':'')
+        +'</td></tr>';
     }).join('');
-    return`<tr style="background:rgba(124,58,237,.08);border-top:2px solid rgba(124,58,237,.2)">
-      <td colspan="7" style="padding:8px 14px">
-        <span style="font-size:12px;font-weight:700;color:var(--purple)">&#128300; ${escHtml(asmPn)}</span>
-        ${asmDesc?`<span style="font-size:11px;color:var(--text3);margin-left:8px">${escHtml(asmDesc)}</span>`:''}
-        <span style="font-size:10px;color:var(--text3);margin-left:8px">${asmParts.length} part${asmParts.length!==1?'s':''}</span>
-      </td>
-    </tr>${rows}`;
+    return '<div class="panel" style="padding:0;margin-bottom:14px;border-left:3px solid var(--purple)">'
+      +'<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:11px 16px;background:rgba(124,58,237,.06);border-bottom:1px solid var(--border)">'
+        +'<span style="font-size:12.5px;font-weight:700;color:var(--purple)">\u{1F52C} '+escHtml(dispPn(a))+'</span>'
+        +'<span style="font-size:11px;color:var(--text3);flex:1;min-width:120px">'+escHtml(a.description||'')+'</span>'
+        +'<label style="font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--text3);display:flex;align-items:center;gap:6px">Build qty'
+        +'<input type="number" min="1" step="1" class="form-input" style="width:74px;text-align:center;font-family:var(--mono);padding:4px 6px" value="'+plan.qty+'" onchange="devSetBuildQty(\''+escHtml(a.pn)+'\',this.value)"></label>'
+        +'<span class="t3xs">'+plan.rows.length+' part'+(plan.rows.length!==1?'s':'')+' \u00b7 '+plan.sharedCount+' shared \u00b7 <b style="color:'+(plan.shortCount?'var(--red)':'var(--green)')+'">'+plan.shortCount+' short</b></span>'
+        +'<span style="font-size:11px;color:var(--text3)">Shortfall <b class="money-cost" style="font-size:13px">'+fc(plan.shortCost)+'</b></span>'
+        +'<button class="btn btn-primary btn-sm" onclick="devAddAllToCart(\''+escHtml(a.pn)+'\')"'+(plan.shortCount?'':' disabled')+'>\u{1F6D2} Order all short ('+plan.shortCount+')</button>'
+      +'</div>'
+      +(subInfo.length?('<div style="padding:7px 16px;font-size:10.5px;color:var(--text3);border-bottom:1px solid var(--border);background:var(--bg3)">Netted from existing sub-assembly stock: '
+        +subInfo.map(function(sb){return escHtml(sb.disp)+' \u00d7'+sb.fromStock;}).join(' \u00b7 ')+'</div>'):'')
+      +'<div class="tbl-wrap" style="border:none;border-radius:0"><table><thead><tr>'
+        +'<th>Part</th><th>Description</th><th>Scope</th><th>Vendor</th>'
+        +'<th style="text-align:right">Per Build</th><th style="text-align:right">Need</th>'
+        +'<th style="text-align:right">On Hand</th><th style="text-align:right">On Order</th>'
+        +'<th style="text-align:right">Short</th><th style="text-align:right">Unit</th>'
+        +'<th style="text-align:right">Ext</th><th style="width:70px"></th>'
+      +'</tr></thead><tbody>'+rows+'</tbody></table></div></div>';
   }).join('');
-  return`<div class="panel" style="padding:10px 16px;margin-bottom:0;border-left:3px solid var(--purple)">
-    <span style="font-size:12px;font-weight:700;color:var(--purple)">&#128300; DEV Parts</span>
-    <span style="font-size:11px;color:var(--text3);margin-left:8px">${devAsmPns.length} assembl${devAsmPns.length!==1?'ies':'y'} &middot; ${devParts.length} unique part${devParts.length!==1?'s':''}</span>
-  </div>
-  <div class="tbl-wrap"><table class="data-table" style="font-size:12px"><thead class="sticky-header"><tr>
-    <th>Part #</th><th>Description</th><th>Vendor</th><th style="text-align:center">BOM Qty</th><th>On Hand</th><th>Unit Cost</th><th style="width:80px"></th>
-  </tr></thead><tbody>${sections}</tbody></table></div>`;
+  var totShort=devAsms.reduce(function(t,a){return t+_devPlanFor(a.pn).shortCost;},0);
+  return '<div style="margin-top:14px">'
+    +'<div class="panel" style="padding:10px 16px;margin-bottom:12px;border-left:3px solid var(--purple);display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
+      +'<span style="font-size:12px;font-weight:700;color:var(--purple)">\u{1F52C} DEV Build-Out</span>'
+      +'<span class="t3xs" style="flex:1;min-width:200px">Full BOM for every DEV assembly, exploded through sub-assemblies. <b>DEV ONLY</b> parts are exclusive to development; <b>SHARED</b> parts also feed production, so ordering them affects live stock. Short = need minus on hand minus on order.</span>'
+      +'<span style="font-size:11px;color:var(--text3)">Total shortfall <b class="money-cost" style="font-size:14px">'+fc(totShort)+'</b></span>'
+      +'<button class="btn btn-sm" onclick="openCart()">\u{1F6D2} Open PO Cart</button>'
+    +'</div>'+sections+'</div>';
 }
 
 window.quickAddDevPO=async function(pn){
