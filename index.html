@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.93</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.94</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.93';
+const TGK_ERP_VERSION = 'v20.94';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -949,6 +949,7 @@ async function loadAll(){
     setSyncState('ok');
     updateBadge();
     render();
+    try{autoResolveTrackedTickets();}catch(_ar){console.warn('auto-resolve sweep failed',_ar);}
   }catch(e){
     setSyncState('err');
     console.error('loadAll error:',e);
@@ -17901,12 +17902,29 @@ async function _autoResolveOnTracking(table,id){
     var _lr = table==='warranty_claims' ? (S.warrantyClaims||[]).find(w=>w.id===id) : (S.shipmentErrors||[]).find(e=>e.id===id);
     _resolveLinkedTicket(table==='warranty_claims'?'warranty':'shiperror', id, _lr&&_lr.tracking_number, _lr&&_lr.carrier);
     if(S.view==='warranty'&&typeof scheduleRender==='function')scheduleRender();
-  }catch(err){console.warn('auto-resolve failed',err);try{toast('\u26a0 Auto-resolve failed'+(err&&err.message?': '+err.message:'')+' \u2014 status left unchanged',7000);}catch(_){}}
+  }catch(err){
+    console.warn('auto-resolve failed',err);
+    try{if(S._autoResolveTried)delete S._autoResolveTried[(table==='warranty_claims'?'w':'e')+id];}catch(_g){}
+    try{toast('\u26a0 Auto-resolve failed'+(err&&err.message?': '+err.message:'')+' \u2014 status left unchanged',7000);}catch(_){}
+  }
 }
 function autoResolveTrackedTickets(){
-  // Catch-up on load: any ticket that already has tracking but is not closed becomes Resolved.
-  (S.warrantyClaims||[]).forEach(function(w){ if(w.tracking_number&&w.status!=='Resolved'&&w.status!=='Denied')_autoResolveOnTracking('warranty_claims',w.id); });
-  (S.shipmentErrors||[]).forEach(function(e){ if(e.tracking_number&&e.status!=='Resolved'&&e.status!=='Denied')_autoResolveOnTracking('shipment_errors',e.id); });
+  // Catch-up on every load: anything already carrying tracking that is not closed
+  // gets resolved. Skipped: shipment errors that still owe us a customer return.
+  if(!S._autoResolveTried)S._autoResolveTried={};
+  (S.warrantyClaims||[]).forEach(function(w){
+    if(!w.tracking_number||w.status==='Resolved'||w.status==='Denied')return;
+    if(S._autoResolveTried['w'+w.id])return;
+    S._autoResolveTried['w'+w.id]=1;
+    _autoResolveOnTracking('warranty_claims',w.id);
+  });
+  (S.shipmentErrors||[]).forEach(function(e){
+    if(!e.tracking_number||e.status==='Resolved'||e.status==='Denied')return;
+    if(e.resolution==='return_required'&&!e.return_received_at)return;
+    if(S._autoResolveTried['e'+e.id])return;
+    S._autoResolveTried['e'+e.id]=1;
+    _autoResolveOnTracking('shipment_errors',e.id);
+  });
 }
 window._autoResolveOnTracking=_autoResolveOnTracking;window.autoResolveTrackedTickets=autoResolveTrackedTickets;
 
@@ -18046,6 +18064,7 @@ async function saveManualTracking(type, id){
   }
   document.getElementById('mt-overlay')?.remove();
   toast('✓ Tracking saved');render();
+  try{await _autoResolveOnTracking(type==='warranty'?'warranty_claims':'shipment_errors',id);}catch(_at){}
 }
 
 function openShipmentErrorModal(editId, prefill){
