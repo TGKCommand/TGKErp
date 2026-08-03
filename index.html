@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v20.96</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.01</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v20.96';
+const TGK_ERP_VERSION = 'v21.01';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -3950,6 +3950,13 @@ async function refreshAllPOTracking(poId,silent){
 }
 
 async function checkPOTracking(poTrackingId, poId, carrier, tracking){
+  // Known-blocked by the ShipStation plan: skip a request that cannot succeed.
+  if(S._etaPlanBlocked){
+    const _u=trackingUrl(carrier,tracking);
+    toast('Live ETA is not available on your ShipStation plan \u2014 opening the carrier page.',5000);
+    if(_u)window.open(_u,'_blank','noopener');
+    return;
+  }
   const btn=document.getElementById('chk-eta-'+poTrackingId);
   if(btn){btn.disabled=true;btn.textContent='Checking…';}
   try{
@@ -3959,7 +3966,31 @@ async function checkPOTracking(poTrackingId, poId, carrier, tracking){
       body:JSON.stringify({action:'track_po',carrier,tracking,po_tracking_id:poTrackingId})
     });
     const data=await res.json().catch(()=>({}));
-    if(!res.ok){toast('Tracking error: '+(data.error||res.status),4000);return;}
+    if(!res.ok){
+      // Fall back to the carrier's own page, which never depends on our API. Three cases are
+      // worth telling apart, because the fix for each is completely different:
+      //  * 401 + "upgrade your billing plan" -> the ShipStation plan does not include the V2
+      //    API. Retrying can never succeed, so remember it and stop calling out this session.
+      //  * 501 -> the SS_V2_KEY secret is not set on the edge function.
+      //  * 404 -> key works, but that carrier/tracking pair is not reachable via the account.
+      const url=trackingUrl(carrier,tracking);
+      const raw=String(data.error||'');
+      const planBlocked=(res.status===401||res.status===403)&&/upgrade your bil|unauthorized/i.test(raw);
+      let why;
+      if(planBlocked){
+        S._etaPlanBlocked=true;
+        why='Live ETA is not included in your ShipStation plan (V2 API says "you must upgrade your billing plan"). Opening the carrier page instead \u2014 Check ETA will go straight there from now on.';
+      }else if(res.status===501){
+        why='Live ETA needs the SS_V2_KEY secret on the shipstation-ship function. Opening the carrier page instead.';
+      }else if(res.status===404){
+        why='Carrier or tracking number not recognised by the tracking API. Opening the carrier page instead.';
+      }else{
+        why='ETA lookup failed: '+(raw||('HTTP '+res.status))+'. Opening the carrier page instead.';
+      }
+      toast(why,planBlocked?9000:7000);
+      if(url)window.open(url,'_blank','noopener');
+      return;
+    }
     if(S.poTracking[poId]){
       S.poTracking[poId]=S.poTracking[poId].map(function(t){
         if(t.id!==poTrackingId)return t;
@@ -5472,15 +5503,17 @@ function ok(body: string) { return new Response(body, { headers: CORS }) }
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { ...CORS, 'Content-Type': 'application/json' } })
 }
-function stripHash(s: string): string { return s.replace(/^#/, '') }
+function stripHash(s: string): string { return s.replace(/^#/, '').replace(/^Manual_/i, '') }
 async function buildOrderMap() {
-  // Every status an order can sit in BEFORE it's fully resolved. This map is shared by bulk_sync,
-  // hold_sync, and anything else that needs to find a sales line by order number — excluding
-  // Pre-order and On Hold here meant those orders were invisible to this lookup entirely, regardless
-  // of date range, causing them to silently count as "not found" and get skipped no matter what.
   const { data } = await db.from('sales')
-    .select('id,order_number,pn,fulfillment_status')
-    .in('fulfillment_status', ['Open', 'Pre-order', 'On Hold', 'Packed', 'Partial'])
+    // [FIX 3a] added \`qty\` — bulk_sync now needs per-line quantity to deduct inventory, not just flip status
+    .select('id,order_number,pn,fulfillment_status,qty')
+    // [FIX] Include On Hold and Pre-Order lines so bulk tracking sync catches shipments for orders that
+    // ShipStation shipped while the ERP still had them On Hold or Pre-Order. These were previously
+    // excluded, so every such shipment came back "not found in ERP" and never received tracking. Terminal
+    // states (Shipped/Delivered/Cancelled/fulfilled) stay excluded to avoid re-processing and
+    // double-deduction; deductForShipment also dedups on the tracking number as a second guard.
+    .in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
     .limit(100000)
   const map: any = {}
   for (const line of (data || [])) {
@@ -5494,75 +5527,123 @@ function ssAuth(): string {
   const k = Deno.env.get('SS_KEY') || '', s = Deno.env.get('SS_SECRET') || ''
   return btoa(k + ':' + s)
 }
-async function bomMaxBuild(pn: string, depth = 0): Promise<{ hasBOM: boolean, maxBuild: number }> {
-  if (depth > 6) return { hasBOM: false, maxBuild: 0 } // guard infinite recursion
-  const { data: bom } = await db.from('bom_items').select('child_pn,qty,item_type').eq('parent_pn', pn)
-  if (!bom?.length) return { hasBOM: false, maxBuild: 0 }
-  let maxBuild = Infinity
-  for (const item of bom) {
-    const need = Number(item.qty) || 1
-    const isSub = item.item_type === 'assembly' || item.item_type === 'subassembly'
-    let avail = 0
-    if (isSub) {
-      const { data: rows } = await db.from('assemblies').select('total_on_hand').eq('pn', item.child_pn).limit(1)
-      const oh = Number(rows?.[0]?.total_on_hand) || 0
-      if (oh > 0) {
-        avail = oh
-      } else {
-        const subB = await bomMaxBuild(item.child_pn, depth + 1)
-        avail = subB.hasBOM ? subB.maxBuild : 0
-      }
-    } else {
-      const { data: rows } = await db.from('parts').select('total_unpckgd').eq('pn', item.child_pn).limit(1)
-      avail = Number(rows?.[0]?.total_unpckgd) || 0
-    }
-    const fromThis = need > 0 ? Math.floor(avail / need) : Infinity
-    if (fromThis < maxBuild) maxBuild = fromThis
-  }
-  return { hasBOM: true, maxBuild: maxBuild === Infinity ? 0 : Math.max(0, maxBuild) }
-}
+
+// [FIX 5a] Ported from the ERP reference copy — only genuine finished goods should ever have their
+// Shopify listing touched by the backorder automation. Subassemblies and hardware packs aren't
+// standalone Shopify products; Pre-Order items use a separate template that must never be overwritten;
+// discontinued/dev items shouldn't be actively managed. The deployed function was missing this gate,
+// so it could clobber the template on those SKUs.
 function isHWPackServer(pn: string): boolean {
-  return /^TGK-P\d/i.test(pn || '')
+  return /^TGK-P\\d/i.test(pn || '')
 }
 function isEligibleForBackorderSync(item: any): boolean {
-  // Server-side mirror of the ERP's client-side eligibleForBackorderSync — only genuine finished
-  // goods should ever have their Shopify listing touched by this automation. Subassemblies and
-  // hardware packs aren't standalone Shopify products; Pre-Order items use their own separate
-  // Shopify template that must never be overwritten by the backorder automation; discontinued and
-  // dev-stage items shouldn't be actively managed at all.
   if (!item) return false
   if (item.discontinued || item.stage === 'dev') return false
   if (item.is_subassembly || isHWPackServer(item.pn)) return false
   if ((item.category || '') === 'Pre-Order') return false
   return true
 }
-async function cascadeShopifyBackorder(childPn: string): Promise<void> {
-  // Server-side equivalent of the ERP's client-side cascadeShopifySync. Only matters when the
-  // directly-shipped item was a PART — parts can be shared components across several assemblies,
-  // so depleting one via a direct-part sale can push ANOTHER assembly's buildability to zero without
-  // that assembly's own stock ever changing. Without this, only the part's own Shopify listing (if it
-  // has one) gets rechecked; every assembly depending on it silently goes stale.
-  const { data: boms } = await db.from('bom_items').select('parent_pn').eq('child_pn', childPn)
-  const parentPns = [...new Set((boms || []).map((b: any) => b.parent_pn))]
-  if (!parentPns.length) return
-  const { data: parents } = await db.from('assemblies').select('pn,total_on_hand,discontinued,stage,is_subassembly,category').in('pn', parentPns)
-  for (const parent of (parents || [])) {
-    if (!isEligibleForBackorderSync(parent)) continue
-    if ((parent.total_on_hand || 0) <= 0) await syncShopifyBackorder(parent.pn, parent.total_on_hand || 0)
+
+// [SHARED] Mirrors the client's buildabilityForBackorder EXACTLY so the edge (ship-time) and the client
+// (manual/bulk sync) never disagree on backorder status. Pre-fetches the whole BOM tree in a bounded
+// number of queries, ignores packaging/supply lines, consumes subassembly on-hand before building the
+// remainder from raw parts, and draws a shared part from ONE stock pool across every place it is used.
+async function bomMaxBuild(pn: string): Promise&lt;{ hasBOM: boolean, maxBuild: number }&gt; {
+  const bomOf: Record&lt;string, { child_pn: string, qty: number, item_type: string }[]&gt; = {}
+  const childPns = new Set&lt;string&gt;()
+  let frontier: string[] = [pn]; let depth = 0; const fetched = new Set&lt;string&gt;()
+  while (frontier.length &amp;&amp; depth &lt;= 6) {
+    const toFetch = frontier.filter(p =&gt; !fetched.has(p)); toFetch.forEach(p =&gt; fetched.add(p))
+    if (!toFetch.length) break
+    const { data: rows } = await db.from('bom_items').select('parent_pn,child_pn,qty,item_type').in('parent_pn', toFetch)
+    toFetch.forEach(p =&gt; { if (!bomOf[p]) bomOf[p] = [] })
+    const next: string[] = []
+    ;(rows || []).forEach((r: any) =&gt; {
+      (bomOf[r.parent_pn] = bomOf[r.parent_pn] || []).push({ child_pn: r.child_pn, qty: Number(r.qty) || 1, item_type: r.item_type })
+      childPns.add(r.child_pn)
+      if (r.item_type === 'assembly' || r.item_type === 'subassembly') next.push(r.child_pn)
+    })
+    frontier = next; depth++
   }
+  if (!(bomOf[pn] || []).length) return { hasBOM: false, maxBuild: 0 }
+  const allChildren = [...childPns]
+  const partRec: Record&lt;string, { stock: number, cat: string }&gt; = {}
+  const asmRec: Record&lt;string, { oh: number }&gt; = {}
+  if (allChildren.length) {
+    const { data: prows } = await db.from('parts').select('pn,total_unpckgd,category').in('pn', allChildren)
+    ;(prows || []).forEach((p: any) =&gt; { partRec[p.pn] = { stock: Number(p.total_unpckgd) || 0, cat: (p.category || '').toLowerCase() } })
+    const { data: arows } = await db.from('assemblies').select('pn,total_on_hand').in('pn', allChildren)
+    ;(arows || []).forEach((a: any) =&gt; { asmRec[a.pn] = { oh: Number(a.total_on_hand) || 0 } })
+  }
+  const SUPPLY = ['shipping', 'bulk pieces']
+  const inc = (i: { child_pn: string, item_type: string }): boolean =&gt; {
+    if (i.item_type === 'packaging') return false
+    const pr = partRec[i.child_pn]
+    if (pr) { const c = pr.cat; if (SUPPLY.includes(c)) return false; if (c.includes('box') || c.includes('packaging') || c.includes('shipping')) return false }
+    return true
+  }
+  const isSub = (i: { child_pn: string, item_type: string }): boolean =&gt; (i.child_pn in asmRec) || i.item_type === 'assembly' || i.item_type === 'subassembly'
+  const ub = (node: string, d: number): number =&gt; {
+    if (d &gt; 6) return 0
+    const bom = bomOf[node] || []; const per: number[] = []
+    for (const i of bom) {
+      if (!inc(i)) continue
+      let avail: number
+      if (isSub(i)) { const oh = (asmRec[i.child_pn]?.oh) || 0; const cap = ub(i.child_pn, d + 1); avail = oh + (cap === Infinity ? 0 : cap) }
+      else { avail = (partRec[i.child_pn]?.stock) || 0 }
+      per.push(i.qty &gt; 0 ? Math.floor(avail / i.qty) : Infinity)
+    }
+    if (!per.length) return Infinity
+    return Math.max(0, Math.min(...per))
+  }
+  const UB = ub(pn, 0)
+  if (UB === Infinity) return { hasBOM: true, maxBuild: 1 } // only packaging/supply remains -&gt; trivially buildable
+  if (UB &lt;= 0) return { hasBOM: true, maxBuild: 0 }
+  const feasible = (N: number): boolean =&gt; {
+    const partUsed: Record&lt;string, number&gt; = {}, subLeft: Record&lt;string, number&gt; = {}; let ok = true
+    const explode = (node: string, count: number, d: number): void =&gt; {
+      if (!ok || count &lt;= 0) return
+      if (d &gt; 8) { ok = false; return }
+      const bom = bomOf[node] || []
+      for (const i of bom) {
+        if (!ok) break
+        if (!inc(i)) continue
+        const need = count * (i.qty || 1); if (need &lt;= 0) continue
+        if (isSub(i)) {
+          if (subLeft[i.child_pn] === undefined) subLeft[i.child_pn] = (asmRec[i.child_pn]?.oh) || 0
+          const fromStock = Math.min(need, subLeft[i.child_pn]); subLeft[i.child_pn] -= fromStock
+          const toBuild = need - fromStock
+          if (toBuild &gt; 0) { if (!(bomOf[i.child_pn] || []).length) { ok = false; return } explode(i.child_pn, toBuild, d + 1) }
+        } else {
+          partUsed[i.child_pn] = (partUsed[i.child_pn] || 0) + need
+          const stock = (partRec[i.child_pn]?.stock) || 0
+          if (partUsed[i.child_pn] &gt; stock) { ok = false; return }
+        }
+      }
+    }
+    explode(pn, N, 0)
+    return ok
+  }
+  let lo = 0, hi = UB
+  while (lo &lt; hi) { const mid = lo + Math.ceil((hi - lo) / 2); if (feasible(mid)) lo = mid; else hi = mid - 1 }
+  return { hasBOM: true, maxBuild: lo }
 }
-async function syncShopifyBackorder(pn: string, newOh: number): Promise<void> {
-  const { data: asmCheck } = await db.from('assemblies').select('pn,discontinued,stage,is_subassembly,category').eq('pn', pn).limit(1)
-  const { data: partCheck } = asmCheck?.length ? { data: null } : await db.from('parts').select('pn,discontinued,category').eq('pn', pn).limit(1)
-  const item = asmCheck?.[0] || partCheck?.[0]
-  if (item && !isEligibleForBackorderSync(item)) {
-    console.log('[SS->Shopify] skipped — not eligible (subassembly/hardware pack/pre-order/discontinued/dev):', pn)
-    return
-  }
+
+async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&gt; {
   const { data: toggleRow } = await db.from('settings').select('value').eq('key', 'shopify_backorder_sync_enabled').limit(1)
   const syncEnabled = toggleRow?.[0]?.value
   if (syncEnabled === false || syncEnabled === 'false') {
-    console.log('[SS->Shopify] sync disabled via ERP toggle — skipped for', pn)
+    console.log('[SS-&gt;Shopify] sync disabled via ERP toggle — skipped for', pn)
+    return
+  }
+  // [FIX 5b] eligibility gate — never touch subassembly / hardware-pack / pre-order / discontinued / dev listings
+  // [FIX B] new_sku-aware eligibility resolve (pn may be a new_sku)
+  let { data: asmCheck } = await db.from('assemblies').select('pn,discontinued,stage,is_subassembly,category').eq('pn', pn).limit(1)
+  if (!asmCheck?.length) { const _r = await db.from('assemblies').select('pn,discontinued,stage,is_subassembly,category').eq('new_sku', pn).limit(1); asmCheck = _r.data }
+  const { data: partCheck } = asmCheck?.length ? { data: null } : await db.from('parts').select('pn,discontinued,category').eq('pn', pn).limit(1)
+  const eligItem = asmCheck?.[0] || partCheck?.[0]
+  if (eligItem &amp;&amp; !isEligibleForBackorderSync(eligItem)) {
+    console.log('[SS-&gt;Shopify] skipped — not eligible (subassembly/hardware pack/pre-order/discontinued/dev):', pn)
     return
   }
   const store = (Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
@@ -5570,44 +5651,47 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise<void> {
   if (!store || !key) return
   let template = ''
   let ssRestock = ''
-  if (newOh <= 0) {
+  if (newOh &lt;= 0) {
     const { hasBOM, maxBuild } = await bomMaxBuild(pn)
-    const isBackorder = !hasBOM || maxBuild <= 0
+    const isBackorder = !hasBOM || maxBuild &lt;= 0
     if (isBackorder) {
       template = Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder'
       const { data: rdRow } = await db.from('settings').select('value').eq('key', 'shopify_restock_days').limit(1)
       const rdDays = Number(rdRow?.[0]?.value) || 30
       ssRestock = new Date(Date.now() + rdDays * 86400000).toISOString().slice(0, 10)
     }
-    console.log('[SS->Shopify]', pn, 'newOh='+newOh, 'hasBOM='+hasBOM, 'maxBuild='+maxBuild, '->', template || '(revert)', ssRestock ? 'restock:'+ssRestock : '')
+    console.log('[SS-&gt;Shopify]', pn, 'newOh='+newOh, 'hasBOM='+hasBOM, 'maxBuild='+maxBuild, '-&gt;', template || '(revert)', ssRestock ? 'restock:'+ssRestock : '')
   }
-  const body: any = { restock_date: ssRestock }
   try {
-    const varRes = await fetch('https://' + store + '/admin/api/2024-01/variants.json?sku=' + encodeURIComponent(pn) + '&fields=product_id,id,sku', {
+    const varRes = await fetch('https://' + store + '/admin/api/2024-01/variants.json?sku=' + encodeURIComponent(pn) + '&amp;fields=product_id,id,sku', {
       headers: { 'X-Shopify-Access-Token': key }
     })
-    if (!varRes.ok) { console.warn('[SS->Shopify] variant lookup failed', pn, varRes.status); return }
+    if (!varRes.ok) { console.warn('[SS-&gt;Shopify] variant lookup failed', pn, varRes.status); return }
     const varData = await varRes.json()
-    const candidateIds: number[] = [...new Set((varData.variants || []).map((v: any) => v.product_id).filter(Boolean))]
-    if (!candidateIds.length) { console.warn('[SS->Shopify] no product for SKU', pn); return }
+    const candidateIds: number[] = [...new Set((varData.variants || []).map((v: any) =&gt; v.product_id).filter(Boolean))]
+    if (!candidateIds.length) { console.warn('[SS-&gt;Shopify] no product for SKU', pn); return }
     let productId: number | null = null
     for (const cid of candidateIds) {
       const checkRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + cid + '.json?fields=id,variants', { headers: { 'X-Shopify-Access-Token': key } })
-      if (!checkRes.ok) { console.warn('[SS->Shopify] product', cid, 'returned', checkRes.status, '— skipping'); continue }
+      if (!checkRes.ok) { console.warn('[SS-&gt;Shopify] product', cid, 'returned', checkRes.status, '— skipping'); continue }
       const checkData = await checkRes.json()
-      const skuMatch = (checkData.product?.variants || []).find((v: any) => (v.sku || '').trim().toUpperCase() === pn.toUpperCase())
+      const skuMatch = (checkData.product?.variants || []).find((v: any) =&gt; (v.sku || '').trim().toUpperCase() === pn.toUpperCase())
       if (skuMatch) { productId = cid; break }
-      console.warn('[SS->Shopify] product', cid, 'exists but SKU', pn, 'not on it — skipping')
+      console.warn('[SS-&gt;Shopify] product', cid, 'exists but SKU', pn, 'not on it — skipping')
     }
-    if (!productId) { console.warn('[SS->Shopify] could not confirm product for SKU', pn); return }
+    if (!productId) { console.warn('[SS-&gt;Shopify] could not confirm product for SKU', pn); return }
     const putRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + productId + '.json', {
       method: 'PUT',
       headers: { 'X-Shopify-Access-Token': key, 'Content-Type': 'application/json' },
       body: JSON.stringify({ product: { id: productId, template_suffix: template } })
     })
-    console.log('[SS->Shopify] template set', pn, '->', template || '(normal)', 'HTTP', putRes.status)
+    console.log('[SS-&gt;Shopify] template set', pn, '-&gt;', template || '(normal)', 'HTTP', putRes.status)
+    // [FIX 4] Declare ssRestockDate BEFORE it is used. The deployed version referenced ssRestockDate in
+    // the log insert below and only declared it (const) a few lines later — a temporal-dead-zone
+    // ReferenceError that was silently swallowed by the catch, so the sync-log row never got written.
+    const ssRestockDate = ssRestock || ''
     try {
-      const { hasBOM: logHasBOM, maxBuild: logMaxBuild } = await bomMaxBuild(pn)
+      const { maxBuild: logMaxBuild } = await bomMaxBuild(pn)
       await db.from('shopify_sync_log').insert({
         pn,
         action: template ? 'backorder' : 'reverted',
@@ -5616,9 +5700,8 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise<void> {
         max_build: logMaxBuild || null,
         restock_date: ssRestockDate || null
       })
-    } catch (e) { console.warn('[SS->Shopify] log insert failed:', e) }
-    const ssRestockDate = body.restock_date || ''
-    if (template && ssRestockDate) {
+    } catch (e) { console.warn('[SS-&gt;Shopify] log insert failed:', e) }
+    if (template &amp;&amp; ssRestockDate) {
       try {
         const ssGid = 'gid://shopify/Product/' + productId
         const ssMutation = 'mutation { metafieldsSet(metafields: [{ownerId: "' + ssGid + '", namespace: "custom", key: "estimated_arrival_date", value: "' + ssRestockDate + '", type: "single_line_text_field"}]) { metafields { id } userErrors { field message } } }'
@@ -5626,20 +5709,88 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise<void> {
           method: 'POST', headers: { 'X-Shopify-Access-Token': key, 'Content-Type': 'application/json' },
           body: JSON.stringify({ query: ssMutation })
         })
-        console.log('[SS->Shopify] estimated_arrival_date metafield set to', ssRestockDate)
-      } catch (e) { console.warn('[SS->Shopify] metafield write failed:', e) }
+        console.log('[SS-&gt;Shopify] estimated_arrival_date metafield set to', ssRestockDate)
+      } catch (e) { console.warn('[SS-&gt;Shopify] metafield write failed:', e) }
     }
   } catch (e) {
-    console.warn('[SS->Shopify] error for', pn, e)
+    console.warn('[SS-&gt;Shopify] error for', pn, e)
   }
 }
-Deno.serve(async (req) => {
+
+// [FIX 5c] Ported from the ERP reference copy. When a directly-sold PART ships, that part can be a
+// shared component of several assemblies; depleting it can push ANOTHER assembly's buildability to zero
+// without that assembly's own stock ever changing. Re-check every assembly that uses this part and is
+// already sitting at zero on-hand, so its Shopify backorder status doesn't go stale.
+async function cascadeShopifyBackorder(childPn: string): Promise&lt;void&gt; {
+  const { data: boms } = await db.from('bom_items').select('parent_pn').eq('child_pn', childPn)
+  const parentPns = [...new Set((boms || []).map((b: any) =&gt; b.parent_pn))]
+  if (!parentPns.length) return
+  const { data: parents } = await db.from('assemblies').select('pn,total_on_hand,discontinued,stage,is_subassembly,category').in('pn', parentPns)
+  for (const parent of (parents || [])) {
+    if (!isEligibleForBackorderSync(parent)) continue
+    if ((parent.total_on_hand || 0) &lt;= 0) await syncShopifyBackorder(parent.pn, parent.total_on_hand || 0)
+  }
+}
+
+// [FIX 1/2/3b] Single shared deduction routine used by BOTH the real-time webhook and bulk_sync, so the
+// two paths can never diverge. Handles assemblies AND directly-sold parts (the deployed webhook loop had
+// \`if(!asm) continue\`, so part sales were never deducted). Idempotent on the tracking number: a physical
+// shipment is deducted once, ever. This closes three holes at once —
+//   * duplicate webhook redelivery (ShipStation resends the same event, sometimes sub-second),
+//   * the same shipment arriving via both the real-time webhook and a later catch-up bulk_sync,
+//   * a bulk_sync being re-run over an overlapping date range.
+// Returns true if it deducted, false if it skipped (duplicate or SKU not found).
+async function deductForShipment(pn: string, qty: number, tracking: string, orderRef: string): Promise&lt;boolean&gt; {
+  if (tracking) {
+    const { data: dup } = await db.from('inv_corrections')
+      .select('id').eq('source', 'shipment').eq('pn', pn)
+      .ilike('reason', '%' + tracking + '%').limit(1)
+    if (dup?.length) {
+      console.log('[SS] Already deducted', pn, 'for tracking', tracking, '— skipping (idempotent)')
+      return false
+    }
+  }
+  const reason = 'Shipped via ShipStation ' + orderRef + ' ' + tracking
+  // [FIX B] new_sku-aware: sales.pn may hold a new_sku for a migrated product, whose assembly record
+  // still keys on the legacy .pn. Match .pn first, then fall back to .new_sku (injection-safe two-query
+  // form rather than .or(), which would break on any SKU containing a PostgREST filter character).
+  let { data: asms } = await db.from('assemblies').select('id,total_on_hand').eq('pn', pn).limit(1)
+  if (!asms?.length) { const _r = await db.from('assemblies').select('id,total_on_hand').eq('new_sku', pn).limit(1); asms = _r.data }
+  const asm = asms?.[0]
+  if (asm) {
+    const prev = asm.total_on_hand || 0
+    const newOh = prev - qty // allow negative — backorder convention used everywhere else in the ERP
+    await db.from('assemblies').update({ total_on_hand: newOh, updated_at: new Date().toISOString() }).eq('id', asm.id)
+    await db.from('inv_corrections').insert({ pn, previous_qty: prev, new_qty: newOh, adjustment: -qty, reason, source: 'shipment' })
+    console.log('[SS] Deducted', qty, 'of', pn, 'on', orderRef, '| on_hand:', prev, '-&gt;', newOh)
+    await syncShopifyBackorder(pn, newOh)
+    return true
+  }
+  // Directly-sold part (not an assembly) — same deduction, different table.
+  let { data: prts } = await db.from('parts').select('id,total_unpckgd').eq('pn', pn).limit(1)
+  if (!prts?.length) { const _r = await db.from('parts').select('id,total_unpckgd').eq('new_sku', pn).limit(1); prts = _r.data } // [FIX B] new_sku-aware
+  const prt = prts?.[0]
+  if (!prt) {
+    console.warn('[SS] SKU not found in parts or assemblies — no deduction:', pn)
+    return false
+  }
+  const prevP = prt.total_unpckgd || 0
+  const newQtyP = prevP - qty
+  await db.from('parts').update({ total_unpckgd: newQtyP, updated_at: new Date().toISOString() }).eq('id', prt.id)
+  await db.from('inv_corrections').insert({ pn, previous_qty: prevP, new_qty: newQtyP, adjustment: -qty, reason, source: 'shipment' })
+  console.log('[SS] Deducted', qty, 'of', pn, '(part) on', orderRef, '| on_hand:', prevP, '-&gt;', newQtyP)
+  await syncShopifyBackorder(pn, newQtyP)
+  await cascadeShopifyBackorder(pn)
+  return true
+}
+
+Deno.serve(async (req) =&gt; {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
-  const body = await req.json().catch(() => ({})) as any
+  const body = await req.json().catch(() =&gt; ({})) as any
   if (req.method === 'GET' || body.ping) return new Response('pong', { headers: CORS })
   if (body.check_secrets) {
     const k = Deno.env.get('SS_KEY') || '', s = Deno.env.get('SS_SECRET') || ''
-    return json({ ss_key_set: k.length > 0, ss_key_length: k.length, ss_key_preview: k.length > 4 ? k.slice(0,2)+'...'+k.slice(-2) : '(empty)', ss_secret_set: s.length > 0, ss_secret_length: s.length, ss_secret_preview: s.length > 4 ? s.slice(0,2)+'...'+s.slice(-2) : '(empty)' })
+    return json({ ss_key_set: k.length &gt; 0, ss_key_length: k.length, ss_key_preview: k.length &gt; 4 ? k.slice(0,2)+'...'+k.slice(-2) : '(empty)', ss_secret_set: s.length &gt; 0, ss_secret_length: s.length, ss_secret_preview: s.length &gt; 4 ? s.slice(0,2)+'...'+s.slice(-2) : '(empty)', ss_v2_key_set: (Deno.env.get('SS_V2_KEY') || '').length &gt; 0 })
   }
   if (body.action === 'bulk_sync') {
     const auth = ssAuth()
@@ -5647,11 +5798,13 @@ Deno.serve(async (req) => {
     const since = body.since || new Date(Date.now() - 30*24*60*60*1000).toISOString().slice(0,10)
     const until = body.until || new Date().toISOString().slice(0,10)
     const orderMap = await buildOrderMap()
-    const norm = (s: string) => s.trim().toUpperCase()
+    const norm = (s: string) =&gt; s.trim().toUpperCase()
     const updateGroups: any = {}
+    // [FIX 3c] collect the matched lines (pn + qty + tracking) so we can deduct after status updates.
+    const deductQueue: any[] = []
     let page = 1, totalPages = 1, synced = 0, skipped = 0, notFound = 0
-    while (page <= totalPages) {
-      const url = 'https://ssapi.shipstation.com/shipments?shipDateStart=' + since + '&shipDateEnd=' + until + '&pageSize=500&page=' + page + '&includeShipmentItems=true'
+    while (page &lt;= totalPages) {
+      const url = 'https://ssapi.shipstation.com/shipments?shipDateStart=' + since + '&amp;shipDateEnd=' + until + '&amp;pageSize=500&amp;page=' + page + '&amp;includeShipmentItems=true'
       const res = await fetch(url, { headers: { Authorization: 'Basic ' + auth } })
       if (!res.ok) return json({ error: 'ShipStation error ' + res.status }, 502)
       const data = await res.json()
@@ -5661,10 +5814,10 @@ Deno.serve(async (req) => {
         const rawNum = stripHash(ship.orderNumber || '')
         const lines = orderMap[rawNum] || []
         if (!lines.length) { notFound++; continue }
-        const rawSkus = (ship.shipmentItems || []).flatMap((i: any) => [i.sku, i.name].filter(Boolean))
-        const allPns = lines.map((l: any) => l.pn as string)
-        const matched = rawSkus.length > 0
-          ? allPns.filter(p => rawSkus.some((s: string) => { const e=norm(p),k=norm(s); return e===k||e.includes(k)||k.includes(e) }))
+        const rawSkus = (ship.shipmentItems || []).flatMap((i: any) =&gt; [i.sku, i.name].filter(Boolean))
+        const allPns = lines.map((l: any) =&gt; l.pn as string)
+        const matched = rawSkus.length &gt; 0
+          ? allPns.filter(p =&gt; rawSkus.some((s: string) =&gt; { const e=norm(p),k=norm(s); return e===k||e.includes(k)||k.includes(e) }))
           : allPns
         const tracking = ship.trackingNumber
         const carrier = (ship.carrierCode || '').toUpperCase()
@@ -5672,8 +5825,11 @@ Deno.serve(async (req) => {
         const gKey = tracking + '|' + carrier + '|' + shippedAt.slice(0,10)
         if (!updateGroups[gKey]) updateGroups[gKey] = { ids: [], tracking, carrier, shippedAt }
         for (const pn of matched) {
-          const line = lines.find((l: any) => l.pn === pn)
-          if (line) updateGroups[gKey].ids.push(line.id)
+          const line = lines.find((l: any) =&gt; l.pn === pn)
+          if (line) {
+            updateGroups[gKey].ids.push(line.id)
+            deductQueue.push({ id: line.id, pn, qty: line.qty || 1, tracking, order: rawNum }) // [FIX 3c]
+          }
         }
         synced++
       }
@@ -5681,29 +5837,44 @@ Deno.serve(async (req) => {
     }
     let applied = 0
     for (const g of Object.values(updateGroups)) {
-      const deduped = [...new Set(g.ids)]
-      for (let i = 0; i < deduped.length; i += 200) {
+      const deduped = [...new Set((g as any).ids)]
+      for (let i = 0; i &lt; deduped.length; i += 200) {
         await db.from('sales').update({
-          fulfillment_status: 'Shipped', tracking_number: g.tracking,
-          carrier: g.carrier, shipped_at: g.shippedAt
+          fulfillment_status: 'Shipped', tracking_number: (g as any).tracking,
+          carrier: (g as any).carrier, shipped_at: (g as any).shippedAt
         }).in('id', deduped.slice(i, i+200))
         applied += Math.min(200, deduped.length - i)
       }
     }
-    return json({ synced, skipped, notFound, applied, pages: totalPages, message: 'Synced ' + synced + ' shipments, applied ' + applied + ' line updates' })
+    // [FIX 3d] Deduct inventory for the shipments we just marked Shipped. bulk_sync previously flipped
+    // status WITHOUT ever deducting, so any shipment the real-time webhook missed (not delivered, edge
+    // function cold, etc.) was marked shipped with its stock never reduced — a silent, permanent
+    // overstatement. Guards against double-deduction: buildOrderMap only returned Open/Packed/Partial
+    // lines (anything already shipped-and-deducted by the webhook is excluded), deductForShipment dedups
+    // on the tracking number, and we dedup line ids within this run so one line matched by two shipments
+    // is only deducted once.
+    let deducted = 0
+    const seenLineIds = new Set()
+    for (const d of deductQueue) {
+      if (seenLineIds.has(d.id)) continue
+      seenLineIds.add(d.id)
+      const did = await deductForShipment(d.pn, d.qty, d.tracking, d.order)
+      if (did) deducted++
+    }
+    return json({ synced, skipped, notFound, applied, deducted, pages: totalPages, message: 'Synced ' + synced + ' shipments, applied ' + applied + ' line updates, deducted ' + deducted + ' line(s)' })
   }
   if (body.action === 'hold_sync') {
     const auth = ssAuth()
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
     const orderMap = await buildOrderMap()
     let page = 1, totalPages = 1, markedHold = 0, markedOpen = 0
-    const stillOnHoldOrderNums = new Set<string>() // order numbers ShipStation currently reports as on_hold —
+    const stillOnHoldOrderNums = new Set() // order numbers ShipStation currently reports as on_hold —
     // a split/drop-ship order can have ONE line genuinely on hold while ShipStation reports the OVERALL
     // order as awaiting_shipment (because the other line is ready to move). Without tracking this, the
     // release pass below would incorrectly release the still-held line just because its order number also
     // shows up in the awaiting_shipment list — causing it to flip Open→On Hold→Open→On Hold every cycle.
-    while (page <= totalPages) {
-      const res = await fetch('https://ssapi.shipstation.com/orders?orderStatus=on_hold&pageSize=500&page=' + page, { headers: { Authorization: 'Basic ' + auth } })
+    while (page &lt;= totalPages) {
+      const res = await fetch('https://ssapi.shipstation.com/orders?orderStatus=on_hold&amp;pageSize=500&amp;page=' + page, { headers: { Authorization: 'Basic ' + auth } })
       if (!res.ok) return json({ error: 'ShipStation error ' + res.status }, 502)
       const data = await res.json()
       totalPages = data.pages || 1
@@ -5711,7 +5882,7 @@ Deno.serve(async (req) => {
         const rawNum = stripHash(order.orderNumber || '')
         stillOnHoldOrderNums.add(rawNum)
         const lines = orderMap[rawNum] || []
-        const ids = lines.filter((l: any) => ['Open','Packed'].includes(l.fulfillment_status)).map((l: any) => l.id as string)
+        const ids = lines.filter((l: any) =&gt; ['Open','Packed'].includes(l.fulfillment_status)).map((l: any) =&gt; l.id as string)
         if (ids.length) {
           await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', ids)
           markedHold += ids.length
@@ -5722,15 +5893,15 @@ Deno.serve(async (req) => {
     const { data: heldLines } = await db.from('sales').select('id,order_number').eq('fulfillment_status', 'On Hold').limit(5000)
     if (heldLines?.length) {
       let rPage = 1, rTotalPages = 1
-      while (rPage <= rTotalPages) {
-        const relRes = await fetch('https://ssapi.shipstation.com/orders?orderStatus=awaiting_shipment&pageSize=500&page=' + rPage, { headers: { Authorization: 'Basic ' + auth } })
+      while (rPage &lt;= rTotalPages) {
+        const relRes = await fetch('https://ssapi.shipstation.com/orders?orderStatus=awaiting_shipment&amp;pageSize=500&amp;page=' + rPage, { headers: { Authorization: 'Basic ' + auth } })
         if (!relRes.ok) break
         const relData = await relRes.json()
         rTotalPages = relData.pages || 1
         for (const order of (relData.orders || [])) {
           const rawNum = stripHash(order.orderNumber || '')
           if (stillOnHoldOrderNums.has(rawNum)) continue // this order still has a genuinely-held line — don't release it
-          const toRelease = (heldLines || []).filter((l: any) => stripHash(l.order_number || '') === rawNum).map((l: any) => l.id as string)
+          const toRelease = (heldLines || []).filter((l: any) =&gt; stripHash(l.order_number || '') === rawNum).map((l: any) =&gt; l.id as string)
           if (toRelease.length) {
             await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', toRelease)
             markedOpen += toRelease.length
@@ -5747,8 +5918,8 @@ Deno.serve(async (req) => {
     const days = body.days || 30
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
     let page = 1, totalPages = 1, markedCancelled = 0
-    while (page <= totalPages) {
-      const res = await fetch('https://ssapi.shipstation.com/orders?orderStatus=cancelled&pageSize=500&page=' + page + '&modifyDateStart=' + since, { headers: { Authorization: 'Basic ' + auth } })
+    while (page &lt;= totalPages) {
+      const res = await fetch('https://ssapi.shipstation.com/orders?orderStatus=cancelled&amp;pageSize=500&amp;page=' + page + '&amp;modifyDateStart=' + since, { headers: { Authorization: 'Basic ' + auth } })
       if (!res.ok) return json({ error: 'ShipStation error ' + res.status }, 502)
       const data = await res.json()
       totalPages = data.pages || 1
@@ -5771,10 +5942,10 @@ Deno.serve(async (req) => {
   if (body.action === 'hold_sync_debug') {
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
     const auth = ssAuth()
-    const ssRes = await fetch('https://ssapi.shipstation.com/orders?orderStatus=on_hold&pageSize=50&page=1', { headers: { Authorization: 'Basic ' + auth } })
+    const ssRes = await fetch('https://ssapi.shipstation.com/orders?orderStatus=on_hold&amp;pageSize=50&amp;page=1', { headers: { Authorization: 'Basic ' + auth } })
     if (!ssRes.ok) return json({ error: 'ShipStation error ' + ssRes.status }, 502)
     const ssData = await ssRes.json()
-    const ssOrders = (ssData.orders || []).map((o: any) => ({
+    const ssOrders = (ssData.orders || []).map((o: any) =&gt; ({
       raw: o.orderNumber,
       stripped: stripHash(o.orderNumber || ''),
       status: o.orderStatus,
@@ -5784,13 +5955,13 @@ Deno.serve(async (req) => {
       .select('order_number,fulfillment_status')
       .in('fulfillment_status', ['Open','Packed','Partial','On Hold'])
       .limit(20)
-    const erpSample2 = (erpSample || []).map((r: any) => ({
+    const erpSample2 = (erpSample || []).map((r: any) =&gt; ({
       raw: r.order_number,
       stripped: stripHash(r.order_number || ''),
       status: r.fulfillment_status
     }))
-    const erpKeys = new Set((erpSample || []).map((r: any) => stripHash(r.order_number || '')))
-    const matches = ssOrders.filter((o: any) => erpKeys.has(o.stripped))
+    const erpKeys = new Set((erpSample || []).map((r: any) =&gt; stripHash(r.order_number || '')))
+    const matches = ssOrders.filter((o: any) =&gt; erpKeys.has(o.stripped))
     return json({
       ss_on_hold_count: ssData.total || ssOrders.length,
       ss_on_hold_sample: ssOrders.slice(0, 10),
@@ -5807,7 +5978,7 @@ Deno.serve(async (req) => {
   if (body.action === 'delivery_sync') {
     const auth = ssAuth()
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
-    const since = body.since || new Date(Date.now() - 90*24*60*60*1000).toISOString().slice(0,10)
+    const since = body.since || new Date(Date.now() - 45*24*60*60*1000).toISOString().slice(0,10)
     const { data: shipped } = await db.from('sales')
       .select('id,order_number,tracking_number')
       .eq('fulfillment_status', 'Shipped')
@@ -5816,51 +5987,85 @@ Deno.serve(async (req) => {
     if (!shipped?.length) return json({ delivered: 0, message: 'No shipped orders to check' })
     const trackMap: any = {}
     for (const s of (shipped || [])) trackMap[(s.tracking_number || '').toUpperCase()] = s.id
-    const res = await fetch('https://ssapi.shipstation.com/shipments?shipDateStart=' + since + '&pageSize=500&includeShipmentItems=false', { headers: { Authorization: 'Basic ' + auth } })
+    const res = await fetch('https://ssapi.shipstation.com/shipments?shipDateStart=' + since + '&amp;pageSize=500&amp;includeShipmentItems=false', { headers: { Authorization: 'Basic ' + auth } })
     if (!res.ok) return json({ error: 'ShipStation error ' + res.status }, 502)
     const data = await res.json()
     const toDeliver: string[] = []
     for (const ship of (data.shipments || [])) {
-      if (!ship.deliveryDate && ship.shipmentStatus !== 'delivered') continue
+      if (!ship.deliveryDate &amp;&amp; ship.shipmentStatus !== 'delivered') continue
       const id = trackMap[(ship.trackingNumber || '').toUpperCase()]
       if (id) toDeliver.push(id)
     }
     let delivered = 0
     const now = new Date().toISOString()
-    for (let i = 0; i < toDeliver.length; i += 200) {
+    for (let i = 0; i &lt; toDeliver.length; i += 200) {
       await db.from('sales').update({ fulfillment_status: 'Delivered', delivered_at: now }).in('id', toDeliver.slice(i, i+200))
       delivered += Math.min(200, toDeliver.length - i)
     }
     return json({ delivered, checked: shipped?.length || 0, message: delivered + ' orders marked Delivered' })
   }
+  // ─────────────────────────────────────────────────────────────────────────────
+  // track_po — PO ETA lookup.  [FIXED]
+  //
+  // Was: GET https://ssapi.shipstation.com/carriers/track?carrierCode=..&amp;trackingNumber=..
+  // That path does not exist in the ShipStation V1 API (V1 exposes /orders, /shipments,
+  // /carriers, /carriers/listservices ... but no tracking lookup), so ShipStation always
+  // answered 404 and this handler forwarded the 404 to the ERP. The button could never work.
+  //
+  // Live carrier tracking lives in the ShipStation V2 API:
+  //   GET https://api.shipstation.com/v2/tracking?carrier_code=..&amp;tracking_number=..
+  // V2 authenticates with an \`API-Key\` header instead of V1's Basic auth, so it needs its
+  // own secret:  supabase secrets set SS_V2_KEY=&lt;your V2 api key&gt;
+  //
+  // Response shape returned to the ERP is unchanged (estimatedDelivery / statusDesc / events)
+  // so no client change is required.
+  // ─────────────────────────────────────────────────────────────────────────────
   if (body.action === 'track_po') {
-    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
-    const auth = ssAuth()
-    const rawCarrier = (body.carrier || '').trim()
     const trackingNum = (body.tracking || '').trim()
+    const rawCarrier = (body.carrier || '').trim()
     const poTrackingId = body.po_tracking_id || null
     if (!trackingNum) return json({ error: 'tracking number required' }, 400)
+
+    const v2key = Deno.env.get('SS_V2_KEY') || ''
+    if (!v2key) {
+      return json({ error: 'Live ETA needs a ShipStation V2 API key. Set the SS_V2_KEY secret, or use the Carrier link on the PO line.' }, 501)
+    }
+
+    // V2 carrier codes
     const cu = rawCarrier.toUpperCase()
-    const ssCarrier = cu.includes('FEDEX') || cu.includes('FED') ? 'fedex'
+    const carrierCode =
+        cu.includes('FEDEX') || cu.includes('FED') ? 'fedex'
       : cu.includes('UPS') ? 'ups'
       : cu.includes('USPS') || cu.includes('STAMPS') || cu.includes('ENDICIA') ? 'stamps_com'
-      : cu.includes('DHL') ? 'dhl_express_worldwide'
+      : cu.includes('DHL') ? 'dhl_express'
       : cu.includes('ONTRAC') ? 'ontrac'
       : cu.toLowerCase()
-    const res = await fetch('https://ssapi.shipstation.com/carriers/track?carrierCode=' + encodeURIComponent(ssCarrier) + '&trackingNumber=' + encodeURIComponent(trackingNum), {
-      headers: { Authorization: 'Basic ' + auth }
-    })
-    if (!res.ok) return json({ error: 'ShipStation tracking error ' + res.status + ' — carrier may not support API tracking' }, res.status)
+
+    const trackUrl = 'https://api.shipstation.com/v2/tracking'
+      + '?carrier_code=' + encodeURIComponent(carrierCode)
+      + '&amp;tracking_number=' + encodeURIComponent(trackingNum)
+
+    const res = await fetch(trackUrl, { headers: { 'API-Key': v2key } })
+    if (!res.ok) {
+      const detail = await res.text().catch(() =&gt; '')
+      console.warn('[track_po] V2 tracking', res.status, carrierCode, trackingNum, detail.slice(0, 300))
+      return json({
+        error: 'ShipStation V2 tracking ' + res.status
+          + (res.status === 404 ? ' — carrier/tracking pair not recognised (is this carrier connected in ShipStation?)' : '')
+          + (res.status === 401 || res.status === 403 ? ' — SS_V2_KEY rejected' : '')
+          + (detail ? ' — ' + detail.slice(0, 180) : '')
+      }, res.status)
+    }
     const data = await res.json()
-    const estimatedDelivery = data.estimatedDeliveryDate ? data.estimatedDeliveryDate.slice(0, 10) : null
-    const statusDesc = data.statusDescription || data.status || null
-    if (poTrackingId && (estimatedDelivery || statusDesc)) {
+    const estimatedDelivery = data.estimated_delivery_date ? String(data.estimated_delivery_date).slice(0, 10) : null
+    const statusDesc = data.status_description || data.carrier_status_description || data.status_code || null
+    if (poTrackingId &amp;&amp; (estimatedDelivery || statusDesc)) {
       const patch: any = { updated_at: new Date().toISOString() }
       if (estimatedDelivery) patch.estimated_delivery = estimatedDelivery
       if (statusDesc) patch.carrier_status = statusDesc
       await db.from('po_tracking').update(patch).eq('id', poTrackingId)
     }
-    return json({ estimatedDelivery, statusDesc, events: (data.trackingEvents || []).slice(0, 5) })
+    return json({ estimatedDelivery, statusDesc, events: (data.events || []).slice(0, 5) })
   }
   if (body.action === 'ss_order_audit') {
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
@@ -5868,13 +6073,13 @@ Deno.serve(async (req) => {
     const days = body.days || 90
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
     const doImport = body.import === true
-    const stripH = (s: string) => (s || '').replace(/^#/, '')
+    const stripH = (s: string) =&gt; (s || '').replace(/^#/, '')
     const allSSOrders: any[] = []
     for (const status of ['awaiting_shipment', 'on_hold', 'awaiting_payment', 'pending_fulfillment', 'shipped']) {
       let p = 1, pages = 1
-      while (p <= pages && p <= 5) { // cap 5 pages per status = 2500 max per status
+      while (p &lt;= pages &amp;&amp; p &lt;= 5) { // cap 5 pages per status = 2500 max per status
         const r = await fetch(
-          'https://ssapi.shipstation.com/orders?orderStatus=' + status + '&pageSize=500&page=' + p + '&modifyDateStart=' + since,
+          'https://ssapi.shipstation.com/orders?orderStatus=' + status + '&amp;pageSize=500&amp;page=' + p + '&amp;modifyDateStart=' + since,
           { headers: { Authorization: 'Basic ' + auth } }
         )
         if (!r.ok) break
@@ -5884,22 +6089,22 @@ Deno.serve(async (req) => {
         p++
       }
     }
-    const seenNums = new Set<string>()
-    const uniqueSSOrders = allSSOrders.filter((o: any) => {
+    const seenNums = new Set()
+    const uniqueSSOrders = allSSOrders.filter((o: any) =&gt; {
       const k = stripH(o.orderNumber || '')
       if (!k || seenNums.has(k)) return false
       seenNums.add(k)
       return true
     })
-    const erpFound = new Set<string>()
-    const ssNums = uniqueSSOrders.map((o: any) => stripH(o.orderNumber || ''))
-    for (let i = 0; i < ssNums.length; i += 100) {
+    const erpFound = new Set()
+    const ssNums = uniqueSSOrders.map((o: any) =&gt; stripH(o.orderNumber || ''))
+    for (let i = 0; i &lt; ssNums.length; i += 100) {
       const chunk = ssNums.slice(i, i + 100)
-      const bothForms = [...chunk, ...chunk.map((n: string) => '#' + n)]
+      const bothForms = [...chunk, ...chunk.map((n: string) =&gt; '#' + n)]
       const { data: rows } = await db.from('sales').select('order_number').in('order_number', bothForms).limit(bothForms.length)
       for (const r of (rows || [])) erpFound.add(stripH(r.order_number || ''))
     }
-    const missing = uniqueSSOrders.filter((o: any) => !erpFound.has(stripH(o.orderNumber || '')))
+    const missing = uniqueSSOrders.filter((o: any) =&gt; !erpFound.has(stripH(o.orderNumber || '')))
     let imported = 0
     if (doImport) {
       const fsMap: any = { awaiting_shipment: 'Open', on_hold: 'On Hold', shipped: 'Shipped', cancelled: 'Cancelled', awaiting_payment: 'Open', pending_fulfillment: 'Open' }
@@ -5916,6 +6121,7 @@ Deno.serve(async (req) => {
             source: 'ShipStation Import',
             sale_date: (order.orderDate || new Date().toISOString()).slice(0, 10),
             customer_name: order.shipTo?.name || null,
+            customer_email: order.customerEmail || null, // [CUST]
             created_at: order.orderDate
               ? new Date(order.orderDate.slice(0, 10) + 'T12:00:00.000Z').toISOString()
               : new Date().toISOString(),
@@ -5929,14 +6135,14 @@ Deno.serve(async (req) => {
       erpFound: erpFound.size,
       missingCount: missing.length,
       imported,
-      missing: missing.map((o: any) => ({
+      missing: missing.map((o: any) =&gt; ({
         orderNumber: o.orderNumber,
         date: (o.orderDate || '').slice(0, 10),
         customer: o.shipTo?.name || '',
         status: o.orderStatus,
         tracking: o.trackingNumber || '',
         carrier: (o.carrierCode || '').toUpperCase(),
-        items: (o.items || []).map((i: any) => ({ sku: i.sku || i.name, qty: i.quantity || 1 }))
+        items: (o.items || []).map((i: any) =&gt; ({ sku: i.sku || i.name, qty: i.quantity || 1 }))
       }))
     })
   }
@@ -5975,8 +6181,8 @@ Deno.serve(async (req) => {
     const auth = ssAuth()
     const { orderNumber, customerName, customerEmail, pn, description, qty, shipTo, internalNotes, ssItems } = body
     if (!orderNumber || !pn) return json({ error: 'orderNumber and pn are required' }, 400)
-    const items = (Array.isArray(ssItems) && ssItems.length)
-      ? ssItems.map((it: any, i: number) => ({ lineItemKey: String(i + 1), sku: it.sku || it.pn || pn, name: it.name || it.description || it.sku || pn, quantity: it.quantity || it.qty || 1, unitPrice: 0 }))
+    const items = (Array.isArray(ssItems) &amp;&amp; ssItems.length)
+      ? ssItems.map((it: any, i: number) =&gt; ({ lineItemKey: String(i + 1), sku: it.sku || it.pn || pn, name: it.name || it.description || it.sku || pn, quantity: it.quantity || it.qty || 1, unitPrice: 0 }))
       : [{ lineItemKey: '1', sku: pn, name: description || pn, quantity: qty || 1, unitPrice: 0 }]
     const safe = shipTo || {}
     const addrName = safe.name || customerName || 'Customer'
@@ -6012,7 +6218,7 @@ Deno.serve(async (req) => {
     const results = []
     for (const ord of orders) {
       try {
-        const res = await fetch('https://ssapi.shipstation.com/shipments?orderNumber=' + encodeURIComponent(ord.orderNumber) + '&pageSize=10', {
+        const res = await fetch('https://ssapi.shipstation.com/shipments?orderNumber=' + encodeURIComponent(ord.orderNumber) + '&amp;pageSize=10', {
           headers: { Authorization: 'Basic ' + auth }
         })
         if (!res.ok) continue
@@ -6038,16 +6244,16 @@ Deno.serve(async (req) => {
     const { orderNumber, trackingNumber, weightOz, carrierCode, serviceCode } = body
     let shipFrom: any = null, shipTo: any = null
     const searchUrl = trackingNumber
-      ? 'https://ssapi.shipstation.com/shipments?trackingNumber=' + encodeURIComponent(trackingNumber) + '&pageSize=10'
-      : 'https://ssapi.shipstation.com/shipments?orderNumber=' + encodeURIComponent(orderNumber||'') + '&pageSize=10'
+      ? 'https://ssapi.shipstation.com/shipments?trackingNumber=' + encodeURIComponent(trackingNumber) + '&amp;pageSize=10'
+      : 'https://ssapi.shipstation.com/shipments?orderNumber=' + encodeURIComponent(orderNumber||'') + '&amp;pageSize=10'
     const ssSearch = await fetch(searchUrl, { headers: { Authorization: 'Basic ' + auth } })
     if (ssSearch.ok) {
       const sd = await ssSearch.json()
       const shipment = sd.shipments?.[0]
       if (shipment?.shipTo) { shipFrom = shipment.shipTo; shipTo = shipment.shipFrom }
     }
-    if (!shipFrom && orderNumber) {
-      const ordRes = await fetch('https://ssapi.shipstation.com/orders?orderNumber=' + encodeURIComponent(orderNumber) + '&pageSize=5', { headers: { Authorization: 'Basic ' + auth } })
+    if (!shipFrom &amp;&amp; orderNumber) {
+      const ordRes = await fetch('https://ssapi.shipstation.com/orders?orderNumber=' + encodeURIComponent(orderNumber) + '&amp;pageSize=5', { headers: { Authorization: 'Basic ' + auth } })
       if (ordRes.ok) { const od = await ordRes.json(); const ord = od.orders?.[0]; if (ord?.shipTo) shipFrom = ord.shipTo }
     }
     if (!shipFrom) return json({ error: 'Original shipment not found in ShipStation — ensure the order was fulfilled through ShipStation' }, 404)
@@ -6074,7 +6280,7 @@ Deno.serve(async (req) => {
   if (!resource_url) return new Response('no resource_url', { status: 400, headers: CORS })
   const ssKey = Deno.env.get('SS_KEY')!, ssSec = Deno.env.get('SS_SECRET')!
   const auth = btoa(ssKey + ':' + ssSec)
-  const fetchUrl = resource_url.includes('includeShipmentItems') ? resource_url : resource_url + '&includeShipmentItems=true'
+  const fetchUrl = resource_url.includes('includeShipmentItems') ? resource_url : resource_url + '&amp;includeShipmentItems=true'
   const ssRes = await fetch(fetchUrl, { headers: { Authorization: 'Basic ' + auth } })
   if (!ssRes.ok) return new Response('SS fetch failed: ' + ssRes.status, { status: 502, headers: CORS })
   const data = await ssRes.json()
@@ -6086,7 +6292,7 @@ Deno.serve(async (req) => {
       const tracking = ship.trackingNumber
       const carrier = ship.carrierCode?.toUpperCase() || ''
       const shippedAt = new Date().toISOString()
-      const rawSkus = (ship.shipmentItems ?? []).flatMap((i: any) => [i.sku, i.name, i.lineItemKey].filter(Boolean))
+      const rawSkus = (ship.shipmentItems ?? []).flatMap((i: any) =&gt; [i.sku, i.name, i.lineItemKey].filter(Boolean))
       console.log('[SS] order', orderNum, 'tracking', tracking, 'rawSkus', JSON.stringify(rawSkus))
       if (orderNum?.startsWith('SHERROR-')) {
         const errorId = orderNum.replace('SHERROR-', '')
@@ -6100,36 +6306,38 @@ Deno.serve(async (req) => {
         console.log('[SS] WARRANTY tracking saved for', claimId, tracking)
         continue
       }
-      const { data: orderLines } = await db.from('sales').select('id,pn,fulfillment_status,qty').eq('order_number', orderNum)
-      const erpLines = orderLines?.length ? orderLines : (await db.from('sales').select('id,pn,fulfillment_status,qty').eq('order_number', '#' + orderNum)).data ?? []
-      const resolvedOrderNum = erpLines.length && !orderLines?.length ? '#' + orderNum : orderNum
-      const allErpPns = erpLines.map((l: any) => l.pn as string)
-      const norm = (s: string) => s.trim().toUpperCase()
-      const matchedPns = allErpPns.filter(erpPn => rawSkus.some((ssSku: string) => { const e=norm(erpPn),s=norm(ssSku); return e===s||e.includes(s)||s.includes(e) }))
+      const salesNum = (orderNum || '').replace(/^Manual_/i, '')
+      const { data: orderLines } = await db.from('sales').select('id,pn,fulfillment_status,qty').eq('order_number', salesNum)
+      const erpLines = orderLines?.length ? orderLines : (await db.from('sales').select('id,pn,fulfillment_status,qty').eq('order_number', '#' + salesNum)).data ?? []
+      const resolvedOrderNum = erpLines.length &amp;&amp; !orderLines?.length ? '#' + salesNum : salesNum
+      const allErpPns = erpLines.map((l: any) =&gt; l.pn as string)
+      const norm = (s: string) =&gt; s.trim().toUpperCase()
+      const matchedPns = allErpPns.filter(erpPn =&gt; rawSkus.some((ssSku: string) =&gt; { const e=norm(erpPn),s=norm(ssSku); return e===s||e.includes(s)||s.includes(e) }))
       console.log('[SS] matchedPns', JSON.stringify(matchedPns), 'of', JSON.stringify(allErpPns))
-      const isSplit = matchedPns.length > 0 && matchedPns.length < allErpPns.length
-      // Idempotency guard: ShipStation is known to redeliver the same webhook event more than once
-      // (observed duplicates landing within under a second of each other). A given tracking number
-      // represents one physical shipment and should only ever be deducted once, ever — if a
-      // shipment-sourced correction already references this exact tracking number, this is a
-      // duplicate delivery of an event we've already fully processed. Skip the deduction entirely.
-      let _alreadyProcessed = false
+      const isSplit = matchedPns.length &gt; 0 &amp;&amp; matchedPns.length &lt; allErpPns.length
+
+      // [FIX 2] Duplicate-webhook idempotency guard. ShipStation redelivers the same webhook event
+      // (observed sub-second duplicates). The per-line status guard alone has a check-then-act race when
+      // duplicates land before the first delivery has flipped the line to Shipped. A tracking number is
+      // one physical shipment; if a shipment-sourced correction already references it, this delivery is a
+      // duplicate — skip status changes AND inventory entirely.
+      let alreadyProcessed = false
       if (tracking) {
         const { data: dupeCheck } = await db.from('inv_corrections').select('id').eq('source', 'shipment').ilike('reason', '%' + tracking + '%').limit(1)
-        _alreadyProcessed = !!dupeCheck?.length
-        if (_alreadyProcessed) console.log('[SS] Duplicate webhook delivery detected for tracking', tracking, '— skipping inventory deduction (already processed)')
+        alreadyProcessed = !!dupeCheck?.length
+        if (alreadyProcessed) console.log('[SS] Duplicate webhook delivery for tracking', tracking, '— skipping entirely')
       }
-      if (_alreadyProcessed) {
-        console.log('[SS] Skipping status/inventory updates entirely for', resolvedOrderNum, '— duplicate webhook, already fully processed')
-      } else if (matchedPns.length > 0) {
+      if (alreadyProcessed) continue
+
+      if (matchedPns.length &gt; 0) {
         for (const pn of matchedPns) {
           await db.from('sales').update({ fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt, is_split_shipment: isSplit }).eq('order_number', resolvedOrderNum).eq('pn', pn)
         }
         if (isSplit) {
-          const unshippedPns = allErpPns.filter((p: string) => !matchedPns.includes(p))
+          const unshippedPns = allErpPns.filter((p: string) =&gt; !matchedPns.includes(p))
           for (const pn of unshippedPns) {
-            const line = erpLines.find((l: any) => l.pn === pn)
-            if (line && ['Open', 'Packed'].includes(line.fulfillment_status)) {
+            const line = erpLines.find((l: any) =&gt; l.pn === pn)
+            if (line &amp;&amp; ['Open', 'Packed'].includes(line.fulfillment_status)) {
               await db.from('sales').update({ fulfillment_status: 'Partial', is_split_shipment: true }).eq('order_number', resolvedOrderNum).eq('pn', pn)
             }
           }
@@ -6138,35 +6346,14 @@ Deno.serve(async (req) => {
         console.warn('[SS] WARNING: no SKU match for order', resolvedOrderNum, '- updating all Open/Packed lines')
         await db.from('sales').update({ fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt }).eq('order_number', resolvedOrderNum).in('fulfillment_status', ['Open', 'Packed', 'Partial'])
       }
-      const pnsToDeduct = _alreadyProcessed ? [] : (matchedPns.length > 0 ? matchedPns : allErpPns)
+      const pnsToDeduct = (matchedPns.length &gt; 0 ? matchedPns : allErpPns)
       for (const pn of pnsToDeduct) {
-        const line = erpLines.find((l: any) => l.pn === pn)
+        const line = erpLines.find((l: any) =&gt; l.pn === pn)
         if (!line || !['Open', 'Packed', 'Partial'].includes(line.fulfillment_status)) continue
         const lineQty = (line as any).qty || 1
-        const { data: asms } = await db.from('assemblies').select('id,total_on_hand').eq('pn', pn).limit(1)
-        const asm = asms?.[0]
-        if (asm) {
-          const prev = asm.total_on_hand || 0
-          const newOh = prev - lineQty
-          await db.from('assemblies').update({ total_on_hand: newOh, updated_at: new Date().toISOString() }).eq('id', asm.id)
-          await db.from('inv_corrections').insert({ pn, previous_qty: prev, new_qty: newOh, adjustment: -lineQty, reason: 'Shipped via ShipStation ' + resolvedOrderNum + ' ' + tracking, source: 'shipment' })
-          console.log('[SS] Deducted', lineQty, 'of', pn, 'on', resolvedOrderNum, '| on_hand:', prev, '->', newOh)
-          await syncShopifyBackorder(pn, newOh)
-          continue
-        }
-        // Directly-sold part (not an assembly) — same deduction, different table. Without this branch,
-        // a part-only order shipping via ShipStation silently got zero inventory deduction AND its
-        // Shopify backorder status was never re-checked, since the loop used to skip past it here.
-        const { data: prts } = await db.from('parts').select('id,total_unpckgd').eq('pn', pn).limit(1)
-        const prt = prts?.[0]
-        if (!prt) continue
-        const prevP = prt.total_unpckgd || 0
-        const newQtyP = prevP - lineQty
-        await db.from('parts').update({ total_unpckgd: newQtyP, updated_at: new Date().toISOString() }).eq('id', prt.id)
-        await db.from('inv_corrections').insert({ pn, previous_qty: prevP, new_qty: newQtyP, adjustment: -lineQty, reason: 'Shipped via ShipStation ' + resolvedOrderNum + ' ' + tracking, source: 'shipment' })
-        console.log('[SS] Deducted', lineQty, 'of', pn, '(part) on', resolvedOrderNum, '| on_hand:', prevP, '->', newQtyP)
-        await syncShopifyBackorder(pn, newQtyP)
-        await cascadeShopifyBackorder(pn)
+        // [FIX 1] shared routine — handles BOTH assemblies and directly-sold parts. The deployed loop had
+        // \`if(!asm) continue\`, so a part shipped via the webhook was marked Shipped but never deducted.
+        await deductForShipment(pn, lineQty, tracking, resolvedOrderNum)
       }
     }
   }
@@ -6175,16 +6362,19 @@ Deno.serve(async (req) => {
     const orderNum = order.orderNumber
     const source = (order.orderSource || order.advancedOptions?.source || '').toLowerCase()
     const isShopify = source.includes('shopify') || source.includes('api')
-    if (!isShopify && orderNum) {
-      const { data: existing } = await db.from('sales').select('id').eq('order_number', orderNum).limit(1)
+    if (!isShopify &amp;&amp; orderNum) {
+      const salesNum = (orderNum || '').replace(/^Manual_/i, '')
+      const { data: existing } = await db.from('sales').select('id').eq('order_number', salesNum).limit(1)
       if (!existing?.length) {
         for (const item of (order.items || [])) {
           await db.from('sales').insert({
-            order_number: orderNum,
+            order_number: salesNum,
             pn: item.sku ? item.sku.trim().toUpperCase() : (item.name || '').trim(),
             qty: item.quantity || 1,
             fulfillment_status: 'Open',
             source: 'ShipStation Manual',
+            customer_name: order.shipTo?.name || null, // [CUST] NEW_ORDER previously set no customer at all
+            customer_email: order.customerEmail || null,
             sale_date: (order.orderDate || new Date().toISOString()).slice(0, 10)
           })
         }
@@ -6206,11 +6396,11 @@ Deno.serve(async (req) => {
         await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('order_number', resolvedNum)
         console.log('[SS] ORDER_NOTIFY → Cancelled:', resolvedNum)
       } else if (order.orderStatus === 'on_hold') {
-        const ids = erpLines.filter((l: any) => ['Open','Packed','Partial'].includes(l.fulfillment_status)).map((l: any) => l.id)
+        const ids = erpLines.filter((l: any) =&gt; ['Open','Packed','Partial'].includes(l.fulfillment_status)).map((l: any) =&gt; l.id)
         if (ids.length) await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', ids)
         console.log('[SS] ORDER_NOTIFY → On Hold:', resolvedNum)
       } else if (order.orderStatus === 'awaiting_shipment') {
-        const ids = erpLines.filter((l: any) => l.fulfillment_status === 'On Hold').map((l: any) => l.id)
+        const ids = erpLines.filter((l: any) =&gt; l.fulfillment_status === 'On Hold').map((l: any) =&gt; l.id)
         if (ids.length) {
           // Split/drop-ship orders: ShipStation can report the OVERALL order as awaiting_shipment
           // because one line is ready to move, even while ANOTHER line on the same order number is
@@ -6221,14 +6411,14 @@ Deno.serve(async (req) => {
           // specific order number is NOT still on ShipStation's own on-hold list.
           let stillOnHold = false, checkSucceeded = false
           try {
-            const checkRes = await fetch('https://ssapi.shipstation.com/orders?orderNumber=' + encodeURIComponent(rawNum) + '&orderStatus=on_hold&pageSize=10', { headers: { Authorization: 'Basic ' + ssAuth() } })
+            const checkRes = await fetch('https://ssapi.shipstation.com/orders?orderNumber=' + encodeURIComponent(rawNum) + '&amp;orderStatus=on_hold&amp;pageSize=10', { headers: { Authorization: 'Basic ' + ssAuth() } })
             if (checkRes.ok) {
               const checkData = await checkRes.json()
-              stillOnHold = (checkData.orders || []).some((o: any) => stripHash(o.orderNumber || '') === rawNum)
+              stillOnHold = (checkData.orders || []).some((o: any) =&gt; stripHash(o.orderNumber || '') === rawNum)
               checkSucceeded = true
             }
           } catch (_e) { /* checkSucceeded stays false — handled below */ }
-          if (checkSucceeded && !stillOnHold) {
+          if (checkSucceeded &amp;&amp; !stillOnHold) {
             await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', ids)
             console.log('[SS] ORDER_NOTIFY → Released hold:', resolvedNum)
           } else if (!checkSucceeded) {
@@ -6249,7 +6439,8 @@ Deno.serve(async (req) => {
     }
   }
   return ok('ok')
-})</pre>
+})
+</pre>
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">4 — User management function (invite-user)</div>
     <div style="font-size:11px;color:var(--text3);margin:4px 0 6px">Create <span class="pn">supabase/functions/invite-user/index.ts</span> — handles both invites and user removal:</div>
@@ -7987,6 +8178,13 @@ async function ssCheckSecrets(){
     let out='SECRETS DIAGNOSTIC\n'+'─'.repeat(44)+'\n\n';
     out+='SS_KEY:    '+(data.ss_key_set?'✓ SET ('+data.ss_key_length+' chars, preview: '+data.ss_key_preview+')':'✗ NOT SET — go to Supabase → Edge Functions → shipstation-ship → Secrets')+'\n';
     out+='SS_SECRET: '+(data.ss_secret_set?'✓ SET ('+data.ss_secret_length+' chars, preview: '+data.ss_secret_preview+')':'✗ NOT SET — go to Supabase → Edge Functions → shipstation-ship → Secrets')+'\n';
+    // SS_V2_KEY powers PO "Check ETA" (ShipStation V2 tracking). A MISSING FIELD means the
+    // deployed function predates the ETA fix - which is different from the secret being unset.
+    out+='SS_V2_KEY: '+(data.ss_v2_key_set===undefined
+      ? '? UNKNOWN \u2014 the deployed shipstation-ship function predates the ETA fix. Redeploy it, then re-check.'
+      : (data.ss_v2_key_set
+         ? '\u2713 SET \u2014 PO Check ETA is enabled'
+         : '\u2717 NOT SET \u2014 PO Check ETA will answer 501. Add SS_V2_KEY, or use the Carrier link on the PO line.'))+'\n';
     if(data.ss_key_set&&data.ss_secret_set){
       out+='\n✓ Both secrets are loaded.\n';
       out+='If you\'re still getting 401, the values may have extra whitespace.\n';
@@ -7996,7 +8194,9 @@ async function ssCheckSecrets(){
       out+='\nFIX: Supabase Dashboard → Edge Functions → shipstation-ship → Secrets tab\n';
       out+='Add: SS_KEY = your ShipStation API Key\n';
       out+='Add: SS_SECRET = your ShipStation API Secret\n';
-      out+='(Found in ShipStation → Account Settings → API Settings)';
+      out+='(Found in ShipStation → Account Settings → API Settings)\n';
+      out+='\nFor PO ETA lookups also add: SS_V2_KEY = your ShipStation V2 API key\n';
+      out+='(V2 keys are separate from the V1 key/secret pair above)';
     }
     el.textContent=out;
   }catch(e){
@@ -14767,9 +14967,15 @@ async function submitQuickReceive(poId){
     toReceive.push({line,qty});
   }
   let received=0,skipped=lines.length-toReceive.length;
+  const qrFailed=[];
   for(const{line,qty}of toReceive){
-    await checkInLineQuick(line.id,poId,line.pn,line.qty_ordered,line.qty_received||0,qty);
-    received++;
+    try{
+      await checkInLineQuick(line.id,poId,line.pn,line.qty_ordered,line.qty_received||0,qty);
+      received++;
+    }catch(e){
+      console.error('quick receive failed on line',line.pn,e);
+      qrFailed.push(line.pn);
+    }
   }
   await loadPOLines(poId);
   const updated=S.poLines[poId]||[];
@@ -14784,7 +14990,7 @@ async function submitQuickReceive(poId){
   }
   document.getElementById('quick-recv-modal')?.remove();
   render();
-  toast(`✓ Received ${received} line${received!==1?'s':''}${skipped?' ('+skipped+' skipped)':''}${allDone?' — PO complete!':''}`);
+  toast(`${qrFailed.length?'\u26a0':'\u2713'} Received ${received} line${received!==1?'s':''}${skipped?' ('+skipped+' skipped)':''}${qrFailed.length?' \u2014 '+qrFailed.length+' FAILED: '+qrFailed.join(', '):''}${allDone?' — PO complete!':''}`,qrFailed.length?9000:4000);
 }
 
 function quickAddTracking(poId,vendorName){
@@ -14896,7 +15102,7 @@ function renderPODetail(po) {
       ${etaLabel?`<span style="font-size:10px;font-weight:600;color:${etaColor}">📅 ${etaLabel}</span>`:''}
       ${t.notes?`<span class="t3xs">${t.notes}</span>`:''}
       <span style="flex:1"></span>
-      <button id="chk-eta-${t.id}" class="btn btn-sm" style="font-size:9px;padding:2px 7px" onclick="checkPOTracking('${t.id}','${po.id}','${t.carrier}','${t.tracking_number}')">${t._lastChecked?new Date(t._lastChecked).toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"}):"Check ETA"}</button>
+      <a class="btn btn-sm" style="font-size:9px;padding:2px 7px;text-decoration:none;margin-right:3px" href="${trackingUrl(t.carrier,t.tracking_number)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Open ${escHtml(t.carrier||'carrier')} tracking in a new tab">&#128230; Carrier</a><button id="chk-eta-${t.id}" class="btn btn-sm" style="font-size:9px;padding:2px 7px" onclick="checkPOTracking('${t.id}','${po.id}','${t.carrier}','${t.tracking_number}')">${t._lastChecked?new Date(t._lastChecked).toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"}):"Check ETA"}</button>
       <span style="font-size:9px;color:var(--text3);font-family:var(--mono)">${new Date(t.created_at).toLocaleDateString()}</span>
       <button class="action-btn del" onclick="deletePOTracking('${t.id}','${po.id}')">×</button>
     </div>`}).join('')}
@@ -15044,14 +15250,41 @@ async function closeShortBackorder(lineId, poId, pn, qtyOrdered, qtyAlreadyRecei
 
 async function receiveAllLines(poId) {
   const lines = S.poLines[poId]||[];
-  const pending = lines.filter(l=>l.qty_received<l.qty_ordered);
+  const pending = lines.filter(l=>(l.qty_received||0)<(l.qty_ordered||0));
   if(!pending.length){toast('All lines already received');return;}
+  // v20.98: this used to receive the lines and stop - no PO status roll-up, no
+  // loadPOLines, no render - so the screen looked untouched and the PO stayed
+  // On Order / In Transit. Mirrors submitQuickReceive and checkInLine now.
+  const poBefore=S.purchases.find(p=>p.id===poId);
+  const undoOps=[];
+  pending.forEach(function(l){undoOps.push({action:'update',table:'po_lines',data:{id:l.id},prev:Object.assign({},stripMeta(l))});});
+  let done=0;const failed=[];
   for(const line of pending){
-    const remaining = (line.qty_ordered||0)-(line.qty_received||0);
-    if(remaining>0) await checkInLineQuick(line.id, poId, line.pn, line.qty_ordered, line.qty_received||0, remaining);
+    const remaining=(line.qty_ordered||0)-(line.qty_received||0);
+    if(remaining<=0)continue;
+    try{
+      await checkInLineQuick(line.id,poId,line.pn,line.qty_ordered,line.qty_received||0,remaining);
+      done++;
+    }catch(e){
+      console.error('receive-all failed on line',line.pn,e);
+      failed.push(line.pn+': '+(e&&e.message?e.message:'error'));
+    }
   }
-  logAction('PO all lines received on PO '+poId,'purchases',null,null,{poId}).catch(()=>{});
-  toast('All lines received');
+  await loadPOLines(poId);
+  const fresh=S.poLines[poId]||[];
+  const allIn=fresh.length>0&&fresh.every(function(l){return (l.qty_received||0)>=(l.qty_ordered||0)||l.status==='Backordered';});
+  if(allIn){
+    if(poBefore)undoOps.push({action:'update',table:'purchases',data:{id:poId},prev:Object.assign({},stripMeta(poBefore))});
+    const up=await db.from('purchases').update({status:'Received',updated_at:new Date().toISOString()}).eq('id',poId);
+    if(up&&up.error){toast('\u26a0 Lines received, but marking the PO Received failed: '+up.error.message,9000);}
+    else{S.purchases=S.purchases.map(function(p){return p.id===poId?Object.assign({},p,{status:'Received'}):p;});}
+  }
+  if(undoOps.length)pushUndoMulti('Receive all on PO'+(poBefore&&poBefore.vendor?(' \u2014 '+poBefore.vendor):''),undoOps);
+  logAction('PO all lines received on PO '+poId,'purchases',null,null,{poId,lines:done}).catch(()=>{});
+  updateBadge();
+  render();
+  if(failed.length)toast('\u26a0 '+done+' line'+(done!==1?'s':'')+' received, '+failed.length+' failed \u2014 '+failed[0],9000);
+  else toast('\u2713 '+done+' line'+(done!==1?'s':'')+' received'+(allIn?' \u2014 PO marked Received':' \u2014 PO still partially open'),6000);
 }
 
 async function unreceiveLine(lineId, poId){
@@ -15091,7 +15324,10 @@ async function unreceiveLine(lineId, poId){
 
 async function checkInLineQuick(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived, qty) {
   const newReceived = qtyAlreadyReceived + qty;
-  await db.from('po_lines').update({qty_received:newReceived,status:'Complete',updated_at:new Date().toISOString()}).eq('id',lineId);
+  const _lineUp=await db.from('po_lines').update({qty_received:newReceived,status:'Complete',updated_at:new Date().toISOString()}).eq('id',lineId);
+  // Stock must never move on a line whose receipt did not persist - that would leave
+  // inventory up with the PO line still showing outstanding.
+  if(_lineUp&&_lineUp.error)throw new Error('line update failed: '+_lineUp.error.message);
   const part = S.parts.find(p=>p.pn===pn);
   if(part){
     const po=S.purchases.find(p=>p.id===poId);
