@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.03</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.05</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.03';
+const TGK_ERP_VERSION = 'v21.05';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -7700,6 +7700,7 @@ async function syncOrdersNow(){
             shopify_order_id:String(order.id||''),
             shopify_line_item_id:String(li.id||''),
             discount_code:(order.discount_codes?.length?order.discount_codes[0].code:null)||null,
+            ...(salesHavePrice()?{unit_price:shopifyLineUnitPrice(li),price_source:'shopify'}:{}),
           }).select().single();
           if(data){
             existingMap[k]=fs;
@@ -7912,7 +7913,9 @@ async function importOrdersFromShopify(){
           const{data}=await db.from('sales').insert({
             order_number:orderNum,pn,qty:li.quantity||1,
             source:'Shopify Import',fulfillment_status:fs,
-            sale_date:(order.created_at||new Date().toISOString()).slice(0,10)
+            sale_date:(order.created_at||new Date().toISOString()).slice(0,10),
+            discount_code:(order.discount_codes?.length?order.discount_codes[0].code:null)||null,
+            ...(salesHavePrice()?{unit_price:shopifyLineUnitPrice(li),price_source:'shopify'}:{}),
           }).select().single();
           if(data){S.sales=[data,...S.sales];imported++;}
         }
@@ -13808,18 +13811,60 @@ function salesHavePrice(){
   }
   return S._salesHavePrice;
 }
+function listPriceOf(a){
+  // sales_price is the live selling price when set; msrp is list. Price lists already
+  // treat sales_price as the real number, so revenue must agree with them.
+  if(!a)return 0;
+  if(a.sales_price!==null&&a.sales_price!==undefined&&a.sales_price!==''){
+    var sp=parseFloat(a.sales_price);
+    if(isFinite(sp)&&sp>0)return sp;
+  }
+  return Number(a.msrp)||0;
+}
 function lineRevenue(x){
   var q=Number(x&&x.qty)||1;
+  // 1. What the customer actually paid. Always wins.
   var p=(x&&x.unit_price!==null&&x.unit_price!==undefined&&x.unit_price!=='')?Number(x.unit_price):null;
-  if(p!==null&&isFinite(p)&&p>0)return{rev:q*p,unit:p,actual:true};
+  if(p!==null&&isFinite(p)&&p>0)return{rev:q*p,unit:p,actual:true,basis:'actual'};
   var a=(S._asmIdx&&S._asmIdx[x.pn])?S._asmIdx[x.pn]:(typeof findAsm==='function'?findAsm(x.pn):null);
-  if(a){var m=Number(a.msrp)||0;return{rev:q*m,unit:m,actual:false};}
-  // Directly-sold PART. Only an ENTERED part MSRP counts here - never the calculated
-  // 1.6x suggestion, which would invent revenue that was never actually earned.
+  if(a){
+    var list=listPriceOf(a);
+    // 2. Dealer orders carry a Shopify discount code. Pricing them at full list is the
+    //    single biggest way this used to overstate revenue, so apply the dealer's rate.
+    if(x&&x.discount_code&&typeof parseDealerPO==='function'&&Array.isArray(S.dealers)){
+      try{
+        var pd=parseDealerPO(x.discount_code,S.dealers);
+        if(pd&&pd.dealer){
+          var dp=(typeof pd.dealer.discount_pct==='number')?pd.dealer.discount_pct:0.20;
+          var du=Math.round(list*(1-dp)*100)/100;
+          return{rev:q*du,unit:du,actual:false,basis:'dealer'};
+        }
+      }catch(_e){}
+    }
+    // 3. Plain list price.
+    return{rev:q*list,unit:list,actual:false,basis:'list'};
+  }
+  // 4. Directly-sold PART. Only an ENTERED part MSRP counts - never the calculated
+  //    1.6x suggestion, which would invent revenue that was never actually earned.
   var pt=(typeof _findPart==='function')?_findPart(x.pn):null;
   var pm=pt?(Number(pt.msrp)||0):0;
-  return{rev:q*pm,unit:pm,actual:false};
+  return{rev:q*pm,unit:pm,actual:false,basis:pm>0?'list':'unknown'};
 }
+function shopifyLineUnitPrice(li){
+  // Net per-unit price actually charged. Order-level discount codes (how dealers buy)
+  // arrive as discount_allocations; line-level discounts as total_discount. Preferring
+  // allocations when present avoids double-counting a discount that appears in both.
+  if(!li)return null;
+  var q=Number(li.quantity)||1;
+  var gross=(parseFloat(li.price)||0)*q;
+  if(!(gross>0))return null;
+  var alloc=Array.isArray(li.discount_allocations)
+    ? li.discount_allocations.reduce(function(t,d){return t+(parseFloat(d&&d.amount)||0);},0) : 0;
+  var disc=alloc>0?alloc:(parseFloat(li.total_discount)||0);
+  var net=Math.max(0,gross-disc);
+  return Math.round((net/q)*100)/100;
+}
+window.listPriceOf=listPriceOf;window.shopifyLineUnitPrice=shopifyLineUnitPrice;
 window.salesHavePrice=salesHavePrice;window.lineRevenue=lineRevenue;
 
 /* Entered MSRP beats the calculated suggestion (v20.91). parts.msrp is optional:
@@ -14443,7 +14488,7 @@ function _roiSaleMatches(x,a){
   return p===a.pn||(a.new_sku&&p===a.new_sku);
 }
 function _roiFor(a){
-  const invRows=(S.asmInvestments||[]).filter(function(r){return r.pn===a.pn;});
+  const invRows=(S.asmInvestments||[]).filter(function(r){return r.pn===a.pn||(a.new_sku&&r.pn===a.new_sku);});
   const invested=invRows.reduce(function(t,r){return t+(Number(r.amount)||0);},0);
   const cut=new Date(Date.now()-90*86400000).toISOString().slice(0,10);
   let unitsReal=0,unitsBooked=0,revReal=0,revBooked=0,revEstimated=0,units90=0,lines=0,linesActual=0;
@@ -14482,7 +14527,11 @@ function _roiFor(a){
 window.roiOpenAdd=function(pn){
   const old=document.getElementById('roi-overlay'); if(old)old.remove();
   const opts=(S.assemblies||[]).filter(function(a){return !a.discontinued;})
-    .map(function(a){return '<option value="'+escHtml(a.pn)+'">'+escHtml(dispPn(a)+' - '+(a.description||''))+'</option>';}).join('');
+    .map(function(a){
+      var act=dispPn(a);
+      var legacy=(act!==a.pn)?(' [was '+a.pn+']'):'';
+      return '<option value="'+escHtml(act)+'">'+escHtml(act+' - '+(a.description||'')+legacy)+'</option>';
+    }).join('');
   const cats=ROI_CATS.map(function(c){return '<option value="'+escHtml(c)+'">'+escHtml(c)+'</option>';}).join('');
   const ov=document.createElement('div'); ov.id='roi-overlay';
   ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:9000;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(3px)';
@@ -14511,7 +14560,7 @@ window.roiSaveInvestment=async function(){
   if(!raw.trim()){toast('Pick an assembly');return;}
   if(!isFinite(amt)||amt<=0){toast('Enter an amount greater than zero');return;}
   const a=(typeof findAsm==='function')?findAsm(raw.trim()):null;
-  if(!a){toast('No assembly matches '+raw.trim());return;}
+  if(!a){toast('No assembly matches "'+raw.trim()+'" - pick one from the list (either the active or legacy SKU works)');return;}
   const btn=document.getElementById('roi-save'); if(btn){btn.disabled=true;btn.textContent='Saving...';}
   const row={pn:a.pn,amount:Math.round(amt*100)/100,
     category:(document.getElementById('roi-cat')||{}).value||'Other',
@@ -14522,7 +14571,7 @@ window.roiSaveInvestment=async function(){
     const r=await db.from('asm_investments').insert(row).select().single();
     if(r.error)throw r.error;
     S.asmInvestments=(S.asmInvestments||[]).concat([r.data]);
-    if(typeof pushUndo==='function')pushUndo('insert','asm_investments',r.data,null,'Log investment '+fc(row.amount)+' on '+a.pn);
+    if(typeof pushUndo==='function')pushUndo('insert','asm_investments',r.data,null,'Log investment '+fc(row.amount)+' on '+dispPn(a));
     const ov=document.getElementById('roi-overlay'); if(ov)ov.remove();
     toast('\u2713 Logged '+fc(row.amount)+' against '+dispPn(a));
     render();
@@ -14539,7 +14588,8 @@ window.roiDeleteInvestment=async function(id){
     const r=await db.from('asm_investments').delete().eq('id',id);
     if(r&&r.error)throw r.error;
     S.asmInvestments=(S.asmInvestments||[]).filter(function(x){return x.id!==id;});
-    if(typeof pushUndo==='function')pushUndo('delete','asm_investments',row,null,'Remove investment '+fc(row.amount)+' on '+row.pn);
+    var _da=(typeof findAsm==='function')?findAsm(row.pn):null;
+  if(typeof pushUndo==='function')pushUndo('delete','asm_investments',row,null,'Remove investment '+fc(row.amount)+' on '+(_da?dispPn(_da):row.pn));
     toast('Investment entry removed');
     render();
   }catch(e){toast('Delete failed: '+e.message,7000);}
@@ -14553,7 +14603,7 @@ function renderROITab(){
       +'<button class="btn btn-sm" onclick="S._roiLoaded=false;roiLoadInvestments(true)">Retry</button></div>';
   }
   const tracked=(S.assemblies||[]).filter(function(a){
-    return (S.asmInvestments||[]).some(function(r){return r.pn===a.pn;});
+    return (S.asmInvestments||[]).some(function(r){return r.pn===a.pn||(a.new_sku&&r.pn===a.new_sku);});
   }).map(function(a){return{a:a,m:_roiFor(a)};})
     .sort(function(x,y){return x.m.net-y.m.net;});
   const totInv=tracked.reduce(function(t,r){return t+r.m.invested;},0);
@@ -14595,7 +14645,7 @@ function renderROITab(){
         +'<span style="font-size:11px;color:var(--text3);flex:1;min-width:120px">'+escHtml(a.description||'')+'</span>'
         +'<span class="pill '+(inGreen?'pill-green':'pill-red')+'">'+(inGreen?'IN THE GREEN':'IN THE RED')+'</span>'
         +'<span style="font-size:11px;color:var(--text3)">Net <b class="money" style="font-size:14px;color:'+(inGreen?'var(--green)':'var(--red)')+'">'+(m.net>=0?'+':'')+fc(m.net)+'</b></span>'
-        +'<button class="btn btn-sm" onclick="roiOpenAdd(\''+escHtml(a.pn)+'\')">+ Investment</button>'
+        +'<button class="btn btn-sm" onclick="roiOpenAdd(\''+escHtml(dispPn(a))+'\')">+ Investment</button>'
       +'</div>'
       +'<div style="padding:12px 16px">'
         +'<div style="height:10px;background:var(--bg4);border-radius:5px;overflow:hidden;margin-bottom:6px">'
