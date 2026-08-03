@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.05</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.06</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.05';
+const TGK_ERP_VERSION = 'v21.06';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -14477,9 +14477,11 @@ async function roiLoadInvestments(force){
     S.asmInvestments=r.data||[];
     S._roiTableMissing=false;
   }catch(e){
-    console.warn('asm_investments unavailable:',e&&e.message);
+    const msg=(e&&e.message)?String(e.message):'';
+    console.warn('asm_investments unavailable:',msg);
     S.asmInvestments=[];
-    S._roiTableMissing=true;
+    if(/row-level security|permission denied/i.test(msg)){S._roiRlsBlocked=true;S._roiTableMissing=false;}
+    else{S._roiTableMissing=true;}
   }
   render();
 }
@@ -14554,6 +14556,19 @@ window.roiOpenAdd=function(pn){
   document.body.appendChild(ov);
   setTimeout(function(){const f=document.getElementById(pn?'roi-amt':'roi-pn'); if(f)f.focus();},50);
 };
+function _roiErr(e,verb){
+  var m=(e&&e.message)?String(e.message):'unknown error';
+  if(/row-level security|violates row level|permission denied/i.test(m)){
+    return 'Could not '+verb+': the database is blocking writes to asm_investments (row-level security is on with no policy). Run sql/fix_asm_investments_rls.sql in the Supabase SQL editor - it grants the signed-in app access. Nothing is wrong with your entry.';
+  }
+  if(/relation .*asm_investments.* does not exist|could not find the table/i.test(m)){
+    return 'Could not '+verb+': the asm_investments table does not exist yet. Run sql/add_roi_tracking.sql first.';
+  }
+  if(/column .* does not exist|schema cache/i.test(m)){
+    return 'Could not '+verb+': the asm_investments table is missing a column ('+m+'). Run sql/fix_asm_investments_rls.sql - it repairs the schema as well as the policies.';
+  }
+  return 'Could not '+verb+': '+m;
+}
 window.roiSaveInvestment=async function(){
   const raw=(document.getElementById('roi-pn')||{}).value||'';
   const amt=parseFloat((document.getElementById('roi-amt')||{}).value);
@@ -14577,7 +14592,7 @@ window.roiSaveInvestment=async function(){
     render();
   }catch(e){
     if(btn){btn.disabled=false;btn.textContent='Save investment';}
-    toast('Could not save: '+e.message,7000);
+    toast(_roiErr(e,'save'),12000);
   }
 };
 window.roiDeleteInvestment=async function(id){
@@ -14592,7 +14607,7 @@ window.roiDeleteInvestment=async function(id){
   if(typeof pushUndo==='function')pushUndo('delete','asm_investments',row,null,'Remove investment '+fc(row.amount)+' on '+(_da?dispPn(_da):row.pn));
     toast('Investment entry removed');
     render();
-  }catch(e){toast('Delete failed: '+e.message,7000);}
+  }catch(e){toast(_roiErr(e,'delete'),12000);}
 };
 function renderROITab(){
   if(!S._roiLoaded){roiLoadInvestments();return '<div class="panel" style="margin-top:14px;padding:24px;text-align:center;color:var(--text3)">Loading investment log...</div>';}
@@ -14601,6 +14616,12 @@ function renderROITab(){
       +'<div style="font-size:14px;font-weight:800;margin-bottom:6px">One migration needed</div>'
       +'<div style="font-size:12px;color:var(--text2);margin-bottom:12px">The <b>asm_investments</b> table does not exist yet, so there is nowhere to record what an assembly cost to launch. Run <b>sql/add_roi_tracking.sql</b> in the Supabase SQL editor, then reload. It also adds <b>sales.unit_price</b> so revenue can use the real price paid instead of MSRP.</div>'
       +'<button class="btn btn-sm" onclick="S._roiLoaded=false;roiLoadInvestments(true)">Retry</button></div>';
+  }
+  if(S._roiRlsBlocked){
+    return '<div class="panel" style="margin-top:14px;padding:22px;border-left:3px solid var(--orange)">'
+      +'<div style="font-size:14px;font-weight:800;margin-bottom:6px">Database is blocking the investment log</div>'
+      +'<div style="font-size:12px;color:var(--text2);margin-bottom:12px">Row-level security is enabled on <b>asm_investments</b> with no policy for the signed-in app, so rows cannot be read or written. Run <b>sql/fix_asm_investments_rls.sql</b> in the Supabase SQL editor, then retry.</div>'
+      +'<button class="btn btn-sm" onclick="S._roiLoaded=false;S._roiRlsBlocked=false;roiLoadInvestments(true)">Retry</button></div>';
   }
   const tracked=(S.assemblies||[]).filter(function(a){
     return (S.asmInvestments||[]).some(function(r){return r.pn===a.pn||(a.new_sku&&r.pn===a.new_sku);});
