@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.06</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.07</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.06';
+const TGK_ERP_VERSION = 'v21.07';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -742,6 +742,32 @@ function isShippingLine(l){
   var re=/^(shipping|freight|s\s*&\s*h|handling|delivery|postage|courier|duty|duties)\b/;
   return re.test(pn)||(!pn&&re.test(d));
 }
+/* Value still outstanding on a PO - what has been ordered and not yet received,
+   partials included. Mirrors poExtended()'s handling of shipping lines, single-line
+   "stub" POs (where unit_cost holds the whole total) and legacy line-less POs, but
+   swaps ordered qty for the remaining qty. Draft POs count as zero: nothing has
+   actually been placed with the vendor yet. */
+function poOutstanding(p){
+  if(!p)return 0;
+  const st=p.status||'';
+  if(st==='Received'||st==='Cancelled'||st==='Draft')return 0;
+  const _allLs=S.poLines[p.id]||[];
+  const _itemLs=_allLs.filter(l=>!isShippingLine(l));
+  const ls=_itemLs.length?_itemLs:_allLs;
+  const hd=(p.description||'').trim();
+  const rem=l=>Math.max(0,(l.qty_ordered||0)-(l.qty_received||0));
+  if(ls.length===1){
+    const l=ls[0],d=(l.description||'').trim();
+    if(_stubRe.test(d)||_stubRe.test(hd))return rem(l)>0?(l.unit_cost||0):0;
+    return rem(l)*(l.unit_cost||0);
+  }
+  if(ls.length>1)return ls.reduce((t,l)=>t+rem(l)*(l.unit_cost||0),0);
+  const pr=Math.max(0,(p.qty||0)-(p.qty_received||0));
+  if(p.pn==='Multiple'||(p.pn||'').includes(' more'))return pr>0?(p.unit_cost||0):0;
+  if(_stubRe.test(hd))return pr>0?(p.unit_cost||0):0;
+  return (p.unit_cost||0)*pr;
+}
+window.poOutstanding=poOutstanding;
 function poExtended(p){
   const _allLs=S.poLines[p.id]||[];
   const _itemLs=_allLs.filter(l=>!isShippingLine(l));
@@ -4367,12 +4393,13 @@ function renderVendors(){
   const vendorStats={};
   (S.purchases||[]).forEach(p=>{
     if(!p.vendor)return;
-    if(!vendorStats[p.vendor])vendorStats[p.vendor]={openPOs:0,totalPOs:0,spend:0,parts:new Set()};
+    if(!vendorStats[p.vendor])vendorStats[p.vendor]={openPOs:0,totalPOs:0,spend:0,onOrder:0,parts:new Set()};
     vendorStats[p.vendor].totalPOs++;
     if(p.status!=='Received'&&p.status!=='Cancelled')vendorStats[p.vendor].openPOs++;
     vendorStats[p.vendor].spend+=poExtended(p);
+    vendorStats[p.vendor].onOrder+=poOutstanding(p);
   });
-  S.parts.forEach(p=>{if(p.vendor){if(!vendorStats[p.vendor])vendorStats[p.vendor]={openPOs:0,totalPOs:0,spend:0,parts:new Set()};vendorStats[p.vendor].parts.add(p.pn);}});
+  S.parts.forEach(p=>{if(p.vendor){if(!vendorStats[p.vendor])vendorStats[p.vendor]={openPOs:0,totalPOs:0,spend:0,onOrder:0,parts:new Set()};vendorStats[p.vendor].parts.add(p.pn);}});
 
   const regNames=new Set((S.vendors||[]).map(v=>(v.name||'').toLowerCase()));
   const legacyNames=getVendors().filter(n=>n&&!regNames.has(n.toLowerCase()));
@@ -4385,24 +4412,27 @@ function renderVendors(){
 
   const sortBy=sf.sort||'name';
   if(sortBy==='spend')registeredList=[...registeredList].sort((a,b)=>(vendorStats[b.name]?.spend||0)-(vendorStats[a.name]?.spend||0));
+  if(sortBy==='onorder')registeredList=[...registeredList].sort((a,b)=>(vendorStats[b.name]?.onOrder||0)-(vendorStats[a.name]?.onOrder||0));
   else if(sortBy==='pos')registeredList=[...registeredList].sort((a,b)=>(vendorStats[b.name]?.totalPOs||0)-(vendorStats[a.name]?.totalPOs||0));
   else registeredList=[...registeredList].sort((a,b)=>(a.name||'').localeCompare(b.name||''));
 
   const totalVendors=registeredList.length+legacyList.length;
   const totalSpend=(S.purchases||[]).reduce((s,p)=>s+poExtended(p),0);
+  const totalOnOrder=(S.purchases||[]).reduce((s,p)=>s+poOutstanding(p),0);
   const openPOCount=(S.purchases||[]).filter(p=>p.status!=='Received'&&p.status!=='Cancelled').length;
 
   return `
   <div class="kpi-grid kpi-grid-4" style="margin-bottom:16px">
     <div class="kpi"><div class="kpi-label">Total Vendors</div><div class="kpi-value">${totalVendors}</div><div class="kpi-sub">${registeredList.length} with full profiles</div></div>
     <div class="kpi kpi-orange"><div class="kpi-label">Open POs</div><div class="kpi-value">${openPOCount}</div><div class="kpi-sub">across all vendors</div></div>
-    <div class="kpi kpi-teal"><div class="kpi-label">Total Spend (all time)</div><div class="kpi-value" style="font-size:17px">${fc(totalSpend)}</div></div>
+    <div class="kpi ${totalOnOrder>0?'kpi-orange':'kpi-green'}"><div class="kpi-label">Currently On Order</div><div class="kpi-value" style="font-size:17px">${fc(totalOnOrder)}</div><div class="kpi-sub">not yet received</div></div>
+      <div class="kpi kpi-teal"><div class="kpi-label">Total Spend (all time)</div><div class="kpi-value" style="font-size:17px">${fc(totalSpend)}</div></div>
     <div class="kpi"><div class="kpi-label">Parts Tracked</div><div class="kpi-value">${S.parts.filter(p=>p.vendor).length}</div><div class="kpi-sub">with a vendor assigned</div></div>
   </div>
   <div class="filter-bar">
     <div class="search-wrap"><span class="search-icon">⌕</span><input placeholder="Name, city, contact, email…" value="${sf.search||''}" oninput="setFilter('vendors','search',this.value)"></div>
     <span style="font-size:11px;color:var(--text3);margin-left:4px">Sort:</span>
-    ${[['name','A–Z'],['spend','Spend'],['pos','POs']].map(([k,l])=>`<button class="filter-chip ${sortBy===k?'on-teal':''}" onclick="setFilter('vendors','sort','${k}')">${l}</button>`).join('')}
+    ${[['name','A–Z'],['onorder','On Order'],['spend','Spend'],['pos','POs']].map(([k,l])=>`<button class="filter-chip ${sortBy===k?'on-teal':''}" onclick="setFilter('vendors','sort','${k}')">${l}</button>`).join('')}
     <button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="openVendorModal(null,null)">+ Add Vendor</button>
     <span class="filter-count">${totalVendors} vendor${totalVendors!==1?'s':''}</span>
   </div>
@@ -4416,12 +4446,13 @@ function renderVendors(){
     <th>Email / Phone</th>
     <th style="text-align:center">Parts</th>
     <th style="text-align:center">POs</th>
+    <th style="text-align:right" title="Ordered and not yet received, partials included. Draft POs excluded.">On Order</th>
     <th style="text-align:right">Total Spend</th>
     <th style="text-align:center">Open POs</th>
     <th></th>
   </tr></thead><tbody>
   ${registeredList.map(v=>{
-    const st=vendorStats[v.name]||{openPOs:0,totalPOs:0,spend:0,parts:new Set()};
+    const st=vendorStats[v.name]||{openPOs:0,totalPOs:0,spend:0,onOrder:0,parts:new Set()};
     const loc=[v.city,v.state].filter(Boolean).join(', ');
     const contact=v.contact_name||'';
     const email=v.contact_email||v.email||'';
@@ -4443,6 +4474,7 @@ function renderVendors(){
       </td>
       <td style="text-align:center"><span class="money-neutral">${st.parts.size||0}</span></td>
       <td style="text-align:center"><span class="money-neutral">${st.totalPOs}</span></td>
+      <td style="text-align:right"><span class="money" style="font-weight:700;color:${st.onOrder>0?'var(--orange)':'var(--text3)'}" title="Ordered and not yet received, partials included">${st.onOrder>0?fc(st.onOrder):'—'}</span></td>
       <td style="text-align:right"><span class="money-cost" style="font-weight:700">${st.spend>0?fc(st.spend):'—'}</span></td>
       <td style="text-align:center">${st.openPOs>0?`<span class="pill pill-orange" style="font-size:10px">${st.openPOs} open</span>`:'<span style="color:var(--text3);font-size:11px">—</span>'}</td>
       <td onclick="event.stopPropagation()" style="display:flex;gap:4px;white-space:nowrap">
@@ -4461,15 +4493,16 @@ function renderVendors(){
     </div>
     <div class="tbl-wrap">
     <table><thead><tr>
-      <th>Vendor Name</th><th style="text-align:center">Parts</th><th style="text-align:center">POs</th><th style="text-align:right">Spend</th><th></th>
+      <th>Vendor Name</th><th style="text-align:center">Parts</th><th style="text-align:center">POs</th><th style="text-align:right" title="Ordered and not yet received">On Order</th><th style="text-align:right">Spend</th><th></th>
     </tr></thead><tbody>
     ${legacyList.map(name=>{
-      const st=vendorStats[name]||{openPOs:0,totalPOs:0,spend:0,parts:new Set()};
+      const st=vendorStats[name]||{openPOs:0,totalPOs:0,spend:0,onOrder:0,parts:new Set()};
       return `<tr class="rowlink" onclick="rowClick(event,function(){openVendorModal(null,'${escHtml(name.replace(/'/g,"\\'"))}')})">
         <td><span style="font-weight:600;color:var(--text)">${escHtml(name)}</span> <span style="font-size:9px;background:var(--orange-dim);color:var(--orange);border-radius:3px;padding:1px 5px;margin-left:4px">No profile</span></td>
         <td style="text-align:center"><span class="money-neutral">${st.parts.size||0}</span></td>
         <td style="text-align:center"><span class="money-neutral">${st.totalPOs}</span></td>
-        <td style="text-align:right"><span class="money-cost">${st.spend>0?fc(st.spend):'—'}</span></td>
+        <td style="text-align:right"><span class="money" style="color:${st.onOrder>0?'var(--orange)':'var(--text3)'}">${st.onOrder>0?fc(st.onOrder):'—'}</span></td>
+      <td style="text-align:right"><span class="money-cost">${st.spend>0?fc(st.spend):'—'}</span></td>
         <td onclick="event.stopPropagation()" style="display:flex;gap:4px">
           <button class="btn btn-teal btn-sm" onclick="openVendorModal(null,'${escHtml(name.replace(/'/g,"\\'"))}')">+ Add Profile</button>
           <button class="btn btn-sm" title="Create PO for this vendor" onclick="S.filters.pob={vendor:'${escHtml(name.replace(/'/g,"\\'"))}';nav('pobuilder')">+ PO</button>
