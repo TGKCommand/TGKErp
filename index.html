@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.14</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.15</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.14';
+const TGK_ERP_VERSION = 'v21.15';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1623,8 +1623,14 @@ function getCats(table){
   return[...new Set([...itemCats,...custom])].sort();
 }
 function getVendors(){
+  // Sources, in order: vendors used by a part, the REGISTERED vendors table, and any
+  // ad-hoc names added this session. The registered table was missing, so a vendor you
+  // had just created did not appear in the part form until some part already referenced
+  // it - a chicken-and-egg that made adding a vendor look broken.
   var partVendors=S.parts.map(function(p){return p.vendor||'';}).filter(Boolean);
-  return[...new Set([...partVendors,...(S.customVendors||[])])].sort();
+  var registered=(S.vendors||[]).map(function(v){return (v&&v.name)||'';}).filter(Boolean);
+  return[...new Set([...partVendors,...registered,...(S.customVendors||[])])]
+    .sort(function(a,b){return a.localeCompare(b);});
 }
 
 function handleVendorSelNew(el){if(el.value==='__new'){el.value='';showNewVendor(el.id);}}
@@ -1740,6 +1746,78 @@ function catAddSub(id){
   document.getElementById(id+'-nsub-nm').value='';
   toast('"'+top+'/'+nm+'" added — saves with the record');
 }
+
+/* ---- vendor actions (v21.15) ---- */
+window.poForVendor=function(name){
+  if(!S.filters.pob)S.filters.pob={};
+  S.filters.pob.vendor=name;
+  nav('pobuilder');
+};
+window.partsForVendor=function(name){
+  setFilter('parts','vendor',name);
+  setFilter('parts','search','');
+  nav('parts');
+  toast('Showing parts supplied by '+name);
+};
+function vendorUsage(name){
+  return{parts:(S.parts||[]).filter(function(p){return (p.vendor||'')===name;}),
+         pos:(S.purchases||[]).filter(function(p){return (p.vendor||'')===name;})};
+}
+window.openMergeVendor=function(fromName){
+  var others=getVendors().filter(function(v){return v!==fromName;});
+  if(!others.length){toast('There is no other vendor to merge into');return;}
+  var u=vendorUsage(fromName);
+  var old=document.getElementById('mv-overlay');if(old)old.remove();
+  var ov=document.createElement('div');ov.id='mv-overlay';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:9000;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(3px)';
+  ov.innerHTML='<div style="background:#fff;border-radius:6px;width:470px;max-width:94vw;padding:20px 22px;box-shadow:0 16px 48px rgba(14,20,24,.2)" onclick="event.stopPropagation()">'
+    +'<div style="font-size:14px;font-weight:800;margin-bottom:4px">Merge vendor</div>'
+    +'<div style="font-size:11.5px;color:var(--text3);margin-bottom:14px">Everything on <b>'+escHtml(fromName)+'</b> moves to the vendor you pick, and <b>'+escHtml(fromName)+'</b> is removed. '
+      +u.parts.length+' part'+(u.parts.length!==1?'s':'')+' and '+u.pos.length+' purchase order'+(u.pos.length!==1?'s':'')+' will be reassigned.</div>'
+    +'<div class="form-group" style="margin-bottom:14px"><label class="form-label">Merge into</label>'
+      +'<select id="mv-target" class="form-input">'+others.map(function(v){return '<option value="'+escHtml(v)+'">'+escHtml(v)+'</option>';}).join('')+'</select></div>'
+    +'<div style="font-size:11px;color:var(--orange);margin-bottom:14px">This rewrites rows in bulk and cannot be reversed with the Undo button.</div>'
+    +'<div style="display:flex;gap:8px;justify-content:flex-end">'
+      +'<button class="btn" onclick="document.getElementById(\'mv-overlay\').remove()">Cancel</button>'
+      +'<button class="btn btn-primary" id="mv-go" data-from="'+escHtml(fromName)+'" onclick="mergeVendorsGo(this.getAttribute(\'data-from\'))">Merge</button></div>'
+    +'</div>';
+  ov.addEventListener('click',function(){ov.remove();});
+  document.body.appendChild(ov);
+};
+window.mergeVendorsGo=async function(fromName){
+  var sel=document.getElementById('mv-target');
+  var toName=sel?sel.value:'';
+  if(!toName||toName===fromName){toast('Pick a different vendor');return;}
+  var u=vendorUsage(fromName);
+  var btn=document.getElementById('mv-go');if(btn){btn.disabled=true;btn.textContent='Merging...';}
+  try{
+    if(u.parts.length){
+      var r1=await db.from('parts').update({vendor:toName,updated_at:new Date().toISOString()}).eq('vendor',fromName);
+      if(r1&&r1.error)throw r1.error;
+    }
+    if(u.pos.length){
+      var r2=await db.from('purchases').update({vendor:toName,updated_at:new Date().toISOString()}).eq('vendor',fromName);
+      if(r2&&r2.error)throw r2.error;
+    }
+    var reg=(S.vendors||[]).find(function(v){return (v.name||'')===fromName;});
+    if(reg){
+      var r3=await db.from('vendors').delete().eq('id',reg.id);
+      if(r3&&r3.error)throw r3.error;
+      S.vendors=(S.vendors||[]).filter(function(v){return v.id!==reg.id;});
+    }
+    S.parts=(S.parts||[]).map(function(p){return (p.vendor||'')===fromName?Object.assign({},p,{vendor:toName}):p;});
+    S.purchases=(S.purchases||[]).map(function(p){return (p.vendor||'')===fromName?Object.assign({},p,{vendor:toName}):p;});
+    S.customVendors=(S.customVendors||[]).filter(function(v){return v!==fromName;});
+    if(typeof buildLookupMaps==='function')buildLookupMaps();
+    if(typeof logAction==='function')logAction('Merged vendor '+fromName+' into '+toName,'vendors',null,null,{parts:u.parts.length,pos:u.pos.length}).catch(function(){});
+    var ov=document.getElementById('mv-overlay');if(ov)ov.remove();
+    toast('\u2713 Merged '+fromName+' into '+toName+' \u2014 '+u.parts.length+' part(s) and '+u.pos.length+' PO(s) reassigned',7000);
+    render();
+  }catch(e){
+    if(btn){btn.disabled=false;btn.textContent='Merge';}
+    toast('Merge failed: '+(e.message||e),9000);
+  }
+};
 
 function buildVendorSelect(id,selected){
   var vendors=getVendors();
@@ -4538,13 +4616,15 @@ function renderVendors(){
         ${phone?`<a href="tel:${escHtml(phone)}" onclick="event.stopPropagation()" style="font-size:11px;color:var(--text2);text-decoration:none;display:block">${escHtml(phone)}</a>`:''}
         ${!email&&!phone?'<span style="color:var(--text3);font-size:11px">—</span>':''}
       </td>
-      <td style="text-align:center"><span class="money-neutral">${st.parts.size||0}</span></td>
+      <td style="text-align:center" onclick="event.stopPropagation()">${st.parts.size?`<a href="#" onclick="event.preventDefault();partsForVendor('${escHtml(v.name.replace(/'/g,"\\'"))}')" class="money-neutral" style="text-decoration:none;border-bottom:1px dotted var(--border2)" title="Show these parts">${st.parts.size}</a>`:'<span class="money-neutral">0</span>'}</td>
       <td style="text-align:center"><span class="money-neutral">${st.totalPOs}</span></td>
       <td style="text-align:right"><span class="money" style="font-weight:700;color:${st.onOrder>0?'var(--orange)':'var(--text3)'}" title="Ordered and not yet received, partials included">${st.onOrder>0?fc(st.onOrder):'—'}</span></td>
       <td style="text-align:right"><span class="money-cost" style="font-weight:700">${st.spend>0?fc(st.spend):'—'}</span></td>
       <td style="text-align:center">${st.openPOs>0?`<span class="pill pill-orange" style="font-size:10px">${st.openPOs} open</span>`:'<span style="color:var(--text3);font-size:11px">—</span>'}</td>
       <td onclick="event.stopPropagation()" style="display:flex;gap:4px;white-space:nowrap">
-        <button class="btn btn-teal btn-sm" title="Create PO for this vendor" onclick="S.filters.pob={vendor:'${escHtml(v.name.replace(/'/g,"\\'"))}';nav('pobuilder')">+ PO</button>
+        <button class="btn btn-teal btn-sm" title="Create PO for this vendor" onclick="poForVendor('${escHtml(v.name.replace(/'/g,"\\'"))}')">+ PO</button>
+        <button class="action-btn" title="Show the parts we buy from this vendor" onclick="partsForVendor('${escHtml(v.name.replace(/'/g,"\\'"))}')">Parts</button>
+        <button class="action-btn" title="Merge into another vendor (duplicates)" onclick="openMergeVendor('${escHtml(v.name.replace(/'/g,"\\'"))}')">Merge</button>
         <button class="action-btn" onclick="openVendorModal('${v.id}',null)">Edit</button>
       </td>
     </tr>`;
@@ -4565,13 +4645,15 @@ function renderVendors(){
       const st=vendorStats[name]||{openPOs:0,totalPOs:0,spend:0,onOrder:0,parts:new Set()};
       return `<tr class="rowlink" onclick="rowClick(event,function(){openVendorModal(null,'${escHtml(name.replace(/'/g,"\\'"))}')})">
         <td><span style="font-weight:600;color:var(--text)">${escHtml(name)}</span> <span style="font-size:9px;background:var(--orange-dim);color:var(--orange);border-radius:3px;padding:1px 5px;margin-left:4px">No profile</span></td>
-        <td style="text-align:center"><span class="money-neutral">${st.parts.size||0}</span></td>
+        <td style="text-align:center" onclick="event.stopPropagation()">${st.parts.size?`<a href="#" onclick="event.preventDefault();partsForVendor('${escHtml(name.replace(/'/g,"\\'"))}')" class="money-neutral" style="text-decoration:none;border-bottom:1px dotted var(--border2)" title="Show these parts">${st.parts.size}</a>`:'<span class="money-neutral">0</span>'}</td>
         <td style="text-align:center"><span class="money-neutral">${st.totalPOs}</span></td>
         <td style="text-align:right"><span class="money" style="color:${st.onOrder>0?'var(--orange)':'var(--text3)'}">${st.onOrder>0?fc(st.onOrder):'—'}</span></td>
       <td style="text-align:right"><span class="money-cost">${st.spend>0?fc(st.spend):'—'}</span></td>
         <td onclick="event.stopPropagation()" style="display:flex;gap:4px">
           <button class="btn btn-teal btn-sm" onclick="openVendorModal(null,'${escHtml(name.replace(/'/g,"\\'"))}')">+ Add Profile</button>
-          <button class="btn btn-sm" title="Create PO for this vendor" onclick="S.filters.pob={vendor:'${escHtml(name.replace(/'/g,"\\'"))}';nav('pobuilder')">+ PO</button>
+          <button class="btn btn-sm" title="Create PO for this vendor" onclick="poForVendor('${escHtml(name.replace(/'/g,"\\'"))}')">+ PO</button>
+          <button class="action-btn" title="Show the parts we buy from this vendor" onclick="partsForVendor('${escHtml(name.replace(/'/g,"\\'"))}')">Parts</button>
+          <button class="action-btn" title="Merge into another vendor (duplicates)" onclick="openMergeVendor('${escHtml(name.replace(/'/g,"\\'"))}')">Merge</button>
         </td>
       </tr>`;
     }).join('')}
