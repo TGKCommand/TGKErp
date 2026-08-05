@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.09</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.10</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.09';
+const TGK_ERP_VERSION = 'v21.10';
 const TGK_ERP_BUILD_DATE = '2026-07-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -15243,6 +15243,61 @@ async function loadPOLines(poId) {
   return S.poLines[poId];
 }
 
+/* ================= FIFO GUARD (v21.10) =================
+   On a PO's item list, flag any SKU that also has an OLDER still-open PO with
+   outstanding quantity, so old orders get closed out first instead of a newer
+   delivery being checked in against the wrong PO. Draft POs are ignored (nothing
+   placed yet) as are Received/Cancelled. SKU aliases are resolved so a line booked
+   under a legacy pn still matches one booked under new_sku. */
+function _poTime(p){
+  var d=p&&(p.order_date||p.created_at);
+  if(!d)return null;
+  var t=Date.parse(d);
+  return isNaN(t)?null:t;
+}
+function _pnAliases(pn){
+  var out=[String(pn)];
+  var it=(typeof _findPart==='function'&&_findPart(pn))||(typeof _findAsm2==='function'&&_findAsm2(pn))||null;
+  if(it){
+    if(it.pn&&out.indexOf(String(it.pn))<0)out.push(String(it.pn));
+    if(it.new_sku&&out.indexOf(String(it.new_sku))<0)out.push(String(it.new_sku));
+  }
+  return out;
+}
+function olderOpenPOsFor(pn,curPo){
+  if(!pn||!curPo)return[];
+  var curT=_poTime(curPo);
+  if(curT===null)return[];
+  var aliases=_pnAliases(pn),out=[];
+  (S.purchases||[]).forEach(function(p){
+    if(!p||String(p.id)===String(curPo.id))return;
+    var st=p.status||'';
+    if(st==='Received'||st==='Cancelled'||st==='Draft')return;
+    var t=_poTime(p);
+    if(t===null||t>=curT)return;
+    var ls=S.poLines[p.id]||[],qty=0;
+    if(ls.length){
+      ls.forEach(function(l){
+        if(aliases.indexOf(String(l.pn))>-1)qty+=Math.max(0,(l.qty_ordered||0)-(l.qty_received||0));
+      });
+    }else if(aliases.indexOf(String(p.pn))>-1){
+      qty+=Math.max(0,(p.qty||0)-(p.qty_received||0));
+    }
+    if(qty>0)out.push({po:p,qty:qty,t:t});
+  });
+  out.sort(function(a,b){return a.t-b.t;});
+  return out;
+}
+function buildFifoMap(lines,po){
+  var m={};
+  (lines||[]).forEach(function(l){
+    if(!l||!l.pn||m[l.pn]!==undefined)return;
+    m[l.pn]=olderOpenPOsFor(l.pn,po);
+  });
+  return m;
+}
+window.olderOpenPOsFor=olderOpenPOsFor;window.buildFifoMap=buildFifoMap;
+
 async function goToPO(id){
   // nav() resets S.activePO=null on every view change — so calling openPODetail then nav() races.
   // This function sets the view directly without that reset, then opens the PO detail atomically.
@@ -15535,6 +15590,20 @@ function renderPODetail(po) {
   </div>
   ${(function(){var _dmg=(S.receivingDamage||[]).filter(function(r){return String(r.po_id)===String(po.id);}); if(!_dmg.length) return ''; return '<div class="panel" style="padding:0;margin-bottom:14px"><div class="section-header" style="color:var(--red)">Damaged Items ('+_dmg.length+')</div>'+_dmg.map(function(r){return '<div class="check-row" style="cursor:pointer" onclick="openLossDetail(\'receiving\',\''+escHtml(String(r.id))+'\')"><span style="font-family:var(--mono);font-weight:600">'+escHtml(r.pn||'')+'</span><span style="color:var(--red);font-weight:700;margin:0 8px">-'+escHtml(String(r.qty))+'</span><span style="flex:1;font-size:11px;color:var(--text2)">'+escHtml(r.reason||'')+(r.note?' - '+escHtml(r.note):'')+'</span><span style="font-size:10px;color:var(--text3);margin-right:8px">'+escHtml(String(r.created_at||'').slice(0,10))+'</span>'+(r.photo_url?'<a href="'+escHtml(r.photo_url)+'" target="_blank" rel="noopener" onclick="event.stopPropagation()" style="font-size:11px;color:var(--teal)">photo</a>':'')+'</div>';}).join('')+'</div>';})()}
   ${lines.length===0?`<div class="panel"><div class="section-empty">No line items. Click "Add Line" to add parts to this PO.</div></div>`:''}
+  ${(function(){
+    S._fifoMap=buildFifoMap(lines,po);
+    var flagged=Object.keys(S._fifoMap).filter(function(k){return (S._fifoMap[k]||[]).length;});
+    if(!flagged.length)return '';
+    var oldest=null;
+    flagged.forEach(function(k){(S._fifoMap[k]||[]).forEach(function(o){if(!oldest||o.t<oldest.t)oldest=o;});});
+    return '<div class="panel" style="padding:11px 16px;margin-bottom:12px;border-left:3px solid var(--orange);background:var(--orange-dim)">'
+      +'<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
+      +'<span style="font-size:12.5px;font-weight:800;color:var(--orange)">\u26a0 Older POs still open</span>'
+      +'<span class="t3xs" style="flex:1;min-width:220px">'+flagged.length+' SKU'+(flagged.length!==1?'s':'')+' on this PO also '
+      +(flagged.length!==1?'have':'has')+' an older unreceived PO. Close those out first so receipts land on the right order.</span>'
+      +(oldest?('<button class="btn btn-sm" onclick="goToPO(\''+escHtml(oldest.po.id)+'\')">Open oldest \u2014 '+escHtml((oldest.po.order_date||'').slice(0,10)||'undated')+(oldest.po.vendor?(' \u00b7 '+escHtml(oldest.po.vendor)):'')+'</button>'):'')
+      +'</div></div>';
+  })()}
   ${lines.map(line=>{
     const remaining=Math.max(0,(line.qty_ordered||0)-(line.qty_received||0));
     const done=(line.qty_received||0)>=(line.qty_ordered||0);
@@ -15543,6 +15612,13 @@ function renderPODetail(po) {
       <div style="display:flex;flex-direction:column;min-width:120px">
         <span class="pn" style="color:var(--teal)">${(function(){const _li=S.parts.find(p=>p.pn===line.pn)||S.assemblies.find(a=>a.pn===line.pn);return _li?dispPn(_li):line.pn;})()}</span>
         <span style="font-size:10px;color:var(--text3);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${line.description||''}</span>
+        ${(function(){
+          var older=((S._fifoMap||{})[line.pn])||[];
+          if(!older.length)return '';
+          var tip='Older open PO'+(older.length>1?'s':'')+' for this SKU - receive these first:\n'
+            +older.map(function(o){return '  '+((o.po.order_date||'').slice(0,10)||'undated')+'   '+(o.po.vendor||'no vendor')+'   '+o.qty+' outstanding';}).join('\n');
+          return '<span class="pill pill-red" style="align-self:flex-start;margin-top:3px;font-size:9px;cursor:pointer" title="'+escHtml(tip)+'" onclick="event.stopPropagation();goToPO(\''+escHtml(older[0].po.id)+'\')">\u26a0 '+older.length+' older PO'+(older.length>1?'s':'')+'</span>';
+        })()}
       </div>
       <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:180px">
         <span class="t3xs">Ord:</span><span class="money-neutral" style="font-weight:700">${line.qty_ordered}</span>
