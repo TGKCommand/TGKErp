@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.23</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.25</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.23';
+const TGK_ERP_VERSION = 'v21.25';
 const TGK_ERP_BUILD_DATE = '2026-08-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1534,25 +1534,24 @@ function syncShopifyTemplate(pn,newOh){
       console.log('[Shopify backorder] '+pn+': new backorder — restock_date='+restockDate+' ('+restockDays+' days)');
     }
   }
-  fetch(SUPA_URL+'/functions/v1/shopify-orders',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({action:'update_template',pn:shopSku,template,restock_date:restockDate})
-  }).then(function(r){
-    if(!r.ok)r.json().then(function(e){console.warn('[Shopify template]',pn,e.error||r.status);});
-    else{
-      var b2=buildability(canonPn);
-      db.from('shopify_sync_log').insert({
-        pn,
-        action:isBackorder?'backorder':'reverted',
-        trigger_source:'erp_manual',
-        new_oh:newOh,
-        max_build:b2.maxBuild||null,
-        restock_date:restockDate||null,
-        user_email:S.currentUser||null
-      }).then(function(){});
-    }
-  }).catch(function(){});
+  // Variant-level backorder: each SKU is its own Shopify variant, so control THAT variant
+  // (sold out on backorder, always-available on restock) instead of the whole product template.
+  // If the new edge action isn't deployed yet, fall back to the product-template behavior.
+  var _logSync=function(){
+    var b2=buildability(canonPn);
+    db.from('shopify_sync_log').insert({pn,action:isBackorder?'backorder':'reverted',trigger_source:'erp_manual',new_oh:newOh,max_build:b2.maxBuild||null,restock_date:restockDate||null,user_email:S.currentUser||null}).then(function(){});
+  };
+  var _productFallback=function(){
+    fetch(SUPA_URL+'/functions/v1/shopify-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'update_template',pn:shopSku,template,restock_date:restockDate})})
+      .then(function(r){if(!r.ok){r.json().then(function(e){console.warn('[Shopify template]',pn,e.error||r.status);}).catch(function(){});}else{_logSync();}}).catch(function(){});
+  };
+  fetch(SUPA_URL+'/functions/v1/shopify-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'set_variant_backorder',sku:shopSku,backorder:isBackorder,restock_date:restockDate,trigger_source:'erp_manual'})})
+    .then(function(r){return r.text().then(function(txt){
+      var d=null;try{d=JSON.parse(txt);}catch(e){}
+      if(d&&d.ok){_logSync();if(d.errors&&d.errors.length)console.warn('[Shopify variant BO]',shopSku,d.errors);}
+      else if((txt||'').trim()==='ok'||(txt||'').trim()==='pong'){console.log('[Shopify variant BO] action not deployed - product-template fallback for',shopSku);_productFallback();}
+      else{console.warn('[Shopify variant BO]',shopSku,(d&&d.error)||r.status);_productFallback();}
+    });}).catch(function(){_productFallback();});
 }
 
 function dispOH(val){
@@ -4094,6 +4093,32 @@ function openReturnModal(saleId, pn, qty, orderNum){
   const reasons=['Wrong item shipped','Customer changed mind','Defective / not working','Damaged in shipping','Duplicate order','Other'];
 
   window._retLines = allLines.map(l=>({id:l.id,msrp:l.msrp||0,qty:l.qty||1}));
+  const _shippedLines=allLines.filter(l=>l.fulfillment_status==='Shipped'||l.fulfillment_status==='Delivered');
+  const _isShipped=_shippedLines.length>0;
+  const _shipRef=_shippedLines[0]||lead||{};
+  const _shipDate=(_shipRef.shipped_at||'').slice(0,10);
+  const _fs0=lead.fulfillment_status||(allLines[0]&&allLines[0].fulfillment_status)||'Open';
+  const _totalUnits=allLines.reduce((t,l)=>t+(l.qty||1),0);
+  const _anyReturned=allLines.find(l=>l.return_status);
+  const _on=lead.order_number||orderNum;
+  const _wLinked=(S.warrantyClaims||[]).filter(w=>w.order_number===_on).length;
+  const _eLinked=(S.shipmentErrors||[]).filter(e=>e.order_number===_on).length;
+  const _clicked=allLines.find(l=>l.id===saleId)||allLines[0]||{};
+  const _initUnits=_clicked.qty||1;
+  const _initImpact='\u2192 Will restock '+_initUnits+' unit'+(_initUnits!==1?'s':'')+' (1 SKU) back into inventory.';
+  const _shipCell=_isShipped?('<b style="color:var(--teal)">Yes'+(_shipDate?' \u2014 '+_shipDate:'')+'</b>'+((_shipRef.carrier||_shipRef.tracking_number)?('<br><span style="color:var(--text3);font-family:var(--mono);font-size:10px">'+escHtml((carrierLabel(_shipRef.carrier)||_shipRef.carrier||'').toString())+' '+escHtml(_shipRef.tracking_number||'')+'</span>'):'')):('<b style="color:var(--orange)">Not shipped yet</b>');
+  const _invCell=_isShipped?('<b>Deducted at ship</b> <span style="color:var(--text3)">('+_totalUnits+'u)</span>'):(_fs0==='Cancelled'?'<span style="color:var(--text3)">N/A (cancelled)</span>':'<span style="color:var(--text3)">Not yet deducted</span>');
+  const _linkedCell=(_wLinked||_eLinked)?('<div><span style="color:var(--text3)">Linked records</span><br>'+(_wLinked?('<b>'+_wLinked+'</b> warranty'):'')+((_wLinked&&_eLinked)?' \u00b7 ':'')+(_eLinked?('<b>'+_eLinked+'</b> ship error'):'')+'</div>'):'';
+  const _doneBanner=_anyReturned?('<div style="margin-top:8px;padding:6px 10px;background:rgba(234,88,12,.1);border:1px solid rgba(234,88,12,.3);border-radius:6px;color:var(--orange);font-size:11px;font-weight:600">Already processed \u2014 this order is marked "'+escHtml(_anyReturned.return_status)+'". Reverse it from the order row if you need to redo this.</div>'):'';
+  const ctxPanel='<div style="margin:-4px -24px 12px;padding:10px 24px;background:var(--bg2);border-bottom:1px solid var(--border)">'
+    +'<div style="display:flex;flex-wrap:wrap;gap:18px;font-size:11px;line-height:1.5">'
+      +'<div><span style="color:var(--text3)">Order status</span><br><b>'+escHtml(_fs0)+'</b></div>'
+      +'<div><span style="color:var(--text3)">Shipped?</span><br>'+_shipCell+'</div>'
+      +'<div><span style="color:var(--text3)">Inventory</span><br>'+_invCell+'</div>'
+      +_linkedCell
+    +'</div>'+_doneBanner
+    +'<div id="ret-impact" style="margin-top:8px;font-size:11.5px;font-weight:600;color:var(--teal)">'+_initImpact+'</div>'
+  +'</div>';
   const orderTotal = allLines.reduce((t,l)=>t+(l.msrp||0)*(l.qty||1),0);
   const defaultFee = 25;
   const defaultNet = orderTotal*(1-defaultFee/100);
@@ -4113,6 +4138,7 @@ function openReturnModal(saleId, pn, qty, orderNum){
   openModal('custom',{
     title: '↩ Return — Order '+orderNum,
     html: `
+    ${ctxPanel}
     <div style="margin:-4px -24px 0;border-bottom:1px solid var(--border)">
       <div style="padding:6px 24px 10px;display:flex;align-items:center;justify-content:space-between">
         <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text3)">Select Items to Return</span>
@@ -4144,7 +4170,7 @@ function openReturnModal(saleId, pn, qty, orderNum){
       </div>
       <div class="form-group">
         <label class="form-label">Item Condition</label>
-        <select id="ret-condition" class="form-input" onchange="document.getElementById('ret-condition-note').textContent=this.value==='Resellable'?'✓ Will restock inventory':this.value==='PreERP'?'⊘ No inventory change — pre-ERP order':'✕ Will NOT restock'">
+        <select id="ret-condition" class="form-input" onchange="document.getElementById('ret-condition-note').textContent=this.value==='Resellable'?'✓ Will restock inventory':this.value==='PreERP'?'⊘ No inventory change — pre-ERP order':'✕ Will NOT restock';if(typeof _retImpact==='function')_retImpact()">
           <option value="Resellable">Resellable — restock</option>
           <option value="Defective">Defective — do not restock</option>
           <option value="Damaged">Damaged — do not restock</option>
@@ -4204,6 +4230,22 @@ function openReturnModal(saleId, pn, qty, orderNum){
   });
 }
 
+window._retImpact=function(){
+  var el=document.getElementById('ret-impact');if(!el)return;
+  var cond=(document.getElementById('ret-condition')||{}).value||'Resellable';
+  var lines=window._retLines||[];
+  var units=0,skus=0;
+  document.querySelectorAll('.ret-line-chk:checked').forEach(function(c){
+    var f=lines.find(function(x){return String(x.id)===c.getAttribute('data-id');});
+    units+=f?(f.qty||1):0;skus++;
+  });
+  var msg,color;
+  if(!skus){msg='Select at least one item above.';color='var(--text3)';}
+  else if(cond==='Resellable'){msg='\u2192 Will restock '+units+' unit'+(units!==1?'s':'')+' ('+skus+' SKU'+(skus!==1?'s':'')+') back into inventory.';color='var(--teal)';}
+  else if(cond==='PreERP'){msg='\u2192 No inventory change (pre-ERP / external order).';color='var(--text3)';}
+  else{msg='\u2192 Will NOT restock \u2014 '+units+' unit'+(units!==1?'s':'')+' stay deducted (marked '+cond+').';color='var(--orange)';}
+  el.textContent=msg;el.style.color=color;
+};
 function _retUpdateTotals(){
   const lines = window._retLines||[];
   let total=0;
@@ -4221,6 +4263,7 @@ function _retUpdateTotals(){
   const na=document.getElementById('ret-net');if(na)na.textContent='$'+net.toFixed(2);
   const ra=document.getElementById('ret-refund-amount');
   if(ra&&ra.dataset.auto==='1')ra.value=net.toFixed(2);
+  if(typeof _retImpact==='function')_retImpact();
 }
 
 async function submitReturnV2(orderNum){
@@ -5987,6 +6030,57 @@ Deno.serve(async (req) => {
       if (part.includes('rel="next"')) { const m = part.match(/page_info=([^&>"]+)/); if (m) { next_page_info = m[1]; break } }
     }
     return new Response(JSON.stringify({skus, count: products.length, next_page_info}), {headers:{...CORS,'Content-Type':'application/json'}})
+  }
+  if (body.action === 'set_variant_backorder') {
+    const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
+    const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
+    const sku = (body.sku || body.pn || '').trim()
+    const backorder = !!body.backorder
+    const restockDate = body.restock_date || ''
+    if (!store || !key || !sku) return new Response(JSON.stringify({error:'Missing store, key or sku'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
+    const H = {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'}
+    const gql = (q) => fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:H, body: JSON.stringify({query:q})}).then(r=>r.json())
+    const safe = sku.replace(/"/g, '')
+    // Find the exact variant (each SKU is its own variant) + its inventory item.
+    const find = await gql('{ productVariants(first: 10, query: "sku:' + safe + '") { edges { node { id sku inventoryItem { id } product { id } } } } }')
+    const edges = find?.data?.productVariants?.edges || []
+    const match = edges.find((e:any) => (e.node.sku || '').trim().toUpperCase() === sku.toUpperCase())
+    if (!match) return new Response(JSON.stringify({error:'No Shopify variant found for SKU: ' + sku, debug: edges.map((e:any)=>e.node.sku)}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
+    const variantId = match.node.id
+    const invItemId = match.node.inventoryItem?.id
+    const errs:string[] = []
+    if (backorder) {
+      // Turn tracking ON for this variant only, zero its on-hand, and deny purchase when
+      // out of stock -> that variant shows sold out; sibling variants are untouched.
+      if (invItemId) {
+        const t = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: true}) { userErrors { message } } }')
+        ;(t?.data?.inventoryItemUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+        const loc = await gql('{ locations(first: 1) { edges { node { id } } } }')
+        const locId = loc?.data?.locations?.edges?.[0]?.node?.id
+        if (locId) {
+          const z = await gql('mutation { inventorySetOnHandQuantities(input: {reason: "correction", setQuantities: [{inventoryItemId: "' + invItemId + '", locationId: "' + locId + '", quantity: 0}]}) { userErrors { message } } }')
+          ;(z?.data?.inventorySetOnHandQuantities?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+        }
+      }
+      const p = await gql('mutation { productVariantUpdate(input: {id: "' + variantId + '", inventoryPolicy: DENY}) { userErrors { message } } }')
+      ;(p?.data?.productVariantUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+      if (restockDate) {
+        const m = await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: "' + restockDate + '", type: "single_line_text_field"}]) { userErrors { message } } }')
+        ;(m?.data?.metafieldsSet?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+      }
+    } else {
+      // Restock -> restore the made-to-order default: untrack the variant so it is always
+      // available again, and clear its restock date.
+      if (invItemId) {
+        const t = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: false}) { userErrors { message } } }')
+        ;(t?.data?.inventoryItemUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+      }
+      const p = await gql('mutation { productVariantUpdate(input: {id: "' + variantId + '", inventoryPolicy: CONTINUE}) { userErrors { message } } }')
+      ;(p?.data?.productVariantUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+      await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
+    }
+    try { await db.from('shopify_sync_log').insert({ pn: sku, action: backorder ? 'backorder' : 'reverted', trigger_source: body.trigger_source || 'erp_manual', restock_date: restockDate || null }) } catch (e) { console.warn('[set_variant_backorder] log failed:', e) }
+    return new Response(JSON.stringify({ok:true, variant: variantId, backorder, errors: errs}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
   let topic = req.headers.get('x-shopify-topic')
     || req.headers.get('X-Shopify-Topic')
