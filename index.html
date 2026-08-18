@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.36</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.39</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,8 +456,8 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.36';
-const TGK_ERP_BUILD_DATE = '2026-08-14';
+const TGK_ERP_VERSION = 'v21.39';
+const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
   var vb=document.getElementById('erp-version-badge');if(vb)vb.textContent=TGK_ERP_VERSION;
@@ -6373,6 +6373,10 @@ Deno.serve(async (req) => {
           actual_tracked = rb?.data?.inventoryItemUpdate?.inventoryItem?.tracked ?? actual_tracked
           failsafe_applied = true
         }
+        // Also clear the ETA metafield. The storefront draws its per-variant backorder
+        // marker from this field, so leaving a date behind on a variant we just reverted
+        // would make the marker contradict the ERP's own state.
+        await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
       } catch (e) { console.warn('[set_variant_backorder] failsafe untrack failed:', e) }
       reason = 'Could not set inventoryPolicy to CONTINUE' + (actual_policy ? (' (Shopify reports ' + actual_policy + ')') : '') + '. '
         + (errs.length ? ('Shopify said: ' + errs.join('; ') + '. ') : '')
@@ -6680,14 +6684,20 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
   }
   // [FIX 5b] eligibility gate — never touch subassembly / hardware-pack / pre-order / discontinued / dev listings
   // [FIX B] new_sku-aware eligibility resolve (pn may be a new_sku)
-  let { data: asmCheck } = await db.from('assemblies').select('pn,discontinued,stage,is_subassembly,category').eq('pn', pn).limit(1)
-  if (!asmCheck?.length) { const _r = await db.from('assemblies').select('pn,discontinued,stage,is_subassembly,category').eq('new_sku', pn).limit(1); asmCheck = _r.data }
-  const { data: partCheck } = asmCheck?.length ? { data: null } : await db.from('parts').select('pn,discontinued,category').eq('pn', pn).limit(1)
+  let { data: asmCheck } = await db.from('assemblies').select('pn,new_sku,use_new_sku,discontinued,stage,is_subassembly,category').eq('pn', pn).limit(1)
+  if (!asmCheck?.length) { const _r = await db.from('assemblies').select('pn,new_sku,use_new_sku,discontinued,stage,is_subassembly,category').eq('new_sku', pn).limit(1); asmCheck = _r.data }
+  const { data: partCheck } = asmCheck?.length ? { data: null } : await db.from('parts').select('pn,new_sku,use_new_sku,discontinued,category').eq('pn', pn).limit(1)
   const eligItem = asmCheck?.[0] || partCheck?.[0]
   if (eligItem &amp;&amp; !isEligibleForBackorderSync(eligItem)) {
     console.log('[SS-&gt;Shopify] skipped — not eligible (subassembly/hardware pack/pre-order/discontinued/dev):', pn)
     return
   }
+  // [SKU] Shopify variant SKUs are the customer-facing SKU (new_sku once use_new_sku is on).
+  // Callers such as cascadeShopifyBackorder hand us the CANONICAL pn, so resolve the display
+  // SKU before touching Shopify -- otherwise the variant lookup below silently misses every
+  // migrated product and the backorder never lands. Same rule as the client's dispPn().
+  const shopSkuBO = (eligItem &amp;&amp; eligItem.use_new_sku &amp;&amp; eligItem.new_sku) ? eligItem.new_sku : pn
+  if (shopSkuBO !== pn) console.log('[SS-&gt;Shopify] resolved canonical', pn, '-&gt; variant SKU', shopSkuBO)
   const store = (Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
   const key = Deno.env.get('SHOPIFY_KEY') || ''
   if (!store || !key) return
@@ -6707,11 +6717,11 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
   try {
     const isBO = template !== ''
     const gqlBO = (q) =&gt; fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:{'X-Shopify-Access-Token':key,'Content-Type':'application/json'}, body: JSON.stringify({query:q})}).then(r =&gt; r.json())
-    const safeBO = pn.replace(/"/g, '')
+    const safeBO = shopSkuBO.replace(/"/g, '')
     const findBO = await gqlBO('{ productVariants(first: 10, query: "sku:' + safeBO + '") { edges { node { id sku inventoryItem { id } } } } }')
     const edgesBO = findBO?.data?.productVariants?.edges || []
-    const mBO = edgesBO.find((e:any) =&gt; (e.node.sku || '').trim().toUpperCase() === pn.toUpperCase())
-    if (!mBO) { console.warn('[SS-&gt;Shopify] no variant for SKU', pn); return }
+    const mBO = edgesBO.find((e:any) =&gt; (e.node.sku || '').trim().toUpperCase() === shopSkuBO.toUpperCase())
+    if (!mBO) { console.warn('[SS-&gt;Shopify] no variant for SKU', shopSkuBO, '(from canonical ' + pn + ')'); return }
     const vId = mBO.node.id
     const iId = mBO.node.inventoryItem?.id
     if (isBO) {
@@ -7795,9 +7805,6 @@ async function bulkSyncShopifyBackorder(){
       if(r.ok&&(d.ok||d.success)){
         if(isBackorder){backorderCount++;}else{inStockCount++;}
         log.innerHTML+=(isBackorder?'<span style="color:var(--amber)">BACKORDER</span>':'<span style="color:var(--green)">IN STOCK&nbsp;&nbsp;</span>')+' '+escHtml(pn)+(isBackorder?' → restock '+restockDate:'')+'<br>';
-        if(d.reason){
-          log.innerHTML+='<span style="color:var(--red);font-weight:700">\u26a0 POLICY NOT APPLIED</span> '+escHtml(pn)+' - '+escHtml(d.reason)+'<br>';
-        }
         db.from('shopify_sync_log').insert({
           pn,
           action:isBackorder?'backorder':'reverted',
@@ -7809,7 +7816,15 @@ async function bulkSyncShopifyBackorder(){
         }).then(function(){});
       } else {
         errorCount++;
-        log.innerHTML+='<span style="color:var(--red)">ERROR&nbsp;&nbsp;&nbsp;&nbsp;</span> '+escHtml(pn)+' — '+(d.error||r.status)+'<br>';
+        // Surface the real cause. A policy write that Shopify accepted (HTTP 200) but did not
+        // apply returns ok:false with `reason` + `errors` -- printing r.status alone here was
+        // what produced the meaningless 'ERROR <sku> - 200'.
+        var _why=d.reason||d.error||('HTTP '+r.status);
+        var _raw=(d.errors&&d.errors.length)?(' | Shopify userErrors: '+d.errors.join('; ')):'';
+        var _pol=(d.actual_policy!==undefined)?(' | policy returned: '+(d.actual_policy===null?'null (mutation returned no variant)':d.actual_policy)):'';
+        var _trk=(d.actual_tracked!==undefined)?(' | tracked: '+d.actual_tracked):'';
+        log.innerHTML+='<span style="color:var(--red)">ERROR&nbsp;&nbsp;&nbsp;&nbsp;</span> '+escHtml(pn)+' — '+escHtml(String(_why))+escHtml(_raw+_pol+_trk)
+          +(d.failsafe_applied?' <span style="color:var(--green)">(kept orderable: variant left untracked)</span>':'')+'<br>';
       }
     } catch(e){
       errorCount++;
