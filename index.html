@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.42</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.43</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.42';
+const TGK_ERP_VERSION = 'v21.43';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -6403,10 +6403,14 @@ Deno.serve(async (req) => {
         + 'the edge function needs updating. If it mentions access denied, regenerate the Admin API token. '
         + (failsafe_applied ? 'Left the variant UNTRACKED so it stays orderable (no backorder badge).' : 'WARNING: variant may be unorderable - check it manually.')
     }
+    // Keep the PRODUCT template in step with its variants automatically. Only when the
+    // variant write actually landed - reconciling off a failed update would be guessing.
+    let template_result = null
+    if (policy_ok && prodId) { template_result = await reconcileProductTemplate(gql, prodId) }
     const effective_action = (backorder && !policy_ok) ? 'reverted' : (backorder ? 'backorder' : 'reverted')
     try { await db.from('shopify_sync_log').insert({ pn: sku, action: effective_action, trigger_source: body.trigger_source || 'erp_manual', restock_date: (effective_action === 'backorder' ? (restockDate || null) : null) }) } catch (e) { console.warn('[set_variant_backorder] log failed:', e) }
     const ok = backorder ? policy_ok : true
-    return new Response(JSON.stringify({ok, variant: variantId, backorder, errors: errs, graphql_errors: gqlTopErrors, reason, actual_policy, actual_tracked, expected_policy, policy_ok, failsafe_applied, orderable: (actual_tracked === false) || policy_ok}), {headers:{...CORS,'Content-Type':'application/json'}})
+    return new Response(JSON.stringify({ok, variant: variantId, backorder, errors: errs, graphql_errors: gqlTopErrors, reason, actual_policy, actual_tracked, expected_policy, policy_ok, failsafe_applied, template: template_result, orderable: (actual_tracked === false) || policy_ok}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
   if (body.action === 'list_product_templates') {
     const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
@@ -6602,6 +6606,51 @@ function ssAuth(): string {
 function isHWPackServer(pn: string): boolean {
   return /^TGK-P\\d/i.test(pn || '')
 }
+// Recompute a PRODUCT's template_suffix from the live state of ALL its variants.
+// Rule (must match the ERP's Theme Audit exactly):
+//   * single-variant product  -&gt; backorder template if that variant is backordered
+//   * multi-variant product   -&gt; backorder template ONLY if EVERY variant is backordered;
+//                                if even one is buyable the product stays on default.
+// A variant counts as backordered when it is tracked and its quantity is &lt;= 0.
+// Returns {changed, from, to, errors} and never throws -- template drift must never break
+// the inventory write that triggered it.
+async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;any&gt; {
+  const out = {changed: false, from: null, to: null, errors: [] as string[]}
+  if (!prodId) return out
+  try {
+    const q = await gqlFn('{ product(id: "' + prodId + '") { templateSuffix variants(first: 100) { edges { node { id inventoryQuantity inventoryItem { tracked } } } } } }')
+    const prod = q?.data?.product
+    if (!prod) { out.errors.push('product lookup returned nothing'); return out }
+    const vs = (prod.variants?.edges || []).map((e: any) =&gt; e.node)
+    const n = vs.length
+    if (!n) return out
+    const boCount = vs.filter((v: any) =&gt; v?.inventoryItem?.tracked &amp;&amp; (Number(v.inventoryQuantity) || 0) &lt;= 0).length
+    const shouldBO = (n &lt;= 1) ? (boCount &gt;= 1) : (boCount === n)
+    const desired = shouldBO ? (Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder') : ''
+    const current = prod.templateSuffix || ''
+    out.from = current; out.to = desired
+    if (current === desired) return out
+    // productUpdate changed argument name across API versions (input: -&gt; product:). We were
+    // already bitten once by a mutation shape disappearing, so try the modern form first and
+    // fall back, rather than assuming either one.
+    let applied = false
+    const tryUpdate = async (argName: string) =&gt; {
+      const m = await gqlFn('mutation { productUpdate(' + argName + ': {id: "' + prodId + '", templateSuffix: "' + desired + '"}) { product { templateSuffix } userErrors { field message } } }')
+      const ue = (m?.data?.productUpdate?.userErrors || []).map((u: any) =&gt; u.message)
+      ue.forEach((x: string) =&gt; out.errors.push(x))
+      if (m?.data?.productUpdate?.product) { applied = true; return true }
+      return false
+    }
+    if (!(await tryUpdate('product'))) { await tryUpdate('input') }
+    out.changed = applied
+    if (applied) console.log('[template] product ' + prodId + ': "' + current + '" -&gt; "' + desired + '" (' + boCount + '/' + n + ' variants backordered)')
+    else console.warn('[template] product ' + prodId + ': could NOT set templateSuffix to "' + desired + '"' + (out.errors.length ? (' - ' + out.errors.join('; ')) : ''))
+  } catch (e) {
+    out.errors.push(String((e as any)?.message || e))
+  }
+  return out
+}
+
 function isEligibleForBackorderSync(item: any): boolean {
   if (!item) return false
   if (item.discontinued || item.stage === 'dev') return false
@@ -6783,7 +6832,9 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
       await gqlBO('mutation { productVariantsBulkUpdate(productId: "' + pId + '", variants: [{id: "' + vId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
       await gqlBO('mutation { metafieldsSet(metafields: [{ownerId: "' + vId + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
     }
-    console.log('[SS-&gt;Shopify] variant', pn, isBO ? '-&gt; backorder (sold out)' : '-&gt; available')
+    console.log('[SS-&gt;Shopify] variant', pn, isBO ? '-&gt; backorder' : '-&gt; available')
+    // Keep the product template in step with all its variants (same rule as Theme Audit).
+    if (pId) await reconcileProductTemplate(gqlBO, pId)
     const ssRestockDate = ssRestock || ''
     try {
       const { maxBuild: logMaxBuild } = await bomMaxBuild(pn)
@@ -7792,7 +7843,7 @@ async function bulkSyncShopifyBackorder(){
   if(S.settings.shopify_backorder_sync_enabled===false){toast('Backorder sync is disabled — enable it in the toggle above first');return;}
   const btn=document.getElementById('bulk-shopify-sync-btn');
   const log=document.getElementById('bulk-shopify-sync-log');
-  if(!confirm('This will check every finished good and push the correct backorder or in-stock template to Shopify. This may take a minute. Continue?'))return;
+  if(!confirm('This will check every finished good and push the correct per-variant backorder status to Shopify, updating each product template only when all of its variants agree. This may take a minute. Continue?'))return;
   btn.disabled=true;btn.textContent='Syncing…';
   log.style.display='block';log.innerHTML='Starting bulk sync…<br>';
   const _hwAll=(HW_CATS||[]).concat(SUPPLY_CATS||[]);
@@ -7830,7 +7881,8 @@ async function bulkSyncShopifyBackorder(){
       const d=await r.json();
       if(r.ok&&(d.ok||d.success)){
         if(isBackorder){backorderCount++;}else{inStockCount++;}
-        log.innerHTML+=(isBackorder?'<span style="color:var(--amber)">BACKORDER</span>':'<span style="color:var(--green)">IN STOCK&nbsp;&nbsp;</span>')+' '+escHtml(pn)+(isBackorder?' → restock '+restockDate:'')+'<br>';
+        log.innerHTML+=(isBackorder?'<span style="color:var(--amber)">BACKORDER</span>':'<span style="color:var(--green)">IN STOCK&nbsp;&nbsp;</span>')+' '+escHtml(pn)+(isBackorder?' → restock '+restockDate:'')
+          +((d.template&&d.template.changed)?(' <span style="color:var(--teal)">[product template → '+escHtml(d.template.to||'default')+']</span>'):'')+'<br>';
         db.from('shopify_sync_log').insert({
           pn,
           action:isBackorder?'backorder':'reverted',
