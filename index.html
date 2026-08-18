@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.40</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.41</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.40';
+const TGK_ERP_VERSION = 'v21.41';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -6328,6 +6328,7 @@ Deno.serve(async (req) => {
     if (!match) return new Response(JSON.stringify({error:'No Shopify variant found for SKU: ' + sku, debug: edges.map((e:any)=>e.node.sku)}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
     const variantId = match.node.id
     const invItemId = match.node.inventoryItem?.id
+    const prodId = match.node.product?.id
     const errs:string[] = []
     let actual_policy = null, actual_tracked = null
     if (backorder) {
@@ -6344,9 +6345,11 @@ Deno.serve(async (req) => {
           ;(z?.data?.inventorySetOnHandQuantities?.userErrors || []).forEach((u:any)=>errs.push(u.message))
         }
       }
-      const p = await gql('mutation { productVariantUpdate(input: {id: "' + variantId + '", inventoryPolicy: CONTINUE}) { productVariant { inventoryPolicy } userErrors { message } } }')
-      ;(p?.data?.productVariantUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
-      actual_policy = p?.data?.productVariantUpdate?.productVariant?.inventoryPolicy ?? actual_policy
+      // productVariantsBulkUpdate replaces the removed productVariantUpdate. Needs productId
+      // plus a variants array; returns the updated variants so verification still works.
+      const p = await gql('mutation { productVariantsBulkUpdate(productId: "' + prodId + '", variants: [{id: "' + variantId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
+      ;(p?.data?.productVariantsBulkUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+      actual_policy = p?.data?.productVariantsBulkUpdate?.productVariants?.[0]?.inventoryPolicy ?? actual_policy
       if (restockDate) {
         const m = await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: "' + restockDate + '", type: "single_line_text_field"}]) { userErrors { message } } }')
         ;(m?.data?.metafieldsSet?.userErrors || []).forEach((u:any)=>errs.push(u.message))
@@ -6359,9 +6362,9 @@ Deno.serve(async (req) => {
         ;(t?.data?.inventoryItemUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
         actual_tracked = t?.data?.inventoryItemUpdate?.inventoryItem?.tracked ?? actual_tracked
       }
-      const p = await gql('mutation { productVariantUpdate(input: {id: "' + variantId + '", inventoryPolicy: CONTINUE}) { productVariant { inventoryPolicy } userErrors { message } } }')
-      ;(p?.data?.productVariantUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
-      actual_policy = p?.data?.productVariantUpdate?.productVariant?.inventoryPolicy ?? actual_policy
+      const p = await gql('mutation { productVariantsBulkUpdate(productId: "' + prodId + '", variants: [{id: "' + variantId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
+      ;(p?.data?.productVariantsBulkUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+      actual_policy = p?.data?.productVariantsBulkUpdate?.productVariants?.[0]?.inventoryPolicy ?? actual_policy
       await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
     }
     // actual_policy/actual_tracked come straight from each mutation's own response above
@@ -6391,8 +6394,8 @@ Deno.serve(async (req) => {
       const allErrTxt = errs.concat(gqlTopErrors)
       reason = 'Could not set inventoryPolicy to CONTINUE' + (actual_policy ? (' (Shopify reports ' + actual_policy + ')') : '') + '. '
         + (allErrTxt.length ? ('SHOPIFY SAID: ' + allErrTxt.join(' | ') + '. ') : 'Shopify returned no error text. ')
-        + 'If that mentions access denied, the Admin API token predates the write_products scope - '
-        + 'adding a scope does NOT upgrade an existing token, so reinstall the custom app and regenerate it. '
+        + 'If it mentions a field not existing, the pinned Shopify API version has dropped that mutation - '
+        + 'the edge function needs updating. If it mentions access denied, regenerate the Admin API token. '
         + (failsafe_applied ? 'Left the variant UNTRACKED so it stays orderable (no backorder badge).' : 'WARNING: variant may be unorderable - check it manually.')
     }
     const effective_action = (backorder && !policy_ok) ? 'reverted' : (backorder ? 'backorder' : 'reverted')
@@ -6735,12 +6738,13 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
       return r
     }
     const safeBO = shopSkuBO.replace(/"/g, '')
-    const findBO = await gqlBO('{ productVariants(first: 10, query: "sku:' + safeBO + '") { edges { node { id sku inventoryItem { id } } } } }')
+    const findBO = await gqlBO('{ productVariants(first: 10, query: "sku:' + safeBO + '") { edges { node { id sku inventoryItem { id } product { id } } } } }')
     const edgesBO = findBO?.data?.productVariants?.edges || []
     const mBO = edgesBO.find((e:any) =&gt; (e.node.sku || '').trim().toUpperCase() === shopSkuBO.toUpperCase())
     if (!mBO) { console.warn('[SS-&gt;Shopify] no variant for SKU', shopSkuBO, '(from canonical ' + pn + ')'); return }
     const vId = mBO.node.id
     const iId = mBO.node.inventoryItem?.id
+    const pId = mBO.node.product?.id
     if (isBO) {
       // Backordered: track this variant only, zero it, and keep it PURCHASABLE (CONTINUE).
       // Siblings untouched.
@@ -6750,9 +6754,9 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
         const lId = locBO?.data?.locations?.edges?.[0]?.node?.id
         if (lId) await gqlBO('mutation { inventorySetOnHandQuantities(input: {reason: "correction", setQuantities: [{inventoryItemId: "' + iId + '", locationId: "' + lId + '", quantity: 0}]}) { userErrors { message } } }')
       }
-      const pBO = await gqlBO('mutation { productVariantUpdate(input: {id: "' + vId + '", inventoryPolicy: CONTINUE}) { productVariant { inventoryPolicy } userErrors { message } } }')
-      const polBO = pBO?.data?.productVariantUpdate?.productVariant?.inventoryPolicy || null
-      const polErrsBO = (pBO?.data?.productVariantUpdate?.userErrors || []).map((u:any)=>u.message)
+      const pBO = await gqlBO('mutation { productVariantsBulkUpdate(productId: "' + pId + '", variants: [{id: "' + vId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
+      const polBO = pBO?.data?.productVariantsBulkUpdate?.productVariants?.[0]?.inventoryPolicy || null
+      const polErrsBO = (pBO?.data?.productVariantsBulkUpdate?.userErrors || []).map((u:any)=>u.message)
       if (polBO !== 'CONTINUE') {
         // FAIL-SAFE: tracked + anything-but-CONTINUE means customers cannot buy it, which
         // violates the hard 'always orderable' rule. Could not confirm CONTINUE, so untrack
@@ -6771,7 +6775,7 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
     } else {
       // Restock -&gt; back to made-to-order default: untrack the variant so it is always available.
       if (iId) await gqlBO('mutation { inventoryItemUpdate(id: "' + iId + '", input: {tracked: false}) { userErrors { message } } }')
-      await gqlBO('mutation { productVariantUpdate(input: {id: "' + vId + '", inventoryPolicy: CONTINUE}) { userErrors { message } } }')
+      await gqlBO('mutation { productVariantsBulkUpdate(productId: "' + pId + '", variants: [{id: "' + vId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
       await gqlBO('mutation { metafieldsSet(metafields: [{ownerId: "' + vId + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
     }
     console.log('[SS-&gt;Shopify] variant', pn, isBO ? '-&gt; backorder (sold out)' : '-&gt; available')
