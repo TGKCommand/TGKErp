@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.25</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.26</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.25';
+const TGK_ERP_VERSION = 'v21.26';
 const TGK_ERP_BUILD_DATE = '2026-08-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -6373,55 +6373,37 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
     console.log('[SS-&gt;Shopify]', pn, 'newOh='+newOh, 'hasBOM='+hasBOM, 'maxBuild='+maxBuild, '-&gt;', template || '(revert)', ssRestock ? 'restock:'+ssRestock : '')
   }
   try {
-    const varRes = await fetch('https://' + store + '/admin/api/2024-01/variants.json?sku=' + encodeURIComponent(pn) + '&amp;fields=product_id,id,sku', {
-      headers: { 'X-Shopify-Access-Token': key }
-    })
-    if (!varRes.ok) { console.warn('[SS-&gt;Shopify] variant lookup failed', pn, varRes.status); return }
-    const varData = await varRes.json()
-    const candidateIds: number[] = [...new Set((varData.variants || []).map((v: any) =&gt; v.product_id).filter(Boolean))]
-    if (!candidateIds.length) { console.warn('[SS-&gt;Shopify] no product for SKU', pn); return }
-    let productId: number | null = null
-    for (const cid of candidateIds) {
-      const checkRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + cid + '.json?fields=id,variants', { headers: { 'X-Shopify-Access-Token': key } })
-      if (!checkRes.ok) { console.warn('[SS-&gt;Shopify] product', cid, 'returned', checkRes.status, '— skipping'); continue }
-      const checkData = await checkRes.json()
-      const skuMatch = (checkData.product?.variants || []).find((v: any) =&gt; (v.sku || '').trim().toUpperCase() === pn.toUpperCase())
-      if (skuMatch) { productId = cid; break }
-      console.warn('[SS-&gt;Shopify] product', cid, 'exists but SKU', pn, 'not on it — skipping')
+    const isBO = template !== ''
+    const gqlBO = (q) =&gt; fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:{'X-Shopify-Access-Token':key,'Content-Type':'application/json'}, body: JSON.stringify({query:q})}).then(r =&gt; r.json())
+    const safeBO = pn.replace(/"/g, '')
+    const findBO = await gqlBO('{ productVariants(first: 10, query: "sku:' + safeBO + '") { edges { node { id sku inventoryItem { id } } } } }')
+    const edgesBO = findBO?.data?.productVariants?.edges || []
+    const mBO = edgesBO.find((e:any) =&gt; (e.node.sku || '').trim().toUpperCase() === pn.toUpperCase())
+    if (!mBO) { console.warn('[SS-&gt;Shopify] no variant for SKU', pn); return }
+    const vId = mBO.node.id
+    const iId = mBO.node.inventoryItem?.id
+    if (isBO) {
+      // Sold out for THIS variant only: track it, zero it, deny purchase. Siblings untouched.
+      if (iId) {
+        await gqlBO('mutation { inventoryItemUpdate(id: "' + iId + '", input: {tracked: true}) { userErrors { message } } }')
+        const locBO = await gqlBO('{ locations(first: 1) { edges { node { id } } } }')
+        const lId = locBO?.data?.locations?.edges?.[0]?.node?.id
+        if (lId) await gqlBO('mutation { inventorySetOnHandQuantities(input: {reason: "correction", setQuantities: [{inventoryItemId: "' + iId + '", locationId: "' + lId + '", quantity: 0}]}) { userErrors { message } } }')
+      }
+      await gqlBO('mutation { productVariantUpdate(input: {id: "' + vId + '", inventoryPolicy: DENY}) { userErrors { message } } }')
+      if (ssRestock) await gqlBO('mutation { metafieldsSet(metafields: [{ownerId: "' + vId + '", namespace: "custom", key: "estimated_arrival_date", value: "' + ssRestock + '", type: "single_line_text_field"}]) { userErrors { message } } }')
+    } else {
+      // Restock -&gt; back to made-to-order default: untrack the variant so it is always available.
+      if (iId) await gqlBO('mutation { inventoryItemUpdate(id: "' + iId + '", input: {tracked: false}) { userErrors { message } } }')
+      await gqlBO('mutation { productVariantUpdate(input: {id: "' + vId + '", inventoryPolicy: CONTINUE}) { userErrors { message } } }')
+      await gqlBO('mutation { metafieldsSet(metafields: [{ownerId: "' + vId + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
     }
-    if (!productId) { console.warn('[SS-&gt;Shopify] could not confirm product for SKU', pn); return }
-    const putRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + productId + '.json', {
-      method: 'PUT',
-      headers: { 'X-Shopify-Access-Token': key, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ product: { id: productId, template_suffix: template } })
-    })
-    console.log('[SS-&gt;Shopify] template set', pn, '-&gt;', template || '(normal)', 'HTTP', putRes.status)
-    // [FIX 4] Declare ssRestockDate BEFORE it is used. The deployed version referenced ssRestockDate in
-    // the log insert below and only declared it (const) a few lines later — a temporal-dead-zone
-    // ReferenceError that was silently swallowed by the catch, so the sync-log row never got written.
+    console.log('[SS-&gt;Shopify] variant', pn, isBO ? '-&gt; backorder (sold out)' : '-&gt; available')
     const ssRestockDate = ssRestock || ''
     try {
       const { maxBuild: logMaxBuild } = await bomMaxBuild(pn)
-      await db.from('shopify_sync_log').insert({
-        pn,
-        action: template ? 'backorder' : 'reverted',
-        trigger_source: 'shipstation_webhook',
-        new_oh: newOh,
-        max_build: logMaxBuild || null,
-        restock_date: ssRestockDate || null
-      })
+      await db.from('shopify_sync_log').insert({ pn, action: isBO ? 'backorder' : 'reverted', trigger_source: 'shipstation_webhook', new_oh: newOh, max_build: logMaxBuild || null, restock_date: ssRestockDate || null })
     } catch (e) { console.warn('[SS-&gt;Shopify] log insert failed:', e) }
-    if (template &amp;&amp; ssRestockDate) {
-      try {
-        const ssGid = 'gid://shopify/Product/' + productId
-        const ssMutation = 'mutation { metafieldsSet(metafields: [{ownerId: "' + ssGid + '", namespace: "custom", key: "estimated_arrival_date", value: "' + ssRestockDate + '", type: "single_line_text_field"}]) { metafields { id } userErrors { field message } } }'
-        await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {
-          method: 'POST', headers: { 'X-Shopify-Access-Token': key, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query: ssMutation })
-        })
-        console.log('[SS-&gt;Shopify] estimated_arrival_date metafield set to', ssRestockDate)
-      } catch (e) { console.warn('[SS-&gt;Shopify] metafield write failed:', e) }
-    }
   } catch (e) {
     console.warn('[SS-&gt;Shopify] error for', pn, e)
   }
@@ -7458,10 +7440,10 @@ async function bulkSyncShopifyBackorder(){
       const r=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{
         method:'POST',
         headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
-        body:JSON.stringify({action:'update_template',pn,template,restock_date:isBackorder?restockDate:''})
+        body:JSON.stringify({action:'set_variant_backorder',sku:pn,backorder:isBackorder,restock_date:isBackorder?restockDate:''})
       });
       const d=await r.json();
-      if(r.ok&&d.success){
+      if(r.ok&&(d.ok||d.success)){
         if(isBackorder){backorderCount++;}else{inStockCount++;}
         log.innerHTML+=(isBackorder?'<span style="color:var(--amber)">BACKORDER</span>':'<span style="color:var(--green)">IN STOCK&nbsp;&nbsp;</span>')+' '+escHtml(pn)+(isBackorder?' → restock '+restockDate:'')+'<br>';
         db.from('shopify_sync_log').insert({
