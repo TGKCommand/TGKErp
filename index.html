@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.27</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.28</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.27';
+const TGK_ERP_VERSION = 'v21.28';
 const TGK_ERP_BUILD_DATE = '2026-08-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -2544,6 +2544,7 @@ function renderAssemblies(){
     ${_dupPairs.length?`<button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3);background:rgba(220,38,38,.05)" onclick="openDuplicateMergeReview()" title="These SKU pairs are showing merged for display only — the underlying duplicate database rows still exist and are double-counting stock/BOMs until merged">&#9888; ${_dupPairs.length} Duplicate SKU${_dupPairs.length!==1?'s':''} — Review &amp; Merge</button>`:''}
     ${(function(){var _empty=findEmptyAssemblyRecords();return _empty.length?'<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3);background:rgba(234,88,12,.05)" onclick="openEmptyRecordsReview()" title="These rows have no duplicate counterpart to pull data from — they were never actually filled in and need real data typed or filled from Shopify">&#9998; '+_empty.length+' Empty Record'+(_empty.length!==1?'s':'')+' (No Duplicate — Needs Data)</button>':'';})()}
     <button class="btn btn-sm" style="margin-left:auto;color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="openWebsiteSyncCheck()" title="Check which assemblies are live / draft / missing on the Shopify website">Website Check</button>
+    <button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="openBackorderPolicyAudit()" title="Find any Shopify variant stuck blocking purchase (tracked + deny) and fix it">Backorder Audit</button>
     <button class="btn btn-sm" onclick="openModal('manageCategories',{table:'assemblies'})">⚙ Categories</button>
     <button class="btn btn-sm" onclick="printAllBOMs()" title="Print all BOMs as PDF">🖨 All BOMs</button>
     <span class="filter-count">${list.length} assemblies</span>
@@ -2873,6 +2874,139 @@ window._dtExport=function(){
   var blob=new Blob(['\uFEFF'+lines.join('\r\n')],{type:'text/csv;charset=utf-8'});
   var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='discount-tracker_'+new Date().toISOString().slice(0,10)+'.csv';a.click();URL.revokeObjectURL(a.href);
   toast('Exported '+rows.length+' discount code'+(rows.length!==1?'s':''));
+};
+
+window._bpaRecords=null;
+window.openBackorderPolicyAudit=async function(){
+  if(!S.shopify||!S.shopify.store){toast('Configure your Shopify store URL in Integrations first');return;}
+  var old=document.getElementById('bpa-overlay');if(old)old.remove();
+  var ov=document.createElement('div');ov.id='bpa-overlay';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9200;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto';
+  ov.innerHTML='<div class="modal" style="width:760px;max-width:96vw" onclick="event.stopPropagation()">'
+    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'
+    +'<div style="font-size:15px;font-weight:700;color:var(--text)">Backorder Policy Audit</div>'
+    +'<button onclick="document.getElementById(\'bpa-overlay\').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">\u00d7</button></div>'
+    +'<div id="bpa-body"><div class="section-empty" style="padding:30px">Reading every product from Shopify once - this may take a few seconds...</div></div></div>';
+  ov.addEventListener('click',function(){ov.remove();});
+  document.body.appendChild(ov);
+  var norm=function(s){return String(s||'').toUpperCase().replace(/[\s_]+/g,'-').replace(/[^A-Z0-9-]/g,'');};
+  var records={};
+  var page_info='',pageNum=0,total=0,notDeployed=false,errMsg='';
+  try{
+    while(true){
+      pageNum++;
+      var body={action:'list_products'};
+      if(S.shopify.store)body.store=S.shopify.store;
+      if(S.shopify.key)body.key=S.shopify.key;
+      if(page_info)body.page_info=page_info;
+      var res=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      var txt=await res.text();
+      var data=null;try{data=JSON.parse(txt);}catch(e){data=null;}
+      if(!data||!Array.isArray(data.skus)){
+        if((txt||'').trim()==='ok'||(txt||'').trim()==='pong')notDeployed=true;
+        else errMsg=(data&&data.error)||('HTTP '+res.status);
+        break;
+      }
+      if(!res.ok){errMsg=data.error||('HTTP '+res.status);break;}
+      data.skus.forEach(function(r){
+        var k=norm(r.sku);if(!k)return;
+        records[k]={tracked:!!r.tracked,policy:(r.policy||'').toLowerCase(),qty:(typeof r.qty==='number')?r.qty:null,title:r.title||''};
+      });
+      total+=data.count||0;
+      if(pageNum>1){var b=document.getElementById('bpa-body');if(b)b.innerHTML='<div class="section-empty" style="padding:30px">Reading Shopify products... '+total+' scanned</div>';}
+      if(!data.next_page_info)break;
+      page_info=data.next_page_info;
+      if(pageNum>40)break;
+    }
+  }catch(e){errMsg=(e&&e.message)||String(e);}
+  var bodyEl=document.getElementById('bpa-body');if(!bodyEl)return;
+  if(notDeployed){
+    bodyEl.innerHTML='<div style="padding:16px;line-height:1.5"><div style="font-weight:700;color:var(--orange);margin-bottom:6px">Edge function update needed</div>'
+      +'<div class="t2s">This audit needs the latest <span class="pn">shopify-orders</span> function. Copy it from Integrations &rarr; Setup Guide and redeploy:</div>'
+      +'<pre style="background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:10px;font-size:11px;font-family:var(--mono);color:var(--text2);margin-top:8px">supabase functions deploy shopify-orders</pre></div>';
+    return;
+  }
+  if(errMsg){
+    bodyEl.innerHTML='<div style="padding:16px"><div style="font-weight:700;color:var(--red);margin-bottom:6px">Could not read Shopify</div><div class="t2s">'+escHtml(errMsg)+'</div></div>';
+    return;
+  }
+  window._bpaRecords=records;
+  _bpaRender();
+};
+window._bpaRender=function(){
+  var records=window._bpaRecords||{};
+  var norm=function(s){return String(s||'').toUpperCase().replace(/[\s_]+/g,'-').replace(/[^A-Z0-9-]/g,'');};
+  var pool=S.assemblies.filter(function(a){return !a.discontinued&&eligibleForBackorderSync(a);});
+  var stuck=[],ok=0,missing=0;
+  pool.forEach(function(a){
+    var cands=[a.pn,a.new_sku].filter(Boolean).map(norm);
+    var rec=null;for(var i=0;i<cands.length&&!rec;i++)rec=records[cands[i]]||null;
+    if(!rec){missing++;return;}
+    var stuckOnDeny=rec.tracked&&rec.policy==='deny';
+    if(stuckOnDeny)stuck.push({a:a,rec:rec});else ok++;
+  });
+  var bodyEl=document.getElementById('bpa-body');if(!bodyEl)return;
+  var kpi=function(label,val,color){return '<div style="flex:1;min-width:130px;background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:10px 12px"><div class="t3s">'+label+'</div><div style="font-size:18px;font-weight:700;color:'+(color||'var(--text)')+'">'+val+'</div></div>';};
+  var body='<div class="t3s" style="margin-bottom:10px">Checks every finished good\'s Shopify variant. Flags any variant set to <b>track inventory + deny purchase</b> - that combination blocks ordering, which should never happen given your always-orderable policy.</div>'
+    +'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'
+    +kpi('Checked',pool.length)
+    +kpi('Blocking purchase',stuck.length,stuck.length?'var(--red)':'var(--teal)')
+    +kpi('OK',ok,'var(--teal)')
+    +kpi('Not found on Shopify',missing)
+    +'</div>';
+  if(!stuck.length){
+    body+='<div class="section-empty" style="padding:20px;color:var(--teal)">&#10003; No variants are stuck blocking purchase.</div>';
+  }else{
+    body+='<div style="display:flex;justify-content:flex-end;margin-bottom:8px">'
+      +'<button class="btn btn-teal btn-sm" onclick="_bpaFixAll()">Fix All '+stuck.length+' Now</button></div>'
+      +'<div style="background:var(--bg1);border:1px solid var(--border);border-radius:8px;overflow:hidden;max-height:44vh;overflow-y:auto">'
+      +'<table><thead class="sticky-header"><tr><th>SKU</th><th>Product</th><th style="text-align:center">Qty</th><th style="text-align:center">Action</th></tr></thead><tbody>';
+    stuck.forEach(function(s){
+      body+='<tr><td class="pn" style="color:var(--red);font-weight:700">'+escHtml(dispPn(s.a))+'</td>'
+        +'<td style="font-size:11px">'+escHtml(s.rec.title)+'</td>'
+        +'<td style="text-align:center;color:var(--text3)">'+(s.rec.qty!=null?s.rec.qty:'-')+'</td>'
+        +'<td style="text-align:center"><button class="btn btn-sm" onclick="_bpaFixOne(\''+escHtml(dispPn(s.a)).replace(/'/g,"\\'")+'\')">Fix</button></td></tr>';
+    });
+    body+='</tbody></table></div>';
+  }
+  body+='<div style="display:flex;justify-content:flex-end;margin-top:10px"><button class="btn btn-sm" onclick="openBackorderPolicyAudit()">Re-scan</button></div>';
+  bodyEl.innerHTML=body;
+};
+window._bpaFixOne=async function(sku){
+  try{
+    var res=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'set_variant_backorder',sku:sku,backorder:false})});
+    var d=await res.json();
+    if(!d||!d.ok){toast('Could not fix '+sku+' - '+((d&&d.error)||res.status));return;}
+    toast('\u2713 Fixed '+sku);
+    delete window._bpaRecords[String(sku).toUpperCase().replace(/[\s_]+/g,'-').replace(/[^A-Z0-9-]/g,'')];
+    _bpaRender();
+  }catch(e){toast('Error fixing '+sku+': '+((e&&e.message)||e));}
+};
+window._bpaFixAll=async function(){
+  var records=window._bpaRecords||{};
+  var norm=function(s){return String(s||'').toUpperCase().replace(/[\s_]+/g,'-').replace(/[^A-Z0-9-]/g,'');};
+  var pool=S.assemblies.filter(function(a){return !a.discontinued&&eligibleForBackorderSync(a);});
+  var targets=[];
+  pool.forEach(function(a){
+    var cands=[a.pn,a.new_sku].filter(Boolean).map(norm);
+    var rec=null;for(var i=0;i<cands.length&&!rec;i++)rec=records[cands[i]]||null;
+    if(rec&&rec.tracked&&rec.policy==='deny')targets.push(dispPn(a));
+  });
+  if(!targets.length){toast('Nothing to fix');return;}
+  var bodyEl=document.getElementById('bpa-body');
+  var ok=0,failed=0;
+  for(var i=0;i<targets.length;i++){
+    if(bodyEl)bodyEl.innerHTML='<div class="section-empty" style="padding:30px">Fixing '+(i+1)+' of '+targets.length+'...</div>';
+    try{
+      var res=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({action:'set_variant_backorder',sku:targets[i],backorder:false})});
+      var d=await res.json();
+      if(d&&d.ok)ok++;else failed++;
+    }catch(e){failed++;}
+  }
+  toast('\u2713 Fixed '+ok+' variant'+(ok!==1?'s':'')+(failed?' ('+failed+' failed)':''),7000);
+  openBackorderPolicyAudit();
 };
 
 function renderBOMs(){
@@ -6021,7 +6155,7 @@ Deno.serve(async (req) => {
       for (const variant of (product.variants || [])) {
         const sku = (variant.sku || '').trim()
         if (!sku) continue
-        skus.push({sku, status: product.status || '', published: !!product.published_at, title: product.title || '', handle: product.handle || ''})
+        skus.push({sku, status: product.status || '', published: !!product.published_at, title: product.title || '', handle: product.handle || '', tracked: !!variant.inventory_management, policy: variant.inventory_policy || '', qty: (typeof variant.inventory_quantity === 'number' ? variant.inventory_quantity : null)})
       }
     }
     const link = res.headers.get('link') || ''
