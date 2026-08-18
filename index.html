@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.56</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.57</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.56';
+const TGK_ERP_VERSION = 'v21.57';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -7827,13 +7827,24 @@ Deno.serve(async (req) =&gt; {
           }
         }
       } else {
-        console.warn('[SS] WARNING: no SKU match for order', resolvedOrderNum, '- updating all Open/Packed lines')
-        await db.from('sales').update({ fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt }).eq('order_number', resolvedOrderNum).in('fulfillment_status', ['Open', 'Packed', 'Partial'])
+        console.warn('[SS] WARNING: no SKU match for order', resolvedOrderNum, '- updating all non-terminal lines')
+        // Includes On Hold / Pre-Order for the same reason as the deduction gate below.
+        await db.from('sales').update({ fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt }).eq('order_number', resolvedOrderNum).in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
       }
       const pnsToDeduct = (matchedPns.length &gt; 0 ? matchedPns : allErpPns)
       for (const pn of pnsToDeduct) {
         const line = erpLines.find((l: any) =&gt; l.pn === pn)
-        if (!line || !['Open', 'Packed', 'Partial'].includes(line.fulfillment_status)) continue
+        // Deduct for any NON-TERMINAL line. Listing allowed statuses here silently skipped
+        // 'On Hold' and 'Pre-Order' shipments: they were flipped to Shipped by the update above
+        // but never pulled stock. Excluding terminal states instead means a status we add later
+        // cannot reintroduce the same silent gap. deductForShipment is idempotent on tracking,
+        // so widening this cannot double-deduct.
+        const _TERMINAL = ['shipped', 'delivered', 'cancelled', 'canceled', 'refunded', 'returned', 'fulfilled']
+        if (!line) continue
+        if (_TERMINAL.includes(String(line.fulfillment_status || '').toLowerCase())) {
+          console.log('[SS] skip deduct for', pn, '- terminal status', line.fulfillment_status)
+          continue
+        }
         const lineQty = (line as any).qty || 1
         // [FIX 1] shared routine — handles BOTH assemblies and directly-sold parts. The deployed loop had
         // \`if(!asm) continue\`, so a part shipped via the webhook was marked Shipped but never deducted.
