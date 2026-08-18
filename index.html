@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.32</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.36</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.32';
+const TGK_ERP_VERSION = 'v21.36';
 const TGK_ERP_BUILD_DATE = '2026-08-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -6319,12 +6319,14 @@ Deno.serve(async (req) => {
     const variantId = match.node.id
     const invItemId = match.node.inventoryItem?.id
     const errs:string[] = []
+    let actual_policy = null, actual_tracked = null
     if (backorder) {
       // Turn tracking ON for this variant only, zero its on-hand, and deny purchase when
       // out of stock -> that variant shows sold out; sibling variants are untouched.
       if (invItemId) {
-        const t = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: true}) { userErrors { message } } }')
+        const t = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: true}) { inventoryItem { tracked } userErrors { message } } }')
         ;(t?.data?.inventoryItemUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+        actual_tracked = t?.data?.inventoryItemUpdate?.inventoryItem?.tracked ?? actual_tracked
         const loc = await gql('{ locations(first: 1) { edges { node { id } } } }')
         const locId = loc?.data?.locations?.edges?.[0]?.node?.id
         if (locId) {
@@ -6332,8 +6334,9 @@ Deno.serve(async (req) => {
           ;(z?.data?.inventorySetOnHandQuantities?.userErrors || []).forEach((u:any)=>errs.push(u.message))
         }
       }
-      const p = await gql('mutation { productVariantUpdate(input: {id: "' + variantId + '", inventoryPolicy: CONTINUE}) { userErrors { message } } }')
+      const p = await gql('mutation { productVariantUpdate(input: {id: "' + variantId + '", inventoryPolicy: CONTINUE}) { productVariant { inventoryPolicy } userErrors { message } } }')
       ;(p?.data?.productVariantUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+      actual_policy = p?.data?.productVariantUpdate?.productVariant?.inventoryPolicy ?? actual_policy
       if (restockDate) {
         const m = await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: "' + restockDate + '", type: "single_line_text_field"}]) { userErrors { message } } }')
         ;(m?.data?.metafieldsSet?.userErrors || []).forEach((u:any)=>errs.push(u.message))
@@ -6342,28 +6345,44 @@ Deno.serve(async (req) => {
       // Restock -> restore the made-to-order default: untrack the variant so it is always
       // available again, and clear its restock date.
       if (invItemId) {
-        const t = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: false}) { userErrors { message } } }')
+        const t = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: false}) { inventoryItem { tracked } userErrors { message } } }')
         ;(t?.data?.inventoryItemUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+        actual_tracked = t?.data?.inventoryItemUpdate?.inventoryItem?.tracked ?? actual_tracked
       }
-      const p = await gql('mutation { productVariantUpdate(input: {id: "' + variantId + '", inventoryPolicy: CONTINUE}) { userErrors { message } } }')
+      const p = await gql('mutation { productVariantUpdate(input: {id: "' + variantId + '", inventoryPolicy: CONTINUE}) { productVariant { inventoryPolicy } userErrors { message } } }')
       ;(p?.data?.productVariantUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+      actual_policy = p?.data?.productVariantUpdate?.productVariant?.inventoryPolicy ?? actual_policy
       await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
     }
-    try { await db.from('shopify_sync_log').insert({ pn: sku, action: backorder ? 'backorder' : 'reverted', trigger_source: body.trigger_source || 'erp_manual', restock_date: restockDate || null }) } catch (e) { console.warn('[set_variant_backorder] log failed:', e) }
-    // Read back the ACTUAL live policy/tracked state from Shopify right now, rather than
-    // trusting that the mutation above landed as intended. This is what lets the ERP tell
-    // apart 'the request succeeded but something reverted it later' from 'a stale deployed
-    // function is still applying the old logic' -- the two look identical from the outside
-    // otherwise, and only this readback can tell them apart with certainty.
-    let actual_policy = null, actual_tracked = null
-    try {
-      const verify = await gql('{ productVariant(id: "' + variantId + '") { inventoryPolicy inventoryItem { tracked } } }')
-      actual_policy = verify?.data?.productVariant?.inventoryPolicy || null
-      actual_tracked = verify?.data?.productVariant?.inventoryItem?.tracked ?? null
-    } catch (e) { console.warn('[set_variant_backorder] readback failed:', e) }
+    // actual_policy/actual_tracked come straight from each mutation's own response above
+    // (not a separate follow-up query), so there is no read-after-write race - Shopify
+    // guarantees the returned fields reflect exactly what that mutation just wrote.
     const expected_policy = 'CONTINUE'
-    const policy_mismatch = actual_policy !== null && actual_policy !== expected_policy
-    return new Response(JSON.stringify({ok:true, variant: variantId, backorder, errors: errs, actual_policy, actual_tracked, expected_policy, policy_mismatch}), {headers:{...CORS,'Content-Type':'application/json'}})
+    const policy_ok = actual_policy === expected_policy
+    let reason = ''
+    let failsafe_applied = false
+    // FAIL-SAFE: a backordered variant is only safe to leave TRACKED if we positively
+    // confirmed CONTINUE. tracked + anything-but-CONTINUE = customers cannot buy it, which
+    // violates the hard 'always orderable' requirement. If we could not confirm CONTINUE,
+    // untrack the variant again - an untracked variant is always purchasable in Shopify.
+    // Losing the backorder badge is strictly preferable to losing the sale.
+    if (backorder && !policy_ok) {
+      try {
+        if (invItemId) {
+          const rb = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: false}) { inventoryItem { tracked } userErrors { message } } }')
+          actual_tracked = rb?.data?.inventoryItemUpdate?.inventoryItem?.tracked ?? actual_tracked
+          failsafe_applied = true
+        }
+      } catch (e) { console.warn('[set_variant_backorder] failsafe untrack failed:', e) }
+      reason = 'Could not set inventoryPolicy to CONTINUE' + (actual_policy ? (' (Shopify reports ' + actual_policy + ')') : '') + '. '
+        + (errs.length ? ('Shopify said: ' + errs.join('; ') + '. ') : '')
+        + 'This usually means the Admin API token is missing the write_products scope. '
+        + (failsafe_applied ? 'Left the variant UNTRACKED so it stays orderable (no backorder badge).' : 'WARNING: variant may be unorderable - check it manually.')
+    }
+    const effective_action = (backorder && !policy_ok) ? 'reverted' : (backorder ? 'backorder' : 'reverted')
+    try { await db.from('shopify_sync_log').insert({ pn: sku, action: effective_action, trigger_source: body.trigger_source || 'erp_manual', restock_date: (effective_action === 'backorder' ? (restockDate || null) : null) }) } catch (e) { console.warn('[set_variant_backorder] log failed:', e) }
+    const ok = backorder ? policy_ok : true
+    return new Response(JSON.stringify({ok, variant: variantId, backorder, errors: errs, reason, actual_policy, actual_tracked, expected_policy, policy_ok, failsafe_applied, orderable: (actual_tracked === false) || policy_ok}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
   if (body.action === 'list_product_templates') {
     const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
@@ -6696,15 +6715,32 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
     const vId = mBO.node.id
     const iId = mBO.node.inventoryItem?.id
     if (isBO) {
-      // Sold out for THIS variant only: track it, zero it, deny purchase. Siblings untouched.
+      // Backordered: track this variant only, zero it, and keep it PURCHASABLE (CONTINUE).
+      // Siblings untouched.
       if (iId) {
         await gqlBO('mutation { inventoryItemUpdate(id: "' + iId + '", input: {tracked: true}) { userErrors { message } } }')
         const locBO = await gqlBO('{ locations(first: 1) { edges { node { id } } } }')
         const lId = locBO?.data?.locations?.edges?.[0]?.node?.id
         if (lId) await gqlBO('mutation { inventorySetOnHandQuantities(input: {reason: "correction", setQuantities: [{inventoryItemId: "' + iId + '", locationId: "' + lId + '", quantity: 0}]}) { userErrors { message } } }')
       }
-      await gqlBO('mutation { productVariantUpdate(input: {id: "' + vId + '", inventoryPolicy: CONTINUE}) { userErrors { message } } }')
-      if (ssRestock) await gqlBO('mutation { metafieldsSet(metafields: [{ownerId: "' + vId + '", namespace: "custom", key: "estimated_arrival_date", value: "' + ssRestock + '", type: "single_line_text_field"}]) { userErrors { message } } }')
+      const pBO = await gqlBO('mutation { productVariantUpdate(input: {id: "' + vId + '", inventoryPolicy: CONTINUE}) { productVariant { inventoryPolicy } userErrors { message } } }')
+      const polBO = pBO?.data?.productVariantUpdate?.productVariant?.inventoryPolicy || null
+      const polErrsBO = (pBO?.data?.productVariantUpdate?.userErrors || []).map((u:any)=>u.message)
+      if (polBO !== 'CONTINUE') {
+        // FAIL-SAFE: tracked + anything-but-CONTINUE means customers cannot buy it, which
+        // violates the hard 'always orderable' rule. Could not confirm CONTINUE, so untrack
+        // the variant again - an untracked variant is always purchasable. Losing the
+        // backorder badge beats losing the sale. (Most likely cause: the Admin API token is
+        // missing the write_products scope, since tracking/quantity writes clearly succeed.)
+        console.warn('[SS-&gt;Shopify] ' + pn + ': could NOT set inventoryPolicy CONTINUE (got ' + (polBO || 'null') + ')'
+          + (polErrsBO.length ? (' - Shopify said: ' + polErrsBO.join('; ')) : '')
+          + ' -- untracking variant so it stays orderable. Check the write_products API scope.')
+        if (iId) await gqlBO('mutation { inventoryItemUpdate(id: "' + iId + '", input: {tracked: false}) { userErrors { message } } }')
+        template = ''
+        ssRestock = ''
+      } else if (ssRestock) {
+        await gqlBO('mutation { metafieldsSet(metafields: [{ownerId: "' + vId + '", namespace: "custom", key: "estimated_arrival_date", value: "' + ssRestock + '", type: "single_line_text_field"}]) { userErrors { message } } }')
+      }
     } else {
       // Restock -&gt; back to made-to-order default: untrack the variant so it is always available.
       if (iId) await gqlBO('mutation { inventoryItemUpdate(id: "' + iId + '", input: {tracked: false}) { userErrors { message } } }')
@@ -7759,8 +7795,8 @@ async function bulkSyncShopifyBackorder(){
       if(r.ok&&(d.ok||d.success)){
         if(isBackorder){backorderCount++;}else{inStockCount++;}
         log.innerHTML+=(isBackorder?'<span style="color:var(--amber)">BACKORDER</span>':'<span style="color:var(--green)">IN STOCK&nbsp;&nbsp;</span>')+' '+escHtml(pn)+(isBackorder?' → restock '+restockDate:'')+'<br>';
-        if(d.policy_mismatch){
-          log.innerHTML+='<span style="color:var(--red);font-weight:700">\u26a0 STALE FUNCTION DETECTED</span> for '+escHtml(pn)+' - requested '+(d.expected_policy||'CONTINUE')+' but Shopify actually has '+(d.actual_policy||'?')+'. The deployed shopify-orders edge function is NOT the current code. Redeploy it, then re-run this sync.<br>';
+        if(d.reason){
+          log.innerHTML+='<span style="color:var(--red);font-weight:700">\u26a0 POLICY NOT APPLIED</span> '+escHtml(pn)+' - '+escHtml(d.reason)+'<br>';
         }
         db.from('shopify_sync_log').insert({
           pn,
@@ -9418,21 +9454,32 @@ async function startDealerPortal(dealerId){
     if(dErr||!dealer){wrap.innerHTML=dealerPortalError('This price list link is invalid or has been removed.');return;}
     if(dealer.status!=='Active'){wrap.innerHTML=dealerPortalError('This price list is not currently active. Contact TGK Motorsport.');return;}
 
-    const[prodResult,storeResult,fitResult]=await Promise.all([
+    const[prodResult,storeResult,fitResult,syncLogResult]=await Promise.all([
       db.from('assemblies')
         .select('pn,new_sku,use_new_sku,description,category,msrp,image_url,ship_us,ship_ca,ship_intl,sales_price,pl_notes,product_url')
         .eq('is_subassembly',false).eq('discontinued',false).gt('msrp',0).neq('pl_active',false)
         .order('category').order('pn'),
       db.from('settings').select('value').eq('key','portal_store_url').maybeSingle(),
-      fetchAll((f,t)=>db.from('fitments').select('*').order('make').order('model').order('year_from').range(f,t)).then(data=>({data,error:null}),e=>{console.warn('[TGK] Dealer portal: fitments fetch failed —',e?.message||e);return{data:[],error:e};})
+      fetchAll((f,t)=>db.from('fitments').select('*').order('make').order('model').order('year_from').range(f,t)).then(data=>({data,error:null}),e=>{console.warn('[TGK] Dealer portal: fitments fetch failed —',e?.message||e);return{data:[],error:e};}),
+      db.from('shopify_sync_log').select('pn,action,restock_date,created_at').order('created_at',{ascending:false}).limit(3000).then(r=>r,e=>({data:[],error:e}))
     ]);
     const products=prodResult.data||[];
     const storeUrl=(storeResult.data?.value||'https://tgkmotorsport.com').replace(/\/$/,'');
     const portalFitments=fitResult?.data||[];
     if(S.fitments===null)S.fitments=portalFitments;
+    // Newest-row-per-SKU wins (query is already sorted newest-first) -- mirrors the same
+    // logic the in-app backorderBadge() uses, so dealers see a status consistent with staff.
+    const dpSyncMap={};
+    if(!syncLogResult?.error){
+      const seenDp=new Set();
+      (syncLogResult.data||[]).forEach(function(r){
+        var key=(r.pn||'').trim().toUpperCase();if(!key||seenDp.has(key))return;seenDp.add(key);
+        if(r.action==='backorder')dpSyncMap[key]={restock_date:r.restock_date||null};
+      });
+    }
 
     try{var _nhD=await db.from('settings').select('value').eq('key','note_highlights').maybeSingle();if(_nhD&&_nhD.data&&_nhD.data.value)S.noteHL=_nhD.data.value;}catch(_e){}
-    const _dph=buildDealerPortalHTML(dealer,products,storeUrl,portalFitments,!!fitResult.error);
+    const _dph=buildDealerPortalHTML(dealer,products,storeUrl,portalFitments,!!fitResult.error,dpSyncMap);
     window._dealerPortalHTML=_dph;
     wrap.innerHTML=_dph;
     document.title='TGK Dealer Pricing';
@@ -9529,7 +9576,18 @@ window.exportDealerXLS=function(type){
   toast('\u2713 Excel file downloaded');
 };
 
-function buildDealerPortalHTML(dealer,products,storeUrl,fitments,fitError){
+function buildDealerPortalHTML(dealer,products,storeUrl,fitments,fitError,dpSyncMap){
+  dpSyncMap=dpSyncMap||{};
+  // Read-only reference badge for dealers -- they order by phone/email, not through this
+  // portal, so this is purely informational: same badge + ETA staff already trust in-app,
+  // shown here without any Shopify round-trip since the portal is ERP-data-driven.
+  function dpBackorderBadge(p){
+    if((p.category||'')==='Pre-Order')return '';
+    var rec=dpSyncMap[(p.pn||'').trim().toUpperCase()]||dpSyncMap[(p.new_sku||'').trim().toUpperCase()];
+    if(!rec)return '';
+    var eta=rec.restock_date?(' \u2014 ETA '+escHtml(rec.restock_date)):'';
+    return '<div style="margin-top:2px"><span style="display:inline-block;background:#fee2e2;color:#dc2626;border:1px solid rgba(220,38,38,.3);border-radius:4px;padding:1px 6px;font-size:9px;font-weight:700;white-space:nowrap">\u23f3 BACKORDERED'+eta+'</span></div>';
+  }
   fitments=fitments||[];
   const disc=typeof dealer.discount_pct==='number'?dealer.discount_pct:0.2;
   const tier=Math.round(disc*100)+'% off MSRP';
@@ -9554,8 +9612,8 @@ function buildDealerPortalHTML(dealer,products,storeUrl,fitments,fitError){
       priceRows.push({sku,desc:p.description||'',cat,msrp:p.msrp||0,dp,shipUS:su,shipCA:sc2,shipIntl:si,notes:p.pl_notes||''});
       return '<tr data-dpn="'+escHtml(sku)+'" data-search="'+escHtml(search)+'" style="'+(noteHighlightStyle(p)?noteHighlightStyle(p)+';':'')+'border-bottom:1px solid #f0f0f0">'
         +(p.product_url
-          ?'<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:9px 12px;white-space:nowrap"><a href="'+escHtml(p.product_url)+'" target="_blank" style="color:#0d9488;text-decoration:none;border-bottom:1px dashed rgba(13,148,136,.4)">'+escHtml(sku)+'&thinsp;&#8599;</a>'+legacyNote+'</td>'
-          :'<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:9px 12px;white-space:nowrap">'+escHtml(sku)+legacyNote+'</td>')
+          ?'<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:9px 12px;white-space:nowrap"><a href="'+escHtml(p.product_url)+'" target="_blank" style="color:#0d9488;text-decoration:none;border-bottom:1px dashed rgba(13,148,136,.4)">'+escHtml(sku)+'&thinsp;&#8599;</a>'+legacyNote+dpBackorderBadge(p)+'</td>'
+          :'<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:9px 12px;white-space:nowrap">'+escHtml(sku)+legacyNote+dpBackorderBadge(p)+'</td>')
         +'<td style="font-size:12px;padding:9px 12px">'+escHtml(p.description||'')+'</td>'
         +'<td class="dp-msrp" style="text-align:right;font-size:12px;padding:9px 12px;color:#374151;white-space:nowrap">$'+p.msrp.toFixed(2)+'</td>'
         +'<td class="dp-price" style="text-align:right;font-weight:700;font-size:12px;padding:9px 12px;color:'+(isSale?'#dc2626':'#0d9488')+';white-space:nowrap">$'+dp.toFixed(2)+(isSale?' <span style="background:#dc2626;color:#fff;border-radius:3px;padding:1px 4px;font-size:9px">SALE</span>':'')+'</td>'
@@ -9722,8 +9780,8 @@ function buildProspectPortalHTML(tiers,products,storeUrl,fitments,fitError){
       const su=p.ship_us||'FREE';const sc=p.ship_ca||'$25.00';const si=p.ship_intl||'--';
       return `<tr data-dpn="${escHtml(sku)}" data-search="${escHtml(searchStr)}" style="${noteHighlightStyle(p)?noteHighlightStyle(p)+';':''}border-bottom:1px solid #f0f0f0">`
         +(p.product_url
-          ?`<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:9px 12px;white-space:nowrap"><a href="${escHtml(p.product_url)}" target="_blank" style="color:#0d9488;text-decoration:none;border-bottom:1px dashed rgba(13,148,136,.4)" title="View product page">${escHtml(sku)}&thinsp;&#8599;</a>${legacyNote}</td>`
-          :`<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:9px 12px;white-space:nowrap">${escHtml(sku)}${legacyNote}</td>`
+          ?`<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:9px 12px;white-space:nowrap"><a href="${escHtml(p.product_url)}" target="_blank" style="color:#0d9488;text-decoration:none;border-bottom:1px dashed rgba(13,148,136,.4)" title="View product page">${escHtml(sku)}&thinsp;&#8599;</a>${legacyNote}${dpBackorderBadge(p)}</td>`
+          :`<td style="font-family:monospace;font-size:11px;font-weight:700;color:#0d9488;padding:9px 12px;white-space:nowrap">${escHtml(sku)}${legacyNote}${dpBackorderBadge(p)}</td>`
         )
         +`<td style="font-size:12px;padding:9px 12px">${escHtml(p.description||'')}</td>`
         +`<td style="text-align:right;font-size:12px;padding:9px 12px;white-space:nowrap;color:#374151">$${p.msrp.toFixed(2)}</td>`
