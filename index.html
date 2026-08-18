@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.52</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.55</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.52';
+const TGK_ERP_VERSION = 'v21.55';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -3205,6 +3205,169 @@ window._ttaFixAll=async function(){
   openThemeTemplateAudit();
 };
 
+window._sdaRows=null;
+window.openShipDeductionAudit=async function(){
+  var old=document.getElementById('sda-overlay');if(old)old.remove();
+  var ov=document.createElement('div');ov.id='sda-overlay';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9200;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto';
+  ov.innerHTML='<div class="modal" style="width:900px;max-width:96vw" onclick="event.stopPropagation()">'
+    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'
+    +'<div style="font-size:15px;font-weight:700;color:var(--text)">Shipment Deduction Audit</div>'
+    +'<button onclick="document.getElementById(\'sda-overlay\').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">\u00d7</button></div>'
+    +'<div id="sda-body"><div class="section-empty" style="padding:30px">Reading shipped orders and inventory corrections...</div></div></div>';
+  ov.addEventListener('click',function(){ov.remove();});
+  document.body.appendChild(ov);
+  var days=parseInt(S._sdaDays||30,10);
+  var since=new Date(Date.now()-days*86400000).toISOString();
+  var corr=[],err='';
+  try{
+    // Pull ALL deduction-type corrections in the window, not just the cached 1000.
+    var res=await db.from('inv_corrections')
+      .select('id,pn,adjustment,reason,source,created_at,reference_id')
+      .gte('created_at',since)
+      .order('created_at',{ascending:false}).limit(5000);
+    if(res.error)err=res.error.message;else corr=res.data||[];
+  }catch(e){err=(e&&e.message)||String(e);}
+  var bodyEl=document.getElementById('sda-body');if(!bodyEl)return;
+  if(err){bodyEl.innerHTML='<div style="padding:16px"><div style="font-weight:700;color:var(--red)">Could not read corrections</div><div class="t2s">'+escHtml(err)+'</div></div>';return;}
+
+  var norm=function(x){return String(x||'').toUpperCase().replace(/[\s_]+/g,'-').replace(/[^A-Z0-9-]/g,'');};
+  // Index every deduction we can attribute to an order, by order number and by tracking.
+  var byOrder={},byTrack={};
+  corr.forEach(function(c){
+    if(!c||(Number(c.adjustment)||0)>=0)return;      // only deductions
+    var src=(c.source||'').toLowerCase();
+    if(['shipment','dropship'].indexOf(src)<0&&src!=='manual')return;
+    var r=String(c.reason||'');
+    var k=norm(c.pn);
+    // Order numbers appear in the reason text on every shipment path.
+    var mo=r.match(/(?:order|SS#)\s*#?\s*([A-Za-z0-9._\/-]+)/i);
+    if(mo){var ok=norm(mo[1])+'|'+k;byOrder[ok]=(byOrder[ok]||0)+Math.abs(Number(c.adjustment)||0);}
+    var mt=r.match(/\b(\d{10,})\b/);
+    if(mt){var tk=mt[1]+'|'+k;byTrack[tk]=(byTrack[tk]||0)+Math.abs(Number(c.adjustment)||0);}
+  });
+
+  // Every shipped/delivered sale line in the window should have a matching deduction.
+  var rows=[];
+  (S.sales||[]).forEach(function(s){
+    if(!s||!s.pn)return;
+    var fs=s.fulfillment_status||'';
+    if(['Shipped','Delivered'].indexOf(fs)<0)return;
+    if(typeof isInternal==='function'&&isInternal(s.order_number))return; // warranty/error reships tracked separately
+    var when=s.shipped_at||s.sale_date||'';
+    if(when&&when<since.slice(0,10))return;
+    var k=norm(s.pn);
+    var qty=Number(s.qty)||1;
+    var got=0,how='';
+    var ok=norm(s.order_number)+'|'+k;
+    if(byOrder[ok]){got=byOrder[ok];how='order #';}
+    else if(s.tracking_number&&byTrack[String(s.tracking_number).replace(/\D/g,'')+'|'+k]){
+      got=byTrack[String(s.tracking_number).replace(/\D/g,'')+'|'+k];how='tracking';
+    }
+    var item=(typeof findAsm==='function'?findAsm(s.pn):null)||(typeof _findPart==='function'?_findPart(s.pn):null);
+    var isDrop=false;
+    corr.forEach(function(c){if((c.source||'')==='dropship'&&norm(c.pn)===k&&String(c.reason||'').indexOf(String(s.order_number||''))>=0)isDrop=true;});
+    rows.push({sale:s,pn:s.pn,disp:(item&&typeof dispPn==='function')?dispPn(item):s.pn,qty:qty,got:got,how:how,
+      when:(when||'').slice(0,10),order:s.order_number||'',dropship:isDrop,
+      status:isDrop?'dropship':(got<=0?'missing':(got<qty?'partial':'ok'))});
+  });
+  rows.sort(function(a,b){return String(b.when).localeCompare(String(a.when));});
+  window._sdaRows=rows;
+  _sdaRender();
+};
+window._sdaRender=function(){
+  var rows=window._sdaRows||[];
+  var miss=rows.filter(function(r){return r.status==='missing';});
+  var part=rows.filter(function(r){return r.status==='partial';});
+  var ok=rows.filter(function(r){return r.status==='ok';});
+  var drop=rows.filter(function(r){return r.status==='dropship';});
+  var bodyEl=document.getElementById('sda-body');if(!bodyEl)return;
+  var kpi=function(l,v,c){return '<div style="flex:1;min-width:120px;background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:10px 12px"><div class="t3s">'+l+'</div><div style="font-size:18px;font-weight:700;color:'+(c||'var(--text)')+'">'+v+'</div></div>';};
+  var days=parseInt(S._sdaDays||30,10);
+  var body='<div class="t3s" style="margin-bottom:10px">Every shipped line should have a matching inventory deduction. Matched on order # first, then tracking number. Drop-ship lines are listed separately because they intentionally never deduct.</div>'
+    +'<div style="display:flex;gap:6px;align-items:center;margin-bottom:10px">'
+    +'<span class="t3s">Window:</span>'
+    +[7,30,90].map(function(d){return '<button class="filter-chip '+(days===d?'on-teal':'')+'" onclick="S._sdaDays='+d+';openShipDeductionAudit()">'+d+'d</button>';}).join('')
+    +'</div>'
+    +'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'
+    +kpi('Shipped lines',rows.length)
+    +kpi('NOT deducted',miss.length,miss.length?'var(--red)':'var(--teal)')
+    +kpi('Partial',part.length,part.length?'var(--orange)':'var(--teal)')
+    +kpi('Correct',ok.length,'var(--teal)')
+    +kpi('Drop-ship',drop.length,'var(--text3)')
+    +'</div>';
+  var bad=miss.concat(part);
+  if(!bad.length){
+    body+='<div class="section-empty" style="padding:20px;color:var(--teal)">&#10003; Every shipped line in this window has a matching deduction.</div>';
+  }else{
+    body+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+      +'<span class="t3s">Review before correcting - a missing match can also mean the deduction was logged with different wording.</span>'
+      +'<button class="btn btn-teal btn-sm" onclick="_sdaFixAll()">Deduct All '+bad.length+' Now</button></div>'
+      +'<div style="background:var(--bg1);border:1px solid var(--border);border-radius:8px;overflow:hidden;max-height:44vh;overflow-y:auto">'
+      +'<table><thead class="sticky-header"><tr><th>Shipped</th><th>Order #</th><th>SKU</th><th style="text-align:right">Qty</th><th style="text-align:right">Deducted</th><th>State</th><th style="text-align:center">Fix</th></tr></thead><tbody>';
+    bad.forEach(function(r,i){
+      var idx=rows.indexOf(r);
+      body+='<tr><td class="t3s">'+escHtml(r.when)+'</td>'
+        +'<td class="pn" style="font-size:11px">'+escHtml(r.order)+'</td>'
+        +'<td class="pn" style="color:var(--teal);font-weight:700">'+escHtml(r.disp)+'</td>'
+        +'<td style="text-align:right">'+r.qty+'</td>'
+        +'<td style="text-align:right;color:'+(r.got?'var(--orange)':'var(--red)')+';font-weight:700">'+r.got+'</td>'
+        +'<td><span class="pill '+(r.status==='missing'?'pill-red':'pill-orange')+'" style="font-size:9px">'+(r.status==='missing'?'NOT DEDUCTED':'PARTIAL')+'</span></td>'
+        +'<td style="text-align:center"><button class="btn btn-sm" onclick="_sdaFixOne('+idx+')">Deduct</button></td></tr>';
+    });
+    body+='</tbody></table></div>';
+  }
+  body+='<div style="display:flex;justify-content:space-between;margin-top:10px">'
+    +'<button class="btn btn-sm" onclick="_sdaExport()">Export CSV</button>'
+    +'<button class="btn btn-sm" onclick="openShipDeductionAudit()">Re-scan</button></div>';
+  bodyEl.innerHTML=body;
+};
+window._sdaFixOne=async function(idx){
+  var r=(window._sdaRows||[])[idx];if(!r)return;
+  var need=r.qty-r.got;
+  if(need<=0){toast('Nothing outstanding for '+r.disp);return;}
+  var tgt=(typeof findAsm==='function'?findAsm(r.pn):null);
+  var kind='assembly',rec=tgt;
+  if(!rec){rec=(typeof _findPart==='function')?_findPart(r.pn):null;kind='part';}
+  if(!rec){toast('SKU not found: '+r.pn);return;}
+  try{
+    await adjustStock(kind,rec,-need,{reason:'Audit correction - shipped order '+r.order+' was not deducted',source:'shipment'});
+    toast('\u2713 Deducted '+need+' of '+r.disp);
+    r.got=r.qty;r.status='ok';
+    _sdaRender();
+  }catch(e){toast('Error: '+((e&&e.message)||e));}
+};
+window._sdaFixAll=async function(){
+  var rows=window._sdaRows||[];
+  var bad=rows.filter(function(r){return r.status==='missing'||r.status==='partial';});
+  if(!bad.length){toast('Nothing to correct');return;}
+  if(!confirm('Deduct inventory for '+bad.length+' shipped line'+(bad.length!==1?'s':'')+' that appear never to have been deducted?\n\nThis writes real stock corrections. Review the list first - a line can also show as missing if its deduction was logged with different wording.'))return;
+  var okN=0,failN=0;
+  for(var i=0;i<bad.length;i++){
+    var r=bad[i];var need=r.qty-r.got;if(need<=0)continue;
+    var rec=(typeof findAsm==='function'?findAsm(r.pn):null),kind='assembly';
+    if(!rec){rec=(typeof _findPart==='function')?_findPart(r.pn):null;kind='part';}
+    if(!rec){failN++;continue;}
+    try{
+      await adjustStock(kind,rec,-need,{reason:'Audit correction - shipped order '+r.order+' was not deducted',source:'shipment'});
+      r.got=r.qty;r.status='ok';okN++;
+    }catch(e){failN++;}
+  }
+  toast('\u2713 Corrected '+okN+' line'+(okN!==1?'s':'')+(failN?' ('+failN+' failed)':''),7000);
+  _sdaRender();
+};
+window._sdaExport=function(){
+  var rows=window._sdaRows||[];
+  if(!rows.length){toast('Nothing to export');return;}
+  var cols=['Shipped','Order #','SKU','Qty Shipped','Qty Deducted','State','Matched By'];
+  var esc=function(v){var s=String(v==null?'':v);return (s.indexOf(',')>=0||s.indexOf('"')>=0||s.indexOf('\n')>=0)?'"'+s.replace(/"/g,'""')+'"':s;};
+  var lines=[cols.join(',')];
+  rows.forEach(function(r){lines.push([esc(r.when),esc(r.order),esc(r.disp),r.qty,r.got,esc(r.status),esc(r.how||'')].join(','));});
+  var blob=new Blob(['\uFEFF'+lines.join('\r\n')],{type:'text/csv;charset=utf-8'});
+  var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='shipment-deduction-audit_'+new Date().toISOString().slice(0,10)+'.csv';a.click();URL.revokeObjectURL(a.href);
+  toast('Exported '+rows.length+' rows');
+};
+
 function renderBOMs(){
   const keys=Object.keys(S.boms).sort();
   const sel=S.selBOM||keys[0]||'';
@@ -3852,6 +4015,7 @@ function renderSales(){
     <button class="btn btn-primary btn-sm" onclick='openModal("addSale",{})'>+ Order</button>
     <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="printBatchPickList()" title="Print pick list for all Open + Packed orders">&#128203; Batch Pick List</button>
     <button class="btn btn-sm" style="color:var(--purple);border-color:rgba(124,58,237,.3)" onclick="openDiscountTracker()" title="Every discount and dealer code used - how many times and how much came off">Discount Tracker</button>
+    <button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="openShipDeductionAudit()" title="Verify every shipped order actually pulled stock from inventory">Deduction Audit</button>
   </div>
   <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:14px;padding:7px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r)">
     <span style="font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text3);margin-right:2px">Sync</span>
@@ -4599,8 +4763,18 @@ function _retUpdateTotals(){
 async function submitReturnV2(orderNum){
   const checkedIds=Array.from(document.querySelectorAll('.ret-line-chk:checked')).map(c=>c.dataset.id);
   if(!checkedIds.length){toast('Select at least one item to return');return;}
-  const lines=S.sales.filter(s=>checkedIds.includes(s.id)&&s.pn);
-  if(!lines.length){toast('Lines not found');return;}
+  const _picked=S.sales.filter(s=>checkedIds.includes(s.id)&&s.pn);
+  // Never restock a line that has already been returned. Without this, a stale panel or a
+  // double submit restocks the same physical unit twice and silently inflates on-hand.
+  const _already=_picked.filter(s=>!!s.return_status);
+  const lines=_picked.filter(s=>!s.return_status);
+  if(!lines.length){
+    toast(_already.length
+      ? 'Already processed - '+_already.length+' selected line'+(_already.length!==1?'s have':' has')+' been returned. Use Reverse Return first if you need to redo it.'
+      : 'Lines not found',7000);
+    return;
+  }
+  if(_already.length)toast('Skipping '+_already.length+' line'+(_already.length!==1?'s':'')+' already returned; processing the remaining '+lines.length+'.',6000);
 
   const reason=document.getElementById('ret-reason')?.value||'Return';
   const condition=document.getElementById('ret-condition')?.value||'Resellable';
@@ -7013,6 +7187,38 @@ async function cascadeShopifyBackorder(childPn: string): Promise&lt;void&gt; {
 //   * a bulk_sync being re-run over an overlapping date range.
 // Returns true if it deducted, false if it skipped (duplicate or SKU not found).
 async function deductForShipment(pn: string, qty: number, tracking: string, orderRef: string): Promise&lt;boolean&gt; {
+  const reason = 'Shipped via ShipStation ' + orderRef + ' ' + tracking
+  // PREFERRED PATH: atomic, race-proof. One transaction claims the shipment via a UNIQUE
+  // dedup_key and does the subtraction in SQL, so simultaneous webhooks cannot both deduct
+  // and cannot lose an update. Requires migration-atomic-shipment-deduction.sql.
+  if (tracking) {
+    const dedupKey = 'shipment|' + pn + '|' + tracking
+    try {
+      const { data: rpcRes, error: rpcErr } = await db.rpc('apply_shipment_deduction', {
+        p_pn: pn, p_qty: qty, p_dedup_key: dedupKey, p_reason: reason, p_source: 'shipment'
+      })
+      if (!rpcErr) {
+        const row = Array.isArray(rpcRes) ? rpcRes[0] : rpcRes
+        if (row &amp;&amp; row.applied === false) {
+          console.log('[SS]', pn, 'tracking', tracking, '-&gt; not applied (' + (row.kind || 'duplicate') + ') - skipping')
+          return false
+        }
+        if (row &amp;&amp; row.applied === true) {
+          console.log('[SS] Deducted', qty, 'of', pn, 'on', orderRef, '| atomic |', row.kind, 'on_hand:', row.prev_qty, '-&gt;', row.new_qty)
+          await syncShopifyBackorder(pn, Number(row.new_qty))
+          if (row.kind === 'part') await cascadeShopifyBackorder(pn)
+          return true
+        }
+      } else {
+        console.warn('[SS] apply_shipment_deduction unavailable (' + rpcErr.message + ') - falling back to non-atomic path. Run migration-atomic-shipment-deduction.sql to close the concurrency gap.')
+      }
+    } catch (e) {
+      console.warn('[SS] apply_shipment_deduction threw - falling back to non-atomic path:', e)
+    }
+  }
+  // FALLBACK: pre-migration behaviour. Still idempotent on the tracking number, but the
+  // check and the write are separate statements, so a true simultaneous double-delivery can
+  // slip through. Better than refusing to move stock at all.
   if (tracking) {
     const { data: dup } = await db.from('inv_corrections')
       .select('id').eq('source', 'shipment').eq('pn', pn)
@@ -7022,7 +7228,6 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
       return false
     }
   }
-  const reason = 'Shipped via ShipStation ' + orderRef + ' ' + tracking
   // [FIX B] new_sku-aware: sales.pn may hold a new_sku for a migrated product, whose assembly record
   // still keys on the legacy .pn. Match .pn first, then fall back to .new_sku (injection-safe two-query
   // form rather than .or(), which would break on any SKU containing a PostgREST filter character).
