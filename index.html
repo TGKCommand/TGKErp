@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.39</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.40</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.39';
+const TGK_ERP_VERSION = 'v21.40';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -6309,7 +6309,17 @@ Deno.serve(async (req) => {
     const restockDate = body.restock_date || ''
     if (!store || !key || !sku) return new Response(JSON.stringify({error:'Missing store, key or sku'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
     const H = {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'}
-    const gql = (q) => fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:H, body: JSON.stringify({query:q})}).then(r=>r.json())
+    // Top-level GraphQL errors (access denied, unknown field, throttling) arrive in
+    // response.errors with data null -- NOT in userErrors. Capture them or the real cause
+    // of a failed mutation is invisible.
+    const gqlTopErrors:string[] = []
+    const gql = async (q) => {
+      const r = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:H, body: JSON.stringify({query:q})}).then(x=>x.json())
+      if (r && Array.isArray(r.errors) && r.errors.length) {
+        r.errors.forEach((e:any)=>gqlTopErrors.push(e?.message || JSON.stringify(e)))
+      }
+      return r
+    }
     const safe = sku.replace(/"/g, '')
     // Find the exact variant (each SKU is its own variant) + its inventory item.
     const find = await gql('{ productVariants(first: 10, query: "sku:' + safe + '") { edges { node { id sku inventoryItem { id } product { id } } } } }')
@@ -6378,15 +6388,17 @@ Deno.serve(async (req) => {
         // would make the marker contradict the ERP's own state.
         await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
       } catch (e) { console.warn('[set_variant_backorder] failsafe untrack failed:', e) }
+      const allErrTxt = errs.concat(gqlTopErrors)
       reason = 'Could not set inventoryPolicy to CONTINUE' + (actual_policy ? (' (Shopify reports ' + actual_policy + ')') : '') + '. '
-        + (errs.length ? ('Shopify said: ' + errs.join('; ') + '. ') : '')
-        + 'This usually means the Admin API token is missing the write_products scope. '
+        + (allErrTxt.length ? ('SHOPIFY SAID: ' + allErrTxt.join(' | ') + '. ') : 'Shopify returned no error text. ')
+        + 'If that mentions access denied, the Admin API token predates the write_products scope - '
+        + 'adding a scope does NOT upgrade an existing token, so reinstall the custom app and regenerate it. '
         + (failsafe_applied ? 'Left the variant UNTRACKED so it stays orderable (no backorder badge).' : 'WARNING: variant may be unorderable - check it manually.')
     }
     const effective_action = (backorder && !policy_ok) ? 'reverted' : (backorder ? 'backorder' : 'reverted')
     try { await db.from('shopify_sync_log').insert({ pn: sku, action: effective_action, trigger_source: body.trigger_source || 'erp_manual', restock_date: (effective_action === 'backorder' ? (restockDate || null) : null) }) } catch (e) { console.warn('[set_variant_backorder] log failed:', e) }
     const ok = backorder ? policy_ok : true
-    return new Response(JSON.stringify({ok, variant: variantId, backorder, errors: errs, reason, actual_policy, actual_tracked, expected_policy, policy_ok, failsafe_applied, orderable: (actual_tracked === false) || policy_ok}), {headers:{...CORS,'Content-Type':'application/json'}})
+    return new Response(JSON.stringify({ok, variant: variantId, backorder, errors: errs, graphql_errors: gqlTopErrors, reason, actual_policy, actual_tracked, expected_policy, policy_ok, failsafe_applied, orderable: (actual_tracked === false) || policy_ok}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
   if (body.action === 'list_product_templates') {
     const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
@@ -6716,7 +6728,12 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
   }
   try {
     const isBO = template !== ''
-    const gqlBO = (q) =&gt; fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:{'X-Shopify-Access-Token':key,'Content-Type':'application/json'}, body: JSON.stringify({query:q})}).then(r =&gt; r.json())
+    const gqlTopErrorsBO:string[] = []
+    const gqlBO = async (q) =&gt; {
+      const r = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:{'X-Shopify-Access-Token':key,'Content-Type':'application/json'}, body: JSON.stringify({query:q})}).then(x =&gt; x.json())
+      if (r &amp;&amp; Array.isArray(r.errors) &amp;&amp; r.errors.length) r.errors.forEach((e:any)=&gt;gqlTopErrorsBO.push(e?.message || JSON.stringify(e)))
+      return r
+    }
     const safeBO = shopSkuBO.replace(/"/g, '')
     const findBO = await gqlBO('{ productVariants(first: 10, query: "sku:' + safeBO + '") { edges { node { id sku inventoryItem { id } } } } }')
     const edgesBO = findBO?.data?.productVariants?.edges || []
@@ -6743,7 +6760,7 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
         // backorder badge beats losing the sale. (Most likely cause: the Admin API token is
         // missing the write_products scope, since tracking/quantity writes clearly succeed.)
         console.warn('[SS-&gt;Shopify] ' + pn + ': could NOT set inventoryPolicy CONTINUE (got ' + (polBO || 'null') + ')'
-          + (polErrsBO.length ? (' - Shopify said: ' + polErrsBO.join('; ')) : '')
+          + (polErrsBO.concat(gqlTopErrorsBO).length ? (' - Shopify said: ' + polErrsBO.concat(gqlTopErrorsBO).join(' | ')) : '')
           + ' -- untracking variant so it stays orderable. Check the write_products API scope.')
         if (iId) await gqlBO('mutation { inventoryItemUpdate(id: "' + iId + '", input: {tracked: false}) { userErrors { message } } }')
         template = ''
@@ -7821,6 +7838,8 @@ async function bulkSyncShopifyBackorder(){
         // what produced the meaningless 'ERROR <sku> - 200'.
         var _why=d.reason||d.error||('HTTP '+r.status);
         var _raw=(d.errors&&d.errors.length)?(' | Shopify userErrors: '+d.errors.join('; ')):'';
+        var _gqe=(d.graphql_errors&&d.graphql_errors.length)?(' | GraphQL errors: '+d.graphql_errors.join(' | ')):'';
+        _raw=_raw+_gqe;
         var _pol=(d.actual_policy!==undefined)?(' | policy returned: '+(d.actual_policy===null?'null (mutation returned no variant)':d.actual_policy)):'';
         var _trk=(d.actual_tracked!==undefined)?(' | tracked: '+d.actual_tracked):'';
         log.innerHTML+='<span style="color:var(--red)">ERROR&nbsp;&nbsp;&nbsp;&nbsp;</span> '+escHtml(pn)+' — '+escHtml(String(_why))+escHtml(_raw+_pol+_trk)
