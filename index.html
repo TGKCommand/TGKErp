@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.43</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.45</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.43';
+const TGK_ERP_VERSION = 'v21.45';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -3083,10 +3083,20 @@ window._ttaDesired=function(product){
 window._ttaRender=function(){
   var products=window._ttaRecords||[];
   var mismatches=[],ok=0;
+  var unmanaged=0;
+  var backorderTpl=S.settings.shopify_backorder_template||'backorder';
   products.forEach(function(p){
     var d=_ttaDesired(p);
     var current=p.template_suffix||'';
-    if(current!==d.template)mismatches.push({p:p,desired:d.template,current:current,backorderedCount:d.backorderedCount,total:d.total});
+    // This store's main template is literally named 'Default product', so treat that (and
+    // a plain 'default') as the default template rather than a bespoke one.
+    var _cn=current.trim().toLowerCase();
+    var currentEff=(_cn===''||_cn==='default'||_cn==='default product')?'':current;
+    // Only the default <-> backorder transition is ours to manage. Products on a bespoke
+    // template (Pre-Order etc.) are intentional -- forcing them to default would wipe a
+    // deliberate setup, so they are counted separately and never offered as a fix.
+    if(currentEff!==''&&currentEff!==backorderTpl){unmanaged++;return;}
+    if(currentEff!==d.template)mismatches.push({p:p,desired:d.template,current:current,backorderedCount:d.backorderedCount,total:d.total});
     else ok++;
   });
   var bodyEl=document.getElementById('tta-body');if(!bodyEl)return;
@@ -3096,6 +3106,7 @@ window._ttaRender=function(){
     +kpi('Products checked',products.length)
     +kpi('Wrong template',mismatches.length,mismatches.length?'var(--red)':'var(--teal)')
     +kpi('Correct',ok,'var(--teal)')
+    +kpi('Custom template (left alone)',unmanaged,'var(--text3)')
     +'</div>';
   if(!mismatches.length){
     body+='<div class="section-empty" style="padding:20px;color:var(--teal)">&#10003; Every product is on the correct theme template.</div>';
@@ -6203,12 +6214,22 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({error:'No Shopify product found for SKU: ' + sku, debug: edges.map((e:any)=>({sku:e.node.sku,productId:e.node.product?.legacyResourceId}))}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
     }
     const productId = match.node.product.legacyResourceId
-    const putRes = await fetch('https://' + store + '/admin/api/2024-01/products/' + productId + '.json', {
-      method: 'PUT',
-      headers: shopHeaders,
-      body: JSON.stringify({product: {id: productId, template_suffix: templateSuffix}})
-    })
-    if (!putRes.ok) return new Response(JSON.stringify({error:'Product update failed: ' + putRes.status}), {status:putRes.status, headers:{...CORS,'Content-Type':'application/json'}})
+    // REST product writes have been retired by Shopify (same version drift that removed
+    // productVariantUpdate), so the old PUT silently no-opped and Fix could never stick.
+    // Use GraphQL productUpdate, trying both argument shapes across API versions.
+    const prodGid = 'gid://shopify/Product/' + productId
+    const tplErrs: string[] = []
+    let tplApplied = false
+    for (const argName of ['product', 'input']) {
+      const mres = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {
+        method: 'POST', headers: shopHeaders,
+        body: JSON.stringify({query: 'mutation { productUpdate(' + argName + ': {id: "' + prodGid + '", templateSuffix: "' + templateSuffix + '"}) { product { id templateSuffix } userErrors { field message } } }'})
+      }).then(r =&gt; r.json()).catch((e:any) =&gt; ({errors:[{message:String(e)}]}))
+      ;(mres?.errors || []).forEach((e:any)=&gt;tplErrs.push(e?.message || JSON.stringify(e)))
+      ;(mres?.data?.productUpdate?.userErrors || []).forEach((u:any)=&gt;tplErrs.push(u.message))
+      if (mres?.data?.productUpdate?.product) { tplApplied = true; break }
+    }
+    if (!tplApplied) return new Response(JSON.stringify({error:'Product template update failed' + (tplErrs.length ? (': ' + tplErrs.join('; ')) : ''), errors: tplErrs}), {status:502, headers:{...CORS,'Content-Type':'application/json'}})
     console.log('[shopify update_template] set', sku, 'product', productId, 'template_suffix ->', templateSuffix || '(default)')
     try {
       await db.from('shopify_sync_log').insert({
@@ -6615,7 +6636,7 @@ function isHWPackServer(pn: string): boolean {
 // Returns {changed, from, to, errors} and never throws -- template drift must never break
 // the inventory write that triggered it.
 async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;any&gt; {
-  const out = {changed: false, from: null, to: null, errors: [] as string[]}
+  const out = {changed: false, from: null, to: null, skipped: null, errors: [] as string[]}
   if (!prodId) return out
   try {
     const q = await gqlFn('{ product(id: "' + prodId + '") { templateSuffix variants(first: 100) { edges { node { id inventoryQuantity inventoryItem { tracked } } } } } }')
@@ -6626,10 +6647,20 @@ async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;
     if (!n) return out
     const boCount = vs.filter((v: any) =&gt; v?.inventoryItem?.tracked &amp;&amp; (Number(v.inventoryQuantity) || 0) &lt;= 0).length
     const shouldBO = (n &lt;= 1) ? (boCount &gt;= 1) : (boCount === n)
-    const desired = shouldBO ? (Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder') : ''
+    const boTpl = Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder'
+    const desired = shouldBO ? boTpl : ''
     const current = prod.templateSuffix || ''
+    // This store's main template is literally named "Default product", so treat that (and
+    // a plain "default") as the default template rather than a bespoke one.
+    const cnorm = current.trim().toLowerCase()
+    const isDefaultTpl = (cnorm === '' || cnorm === 'default' || cnorm === 'default product')
+    const currentEff = isDefaultTpl ? '' : current
     out.from = current; out.to = desired
-    if (current === desired) return out
+    // Only ever manage the default &lt;-&gt; backorder transition. Any other suffix (preorder,
+    // or any bespoke template) is intentional merchandising - overwriting it would destroy
+    // a deliberate setup, so leave those products completely alone.
+    if (currentEff !== '' &amp;&amp; currentEff !== boTpl) { out.skipped = 'custom template "' + current + '" - not managed'; return out }
+    if (currentEff === desired) return out
     // productUpdate changed argument name across API versions (input: -&gt; product:). We were
     // already bitten once by a mutation shape disappearing, so try the modern form first and
     // fall back, rather than assuming either one.
