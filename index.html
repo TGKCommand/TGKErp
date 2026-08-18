@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.57</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.58</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.57';
+const TGK_ERP_VERSION = 'v21.58';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -3219,14 +3219,20 @@ window.openShipDeductionAudit=async function(){
   document.body.appendChild(ov);
   var days=parseInt(S._sdaDays||30,10);
   var since=new Date(Date.now()-days*86400000).toISOString();
+  // Corrections must span a WIDER window than the shipments being judged: a shipment at the
+  // start of the window has its correction written at that same moment, so an equal window
+  // clips it and the line falsely reads as un-deducted. 30 days of headroom removes that edge.
+  var corrSince=new Date(Date.now()-(days+30)*86400000).toISOString();
   var corr=[],err='';
   try{
-    // Pull ALL deduction-type corrections in the window, not just the cached 1000.
-    var res=await db.from('inv_corrections')
-      .select('id,pn,adjustment,reason,source,created_at,reference_id')
-      .gte('created_at',since)
-      .order('created_at',{ascending:false}).limit(5000);
-    if(res.error)err=res.error.message;else corr=res.data||[];
+    // MUST page. A single request is capped server-side (6056 rows existed, 5000 returned) and
+    // every silently dropped row became a false "NOT deducted".
+    corr=await fetchAll(function(f,t){
+      return db.from('inv_corrections')
+        .select('id,pn,adjustment,reason,source,created_at,reference_id')
+        .gte('created_at',corrSince)
+        .order('created_at',{ascending:false}).range(f,t);
+    });
   }catch(e){err=(e&&e.message)||String(e);}
   var bodyEl=document.getElementById('sda-body');if(!bodyEl)return;
   if(err){bodyEl.innerHTML='<div style="padding:16px"><div style="font-weight:700;color:var(--red)">Could not read corrections</div><div class="t2s">'+escHtml(err)+'</div></div>';return;}
@@ -3235,12 +3241,14 @@ window.openShipDeductionAudit=async function(){
   // Group deduction rows per SKU. Do NOT try to parse an order/tracking number out of the
   // reason text - the wording differs across ship paths and a parser silently mismatches
   // everything. Test containment instead, which is format-agnostic.
-  var dedBySku={};
+  var dedBySku={},dropBySku={};
   corr.forEach(function(c){
-    if(!c||(Number(c.adjustment)||0)>=0)return;      // deductions only
+    if(!c)return;
     var src=(c.source||'').toLowerCase();
-    if(['shipment','dropship','manual'].indexOf(src)<0)return;
     var k=norm(c.pn);
+    if(src==='dropship'){(dropBySku[k]=dropBySku[k]||[]).push(String(c.reason||''));return;}
+    if((Number(c.adjustment)||0)>=0)return;      // deductions only
+    if(['shipment','manual'].indexOf(src)<0)return;
     (dedBySku[k]=dedBySku[k]||[]).push({reason:String(c.reason||''),qty:Math.abs(Number(c.adjustment)||0)});
   });
   // How much of this SKU was deducted against this order/tracking?
@@ -3272,14 +3280,19 @@ window.openShipDeductionAudit=async function(){
     var _m=deductedFor(s.pn,s.order_number,s.tracking_number);
     var got=_m.qty,how=_m.how;
     var item=(typeof findAsm==='function'?findAsm(s.pn):null)||(typeof _findPart==='function'?_findPart(s.pn):null);
-    var isDrop=false;
-    corr.forEach(function(c){if((c.source||'')==='dropship'&&norm(c.pn)===k&&String(c.reason||'').indexOf(String(s.order_number||''))>=0)isDrop=true;});
+    // Drop-ship exists only as a correction row (no flag on the sale), and its reason falls
+    // back to the internal sale id when there is no order number - so match on both.
+    var isDrop=(dropBySku[k]||[]).some(function(r){
+      var o=String(s.order_number||'').replace(/^#/,'');
+      return (o.length>2&&r.indexOf(o)>=0)||(s.id&&r.indexOf(String(s.id))>=0);
+    });
     rows.push({sale:s,pn:s.pn,disp:(item&&typeof dispPn==='function')?dispPn(item):s.pn,qty:qty,got:got,how:how,
       when:(when||'').slice(0,10),order:s.order_number||'',dropship:isDrop,
       status:isDrop?'dropship':(got<=0?'missing':(got<qty?'partial':'ok'))});
   });
   rows.sort(function(a,b){return String(b.when).localeCompare(String(a.when));});
   window._sdaRows=rows;
+  window._sdaCorrCount=corr.length;
   _sdaRender();
 };
 window._sdaRender=function(){
@@ -3291,7 +3304,7 @@ window._sdaRender=function(){
   var bodyEl=document.getElementById('sda-body');if(!bodyEl)return;
   var kpi=function(l,v,c){return '<div style="flex:1;min-width:120px;background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:10px 12px"><div class="t3s">'+l+'</div><div style="font-size:18px;font-weight:700;color:'+(c||'var(--text)')+'">'+v+'</div></div>';};
   var days=parseInt(S._sdaDays||30,10);
-  var body='<div class="t3s" style="margin-bottom:10px">Every shipped line should have a matching inventory deduction. Matched on order # first, then tracking number. Drop-ship lines are listed separately because they intentionally never deduct.</div>'
+  var body='<div class="t3s" style="margin-bottom:10px">Read '+((window._sdaCorrCount)||0)+' inventory corrections. Every shipped line should have a matching inventory deduction. Matched on order # first, then tracking number. Drop-ship lines are listed separately because they intentionally never deduct.</div>'
     +'<div style="display:flex;gap:6px;align-items:center;margin-bottom:10px">'
     +'<span class="t3s">Window:</span>'
     +[7,30,90].map(function(d){return '<button class="filter-chip '+(days===d?'on-teal':'')+'" onclick="S._sdaDays='+d+';openShipDeductionAudit()">'+d+'d</button>';}).join('')
