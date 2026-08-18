@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.51</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.52</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.51';
+const TGK_ERP_VERSION = 'v21.52';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1183,7 +1183,7 @@ const PAGE_TITLES={dashboard:'Dashboard',users:'Users & Permissions',parts:'Part
 
 function nav(v){
   if(v!==S.view){
-    S.navHistory=[...(S.navHistory||[]).slice(-29),{view:S.view,activePO:S.activePO,activeSale:S.activeSale,activeBuild:S.activeBuild,buildStack:[...(S.buildStack||[])],activeCount:S.activeCount,lookupSel:S.lookupSel,lookupQ:S.lookupQ,countMode:S.countMode,intTab:S.intTab}];
+    S.navHistory=[...(S.navHistory||[]).slice(-29),{view:S.view,activePO:S.activePO,activeSale:S.activeSale,activeBuild:S.activeBuild,buildStack:[...(S.buildStack||[])],activeCount:S.activeCount,lookupSel:S.lookupSel,lookupQ:S.lookupQ,countMode:S.countMode,intTab:S.intTab}];if(typeof _navStampHist==='function')_navStampHist();
     S.activePO=null;S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.buildStack=[];S.activeCount=null;
     if(v==='users'){S._profilesLoaded=false;S._profilesLoading=false;S._profilesError=null;}
     if(v==='corrections'){S._auditLogLoaded=false;S._auditLogLoading=false;}
@@ -1231,6 +1231,44 @@ function nav(v){
   pushHist();render();
 }
 
+
+// ---- Back-button step chronology (v21.52) ----
+// Every "step" the user takes gets a monotonically increasing stamp, so Back can reverse the
+// MOST RECENT one instead of guessing from a fixed priority list. Implemented as accessor
+// properties so all existing plain assignments (S.activePO = x) keep working unchanged.
+var _NAV_STEP_KEYS=['activeBuild','activePO','activeSale','activeCount','workOrderMode','customPackMode','bulkEditMode','lookupSel'];
+S._navSeq={};S._navSeqN=0;S._nv={};
+(function(){
+  _NAV_STEP_KEYS.forEach(function(k){
+    S._nv[k]=S[k];              // preserve whatever the initial literal set
+    try{delete S[k];}catch(_){}
+    Object.defineProperty(S,k,{
+      configurable:true,
+      enumerable:true,
+      get:function(){return S._nv[k];},
+      set:function(v){
+        var was=S._nv[k];
+        S._nv[k]=v;
+        var wasOn=!!(was&&was!==false), isOn=!!(v&&v!==false);
+        if(isOn&&!wasOn)S._navSeq[k]=++S._navSeqN;        // stepped IN
+        else if(!isOn&&wasOn){try{delete S._navSeq[k];}catch(_){}} // stepped OUT
+        else if(isOn&&wasOn&&was!==v)S._navSeq[k]=++S._navSeqN;   // switched target: still a new step
+      }
+    });
+  });
+})();
+// Stamp a history push as a step too, so a view change competes fairly with a drill-in.
+function _navStampHist(){S._navSeq.__hist=++S._navSeqN;}
+window._navStampHist=_navStampHist;
+// Which step happened most recently?
+function _navNewestStep(){
+  var best=null,bestN=-1;
+  Object.keys(S._navSeq||{}).forEach(function(k){
+    if(S._navSeq[k]>bestN){bestN=S._navSeq[k];best=k;}
+  });
+  return best;
+}
+window._navNewestStep=_navNewestStep;
 function _navDrillActive(){
   return !!(S.activeBuild||S.activePO||S.activeSale||S.activeCount||S.workOrderMode||S.customPackMode||S.bulkEditMode||S.lookupSel);
 }
@@ -1238,22 +1276,27 @@ function _navSyncBackBtn(){
   var b=$('back-btn');if(b)b.style.display=((S.navHistory||[]).length||_navDrillActive())?'':'none';
 }
 function _navUnwindDrill(){
-  // The most recent "step" is whatever the user drilled into within the current view.
-  // Unwind those first so Back always retraces one step at a time.
-  if(S.activeBuild&&(S.buildStack||[]).length){
-    if(typeof buildJumpTo==='function'){buildJumpTo(S.buildStack.length-1);}
-    else{var p=S.buildStack.pop();S.activeBuild=p&&p.pn?p.pn:null;render();}
-    _navSyncBackBtn();return true;
+  // Reverse ONLY the most recent step. If the newest step was a view change (__hist), do not
+  // touch drill state at all -- let navBack() restore the history snapshot instead.
+  var newest=_navNewestStep();
+  if(newest==='__hist')return false;
+  if(newest===null){
+    // No stamps (e.g. state restored from a snapshot). Fall back to clearing whatever is set,
+    // innermost-first, so Back still does something sensible rather than nothing.
+    newest=['activeBuild','activePO','activeSale','activeCount','workOrderMode','customPackMode','bulkEditMode','lookupSel'].filter(function(k){return !!S[k];})[0]||null;
+    if(newest===null)return false;
   }
-  if(S.activeBuild){S.activeBuild=null;S.buildQty=null;S.buildStack=[];render();_navSyncBackBtn();return true;}
-  if(S.activePO){S.activePO=null;render();_navSyncBackBtn();return true;}
-  if(S.activeSale){S.activeSale=null;render();_navSyncBackBtn();return true;}
-  if(S.activeCount){S.activeCount=null;render();_navSyncBackBtn();return true;}
-  if(S.workOrderMode){S.workOrderMode=false;render();_navSyncBackBtn();return true;}
-  if(S.customPackMode){S.customPackMode=false;render();_navSyncBackBtn();return true;}
-  if(S.bulkEditMode){S.bulkEditMode=null;render();_navSyncBackBtn();return true;}
-  if(S.lookupSel){S.lookupSel=null;render();_navSyncBackBtn();return true;}
-  return false;
+  if(newest==='activeBuild'){
+    // A build can be drilled several levels deep; step out one level at a time.
+    if((S.buildStack||[]).length){
+      if(typeof buildJumpTo==='function'){buildJumpTo(S.buildStack.length-1);}
+      else{var p=S.buildStack.pop();S.activeBuild=p&&p.pn?p.pn:null;render();}
+      _navSyncBackBtn();return true;
+    }
+    S.activeBuild=null;S.buildQty=null;S.buildStack=[];render();_navSyncBackBtn();return true;
+  }
+  if(newest==='workOrderMode'||newest==='customPackMode'){S[newest]=false;render();_navSyncBackBtn();return true;}
+  S[newest]=null;render();_navSyncBackBtn();return true;
 }
 window._navDrillActive=_navDrillActive;window._navSyncBackBtn=_navSyncBackBtn;
 function navBack(){
@@ -1262,6 +1305,10 @@ function navBack(){
   if(!hist.length){_navSyncBackBtn();return;}
   const prev=hist[hist.length-1];
   S.navHistory=hist.slice(0,-1);
+  // Consumed this snapshot: drop its stamp, and re-stamp only if earlier entries remain,
+  // so the next Back compares against a truthful chronology.
+  try{delete S._navSeq.__hist;}catch(_){}
+  if(S.navHistory.length)S._navSeq.__hist=++S._navSeqN;
   S.view=prev.view;
   S.activePO=prev.activePO||null;
   S.activeSale=prev.activeSale||null;
@@ -16535,7 +16582,7 @@ async function goToPO(id){
   // nav() resets S.activePO=null on every view change — so calling openPODetail then nav() races.
   // This function sets the view directly without that reset, then opens the PO detail atomically.
   if(S.view!=='purchases'){
-    S.navHistory=[...(S.navHistory||[]).slice(-29),{view:S.view,activePO:S.activePO,activeSale:S.activeSale,activeBuild:S.activeBuild,buildStack:[...(S.buildStack||[])],activeCount:S.activeCount,lookupSel:S.lookupSel,lookupQ:S.lookupQ,countMode:S.countMode,intTab:S.intTab}];
+    S.navHistory=[...(S.navHistory||[]).slice(-29),{view:S.view,activePO:S.activePO,activeSale:S.activeSale,activeBuild:S.activeBuild,buildStack:[...(S.buildStack||[])],activeCount:S.activeCount,lookupSel:S.lookupSel,lookupQ:S.lookupQ,countMode:S.countMode,intTab:S.intTab}];if(typeof _navStampHist==='function')_navStampHist();
     S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.buildStack=[];S.activeCount=null;S.searchQ='';
     S.view='purchases';
     document.querySelectorAll('.nav-item').forEach(function(el){el.classList.remove('active');});
@@ -16557,7 +16604,7 @@ async function openPODetail(id) {
   // Push a history snapshot BEFORE opening — without this, navBack() has nothing to pop and the
   // back button can't return to wherever the user actually was (e.g. re-opening the list at the
   // same scroll/filter state, or a previous PO if navigating PO-to-PO).
-  S.navHistory=[...(S.navHistory||[]).slice(-29),{view:S.view,activePO:S.activePO,activeSale:S.activeSale,activeBuild:S.activeBuild,buildStack:[...(S.buildStack||[])],activeCount:S.activeCount,lookupSel:S.lookupSel,lookupQ:S.lookupQ,countMode:S.countMode,intTab:S.intTab}];
+  S.navHistory=[...(S.navHistory||[]).slice(-29),{view:S.view,activePO:S.activePO,activeSale:S.activeSale,activeBuild:S.activeBuild,buildStack:[...(S.buildStack||[])],activeCount:S.activeCount,lookupSel:S.lookupSel,lookupQ:S.lookupQ,countMode:S.countMode,intTab:S.intTab}];if(typeof _navStampHist==='function')_navStampHist();
   S.activePO = id;
   await loadPOLines(id);
   const po=S.purchases.find(p=>p.id===id);
