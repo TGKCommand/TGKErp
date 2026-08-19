@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.65</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.67</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.65';
+const TGK_ERP_VERSION = 'v21.67';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -14617,6 +14617,52 @@ function statSuggest(p){
   return{min,max,safety,avg:+avg.toFixed(3),sd:+sd.toFixed(3),trend};
 }
 
+// How far have a part's STORED planning values drifted from what current demand implies?
+// Returns null when there is no demand signal to judge against - a part with no sales history
+// is not "stale", it is simply unknowable, and flagging it would be noise.
+// Purchasing must reach at least as far as the builds production is planning, plus the time
+// it takes components to arrive. Uses a high percentile rather than the single worst lead time
+// so one unusual long-lead part does not drag the whole recommendation out.
+function horizonAdvice(parts){
+  const cov=S.buildCoverage||4;
+  const fw=S.forecastWeeks||8;
+  const leads=(parts||[]).filter(p=>!p.discontinued&&effectiveWkDemand(p)>0)
+    .map(p=>ltWeeks(p)).sort((a,b)=>a-b);
+  if(!leads.length)return{cov,fw,lead:0,need:cov,state:'ok'};
+  const lead=leads[Math.min(leads.length-1,Math.floor(leads.length*0.9))]; // 90th percentile
+  const need=cov+lead;
+  let state='ok';
+  if(fw+0.001<need)state='short';                 // buying less than the build plan consumes
+  else if(fw>need*3)state='long';                 // buying far beyond anything production will use
+  return{cov,fw,lead,need,state};
+}
+window.horizonAdvice=horizonAdvice;
+
+function minMaxDrift(p){
+  if(!p||p.discontinued)return null;
+  const st=statSuggest(p);
+  if(!(st.avg>0))return null;                 // no demand signal - nothing to compare against
+  const curMin=p.min_qty||0, curMax=p.max_qty||0;
+  const pct=(cur,sug)=>{
+    if(sug<=0)return 0;
+    if(cur<=0)return 1;                       // never set, but demand exists - fully adrift
+    return Math.abs(cur-sug)/sug;
+  };
+  const dMin=pct(curMin,st.min), dMax=pct(curMax,st.max);
+  const worst=Math.max(dMin,dMax);
+  let level='ok';
+  if(worst>=1.0)level='severe';
+  else if(worst>=0.40)level='drift';
+  // Direction matters operationally: a stored min far ABOVE current demand ties up cash and
+  // holds the reorder point artificially high, which the live logic cannot correct downward.
+  const dir=(curMin>st.min*1.4)?'high':((curMin>0&&curMin<st.min*0.6)?'low':'');
+  return{level,dir,worst,curMin,curMax,sugMin:st.min,sugMax:st.max,
+    avg:st.avg,sd:st.sd,trend:st.trend,
+    tip:'Stored '+curMin+'/'+curMax+' vs suggested '+st.min+'/'+st.max
+        +' (avg '+st.avg+'/wk, trend '+st.trend+')'};
+}
+window.minMaxDrift=minMaxDrift;
+
 async function aiSuggestMinMax(singlePn, pnList){
   const tracked=singlePn
     ? S.parts.filter(p=>p.pn===singlePn)
@@ -15590,6 +15636,13 @@ function renderPlanning() {
       ${sSort('trend','Trend')}
       <span style="font-size:11px;color:var(--text3);margin-left:8px;flex-shrink:0">Order for:</span>
       ${[4,8,12,26,52].map(w=>`<button class="filter-chip ${weeks===w?'on-teal':''}" onclick="S.forecastWeeks=${w};render()">${w}w</button>`).join('')}
+      ${(()=>{
+        const h=horizonAdvice(parts);
+        const base='font-size:10px;margin-left:10px;padding:2px 8px;border-radius:10px;white-space:nowrap';
+        if(h.state==='short')return `<span style="${base};color:var(--orange);border:1px solid rgba(234,88,12,.4)" title="Production is planning ${h.cov}w of builds and components take about ${h.lead}w to arrive, so purchasing needs roughly ${h.need}w of cover. At ${h.fw}w you are buying less than the build plan will consume.">&#9888; Production plans ${h.cov}w builds &middot; suggest ${h.need}w cover <button class="filter-chip" style="margin-left:6px" onclick="S.forecastWeeks=${[4,8,12,26,52].find(w=>w>=h.need)||52};render()">set ${[4,8,12,26,52].find(w=>w>=h.need)||52}w</button></span>`;
+        if(h.state==='long')return `<span style="${base};color:var(--text3);border:1px solid var(--border)" title="Buying ${h.fw}w of components while production only plans ${h.cov}w of builds. Fine if it is deliberate for MOQ or price breaks, but the parts will sit.">Production plans ${h.cov}w builds &middot; buying ${h.fw}w</span>`;
+        return `<span style="${base};color:var(--teal)" title="Purchasing at ${h.fw}w covers the ${h.cov}w build plan plus about ${h.lead}w component lead time.">&#10003; in step with ${h.cov}w production</span>`;
+      })()}
     </div>
   </div>`:''}
   ${S.planTab==='minmax'?renderMinMaxTab(parts):S.planTab==='builder'?renderPOBuilderTab():S.planTab==='dev'?renderDevPartsTab(devOnlyParts):S.planTab==='roi'?renderROITab():`
@@ -16176,6 +16229,7 @@ function renderMinMaxTab(parts){
     <th style="text-align:center">Min</th>
     <th style="text-align:center">Max</th>
     <th style="text-align:center">Safety</th>
+    <th style="text-align:center" title="How far the stored Min/Max has drifted from what current demand implies">Drift</th>
     <th style="text-align:center">MOQ</th>
     <th style="text-align:center">Lead (wk)</th>
     <th>Demand Avg/Wk</th>
@@ -16204,6 +16258,14 @@ function renderMinMaxTab(parts){
       <td style="padding:4px 6px;text-align:center"><input class="inline-edit" style="width:52px;padding:3px 5px;text-align:center" type="number" min="0" value="${p.min_qty||0}" onclick="event.stopPropagation()" onchange="savePlanField('${p.id}','min_qty',+this.value,'${p.pn}')"></td>
       <td style="padding:4px 6px;text-align:center"><input class="inline-edit" style="width:52px;padding:3px 5px;text-align:center" type="number" min="0" value="${p.max_qty||0}" onclick="event.stopPropagation()" onchange="savePlanField('${p.id}','max_qty',+this.value,'${p.pn}')"></td>
       <td style="padding:4px 6px;text-align:center"><input class="inline-edit" style="width:52px;padding:3px 5px;text-align:center" type="number" min="0" value="${p.safety_stock||0}" onclick="event.stopPropagation()" onchange="savePlanField('${p.id}','safety_stock',+this.value,'${p.pn}')"></td>
+      <td style="padding:4px 6px;text-align:center">${(()=>{
+        const d=minMaxDrift(p);
+        if(!d)return '<span class="t3xs" style="color:var(--text3)" title="No demand history to judge against">-</span>';
+        if(d.level==='ok')return '<span class="t3xs" style="color:var(--teal)" title="'+escHtml(d.tip)+'">ok</span>';
+        const col=d.level==='severe'?'var(--red)':'var(--orange)';
+        const arrow=d.dir==='high'?' \u2193':(d.dir==='low'?' \u2191':'');
+        return '<span class="pill" style="font-size:9px;color:'+col+';border:1px solid '+col+';background:transparent" title="'+escHtml(d.tip)+'">'+Math.round(d.worst*100)+'%'+arrow+'</span>';
+      })()}</td>
       <td style="padding:4px 6px;text-align:center"><input class="inline-edit" style="width:52px;padding:3px 5px;text-align:center" type="number" min="0" value="${p.moq||0}" title="Minimum order qty" onclick="event.stopPropagation()" onchange="savePlanField('${p.id}','moq',+this.value,'${p.pn}')"></td>
       <td style="padding:4px 6px;text-align:center"><input class="inline-edit" style="width:44px;padding:3px 5px;text-align:center" type="number" min="1" value="${p.lead_time_weeks||''}" placeholder="2" onclick="event.stopPropagation()" onchange="savePlanField('${p.id}','lead_time_weeks',+this.value,'${p.pn}')"></td>
       <td style="padding:4px 8px">
