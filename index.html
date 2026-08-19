@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.68</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.69</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.68';
+const TGK_ERP_VERSION = 'v21.69';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -14548,39 +14548,68 @@ async function setPartTier(pn, price){
 // Without the BOM component, a part that is only consumed inside assemblies produces an
 // all-zero series while its average is non-zero, which makes the stdev come out equal to the
 // average and reports every such part as maximally volatile.
-function weeklySeries(pn, weeks){
-  const buckets=new Array(weeks).fill(0);
-  const now=new Date();
-  const canon=((typeof _canonItem==='function'&&_canonItem(pn))||{}).pn||pn;
-  const WK=7*24*3600*1000;
+// Shared, cached inputs for weeklySeries. Built once per data version instead of once per
+// part row - rebuilding them per row made the Min/Max tab do millions of iterations per
+// render, which is what caused the lag on "all products".
+function _seriesCache(weeks){
+  const stamp=(S.sales?S.sales.length:0)+'|'+Object.keys(S.boms||{}).length+'|'+weeks+'|'+(S._seriesBump||0);
+  if(S._sc&&S._sc.stamp===stamp)return S._sc;
+  const WK=7*24*3600*1000, now=Date.now();
+  const canonOf=function(pn){return ((typeof _canonItem==='function'&&_canonItem(pn))||{}).pn||pn;};
 
-  // How many of this part does one unit of each assembly consume? Direct BOM children only,
-  // matching how partCalc attributes component demand.
-  const perAsm={};
+  // child -> [{parent, qty}]. Inverted once, so a part looks up its parents directly rather
+  // than every part re-scanning every BOM.
+  const parentsOf={};
   Object.entries(S.boms||{}).forEach(function(e){
-    const parent=e[0],items=e[1]||[];
+    const parent=e[0], items=e[1]||[];
     items.forEach(function(i){
       if(i.item_type==='assembly'||i.item_type==='subassembly')return;
-      const child=((typeof _canonItem==='function'&&_canonItem(i.child_pn))||{}).pn||i.child_pn;
-      if(child===canon)perAsm[parent]=(perAsm[parent]||0)+(i.qty||1);
+      const child=canonOf(i.child_pn);
+      (parentsOf[child]=parentsOf[child]||[]).push({parent:parent,qty:i.qty||1});
     });
   });
 
-  (S.sales||[]).forEach(function(s){
-    if(!s.pn||!s.sale_date)return;
-    if(s.fulfillment_status==='Cancelled')return;
-    if(typeof isInternal==='function'&&isInternal(s.order_number))return;
-    const wk=Math.floor((now-new Date(s.sale_date))/WK);
+  // canonical sku -> weekly qty buckets. Sales are read once, not once per part.
+  const wkBySku={};
+  (S.sales||[]).forEach(function(sl){
+    if(!sl.pn||!sl.sale_date)return;
+    if(sl.fulfillment_status==='Cancelled')return;
+    if(typeof isInternal==='function'&&isInternal(sl.order_number))return;
+    const wk=Math.floor((now-new Date(sl.sale_date).getTime())/WK);
     if(wk<0||wk>=weeks)return;
-    const k=((typeof _canonItem==='function'&&_canonItem(s.pn))||{}).pn||s.pn;
-    const q=s.qty||1;
-    if(k===canon){buckets[wk]+=q;return;}          // sold as the part itself
-    if(perAsm[k])buckets[wk]+=q*perAsm[k];         // consumed inside an assembly sale
+    const k=canonOf(sl.pn);
+    const arr=wkBySku[k]||(wkBySku[k]=new Array(weeks).fill(0));
+    arr[wk]+=(sl.qty||1);
+  });
+
+  S._sc={stamp:stamp,weeks:weeks,parentsOf:parentsOf,wkBySku:wkBySku,canonOf:canonOf};
+  return S._sc;
+}
+
+function weeklySeries(pn, weeks){
+  const c=_seriesCache(weeks);
+  const canon=c.canonOf(pn);
+  const buckets=new Array(weeks).fill(0);
+  const own=c.wkBySku[canon];
+  if(own)for(let i=0;i<weeks;i++)buckets[i]+=own[i];         // sold as the part itself
+  const parents=c.parentsOf[canon];
+  if(parents)parents.forEach(function(rel){                   // consumed inside assembly sales
+    const a=c.wkBySku[rel.parent];
+    if(!a)return;
+    for(let i=0;i<weeks;i++)buckets[i]+=a[i]*rel.qty;
   });
   return buckets;
 }
 
 function statSuggest(p){
+  const _k=p&&p.pn;
+  const _stamp=(S.sales?S.sales.length:0)+'|'+(S._seriesBump||0)+'|'+(S.forecastWeeks||8)
+    +'|'+(p&&p.lead_time_weeks)+'|'+(p&&p.min_qty)+'|'+(p&&p.max_qty);
+  if(_k){
+    S._ssc=S._ssc||{};
+    const hit=S._ssc[_k];
+    if(hit&&hit.stamp===_stamp)return hit.val;
+  }
   const weeks=26;
   const series=weeklySeries(p.pn,weeks);
 
@@ -14614,7 +14643,9 @@ function statSuggest(p){
     if(c.wk4<c.wk12*0.75)return 'falling';
     return 'flat';
   })();
-  return{min,max,safety,avg:+avg.toFixed(3),sd:+sd.toFixed(3),trend};
+  const _out={min,max,safety,avg:+avg.toFixed(3),sd:+sd.toFixed(3),trend};
+  if(_k)S._ssc[_k]={stamp:_stamp,val:_out};
+  return _out;
 }
 
 // How far have a part's STORED planning values drifted from what current demand implies?
@@ -22716,7 +22747,7 @@ function render(){
   S._onOrderMap=null; // invalidate per-render caches; renderPlanning re-primes when needed
   S._buildabilityCache={}; // [PERF] fresh per-render memo for buildability(); nulled after this pass so post-render calls recompute against live stock
   const views={losses:renderLosses,dashboard:renderDashboard,users:renderUsers,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,fitments:renderFitments,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder,reports:renderReports,pricelist:renderPriceList,dataintegrity:renderDataIntegrity};
-  if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length||S.calc.forecastWks!==(S.forecastWeeks||8))computeDemand();
+  if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length||S.calc.forecastWks!==(S.forecastWeeks||8)){S._seriesBump=(S._seriesBump||0)+1;S._sc=null;S._ssc={};computeDemand();}
   const active=document.activeElement;
   let fkey=null,selS=0,selE=0;
   if(active&&(active.tagName==='INPUT'||active.tagName==='TEXTAREA')&&$('content').contains(active)){
