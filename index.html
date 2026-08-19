@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.72</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.73</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.72';
+const TGK_ERP_VERSION = 'v21.73';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1018,8 +1018,10 @@ async function notifyHoldAlert(sale){
   });
 }
 function setupRealtime(){
-  if(_rtChannel){try{_rtChannel.unsubscribe();}catch(e){}}
-  _rtChannel=db.channel('erp-live')
+  // Remove, do not merely unsubscribe. An unsubscribed channel stays in the client's
+  // registry, and re-joining under the same topic lets a dead listener shadow the live one.
+  if(_rtChannel){try{db.removeChannel(_rtChannel);}catch(e){try{_rtChannel.unsubscribe();}catch(_){}}}
+  _rtChannel=db.channel('erp-live-'+Date.now())
     .on('postgres_changes',{event:'*',schema:'public',table:'parts'},p=>{
       if(p.eventType==='INSERT')S.parts=[...S.parts,p.new].sort((a,b)=>a.pn.localeCompare(b.pn));
       else if(p.eventType==='UPDATE')S.parts=S.parts.map(x=>x.id===p.new.id?p.new:x);
@@ -1173,7 +1175,48 @@ function setupRealtime(){
 }
 
 let _rtHealthTimer=null;
+// Realtime is the fast path, but a channel can report SUBSCRIBED while silently delivering
+// nothing - which is how support tickets stopped surfacing. This poll is the backstop: it asks
+// directly for anything newer than what is already held, so a missed event costs a minute of
+// latency instead of going unnoticed entirely.
+let _supportPollTimer=null;
+async function pollSupportRecords(){
+  try{
+    const newestOf=arr=>(arr||[]).reduce((m,r)=>{const t=r.created_at||'';return t>m?t:m;},'');
+    const checks=[
+      {table:'warranty_claims',state:'warrantyClaims',
+       label:r=>'\uD83D\uDCE8 New warranty claim from Support \u2014 '+(r.pn||'')+(r.order_number?(' \u00b7 order #'+r.order_number):'')},
+      {table:'shipment_errors',state:'shipmentErrors',
+       label:r=>'\uD83D\uDCE8 New shipment error from Support \u2014 order #'+(r.order_number||'?')+(r.expected_pn?(' \u00b7 reship '+r.expected_pn):'')}
+    ];
+    let changed=false;
+    for(const c of checks){
+      const have=S[c.state]||[];
+      const since=newestOf(have);
+      if(!since)continue;                       // nothing loaded yet; initial load will handle it
+      const q=await db.from(c.table).select('*').gt('created_at',since).order('created_at',{ascending:false}).limit(50);
+      if(q.error||!q.data||!q.data.length)continue;
+      const known=new Set(have.map(r=>r.id));
+      const fresh=q.data.filter(r=>!known.has(r.id));
+      if(!fresh.length)continue;
+      S[c.state]=[...fresh,...have];
+      changed=true;
+      fresh.forEach(r=>{try{toast(c.label(r),9000);}catch(_){}}); 
+      console.warn('[TGK] Support poll recovered '+fresh.length+' '+c.table+' row(s) that realtime did not deliver');
+    }
+    if(changed){try{updateBadge();}catch(_){}
+      try{if(typeof rtRender==='function')rtRender(['warranty','dashboard']);}catch(_){}}
+  }catch(e){console.warn('[TGK] support poll failed:',e&&e.message||e);}
+}
+window.pollSupportRecords=pollSupportRecords;
+function startSupportPoll(){
+  if(_supportPollTimer)clearInterval(_supportPollTimer);
+  _supportPollTimer=setInterval(pollSupportRecords,60000);
+}
+window.startSupportPoll=startSupportPoll;
+
 function startRealtimeHealthCheck(){
+  startSupportPoll();
   if(_rtHealthTimer)clearInterval(_rtHealthTimer);
   _rtHealthTimer=setInterval(function(){
     if(_rtStatus!=='SUBSCRIBED'){
