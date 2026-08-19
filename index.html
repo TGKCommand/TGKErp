@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.69</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.71</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.69';
+const TGK_ERP_VERSION = 'v21.71';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -19859,7 +19859,11 @@ function renderWarranty() {
 
 
   const sf=S.filters.warranty||{};
-  let list=S.warrantyClaims;
+  // Newest first. created_at is the reliable ordering key; the array arrives in load order,
+  // which is not guaranteed chronological once realtime inserts and edits have shuffled it.
+  let list=(S.warrantyClaims||[]).slice().sort(function(a,b){
+    return String(b.created_at||'').localeCompare(String(a.created_at||''));
+  });
   const q=(sf.search||'').toLowerCase();
   if(q) list=list.filter(w=>w.pn.toLowerCase().includes(q)||(w.customer_name||'').toLowerCase().includes(q)||(w.order_number||'').toLowerCase().includes(q));
   if(sf.status==='__all__'){/* show everything */}
@@ -19934,7 +19938,9 @@ function renderShipmentErrors(){
       <div style="margin-top:12px;font-size:11px;color:var(--text3)">Error: ${escHtml(S._shipmentErrorsErr)}</div>
     </div>`;
   }
-  let list=S.shipmentErrors||[];
+  let list=(S.shipmentErrors||[]).slice().sort(function(a,b){
+    return String(b.created_at||'').localeCompare(String(a.created_at||''));
+  });
   const q=(sf.search||'').toLowerCase();
   if(q) list=list.filter(e=>(e.order_number||'').toLowerCase().includes(q)||(e.customer_name||'').toLowerCase().includes(q)||(e.expected_pn||'').toLowerCase().includes(q));
   if(sf.status==='__all__'){/* show everything */}
@@ -20063,7 +20069,20 @@ async function advanceWarranty(id, newStatus) {
   const {error}=await db.from('warranty_claims').update({status:newStatus,resolved_at:['Resolved','Denied','Shipped'].includes(newStatus)?new Date().toISOString():null}).eq('id',id);
   if(error){const isRLS=error.code==='42501'||error.message?.includes('row-level security');if(isRLS){S._warrantyRlsError=true;render();}toast(isRLS?'\u26a0 RLS blocking warranty update \u2014 see banner on Warranty page':'Error updating status: '+error.message);return;}
   S.warrantyClaims=S.warrantyClaims.map(w=>w.id===id?{...w,status:newStatus}:w);
-  if(newStatus==='Shipped'){try{var _w=S.warrantyClaims.find(w=>w.id===id);if(_w)await deductShipItemsOnce(id,'warranty',(_w.claim_items&&_w.claim_items.length)?_w.claim_items:[{pn:_w.pn,qty:1}],null);}catch(_){}}
+  // Deduct on Shipped AND on Resolved. Marking a claim Resolved without passing through
+  // Shipped is normal once the replacement has already gone out, and that path used to skip
+  // the deduction silently. Only resolutions that actually send goods count - a refund ships
+  // nothing. deductShipItemsOnce is idempotent per record, so Shipped -> Resolved deducts once.
+  if(newStatus==='Shipped'||newStatus==='Resolved'){try{
+    var _w=S.warrantyClaims.find(w=>w.id===id);
+    var _rt=String((_w&&_w.resolution_type)||'').toLowerCase();
+    var _ships=(_rt==='replacement'||_rt==='repair');
+    if(_w&&(newStatus==='Shipped'||_ships)){
+      await deductShipItemsOnce(id,'warranty',(_w.claim_items&&_w.claim_items.length)?_w.claim_items:[{pn:_w.pn,qty:1}],null);
+    }else if(_w&&!_ships){
+      console.log('[INV] warranty '+id+' resolved as "'+(_rt||'no_action')+'" - nothing shipped, no deduction');
+    }
+  }catch(_){}}
   logAction('Warranty claim → '+newStatus,'warranty_claims',null,null,null).catch(()=>{});
   toast('Status → '+newStatus);render();
 }
@@ -20339,6 +20358,18 @@ async function submitShipmentError(editId){
 }
 
 async function advanceShipmentError(id,newStatus){
+  // Mirror the warranty fix: resolving an error without passing through 'Reshipping' used to
+  // skip the deduction, so a replacement left the shelf unrecorded. Only deduct when goods
+  // actually went out - a refund or a write-off ships nothing. deductShipItemsOnce is
+  // idempotent per record, so Reshipping -> Resolved still deducts only once.
+  if(newStatus==='Resolved'){try{
+    var _se=(S.shipmentErrors||[]).find(function(e){return e.id===id;});
+    var _res=String((_se&&_se.resolution)||'').toLowerCase();
+    var _noShip=(_res==='refund'||_res==='refunded'||_res==='write_off'||_res==='no_action');
+    if(_se&&_se.expected_pn&&!_noShip){
+      await deductShipItemsOnce(id,'shipment',[{pn:_se.expected_pn,qty:_se.expected_qty||1}],null);
+    }
+  }catch(_){}}
   const updates={status:newStatus};
   if(newStatus==='Resolved')updates.resolved_at=new Date().toISOString();
   const{error}=await db.from('shipment_errors').update(updates).eq('id',id);
