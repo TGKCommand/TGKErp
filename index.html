@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.64</span>
+      <span style="font-size:9px;font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.65</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.64';
+const TGK_ERP_VERSION = 'v21.65';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -14542,14 +14542,40 @@ async function setPartTier(pn, price){
   render();
 }
 
+// Weekly demand series for a PART, counting real consumption, not just direct sales.
+// Mirrors the main demand engine: canonical SKU consolidation, cancelled orders excluded,
+// internal warranty/error reships excluded, and assembly sales exploded through the BOM.
+// Without the BOM component, a part that is only consumed inside assemblies produces an
+// all-zero series while its average is non-zero, which makes the stdev come out equal to the
+// average and reports every such part as maximally volatile.
 function weeklySeries(pn, weeks){
   const buckets=new Array(weeks).fill(0);
   const now=new Date();
-  S.sales.forEach(s=>{
-    if(s.pn!==pn||!s.sale_date)return;
-    const d=new Date(s.sale_date);
-    const wk=Math.floor((now-d)/(7*24*3600*1000));
-    if(wk>=0&&wk<weeks)buckets[wk]+=(s.qty||1);
+  const canon=((typeof _canonItem==='function'&&_canonItem(pn))||{}).pn||pn;
+  const WK=7*24*3600*1000;
+
+  // How many of this part does one unit of each assembly consume? Direct BOM children only,
+  // matching how partCalc attributes component demand.
+  const perAsm={};
+  Object.entries(S.boms||{}).forEach(function(e){
+    const parent=e[0],items=e[1]||[];
+    items.forEach(function(i){
+      if(i.item_type==='assembly'||i.item_type==='subassembly')return;
+      const child=((typeof _canonItem==='function'&&_canonItem(i.child_pn))||{}).pn||i.child_pn;
+      if(child===canon)perAsm[parent]=(perAsm[parent]||0)+(i.qty||1);
+    });
+  });
+
+  (S.sales||[]).forEach(function(s){
+    if(!s.pn||!s.sale_date)return;
+    if(s.fulfillment_status==='Cancelled')return;
+    if(typeof isInternal==='function'&&isInternal(s.order_number))return;
+    const wk=Math.floor((now-new Date(s.sale_date))/WK);
+    if(wk<0||wk>=weeks)return;
+    const k=((typeof _canonItem==='function'&&_canonItem(s.pn))||{}).pn||s.pn;
+    const q=s.qty||1;
+    if(k===canon){buckets[wk]+=q;return;}          // sold as the part itself
+    if(perAsm[k])buckets[wk]+=q*perAsm[k];         // consumed inside an assembly sale
   });
   return buckets;
 }
@@ -14557,15 +14583,38 @@ function weeklySeries(pn, weeks){
 function statSuggest(p){
   const weeks=26;
   const series=weeklySeries(p.pn,weeks);
-  const liveAvg=avgWk(p);
-  const seriesAvg=series.reduce((a,b)=>a+b,0)/weeks;
+
+  // Only average over weeks the part could actually have sold in. A part introduced 6 weeks
+  // ago divided by 26 looks like a slow mover and gets starved.
+  let lastActive=-1;
+  for(let i=weeks-1;i>=0;i--){if(series[i]>0){lastActive=i;break;}}
+  const span=lastActive>=0?lastActive+1:weeks;
+
+  // Trend-aware rate. effectiveWkDemand() favours the 4-week rate when demand is
+  // accelerating and blends with recency weighting otherwise; avgWk() is a flat 12-week mean
+  // that lags a rising trend.
+  const liveAvg=(typeof effectiveWkDemand==='function'?effectiveWkDemand(p):avgWk(p))||0;
+  const seriesAvg=series.slice(0,span).reduce((a,b)=>a+b,0)/span;
   const avg=liveAvg>0?liveAvg:(seriesAvg>0?seriesAvg:0);
-  const sd=avg>0?Math.sqrt(series.reduce((a,b)=>a+(b-avg)*(b-avg),0)/weeks):0;
+
+  // Variance must be measured against the mean of the SAME series, otherwise the deviation
+  // is contaminated by the gap between two different estimates rather than real volatility.
+  const sd=(avg>0&&span>1)
+    ? Math.sqrt(series.slice(0,span).reduce((a,b)=>a+(b-seriesAvg)*(b-seriesAvg),0)/span)
+    : 0;
+
   const L=Math.max(1,p.lead_time_weeks||2);
   const safety=avg>0?Math.ceil(1.65*sd*Math.sqrt(L)):0;  // ~95% service level
   const min=avg>0?Math.ceil(avg*L+safety):(p.min_qty||0);// reorder point
   const max=avg>0?Math.ceil(min+avg*(S.forecastWeeks||8)):(p.max_qty||0); // cover next cycle
-  return{min,max,safety,avg:+avg.toFixed(3),sd:+sd.toFixed(3)};
+  const trend=(function(){
+    const c=S.calc&&S.calc.part&&S.calc.part[p.pn];
+    if(!c||!c.wk12)return 'flat';
+    if(c.wk4>c.wk12*1.25)return 'rising';
+    if(c.wk4<c.wk12*0.75)return 'falling';
+    return 'flat';
+  })();
+  return{min,max,safety,avg:+avg.toFixed(3),sd:+sd.toFixed(3),trend};
 }
 
 async function aiSuggestMinMax(singlePn, pnList){
@@ -14595,8 +14644,8 @@ async function aiSuggestMinMax(singlePn, pnList){
   try{
     for(let i=0;i<base.length;i+=chunkSize){
       const chunk=base.slice(i,i+chunkSize);
-      const lines=chunk.map(b=>b.pn+(b.desc?' ('+b.desc.slice(0,30)+')':'')+' | avg/wk:'+b.avg+' | stdev:'+b.sd+' | lead:'+b.lead+'w | moq:'+b.moq+' | onhand:'+b.onHand+' | onOrder:'+b.onOrder+' | curMin:'+b.curMin+' | curMax:'+b.curMax+' | statMin:'+b.min+' | statMax:'+b.max).join('\n');
-      const prompt='You are an inventory planning expert for a motorsport parts manufacturer. For each part below, recommend min_qty (reorder point) and max_qty (order-up-to level) and safety_stock. Fields: onhand=effective available stock (already minus backorder reservations), onOrder=qty already on open POs (already inbound, counts toward coverage). The statistical baseline (95% service) is given as statMin/statMax; adjust with judgment: round to sensible order quantities (always ensure max is a multiple of MOQ when moq>0), raise mins for volatile items (high stdev vs avg), keep slow movers lean, raise if curMin/curMax was already higher (may reflect business rules). Respond with ONLY a JSON array, no markdown: [{"pn":"...","min":N,"max":N,"safety":N,"note":"max 8 words"}]\n\nPARTS:\n'+lines;
+      const lines=chunk.map(b=>b.pn+(b.desc?' ('+b.desc.slice(0,30)+')':'')+' | avg/wk:'+b.avg+' | stdev:'+b.sd+' | trend:'+(b.trend||'flat')+' | lead:'+b.lead+'w | moq:'+b.moq+' | onhand:'+b.onHand+' | onOrder:'+b.onOrder+' | curMin:'+b.curMin+' | curMax:'+b.curMax+' | statMin:'+b.min+' | statMax:'+b.max).join('\n');
+      const prompt='You are an inventory planning expert for a motorsport parts manufacturer. For each part below, recommend min_qty (reorder point) and max_qty (order-up-to level) and safety_stock. Fields: onhand=effective available stock (already minus backorder reservations), onOrder=qty already on open POs (already inbound, counts toward coverage). The statistical baseline (95% service) is given as statMin/statMax; adjust with judgment: round to sensible order quantities (always ensure max is a multiple of MOQ when moq>0), raise mins for volatile items (high stdev vs avg), keep slow movers lean, treat trend as direction of travel - lift min/max for rising items and trim them for falling ones, raise if curMin/curMax was already higher (may reflect business rules). Respond with ONLY a JSON array, no markdown: [{"pn":"...","min":N,"max":N,"safety":N,"note":"max 8 words"}]\n\nPARTS:\n'+lines;
       let data=null;
       for(let attempt=0;attempt<3;attempt++){
         const res=await fetch(SUPA_URL+'/functions/v1/anthropic-proxy',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:4000,messages:[{role:'user',content:prompt}]})});
