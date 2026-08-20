@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.85</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v21.86</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v21.85';
+const TGK_ERP_VERSION = 'v21.86';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -7546,14 +7546,44 @@ Deno.serve(async (req) =&gt; {
       console.log('[SS] order', orderNum, 'tracking', tracking, 'rawSkus', JSON.stringify(rawSkus))
       if (orderNum?.startsWith('SHERROR-')) {
         const errorId = orderNum.replace('SHERROR-', '')
-        await db.from('shipment_errors').update({ tracking_number: tracking, carrier, shipped_at: shippedAt }).eq('id', errorId)
-        console.log('[SS] SHERROR tracking saved for', errorId, tracking)
+        const { data: seRow } = await db.from('shipment_errors')
+          .select('expected_pn,expected_qty,resolution,status').eq('id', errorId).maybeSingle()
+        await db.from('shipment_errors').update({
+          tracking_number: tracking, carrier, shipped_at: shippedAt,
+          status: 'Resolved', resolved_at: shippedAt
+        }).eq('id', errorId)
+        // Pull the replacement out of stock. deductForShipment is idempotent on the tracking
+        // number, so a reship that already deducted when the order was created will not be
+        // deducted twice here.
+        const seRes = String(seRow?.resolution || '').toLowerCase()
+        const seShipsNothing = (seRes === 'refund' || seRes === 'refunded' || seRes === 'write_off' || seRes === 'no_action')
+        if (seRow?.expected_pn && !seShipsNothing) {
+          await deductForShipment(seRow.expected_pn, Number(seRow.expected_qty) || 1, tracking, 'SHERROR-' + errorId)
+        }
+        console.log('[SS] SHERROR', errorId, 'resolved + deducted, tracking', tracking)
         continue
       }
       if (orderNum?.startsWith('WARRANTY-')) {
         const claimId = orderNum.replace('WARRANTY-', '')
-        await db.from('warranty_claims').update({ tracking_number: tracking, carrier, shipped_at: shippedAt, status: 'Shipped' }).eq('id', claimId)
-        console.log('[SS] WARRANTY tracking saved for', claimId, tracking)
+        const { data: wRow } = await db.from('warranty_claims')
+          .select('pn,claim_items,resolution_type,status').eq('id', claimId).maybeSingle()
+        await db.from('warranty_claims').update({
+          tracking_number: tracking, carrier, shipped_at: shippedAt,
+          status: 'Resolved', resolved_at: shippedAt
+        }).eq('id', claimId)
+        // Only resolutions that actually send goods move stock - a refund ships nothing.
+        const wRes = String(wRow?.resolution_type || '').toLowerCase()
+        const wShips = (wRes === 'replacement' || wRes === 'repair' || wRes === '')
+        if (wRow && wShips) {
+          const items = (Array.isArray(wRow.claim_items) && wRow.claim_items.length)
+            ? wRow.claim_items
+            : (wRow.pn ? [{ pn: wRow.pn, qty: 1 }] : [])
+          for (const it of items) {
+            if (!it || !it.pn) continue
+            await deductForShipment(it.pn, Number(it.qty) || 1, tracking, 'WARRANTY-' + claimId)
+          }
+        }
+        console.log('[SS] WARRANTY', claimId, 'resolved + deducted, tracking', tracking)
         continue
       }
       const salesNum = (orderNum || '').replace(/^Manual_/i, '')
