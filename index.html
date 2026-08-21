@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.07</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.09</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -456,7 +456,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.07';
+const TGK_ERP_VERSION = 'v22.09';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -3312,6 +3312,107 @@ window._chvToggle=async function(idx,hold){
     else{toast(hold?('\u2713 Stopped selling on '+(r.product_title||'that page')):('\u2713 Resumed selling on '+(r.product_title||'that page')),5000);}
   }catch(e){toast('Error: '+((e&&e.message)||e),6000);}
   openChassisHolds(window._chvSku);
+};
+
+window._lotRows=null;
+window._lotPn=null;
+window.openBatches=async function(pn){
+  window._lotPn=pn;
+  var old=document.getElementById('lot-overlay');if(old)old.remove();
+  var ov=document.createElement('div');ov.id='lot-overlay';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9200;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto';
+  ov.innerHTML='<div class="modal" style="width:860px;max-width:96vw" onclick="event.stopPropagation()">'
+    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'
+    +'<div style="font-size:var(--t-lg);font-weight:700;color:var(--text)">Batches \u2014 '+escHtml(pn)+'</div>'
+    +'<button onclick="document.getElementById(\'lot-overlay\').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">\u00d7</button></div>'
+    +'<div id="lot-body"><div class="section-empty" style="padding:30px">Loading batches...</div></div></div>';
+  ov.addEventListener('click',function(){ov.remove();});
+  document.body.appendChild(ov);
+  try{
+    var r=await db.from('lots').select('*').eq('pn',pn).order('built_at',{ascending:false}).limit(200);
+    if(r.error){
+      document.getElementById('lot-body').innerHTML=
+        '<div style="padding:16px"><div style="font-weight:700;color:var(--orange);margin-bottom:6px">Batch tracking not set up yet</div>'
+        +'<div class="t2s">Run <span class="pn">migration-lot-tracking.sql</span> in Supabase, then pack a run to create the first batch.</div>'
+        +'<div class="t3xs" style="margin-top:8px;color:var(--text3)">'+escHtml(r.error.message)+'</div></div>';
+      return;
+    }
+    var lots=r.data||[];
+    // Claims and shipments per batch, so a bad batch shows itself rather than waiting to be found.
+    var ids=lots.map(function(l){return l.id;});
+    var claims={},shipped={};
+    if(ids.length){
+      try{
+        var w=await db.from('warranty_claims').select('lot_id').in('lot_id',ids);
+        (w.data||[]).forEach(function(x){claims[x.lot_id]=(claims[x.lot_id]||0)+1;});
+      }catch(e){}
+      try{
+        var sl=await db.from('sales').select('lot_id,qty').in('lot_id',ids);
+        (sl.data||[]).forEach(function(x){shipped[x.lot_id]=(shipped[x.lot_id]||0)+(x.qty||1);});
+      }catch(e){}
+    }
+    window._lotRows=lots.map(function(l){
+      return Object.assign({},l,{claims:claims[l.id]||0,shipped:shipped[l.id]||0});
+    });
+    _lotRender();
+  }catch(e){
+    var b=document.getElementById('lot-body');
+    if(b)b.innerHTML='<div style="padding:16px;color:var(--red)">Could not load: '+escHtml((e&&e.message)||e)+'</div>';
+  }
+};
+window._lotRender=function(){
+  var rows=window._lotRows||[];
+  var body=document.getElementById('lot-body');if(!body)return;
+  if(!rows.length){
+    body.innerHTML='<div class="section-empty" style="padding:26px;line-height:1.6">No batches yet for this part.'
+      +'<div class="t3s" style="margin-top:8px">A batch is created automatically the next time you pack a run in Production. '
+      +'Nothing extra to do \u2014 the code is generated and stamped on the label.</div></div>';
+    return;
+  }
+  var totalMade=rows.reduce(function(t,r){return t+(Number(r.qty)||0);},0);
+  var totalClaims=rows.reduce(function(t,r){return t+r.claims;},0);
+  var flagged=rows.filter(function(r){return r.claims>=2;});
+  var out='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'
+    +'<div style="flex:1;min-width:110px;background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:9px 11px"><div class="t3s">Batches</div><div style="font-size:18px;font-weight:700">'+rows.length+'</div></div>'
+    +'<div style="flex:1;min-width:110px;background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:9px 11px"><div class="t3s">Units built</div><div style="font-size:18px;font-weight:700">'+totalMade+'</div></div>'
+    +'<div style="flex:1;min-width:110px;background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:9px 11px"><div class="t3s">Claims</div><div style="font-size:18px;font-weight:700;color:'+(totalClaims?'var(--red)':'var(--teal)')+'">'+totalClaims+'</div></div>'
+    +'</div>';
+  if(flagged.length){
+    out+='<div style="margin-bottom:10px;padding:9px 11px;background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.3);border-radius:var(--r-md);font-size:var(--t-md);color:var(--red);line-height:1.5">'
+      +'<b>'+flagged.length+' batch'+(flagged.length!==1?'es have':' has')+' 2 or more claims.</b> '
+      +'Repeat claims against one batch is a pattern worth investigating before it becomes a recall.</div>';
+  }
+  out+='<div style="background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden;max-height:50vh;overflow-y:auto">'
+    +'<table><thead class="sticky-header"><tr><th>Batch</th><th>Built</th><th style="text-align:right">Qty</th><th style="text-align:right">Shipped</th><th style="text-align:right">Claims</th><th>By</th></tr></thead><tbody>';
+  rows.forEach(function(r){
+    var cl=r.claims>=2?'color:var(--red);font-weight:700':(r.claims?'color:var(--orange);font-weight:600':'color:var(--text3)');
+    out+='<tr'+(r.claims>=2?' style="background:rgba(220,38,38,.05)"':'')+'>'
+      +'<td class="pn" style="color:var(--purple);font-weight:700">'+escHtml(r.lot_code)+'</td>'
+      +'<td class="t3s">'+escHtml(String(r.built_at||'').slice(0,10))+'</td>'
+      +'<td style="text-align:right">'+(r.qty||0)+'</td>'
+      +'<td style="text-align:right">'+(r.shipped||0)+'</td>'
+      +'<td style="text-align:right;'+cl+'">'+(r.claims||0)+'</td>'
+      +'<td class="t3xs" style="color:var(--text3)">'+escHtml(r.built_by||'')+'</td></tr>';
+  });
+  out+='</tbody></table></div>'
+    +'<div style="display:flex;justify-content:space-between;margin-top:10px">'
+    +'<button class="btn btn-sm" onclick="_lotExport()">Export CSV</button>'
+    +'<button class="btn btn-sm" onclick="openBatches(window._lotPn)">Refresh</button></div>';
+  body.innerHTML=out;
+};
+window._lotExport=function(){
+  var rows=window._lotRows||[];
+  if(!rows.length){toast('Nothing to export');return;}
+  var esc=function(v){var s=String(v==null?'':v);return (s.indexOf(',')>=0||s.indexOf('"')>=0)?'"'+s.replace(/"/g,'""')+'"':s;};
+  var lines=['Batch,Part,Built,Qty,Shipped,Claims,Built By'];
+  rows.forEach(function(r){
+    lines.push([esc(r.lot_code),esc(r.pn),esc(String(r.built_at||'').slice(0,10)),r.qty||0,r.shipped||0,r.claims||0,esc(r.built_by||'')].join(','));
+  });
+  var blob=new Blob(['\uFEFF'+lines.join('\r\n')],{type:'text/csv;charset=utf-8'});
+  var a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download='batches_'+(window._lotPn||'all')+'_'+new Date().toISOString().slice(0,10)+'.csv';
+  a.click();URL.revokeObjectURL(a.href);
+  toast('Exported '+rows.length+' batches');
 };
 
 function renderBOMs(){
@@ -14708,6 +14809,7 @@ function assemblyDossier(pn){
     <button class="btn btn-teal btn-sm" onclick="openBuild('${pn}')">Build Planner</button>
     <button class="btn btn-sm" onclick="openAssemblyScrap('${pn}','assembly')" title="Log scrapped units">Log Scrap</button>
     <button class="btn btn-sm" onclick="openChassisHolds('${dispPn(a)||pn}')" title="Stop or resume selling this SKU on individual chassis product pages">Chassis Availability</button>
+    <button class="btn btn-sm" onclick="openBatches('${pn}')" title="Production batches for this part, with claims per batch"><span class="ic ic-box"></span>Batches</button>
     <button class="btn btn-sm" onclick='openModal("editAsm",${JSON.stringify(a).replace(/'/g,"&#39;")})'>Edit</button>
     <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="printBOM('${a.pn}')"><span class="ic ic-doc"></span>BOM</button>
     <button class="btn btn-sm" onclick="printAssemblyBOMs('${a.pn}')" title="Print this assembly's BOM + all sub-assembly BOMs nested inside it"><span class="ic ic-doc"></span>Print w/ Sub-BOMs</button>
@@ -18612,6 +18714,63 @@ async function orderShortages(pn,want){
   toast(shorts.length+' draft POs created for shortages');
 }
 
+// ---- Batch (lot) tracking -------------------------------------------------
+// A lot code is generated from the build date plus a run letter, so two batches of the same
+// part on the same day are distinguishable without anyone having to pick a number.
+async function nextLotCode(pn){
+  var d=new Date();
+  var yy=String(d.getFullYear()).slice(-2);
+  var mm=String(d.getMonth()+1).padStart(2,'0');
+  var dd=String(d.getDate()).padStart(2,'0');
+  var base='L'+yy+'-'+mm+dd;
+  var letter='A';
+  try{
+    // Ask the database rather than trusting local state: another machine may have packed the
+    // same part today, and two lots sharing a code would corrupt the trace silently.
+    var r=await db.from('lots').select('lot_code').eq('pn',pn).like('lot_code',base+'%');
+    var used=(r.data||[]).map(function(x){return String(x.lot_code||'');});
+    for(var i=0;i<26;i++){
+      var c=String.fromCharCode(65+i);
+      if(used.indexOf(base+'-'+c)<0){letter=c;break;}
+    }
+  }catch(e){console.warn('[lot] code lookup failed, defaulting to A:',e);}
+  return base+'-'+letter;
+}
+window.nextLotCode=nextLotCode;
+
+// Records the batch for a completed pack run. Never throws into the caller: a traceability
+// failure must not roll back a stock movement that already happened.
+async function createBuildLot(pn, qty, packLogId){
+  try{
+    if(!qty||qty<=0)return null;
+    var code=await nextLotCode(pn);
+    var row={lot_code:code, pn:pn, qty:qty, qty_remaining:qty, source:'build',
+             pack_log_id:packLogId||null, built_by:S.currentUser||null,
+             built_at:new Date().toISOString()};
+    var r=await db.from('lots').insert(row).select().single();
+    if(r.error){
+      if(String(r.error.message||'').indexOf('lots')>=0&&String(r.error.code||'')==='42P01'){
+        console.warn('[lot] lots table missing - run migration-lot-tracking.sql');
+        return null;
+      }
+      console.warn('[lot] insert failed:',r.error.message);
+      return null;
+    }
+    S._lastLot=r.data;
+    return r.data;
+  }catch(e){console.warn('[lot] createBuildLot failed:',e);return null;}
+}
+window.createBuildLot=createBuildLot;
+
+// The most recent batch for a part - what a label print should stamp.
+async function latestLotFor(pn){
+  try{
+    var r=await db.from('lots').select('*').eq('pn',pn).order('built_at',{ascending:false}).limit(1);
+    return (r.data&&r.data[0])||null;
+  }catch(e){return null;}
+}
+window.latestLotFor=latestLotFor;
+
 async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
   if(S._packInFlight){toast('A pack/unpack is already in progress \u2014 please wait');return;} // idempotency: block double-taps that would double-apply inventory
   const inpId = isUnpack ? 'unpack-qty-'+asmId : 'pack-qty-'+asmId;
@@ -18701,6 +18860,11 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
   }
 
   await db.from('pack_log').insert({pn,qty:isUnpack?-qty:qty,pack_date:new Date().toISOString(),type:isUnpack?'unpack':'pack',notes:qty+'x '+(isUnpack?'unpacked':'packed')+(skippedLines.length?' — SKIPPED (not deducted, out of stock): '+skippedLines.join(', '):'')});
+  // A build produces a batch; an unpack is a reversal and produces nothing.
+  if(!isUnpack){
+    var _lot=await createBuildLot(pn, qty, null);
+    if(_lot)toast('\u2713 Packed '+qty+'\u00d7 '+pn+' \u2014 batch '+_lot.lot_code, 6000);
+  }
 
   pushUndoMulti((isUnpack?'Unpack':'Pack')+' '+qty+'\u00d7'+pn+' (incl. components)',undoOps);
   updateBadge();
@@ -20093,11 +20257,16 @@ var _labelIsAdvancing=false; // true when _closeOrAdvanceLabel is driving the ne
 
 /* Reads the Copies box at click time so an edit in the modal is respected,
    then falls back to the packed qty the modal was opened with. */
-function _printPendingLabel(url,filename,pn,fallbackQty){
+async function _printPendingLabel(url,filename,pn,fallbackQty){
   var el=document.getElementById('lbl-copies');
   var n=el?parseInt(el.value,10):parseInt(fallbackQty,10);
   if(!n||n<1)n=parseInt(fallbackQty,10)||1;
-  printLabelD450(url,filename,pn,n);
+  // Stamp the batch this part was most recently built under. If lot tracking is not yet
+  // migrated, or the part has never been packed, this is simply null and the label prints
+  // exactly as it always has.
+  var _lot=null;
+  try{ var L=await latestLotFor(pn); _lot=L?L.lot_code:null; }catch(e){}
+  printLabelD450(url,filename,pn,n,_lot);
   _closeOrAdvanceLabel();
 }
 
@@ -20276,7 +20445,7 @@ window.pageCss=pageCss;window.printProfileHint=printProfileHint;
 
 /* qty here means COPIES: one printed page per unit packed, so packing 2 sends a
    2-page job and nobody has to bump "Copies" in the print dialog by hand. */
-function printLabelD450(url, filename, pn, qty){
+function printLabelD450(url, filename, pn, qty, lotCode){
   var n=parseInt(qty,10); if(!n||n<1)n=1;
   if(n>LABEL_COPY_CAP){
     if(!confirm('This will send '+n+' label pages to the printer.\n\nPrint all '+n+'?'))return;
@@ -20296,11 +20465,15 @@ function printLabelD450(url, filename, pn, qty){
     'width='+(_lp.w||576)+',height='+(_lp.h||288)+',menubar=no,toolbar=no,location=no,status=no,scrollbars=no');
   if(!pw){ window.open(url,'_blank'); return; }
 
+  // The batch stamp. Rendered per copy so every printed label carries it.
+  var _lotMark = lotCode
+    ? '<div class="lotmark">'+String(lotCode).replace(/[<>&"]/g,'')+'</div>'
+    : '';
   var pages='';
   for(var i=0;i<n;i++){
     pages+='<div class="pg"><img src="'+url+'"'
       +(i===0?' onerror="document.body.innerHTML=\'<p style=color:red;font:14px sans-serif;padding:12px>Label image failed to load</p>\'"':'')
-      +'></div>';
+      +'>'+_lotMark+'</div>';
   }
 
   var html='<!DOCTYPE html><html><head><meta charset="UTF-8">'
@@ -20308,6 +20481,16 @@ function printLabelD450(url, filename, pn, qty){
     +'<style>'+pageCss('label')
     +'*{margin:0;padding:0;box-sizing:border-box}'
     +'html,body{background:#fff}'
+    // Measured against the artwork: clear zone is x 40-300, y 455-558 of 1200x600.
+    // Percentages keep it correct if a label is exported at another resolution.
+    +'.pg{position:relative}'
+    +'.lotmark{position:absolute;left:3.75%;bottom:5.5%;'
+    +'font-family:\'Arial Black\',\'Helvetica Neue\',Impact,sans-serif;'
+    +'font-weight:900;font-style:italic;color:#000;line-height:1;white-space:nowrap;'
+    +'font-size:1.85vw;letter-spacing:.005em}'
+    // vw is relative to the print window, which is sized from the label profile - so the mark
+    // holds its proportion on the 4x2 page rather than drifting with the viewport.
+    +'@media print{.lotmark{font-size:0.074in}}'
     +'.pg{width:4in;height:2in;overflow:hidden;page-break-inside:avoid;break-inside:avoid;page-break-after:always;break-after:page}'
     +'.pg:last-child{page-break-after:auto;break-after:auto}'
     +'.pg img{display:block;width:4in;height:2in;object-fit:fill}'
