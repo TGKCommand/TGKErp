@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.14</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.16</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -457,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.14';
+const TGK_ERP_VERSION = 'v22.16';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -13116,7 +13116,13 @@ async function submitAsm(eid){
 async function logAction(summary,entityType,entityPn,oldData,newData){
   if(!S.currentUserId||!summary||S._profilesTableMissing)return;
   try{
-    const{error}=await db.from('audit_log').insert({user_id:S.currentUserId,user_email:S.currentUser,user_role:S.currentRole,summary,entity_type:entityType||null,entity_pn:entityPn||null,old_data:oldData||null,new_data:newData||null});
+    // Attribute to the person who did the work. The shop machine stays signed in as one
+    // account while different people pack, so crediting the session user would name the wrong
+    // person with full confidence. The signed-in account is appended to the summary rather
+    // than lost, so the audit trail still shows which login was used.
+    var _actor=(typeof packedByUser==='function'?packedByUser():null)||S.currentUser;
+    var _viaLogin=(_actor&&S.currentUser&&_actor!==S.currentUser)?(' [via '+S.currentUser+']'):'';
+    const{error}=await db.from('audit_log').insert({user_id:S.currentUserId,user_email:_actor,user_role:S.currentRole,summary:summary+_viaLogin,entity_type:entityType||null,entity_pn:entityPn||null,old_data:oldData||null,new_data:newData||null});
     if(error&&(error.code==='42P01'||error.message?.includes('schema cache')))S._profilesTableMissing=true;
   }catch(e){}
 }
@@ -18910,7 +18916,13 @@ async function createBuildLot(pn, qty, packLogId){
           ? 'Batch tracking is not set up \u2014 run migration-lot-tracking.sql in Supabase. Packing worked, but no batch code was created.'
           : 'Batch not recorded: '+msg, 12000);
       }
-      console.warn('[lot] insert failed:',msg,r.error);
+      console.warn('[lot] insert failed:',msg,r.error,'built_by=',row.built_by);
+      // A rejection tied to built_by means the packer value is the problem, not the batch -
+      // worth saying so rather than leaving it looking like batches are broken generally.
+      if(msg.indexOf('built_by')>=0||msg.indexOf('uuid')>=0){
+        toast('Batch not recorded: the packer value was rejected ('+String(row.built_by||'')+'). '
+          +'Console has the detail.', 10000);
+      }
       return null;
     }
     S._lastLot=r.data;
@@ -18996,11 +19008,12 @@ async function openPackAsPicker(){
   var old=document.getElementById('packas-overlay');if(old)old.remove();
   var ov=document.createElement('div');ov.id='packas-overlay';
   ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9200;display:flex;align-items:center;justify-content:center;padding:20px';
-  var rows=users.map(function(u){
+  window._packUserList=users;   // looked up by index so no user text enters an attribute
+  var rows=users.map(function(u,i){
     var on=(u.email===cur);
     return '<button class="btn btn-sm" style="width:100%;justify-content:flex-start;margin-bottom:6px;'
       +(on?'border-color:var(--teal);color:var(--teal);font-weight:700':'')+'" '
-      +'onclick="setPackAs(\''+escHtml(u.email).replace(/'/g,"\\'")+'\')">'
+      +'onclick="setPackAsIdx('+i+')">'
       +(on?'\u2713 ':'')+escHtml(u.name)+(u.name!==u.email?(' <span class="t3xs" style="color:var(--text3);margin-left:6px">'+escHtml(u.email)+'</span>'):'')
       +'</button>';
   }).join('');
@@ -19021,6 +19034,12 @@ async function openPackAsPicker(){
   document.body.appendChild(ov);
 }
 window.openPackAsPicker=openPackAsPicker;
+
+function setPackAsIdx(i){
+  var u=(window._packUserList||[])[i];
+  setPackAs(u?u.email:null);
+}
+window.setPackAsIdx=setPackAsIdx;
 
 function setPackAs(email){
   S._packAs = (email && email!==S.currentUser) ? email : null;
@@ -19832,7 +19851,7 @@ function renderAuditLog(){
   const users=[...new Set(S.auditLog.map(a=>a.user_email).filter(Boolean))].sort();
   let list=[...S.auditLog];
   const q=(sf.search||'').toLowerCase();
-  if(q)list=list.filter(a=>(a.summary||'').toLowerCase().includes(q)||(a.entity_pn||'').toLowerCase().includes(q)||(a.user_email||'').toLowerCase().includes(q)||(a.entity_type||'').toLowerCase().includes(q));
+  if(q)list=list.filter(a=>(a.summary||'').toLowerCase().includes(q)||(a.entity_pn||'').toLowerCase().includes(q)||((typeof dispSku==='function'?dispSku(a.entity_pn||''):'')||'').toLowerCase().includes(q)||(a.user_email||'').toLowerCase().includes(q)||(a.entity_type||'').toLowerCase().includes(q));
   if(sf.user)list=list.filter(a=>a.user_email===sf.user);
   if(sf.from)list=list.filter(a=>a.created_at>=sf.from);
   if(sf.to)list=list.filter(a=>a.created_at<=sf.to+'T23:59:59');
@@ -19861,7 +19880,15 @@ function renderAuditLog(){
       <td style="font-size:var(--t-xs);color:var(--text3);font-family:var(--mono);white-space:nowrap;min-width:100px">${dt?timeAgo(a.created_at):'—'}<br><span style="font-size:8px">${dt?dt.toLocaleString():''}</span></td>
       <td><div style="font-size:var(--t-md);color:var(--text);font-weight:500">${escHtml(a.user_email||'—')}</div><span style="font-size:var(--t-xs);color:${roleColor};background:${roleBg};border-radius:var(--r-sm);padding:1px 5px">${a.user_role||''}</span></td>
       <td style="font-size:var(--t-md);color:var(--text2);max-width:300px">${escHtml(a.summary||'')}</td>
-      <td style="font-size:var(--t-sm);font-family:var(--mono);color:var(--teal)">${a.entity_pn?escHtml(a.entity_pn):'—'}</td>
+      <td style="font-size:var(--t-sm);font-family:var(--mono);color:var(--teal)">${(function(){
+    if(!a.entity_pn)return '\u2014';
+    // Stored value is the canonical pn; show the SKU the item goes by today. If it has been
+    // renamed, the old number is kept as a tooltip so an older log entry is still traceable.
+    var shown=(typeof dispSku==='function')?dispSku(a.entity_pn):a.entity_pn;
+    return shown!==a.entity_pn
+      ? '<span title="was '+escHtml(a.entity_pn)+'">'+escHtml(shown)+'</span>'
+      : escHtml(a.entity_pn);
+  })()}</td>
       <td class="t3xs">${escHtml(a.entity_type||'—')}</td>
     </tr>`;
   }).join('');
