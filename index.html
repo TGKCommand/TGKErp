@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.09</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.12</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -416,6 +416,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       <button class="btn btn-sm" id="undo-btn" onclick="undo()" disabled title="Nothing to undo"><span class="ic ic-arrow-back"></span>Undo</button>
       <button class="btn btn-sm" id="refresh-btn" onclick="refreshAll()" title="Refresh all data from Supabase">↺</button>
       <button class="btn btn-teal btn-sm" onclick="nav('ai')"><span class="ic ic-sparkle"></span>AI</button>
+      <button class="btn btn-sm" onclick="openBatchLookup()" title="Look up a batch code from a label, email or warranty claim"><span class="ic ic-search"></span>Batch</button>
       <button class="btn btn-primary btn-sm" id="add-btn" onclick="addAction()">+ Add</button>
     </div>
   </div>
@@ -456,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.09';
+const TGK_ERP_VERSION = 'v22.12';
 const TGK_ERP_BUILD_DATE = '2026-08-18';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -3413,6 +3414,144 @@ window._lotExport=function(){
   a.download='batches_'+(window._lotPn||'all')+'_'+new Date().toISOString().slice(0,10)+'.csv';
   a.click();URL.revokeObjectURL(a.href);
   toast('Exported '+rows.length+' batches');
+};
+
+window._btRow=null;
+// Reverse lookup: you have a code off a part or an email, and need to know what it is and who
+// else has one. This is the direction a warranty concern actually travels.
+window.openBatchLookup=async function(prefill){
+  var old=document.getElementById('bt-overlay');if(old)old.remove();
+  var ov=document.createElement('div');ov.id='bt-overlay';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9200;display:flex;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto';
+  ov.innerHTML='<div class="modal" style="width:820px;max-width:96vw" onclick="event.stopPropagation()">'
+    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">'
+    +'<div style="font-size:var(--t-lg);font-weight:700;color:var(--text)">Batch Lookup</div>'
+    +'<button onclick="document.getElementById(\'bt-overlay\').remove()" style="background:transparent;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">\u00d7</button></div>'
+    +'<div class="t3s" style="margin-bottom:10px">Enter a batch code from a label, a customer email, or a warranty claim. Partial codes work \u2014 <span class="pn">L26-08</span> finds everything built that month.</div>'
+    +'<div style="display:flex;gap:8px;margin-bottom:12px">'
+    +'<input id="bt-q" class="form-input" placeholder="L26-0821-A" style="flex:1;font-family:var(--mono);font-size:var(--t-lg);letter-spacing:.04em" '
+    +'onkeydown="if(event.key===\'Enter\')_btSearch()">'
+    +'<button class="btn btn-primary" onclick="_btSearch()">Find</button></div>'
+    +'<div id="bt-body"></div></div>';
+  ov.addEventListener('click',function(){ov.remove();});
+  document.body.appendChild(ov);
+  var inp=document.getElementById('bt-q');
+  if(inp){ if(prefill)inp.value=prefill; inp.focus(); if(prefill)_btSearch(); }
+};
+window._btSearch=async function(){
+  var q=(document.getElementById('bt-q')||{}).value||'';
+  q=q.trim().toUpperCase();
+  var body=document.getElementById('bt-body');if(!body)return;
+  if(q.length<3){body.innerHTML='<div class="section-empty" style="padding:20px">Enter at least 3 characters.</div>';return;}
+  body.innerHTML='<div class="section-empty" style="padding:24px">Searching...</div>';
+  try{
+    var r=await db.from('lots').select('*').ilike('lot_code','%'+q+'%').order('built_at',{ascending:false}).limit(50);
+    if(r.error){
+      body.innerHTML='<div style="padding:14px"><div style="font-weight:700;color:var(--orange)">Batch tracking not set up</div>'
+        +'<div class="t2s">Run <span class="pn">migration-lot-tracking.sql</span>, then pack a run.</div></div>';
+      return;
+    }
+    var lots=r.data||[];
+    if(!lots.length){
+      body.innerHTML='<div class="section-empty" style="padding:24px;line-height:1.6">No batch matches <b>'+escHtml(q)+'</b>.'
+        +'<div class="t3s" style="margin-top:6px">Batches only exist for runs packed after tracking was switched on. Older stock has no code.</div></div>';
+      return;
+    }
+    if(lots.length>1){ _btList(lots); return; }
+    _btDetail(lots[0]);
+  }catch(e){
+    body.innerHTML='<div style="padding:14px;color:var(--red)">Error: '+escHtml((e&&e.message)||e)+'</div>';
+  }
+};
+window._btList=function(lots){
+  var out='<div class="t3s" style="margin-bottom:8px">'+lots.length+' batches match. Pick one.</div>'
+    +'<div style="background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden;max-height:52vh;overflow-y:auto">'
+    +'<table><thead class="sticky-header"><tr><th>Batch</th><th>Part</th><th>Built</th><th style="text-align:right">Qty</th></tr></thead><tbody>';
+  window._btCache={};
+  lots.forEach(function(l,i){
+    window._btCache[i]=l;
+    out+='<tr class="rowlink" onclick="_btDetail(window._btCache['+i+'])">'
+      +'<td class="pn" style="color:var(--purple);font-weight:700">'+escHtml(l.lot_code)+'</td>'
+      +'<td class="pn">'+escHtml(l.pn)+'</td>'
+      +'<td class="t3s">'+escHtml(String(l.built_at||'').slice(0,10))+'</td>'
+      +'<td style="text-align:right">'+(l.qty||0)+'</td></tr>';
+  });
+  out+='</tbody></table></div>';
+  document.getElementById('bt-body').innerHTML=out;
+};
+window._btDetail=async function(lot){
+  window._btRow=lot;
+  var body=document.getElementById('bt-body');
+  body.innerHTML='<div class="section-empty" style="padding:24px">Tracing '+escHtml(lot.lot_code)+'...</div>';
+  var sales=[],claims=[];
+  try{ var s1=await db.from('sales').select('*').eq('lot_id',lot.id); sales=s1.data||[]; }catch(e){}
+  try{ var c1=await db.from('warranty_claims').select('*').eq('lot_id',lot.id); claims=c1.data||[]; }catch(e){}
+  var shipped=sales.reduce(function(t,s){return t+(s.qty||1);},0);
+  var onShelf=Math.max(0,(Number(lot.qty)||0)-shipped);
+  var customers={};
+  sales.forEach(function(s){ var k=s.customer_name||s.order_number||'?'; customers[k]=(customers[k]||0)+(s.qty||1); });
+  var custN=Object.keys(customers).length;
+  var risk = claims.length>=2 ? 'high' : (claims.length===1?'watch':'clear');
+  var riskCol = risk==='high'?'var(--red)':(risk==='watch'?'var(--orange)':'var(--teal)');
+
+  var out='<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:10px">'
+    +'<div class="pn" style="font-size:20px;font-weight:700;color:var(--purple)">'+escHtml(lot.lot_code)+'</div>'
+    +'<div class="pn" style="color:var(--teal)">'+escHtml(lot.pn)+'</div>'
+    +'<div class="t3s">built '+escHtml(String(lot.built_at||'').slice(0,10))+(lot.built_by?' by '+escHtml(lot.built_by):'')+'</div></div>';
+
+  out+='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'
+    +'<div style="flex:1;min-width:96px;background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:8px 10px"><div class="t3s">Built</div><div style="font-size:17px;font-weight:700">'+(lot.qty||0)+'</div></div>'
+    +'<div style="flex:1;min-width:96px;background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:8px 10px"><div class="t3s">Shipped</div><div style="font-size:17px;font-weight:700">'+shipped+'</div></div>'
+    +'<div style="flex:1;min-width:96px;background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:8px 10px"><div class="t3s">Still on shelf</div><div style="font-size:17px;font-weight:700;color:'+(onShelf?'var(--orange)':'var(--text3)')+'">'+onShelf+'</div></div>'
+    +'<div style="flex:1;min-width:96px;background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:8px 10px"><div class="t3s">Claims</div><div style="font-size:17px;font-weight:700;color:'+riskCol+'">'+claims.length+'</div></div>'
+    +'</div>';
+
+  if(risk!=='clear'){
+    out+='<div style="margin-bottom:12px;padding:10px 12px;background:rgba(220,38,38,.07);border:1px solid rgba(220,38,38,.3);border-radius:var(--r-md);font-size:var(--t-md);line-height:1.55">'
+      +(risk==='high'
+        ? '<b style="color:var(--red)">'+claims.length+' claims against this batch.</b> That is a pattern rather than bad luck. '+(onShelf>0?('<b>'+onShelf+' units are still on the shelf</b> \u2014 consider quarantining them before they ship.'):'All units have shipped.')
+        : '<b style="color:var(--orange)">One claim against this batch.</b> Worth watching \u2014 a second would suggest the batch rather than the unit.')
+      +'</div>';
+  }
+
+  if(custN){
+    out+='<div class="t3s" style="margin-bottom:6px;font-weight:700">Went to '+custN+' customer'+(custN!==1?'s':'')+' across '+sales.length+' line'+(sales.length!==1?'s':'')+'</div>'
+      +'<div style="background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden;max-height:32vh;overflow-y:auto">'
+      +'<table><thead class="sticky-header"><tr><th>Order</th><th>Customer</th><th style="text-align:right">Qty</th><th>Shipped</th><th>Status</th></tr></thead><tbody>';
+    sales.forEach(function(s){
+      out+='<tr><td class="pn" style="font-size:11px">'+escHtml(s.order_number||'')+'</td>'
+        +'<td>'+escHtml(s.customer_name||'')+'</td>'
+        +'<td style="text-align:right">'+(s.qty||1)+'</td>'
+        +'<td class="t3s">'+escHtml(String(s.shipped_at||'').slice(0,10))+'</td>'
+        +'<td class="t3s">'+escHtml(s.fulfillment_status||'')+'</td></tr>';
+    });
+    out+='</tbody></table></div>';
+  }else{
+    out+='<div class="section-empty" style="padding:18px;line-height:1.5">No shipments recorded against this batch yet.'
+      +'<div class="t3s" style="margin-top:6px">Sale lines are linked to a batch as they ship, so a batch built today will fill in over the coming days.</div></div>';
+  }
+
+  out+='<div style="display:flex;gap:8px;justify-content:space-between;margin-top:12px">'
+    +'<div style="display:flex;gap:8px">'
+    +'<button class="btn btn-sm" onclick="_btExport()">Export affected customers</button>'
+    +'<button class="btn btn-sm" onclick="openBatches(\''+escHtml(lot.pn)+'\')">All batches for this part</button></div>'
+    +'<button class="btn btn-sm" onclick="openBatchLookup()">New search</button></div>';
+  body.innerHTML=out;
+  window._btSales=sales;
+};
+window._btExport=function(){
+  var sales=window._btSales||[],lot=window._btRow||{};
+  if(!sales.length){toast('No shipments to export');return;}
+  var esc=function(v){var s=String(v==null?'':v);return (s.indexOf(',')>=0||s.indexOf('"')>=0)?'"'+s.replace(/"/g,'""')+'"':s;};
+  var lines=['Batch,Part,Order,Customer,Email,Qty,Shipped,Tracking'];
+  sales.forEach(function(s){
+    lines.push([esc(lot.lot_code),esc(lot.pn),esc(s.order_number||''),esc(s.customer_name||''),
+      esc(s.customer_email||''),s.qty||1,esc(String(s.shipped_at||'').slice(0,10)),esc(s.tracking_number||'')].join(','));
+  });
+  var blob=new Blob(['\uFEFF'+lines.join('\r\n')],{type:'text/csv;charset=utf-8'});
+  var a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download='batch_'+(lot.lot_code||'trace')+'_customers.csv';a.click();URL.revokeObjectURL(a.href);
+  toast('Exported '+sales.length+' affected orders');
 };
 
 function renderBOMs(){
@@ -18081,6 +18220,9 @@ async function submitCustomPackList(){
     await dbq(db.from('assemblies').update({total_assembled:newAssembled,updated_at:new Date().toISOString()}).eq('id',asm.id),'pack:assembled');
     S.assemblies=S.assemblies.map(a=>a.id===asm.id?{...a,total_assembled:newAssembled}:a);
     await db.from('pack_log').insert({pn,qty,pack_date:new Date().toISOString(),type:'pack',notes:'Custom pack list: '+qty+'x '+pn});
+  try{ var _clot=await createBuildLot(pn, qty, null);
+       if(_clot)toast('\u2713 Packed '+qty+'\u00d7 '+pn+' \u2014 batch '+_clot.lot_code, 5000);
+  }catch(_e){}
     syncShopifyTemplate(pn,newOh);
     packed++;
   }
@@ -18749,11 +18891,17 @@ async function createBuildLot(pn, qty, packLogId){
              built_at:new Date().toISOString()};
     var r=await db.from('lots').insert(row).select().single();
     if(r.error){
-      if(String(r.error.message||'').indexOf('lots')>=0&&String(r.error.code||'')==='42P01'){
-        console.warn('[lot] lots table missing - run migration-lot-tracking.sql');
-        return null;
+      var msg=String(r.error.message||'');
+      var missing=(String(r.error.code||'')==='42P01')||msg.indexOf('schema cache')>=0||msg.indexOf('does not exist')>=0;
+      // Tell the operator once per session rather than never. Silence here means packing looks
+      // successful while producing no traceability at all, and nobody finds out until a recall.
+      if(!S._lotWarned){
+        S._lotWarned=true;
+        toast(missing
+          ? 'Batch tracking is not set up \u2014 run migration-lot-tracking.sql in Supabase. Packing worked, but no batch code was created.'
+          : 'Batch not recorded: '+msg, 12000);
       }
-      console.warn('[lot] insert failed:',r.error.message);
+      console.warn('[lot] insert failed:',msg,r.error);
       return null;
     }
     S._lastLot=r.data;
@@ -18766,8 +18914,16 @@ window.createBuildLot=createBuildLot;
 async function latestLotFor(pn){
   try{
     var r=await db.from('lots').select('*').eq('pn',pn).order('built_at',{ascending:false}).limit(1);
+    if(r.error){
+      if(!S._lotWarned){
+        S._lotWarned=true;
+        toast('Batch tracking is not set up \u2014 run migration-lot-tracking.sql. Labels will print without a batch code until then.',12000);
+      }
+      console.warn('[lot] lookup failed:',r.error.message);
+      return null;
+    }
     return (r.data&&r.data[0])||null;
-  }catch(e){return null;}
+  }catch(e){console.warn('[lot] lookup threw:',e);return null;}
 }
 window.latestLotFor=latestLotFor;
 
