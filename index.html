@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.29</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.30</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -457,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.29';
+const TGK_ERP_VERSION = 'v22.30';
 const TGK_ERP_BUILD_DATE = '2026-08-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -18869,18 +18869,25 @@ async function nextLotCode(pn){
   var mm=String(d.getMonth()+1).padStart(2,'0');
   var dd=String(d.getDate()).padStart(2,'0');
   var base='L'+yy+'-'+mm+dd;
-  var letter='A';
+  var used={};
   try{
-    // Ask the database rather than trusting local state: another machine may have packed the
-    // same part today, and two lots sharing a code would corrupt the trace silently.
-    var r=await db.from('lots').select('lot_code').eq('pn',pn).like('lot_code',base+'%');
-    var used=(r.data||[]).map(function(x){return String(x.lot_code||'');});
-    for(var i=0;i<26;i++){
-      var c=String.fromCharCode(65+i);
-      if(used.indexOf(base+'-'+c)<0){letter=c;break;}
-    }
-  }catch(e){console.warn('[lot] code lookup failed, defaulting to A:',e);}
-  return base+'-'+letter;
+    // Scope this to the DATE, not the part. lot_code carries a global unique constraint, so
+    // checking only this part's lots hands out a code another part already took - which is
+    // exactly what "duplicate key violates lots_lot_code_key" was.
+    var r=await db.from('lots').select('lot_code').like('lot_code',base+'%');
+    (r.data||[]).forEach(function(x){ used[String(x.lot_code||'')]=1; });
+  }catch(e){console.warn('[lot] code lookup failed:',e);}
+  // A..Z, then AA..ZZ. Twenty-six runs in a day is reachable on a busy build day, and running
+  // out silently would be worse than an ugly code.
+  for(var i=0;i<26;i++){
+    var c=base+'-'+String.fromCharCode(65+i);
+    if(!used[c])return c;
+  }
+  for(var a=0;a<26;a++)for(var b=0;b<26;b++){
+    var c2=base+'-'+String.fromCharCode(65+a)+String.fromCharCode(65+b);
+    if(!used[c2])return c2;
+  }
+  return base+'-'+Date.now().toString(36).slice(-4).toUpperCase();
 }
 window.nextLotCode=nextLotCode;
 
@@ -18896,6 +18903,14 @@ async function createBuildLot(pn, qty, packLogId){
              pack_log_id:packLogId||null, built_by:packedByUser(),
              built_at:new Date().toISOString()};
     var r=await db.from('lots').insert(row).select().single();
+    // A unique violation here means someone else took this code between our lookup and our
+    // insert. Regenerate and retry rather than dropping the batch - the code is disposable,
+    // the traceability is not.
+    for(var _try=0; _try<3 && r.error && String(r.error.code||'')==='23505'; _try++){
+      console.warn('[lot] code collision on '+row.lot_code+' - retrying');
+      row.lot_code=await nextLotCode(pn);
+      r=await db.from('lots').insert(row).select().single();
+    }
     if(r.error){
       var msg=String(r.error.message||'');
       var missing=(String(r.error.code||'')==='42P01')||msg.indexOf('schema cache')>=0||msg.indexOf('does not exist')>=0;
