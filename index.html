@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.36</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.37</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -457,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.36';
+const TGK_ERP_VERSION = 'v22.37';
 const TGK_ERP_BUILD_DATE = '2026-08-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -19123,10 +19123,61 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
       if(avail<need)shortItems.push({pn:item.child_pn,need,avail,isSub});
     }
     if(shortItems.length){
+      // Work out which shortages are subassemblies we could simply build now. Offering that is
+      // the difference between a dead end and one extra click.
+      const buildableSubs=[];
+      shortItems.forEach(function(sh){
+        if(!sh.isSub)return;
+        var can=0;
+        try{ var bb=buildabilityForBackorder(sh.pn)||{}; can=(bb.maxBuild===Infinity)?1e9:(bb.maxBuild||0); }catch(e){}
+        var deficit=sh.need-sh.avail;
+        if(can>=deficit)buildableSubs.push({pn:sh.pn,deficit:deficit,can:can});
+      });
+
+      if(buildableSubs.length && !S.packSkipMissing && !S._packCascaded){
+        const list=buildableSubs.map(function(b){return '  '+((typeof dispSku==='function')?dispSku(b.pn):b.pn)+' \u2014 build '+b.deficit;}).join('\n');
+        const others=shortItems.filter(function(sh){return !buildableSubs.some(function(b){return b.pn===sh.pn;});});
+        const otherTxt=others.length?('\n\nStill short (cannot be built now):\n'
+          +others.map(function(s){return '  '+((typeof dispSku==='function')?dispSku(s.pn):s.pn)+' \u2014 need '+s.need+', have '+s.avail;}).join('\n')):'';
+        if(confirm('This build needs subassemblies you do not have, but they CAN be built from parts on the shelf:\n\n'
+            +list+otherTxt
+            +'\n\nOK = build the subassemblies now, then pack this'
+            +'\nCancel = stop, and decide manually')){
+          S._packInFlight=false;   // release the guard so the nested packs can run
+          S._packCascaded=true;    // one level only - a sub that will not build must not re-prompt
+          for(const b of buildableSubs){
+            try{ await packUnits(b.pn, null, false, b.deficit); }
+            catch(e){ console.warn('[pack] sub build failed for '+b.pn, e); }
+          }
+          toast('Built '+buildableSubs.length+' subassembl'+(buildableSubs.length!==1?'ies':'y')+' \u2014 now packing '+((typeof dispSku==='function')?dispSku(pn):pn), 5000);
+          // Re-run the parent pack against refreshed stock rather than continuing with the
+          // figures read before the subassemblies existed.
+          try{ return await packUnits(pn, asmId, false, qty); }
+          finally{ S._packCascaded=false; }
+        }
+        return;
+      }
+
       if(!S.packSkipMissing){
-        const msg='Missing component'+(shortItems.length!==1?'s':'')+' for '+qty+'\u00d7 '+pn+':\n\n'
-          +shortItems.map(function(s){return '  '+s.pn+(s.isSub?' (subassembly)':'')+' \u2014 need '+s.need+', have '+s.avail+' (short '+(s.need-s.avail)+')';}).join('\n')
-          +'\n\nOK = pack anyway and skip these components (they will NOT be deducted from inventory)\nCancel = don\'t pack';
+        // Name what a blocked subassembly is itself short of - "out of stock" alone sends
+        // someone to the wrong screen.
+        const detail=shortItems.map(function(sh){
+          var base='  '+((typeof dispSku==='function')?dispSku(sh.pn):sh.pn)+(sh.isSub?' (subassembly)':'')
+            +' \u2014 need '+sh.need+', have '+sh.avail+' (short '+(sh.need-sh.avail)+')';
+          if(sh.isSub){
+            try{
+              var bb=buildabilityForBackorder(sh.pn)||{};
+              var can=(bb.maxBuild===Infinity)?1e9:(bb.maxBuild||0);
+              base+='\n      can build '+(can>=1e9?'unlimited':can)+' from parts on hand';
+            }catch(e){}
+          }
+          return base;
+        }).join('\n');
+        const msg='Missing component'+(shortItems.length!==1?'s':'')+' for '+qty+'\u00d7 '+((typeof dispSku==='function')?dispSku(pn):pn)+':\n\n'
+          +detail
+          +'\n\nOK = pack anyway and skip these components'
+          +'\n     WARNING: they will NOT be deducted, so stock will be overstated'
+          +'\nCancel = don\'t pack';
         if(!confirm(msg))return;
       }
       shortItems.forEach(function(s){skippedLines.push(s.pn);});
