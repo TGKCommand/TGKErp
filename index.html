@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.39</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.41</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -457,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.39';
+const TGK_ERP_VERSION = 'v22.41';
 const TGK_ERP_BUILD_DATE = '2026-08-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -997,6 +997,10 @@ async function loadAll(){
     // backorder/reverted event, not a live status field, so the MOST RECENT row per SKU (already
     // sorted newest-first by the query) is the source of truth for whether it's backordered right now.
     S.currentBackorders={};
+    if(shopifySyncLog.error){
+      console.warn('[backorder] sync log unreadable:',shopifySyncLog.error.message);
+      toast('Backorder log could not be read \u2014 badges will be missing. '+(shopifySyncLog.error.message||''),10000);
+    }
     if(!shopifySyncLog.error){
       const seen=new Set();
       (shopifySyncLog.data||[]).forEach(function(r){
@@ -1012,6 +1016,8 @@ async function loadAll(){
         if(r.action==='backorder')S.currentBackorders[key]={restock_date:r.restock_date||null,since:r.created_at};
       });
     }
+    console.log('[backorder] sync log rows:',(shopifySyncLog.data||[]).length,
+      '| currently backordered:',Object.keys(S.currentBackorders).length);
     S.liveActivity=[];
     S.corrections.slice(0,20).forEach(c=>{
       const icon={po_receipt:'<span class="ic ic-download"></span>',pack:'<span class="ic ic-box"></span>',unpack:'<span class="ic ic-arrow-back"></span>',cycle_count:'<span class="ic ic-clipboard"></span>',shipment:'<span class="ic ic-truck"></span>',manual:'<span class="ic ic-pencil"></span>'}[c.source]||'<span class="ic ic-pencil"></span>';
@@ -1749,7 +1755,17 @@ function syncShopifyTemplate(pn,newOh){
   // If the new edge action isn't deployed yet, fall back to the product-template behavior.
   var _logSync=function(){
     var b2=buildability(canonPn);
-    db.from('shopify_sync_log').insert({pn,action:isBackorder?'backorder':'reverted',trigger_source:'erp_manual',new_oh:newOh,max_build:b2.maxBuild||null,restock_date:restockDate||null,user_email:S.currentUser||null}).then(function(){});
+    db.from('shopify_sync_log').insert({pn,action:isBackorder?'backorder':'reverted',trigger_source:'erp_manual',new_oh:newOh,max_build:b2.maxBuild||null,restock_date:restockDate||null,user_email:S.currentUser||null})
+      .then(function(r){
+        // The badge is derived ENTIRELY from this log, so a silent failure here means the
+        // Shopify variant changes but the ERP shows nothing. .then() with no error branch is
+        // how that went unnoticed.
+        if(r&&r.error){
+          console.warn('[backorder log] write failed:',r.error.message,r.error);
+          if(!S._boLogWarned){S._boLogWarned=true;
+            toast('Shopify updated, but the backorder log could not be written \u2014 badges will not appear. '+(r.error.message||''),10000);}
+        }
+      },function(e){console.warn('[backorder log] write threw:',e);});
   };
   // NOTE: there is deliberately NO product-template fallback here any more. Setting
   // template_suffix affects the WHOLE product, so on a multi-variant product it makes every
@@ -8724,7 +8740,7 @@ async function bulkSyncShopifyBackorder(){
           max_build:b.maxBuild||null,
           restock_date:isBackorder?restockDate:null,
           user_email:S.currentUser||null
-        }).then(function(){});
+        }).then(function(r){ if(r&&r.error){console.warn('[backorder log] bulk write failed:',r.error.message);if(!S._boLogWarned){S._boLogWarned=true;toast('Backorder log write failed \u2014 badges will not update. '+(r.error.message||''),10000);}} },function(e){console.warn('[backorder log] bulk write threw:',e);});
       } else {
         errorCount++;
         // Surface the real cause. A policy write that Shopify accepted (HTTP 200) but did not
@@ -26425,9 +26441,7 @@ async function initChat(){
     var {data:_team}=await db.from('team_members').select('*').order('display_name');
     _chat.team=_team||[];
     console.log('[chat] team members:',_chat.team.length);
-    var {data:_msgs,error:_me}=await db.from('chat_messages').select('*').order('created_at',{ascending:true}).limit(80);
-    if(_me){console.warn('[chat] messages:',_me.message);toast('Chat: '+_me.message);}
-    else{_chat.msgs=_msgs||[];_renderChatMessages();_scrollChatBottom();}
+    await chatLoadMessages();
     var {data:_nlist}=await db.from('chat_notifications').select('*').eq('to_email',S.currentUser).order('created_at',{ascending:false}).limit(50);
     _chat.alerts=_nlist||[];
     _chat.unread=_chat.alerts.filter(function(n){return !n.read_at;}).length;
@@ -26435,6 +26449,19 @@ async function initChat(){
     if(_chatLiveChannel){try{_chatLiveChannel.unsubscribe();}catch(e){}}
     _chatLiveChannel=db.channel('chat-live').on('postgres_changes',{event:'INSERT',schema:'public',table:'chat_messages'},
       function(p){
+        // Realtime delivers EVERY insert. Without this filter a private message between two
+        // other people would appear in your team channel - a privacy failure, not a display bug.
+        var r=p.new.recipient_email||null;
+        var mine=(r===null)
+          ? (window._chatDM==null)                                   // team msg, team view
+          : ((p.new.user_email===S.currentUser&&r===window._chatDM)  // my DM to them
+             ||(r===S.currentUser&&p.new.user_email===window._chatDM)); // their DM to me
+        // A DM addressed to me while I am elsewhere still deserves a nudge.
+        if(r===S.currentUser&&p.new.user_email!==S.currentUser&&window._chatDM!==p.new.user_email){
+          toast('\u{1F4AC} Direct message from '+(p.new.user_name||p.new.user_email),6000);
+          _chat.unread=(_chat.unread||0)+1; if(typeof _updateChatBadge==='function')_updateChatBadge();
+        }
+        if(!mine)return;
         if(!_chat.msgs.find(function(m){return m.id===p.new.id;})){
           _chat.msgs.push(p.new);_renderChatMessages();
           if(_chat.open)_scrollChatBottom();
@@ -26554,6 +26581,172 @@ function _scrollChatBottom(){
   var el=document.getElementById('chat-messages');
   if(el)setTimeout(function(){el.scrollTop=el.scrollHeight;},30);
 }
+// ---- Chat: emoji, images/GIFs, and direct messages -------------------------
+// Note the distinction from the rest of this app: emoji were removed from the INTERFACE
+// because an icon there must inherit colour and render identically everywhere. In a message
+// they are content, typed by a person, and entirely appropriate.
+
+// A small curated set beats a 1,800-glyph picker: it opens instantly, needs no search, and
+// covers what actually gets sent in a workshop.
+var CHAT_EMOJI=['\u{1F44D}','\u{1F44E}','\u{1F602}','\u{1F923}','\u{1F62D}','\u{1F621}','\u{1F644}','\u{1F615}',
+  '\u{1F389}','\u{1F525}','\u{1F4AF}','\u2705','\u274C','\u26A0\uFE0F','\u{1F440}','\u{1F64F}',
+  '\u{1F91D}','\u{1F4AA}','\u{1F697}','\u{1F527}','\u{1F4E6}','\u{1F680}','\u{1F480}','\u{1F9E0}'];
+
+window.chatToggleEmoji=function(){
+  var ex=document.getElementById('chat-emoji-pop');
+  if(ex){ex.remove();return;}
+  var inp=document.getElementById('chat-input');
+  var pop=document.createElement('div');
+  pop.id='chat-emoji-pop';
+  pop.style.cssText='position:absolute;bottom:46px;right:8px;z-index:60;background:var(--bg);'
+    +'border:1px solid var(--border2);border-radius:var(--r-md);box-shadow:0 6px 20px rgba(0,0,0,.18);'
+    +'padding:8px;display:grid;grid-template-columns:repeat(8,1fr);gap:2px;width:250px';
+  pop.innerHTML=CHAT_EMOJI.map(function(e,i){
+    return '<button type="button" style="font-size:19px;line-height:1;background:transparent;border:none;'
+      +'cursor:pointer;padding:5px;border-radius:var(--r-sm)" '
+      +'onmouseover="this.style.background=\'var(--bg3)\'" onmouseout="this.style.background=\'transparent\'" '
+      +'onclick="chatInsertEmoji('+i+')">'+e+'</button>';
+  }).join('');
+  var wrap=inp&&inp.parentNode?inp.parentNode:document.body;
+  if(getComputedStyle(wrap).position==='static')wrap.style.position='relative';
+  wrap.appendChild(pop);
+};
+window.chatInsertEmoji=function(i){
+  var e=CHAT_EMOJI[i]; var inp=document.getElementById('chat-input');
+  if(inp){ inp.value=(inp.value||'')+e; inp.focus(); }
+  var pop=document.getElementById('chat-emoji-pop'); if(pop)pop.remove();
+};
+
+// ---- images / GIFs ---------------------------------------------------------
+// A pasted link and an uploaded file both end up as image_url, so they render the same way.
+window.chatPickImage=function(){
+  var f=document.createElement('input');
+  f.type='file'; f.accept='image/*';
+  f.onchange=function(){ if(f.files&&f.files[0])chatUploadImage(f.files[0]); };
+  f.click();
+};
+window.chatUploadImage=async function(file){
+  if(!file)return;
+  if(file.size>8*1024*1024){toast('Image too large \u2014 8MB max',5000);return;}
+  toast('Uploading image...',2500);
+  try{
+    var ext=(file.name.split('.').pop()||'png').toLowerCase().replace(/[^a-z0-9]/g,'');
+    var path='chat/'+Date.now()+'-'+Math.random().toString(36).slice(2,8)+'.'+ext;
+    var up=await db.storage.from('chat-images').upload(path,file,{upsert:false});
+    if(up.error){
+      toast(String(up.error.message||'').indexOf('Bucket not found')>=0
+        ? 'Create a public "chat-images" bucket in Supabase Storage first'
+        : 'Upload failed: '+up.error.message, 8000);
+      return;
+    }
+    var pub=db.storage.from('chat-images').getPublicUrl(path);
+    var url=pub&&pub.data?pub.data.publicUrl:null;
+    if(!url){toast('Upload succeeded but no public URL \u2014 is the bucket public?',7000);return;}
+    chatSend(null,url);
+  }catch(e){ toast('Upload error: '+((e&&e.message)||e),6000); }
+};
+
+// Paste an image straight from the clipboard - how a meme usually arrives.
+window.chatPasteHandler=function(e){
+  var items=(e.clipboardData&&e.clipboardData.items)||[];
+  for(var i=0;i<items.length;i++){
+    if(items[i].type&&items[i].type.indexOf('image/')===0){
+      var f=items[i].getAsFile();
+      if(f){ e.preventDefault(); chatUploadImage(f); return; }
+    }
+  }
+};
+
+// A bare image link posted as text should show the image, not the URL.
+window.chatExtractImageUrl=function(txt){
+  var m=String(txt||'').trim().match(/^(https?:\/\/\S+?\.(?:gif|png|jpe?g|webp))(\?\S*)?$/i);
+  if(m)return m[0];
+  if(/^https?:\/\/(media\d*\.giphy\.com|i\.imgur\.com|tenor\.com)\/\S+/i.test(String(txt||'').trim()))
+    return String(txt).trim();
+  return null;
+};
+
+// ---- direct messages -------------------------------------------------------
+// null = the team channel. Existing messages have null, so nothing moves.
+window._chatDM=null;
+
+window.chatOpenDMPicker=async function(){
+  var users=[];
+  try{ users=await loadPackUsers(); }catch(e){}
+  users=(users||[]).filter(function(u){return u.email&&u.email!==S.currentUser;});
+  var old=document.getElementById('chat-dm-pop'); if(old){old.remove();return;}
+  var pop=document.createElement('div');
+  pop.id='chat-dm-pop';
+  pop.style.cssText='position:absolute;top:42px;right:8px;z-index:60;background:var(--bg);'
+    +'border:1px solid var(--border2);border-radius:var(--r-md);box-shadow:0 6px 20px rgba(0,0,0,.18);'
+    +'padding:6px;width:230px;max-height:280px;overflow-y:auto';
+  var rows='<button type="button" class="btn btn-sm" style="width:100%;justify-content:flex-start;margin-bottom:4px'
+    +(_chatDM===null?';border-color:var(--teal);color:var(--teal);font-weight:700':'')+'" '
+    +'onclick="chatSetDM(null)">'+(_chatDM===null?'\u2713 ':'')+'Team channel</button>';
+  rows+=users.map(function(u,i){
+    var on=(_chatDM===u.email);
+    return '<button type="button" class="btn btn-sm" style="width:100%;justify-content:flex-start;margin-bottom:4px'
+      +(on?';border-color:var(--teal);color:var(--teal);font-weight:700':'')+'" '
+      +'onclick="chatSetDMIdx('+i+')">'+(on?'\u2713 ':'')+escHtml(u.name||u.email)+'</button>';
+  }).join('')||'<div class="t3s" style="padding:8px">No other team members found.</div>';
+  pop.innerHTML=rows;
+  window._chatDMUsers=users;
+  var host=document.getElementById('chat-panel')||document.body;
+  if(getComputedStyle(host).position==='static')host.style.position='relative';
+  host.appendChild(pop);
+};
+window.chatSetDMIdx=function(i){
+  var u=(window._chatDMUsers||[])[i];
+  chatSetDM(u?u.email:null);
+};
+window.chatSetDM=function(email){
+  window._chatDM=email||null;
+  var pop=document.getElementById('chat-dm-pop'); if(pop)pop.remove();
+  _chat.msgs=[];
+  _renderChatMessages();
+  chatLoadMessages();
+  _chatUpdateHeader();
+};
+window._chatUpdateHeader=function(){
+  var el=document.getElementById('chat-dm-label');
+  if(!el)return;
+  if(_chatDM){
+    var u=(window._chatDMUsers||[]).find(function(x){return x.email===_chatDM;});
+    el.textContent=(u&&u.name)||_chatDM;
+    el.style.color='var(--orange)';
+  }else{
+    el.textContent='Team';
+    el.style.color='var(--text3)';
+  }
+};
+
+// Loads the current channel. Team = recipient_email IS NULL; a DM = the pair, in both
+// directions, so each side sees the same conversation.
+window.chatLoadMessages=async function(){
+  try{
+    var q=db.from('chat_messages').select('*').order('created_at',{ascending:true}).limit(80);
+    if(_chatDM){
+      q=q.or('and(user_email.eq.'+S.currentUser+',recipient_email.eq.'+_chatDM+'),'
+            +'and(user_email.eq.'+_chatDM+',recipient_email.eq.'+S.currentUser+')');
+    }else{
+      q=q.is('recipient_email',null);
+    }
+    var r=await q;
+    if(r.error){
+      // recipient_email missing means the migration has not run - fall back to everything
+      // rather than showing an empty chat.
+      if(String(r.error.message||'').indexOf('recipient_email')>=0){
+        var f=await db.from('chat_messages').select('*').order('created_at',{ascending:true}).limit(80);
+        _chat.msgs=f.data||[];
+        if(!S._chatMigWarned){S._chatMigWarned=true;toast('Chat: run migration-chat-upgrade.sql to enable direct messages',8000);}
+      }else{
+        console.warn('[chat] load:',r.error.message); toast('Chat: '+r.error.message); return;
+      }
+    }else{ _chat.msgs=r.data||[]; }
+    _renderChatMessages(); _scrollChatBottom();
+  }catch(e){ console.warn('[chat] load threw:',e); }
+};
+
 function _renderChatMessages(){
   var el=document.getElementById('chat-messages');
   if(!el)return;
@@ -26576,7 +26769,12 @@ function _renderChatMessages(){
       +'<div class="chat-msg-meta">'
       +'<span class="chat-msg-name'+(isMe?' me':'')+'">'+escHtml(m.user_name||m.user_email||'')+'</span>'
       +'<span class="chat-msg-time">'+d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'})+'</span>'
-      +'</div><div class="chat-msg-text">'+txt+'</div></div>';
+      +'</div><div class="chat-msg-text">'+txt
+      +(m.image_url?'<div style="margin-top:5px"><img src="'+escHtml(m.image_url)+'" '
+        +'style="max-width:230px;max-height:230px;border-radius:var(--r-md);border:1px solid var(--border);display:block;cursor:pointer" '
+        +'onclick="window.open(this.src,\'_blank\')" '
+        +'onerror="this.replaceWith(Object.assign(document.createElement(\'a\'),{href:this.src,target:\'_blank\',textContent:\'[image]\'}))"></div>':'')
+      +'</div></div>';
   });
   el.innerHTML=html;
 }
@@ -26650,10 +26848,21 @@ window._ins=function(name,email){
   _chat._idx=-1; inp.focus();
 };
 
+// Used by the image upload path: sets the pending image then reuses the normal send.
+window.chatSend=function(text,imgUrl){
+  window._chatPendingImg=imgUrl||null;
+  var inp=document.getElementById('chat-input');
+  if(inp&&text)inp.value=text;
+  sendChatMessage();
+};
+
 async function sendChatMessage(){
   var inp=document.getElementById('chat-input');
   var msg=(inp?inp.value:'').trim();
-  if(!msg)return;
+  if(!msg&&!window._chatPendingImg)return;
+  // A pasted image link should show the picture rather than the URL.
+  var _autoImg=(typeof chatExtractImageUrl==='function')?chatExtractImageUrl(msg):null;
+  if(_autoImg&&!window._chatPendingImg){ window._chatPendingImg=_autoImg; msg=''; }
   inp.value=''; inp.style.height='auto';
   var list=document.getElementById('chat-mention-list');
   if(list)list.style.display='none';
@@ -26664,7 +26873,9 @@ async function sendChatMessage(){
   _renderChatMessages(); _scrollChatBottom();
   var ins=await db.from('chat_messages').insert({
     user_email:S.currentUser,user_name:myName,message:msg,
-    mentions:[]
+    mentions:[],
+    recipient_email:(window._chatDM||null),
+    image_url:(window._chatPendingImg||null)
   }).select().single();
   if(ins.error){
     _chat.msgs=_chat.msgs.filter(function(m){return m.id!==tmpId;});
@@ -26673,6 +26884,7 @@ async function sendChatMessage(){
     inp.value=msg; // restore
     return;
   }
+  window._chatPendingImg=null;
   _chat.msgs=_chat.msgs.map(function(m){return m.id===tmpId?ins.data:m;});
   var names=[]; msg.replace(/@([\w._]+)/g,function(_,n){names.push(n.toLowerCase());});
   if(names.length){
@@ -26709,11 +26921,18 @@ function _chatInit(){
     +'<button id="chat-tab-msgs" onclick="setChatTab(\'msgs\')" style="flex:1;padding:8px;font-size:var(--t-sm);font-weight:700;border:none;cursor:pointer;background:transparent;border-bottom:2px solid var(--teal);color:var(--teal)">Chat</button>'
     +'<button id="chat-tab-alerts" onclick="setChatTab(\'alerts\')" style="flex:1;padding:8px;font-size:var(--t-sm);font-weight:700;border:none;cursor:pointer;background:transparent;border-bottom:2px solid transparent;color:var(--text3);position:relative">Alerts<span id="chat-tab-alerts-badge" style="display:none;margin-left:5px;background:var(--red);color:#fff;font-size:var(--t-xs);font-weight:700;border-radius:var(--r-md);padding:1px 5px"></span></button>'
     +'</div>'
+    +'<div style="display:flex;align-items:center;gap:6px;padding:5px 10px;border-bottom:1px solid var(--border);background:var(--bg2)">'
+    +'<span class="t3xs" style="color:var(--text3)">Channel:</span>'
+    +'<button type="button" class="btn btn-sm" style="padding:2px 8px" onclick="chatOpenDMPicker()">'
+    +'<span class="ic ic-user"></span><span id="chat-dm-label" style="color:var(--text3)">Team</span></button>'
+    +'</div>'
     +'<div id="chat-messages"><div style="padding:20px;text-align:center;color:var(--text3);font-size:var(--t-sm)">Loading\u2026</div></div>'
     +'<div id="chat-alerts" style="display:none;flex:1;overflow-y:auto;padding:6px 0"></div>'
     +'<div id="chat-input-wrap"><div id="chat-mention-list"></div>'
     +'<textarea id="chat-input" rows="1" placeholder="Message\u2026 type @ to mention"'
-    +' oninput="chatInputChange(this)" onkeydown="chatKeyDown(event)"></textarea>'
+    +' oninput="chatInputChange(this)" onkeydown="chatKeyDown(event)" onpaste="chatPasteHandler(event)"></textarea>'
+    +'<button type="button" title="Emoji" onclick="chatToggleEmoji()" style="background:transparent;border:none;cursor:pointer;font-size:17px;padding:0 4px">\u{1F642}</button>'
+    +'<button type="button" title="Send an image or GIF \u2014 you can also paste one" onclick="chatPickImage()" style="background:transparent;border:none;cursor:pointer;padding:0 4px;color:var(--text3)"><span class="ic ic-box"></span></button>'
     +'<button id="chat-send-btn" onclick="sendChatMessage()">\u27a4</button>'
     +'</div></div>';
   document.body.appendChild(wrap);
