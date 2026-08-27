@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.43</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.44</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -457,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.43';
+const TGK_ERP_VERSION = 'v22.44';
 const TGK_ERP_BUILD_DATE = '2026-08-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -18445,6 +18445,52 @@ function workOrderPriorityLabel(p){
 }
 window.workOrderPriorityLabel=workOrderPriorityLabel;
 
+// Tier: 1 = hardware pack, 2 = subassembly, 3 = finished good. Same classifiers used on the
+// Assemblies screen, so "hardware pack" and "subassembly" mean the same thing everywhere.
+function woTier(pn){
+  if((typeof isHWPack==='function')&&isHWPack(pn))return 1;
+  var a=(S.assemblies||[]).find(function(x){return x.pn===pn;});
+  if(a&&a.is_subassembly)return 2;
+  return 3;
+}
+function woTierLabel(t){return t===1?'Hardware Packs':(t===2?'Subassemblies':'Finished Goods');}
+
+// Does this build need another item in the SAME work order to exist first? One BOM level is
+// enough - the case worth catching is "the sub is right here in this work order and has not
+// been built yet", not a transitive dependency several levels down.
+function woDependsOn(pn, inOrderPns){
+  var bom=(S.boms&&S.boms[pn])||[];
+  var deps=[];
+  bom.forEach(function(item){
+    if(item.item_type!=='assembly'&&item.item_type!=='subassembly')return;
+    if(inOrderPns.has(item.child_pn)&&item.child_pn!==pn){
+      var dt=woTier(item.child_pn);
+      if(dt<woTier(pn))deps.push(item.child_pn);   // only a LOWER tier is a real prerequisite
+    }
+  });
+  return deps;
+}
+
+// Groups the sorted build list into the three tiers, and attaches dependency info to each row.
+// Priority order from sortWorkOrderBuilds is preserved WITHIN each tier - grouping changes
+// where a row sits on the page, not the urgency judgment already made.
+function groupWorkOrderBuilds(builds){
+  var inOrder=new Set(builds.map(function(b){return b.pn;}));
+  var withDeps=builds.map(function(b){
+    var deps=woDependsOn(b.pn, inOrder);
+    return Object.assign({}, b, {
+      _tier:woTier(b.pn),
+      _deps:deps,
+      _depsDisp:deps.map(function(d){return (typeof dispSku==='function')?dispSku(d):d;})
+    });
+  });
+  var groups={1:[],2:[],3:[]};
+  withDeps.forEach(function(b){ groups[b._tier].push(b); });
+  return [1,2,3].map(function(t){return {tier:t,label:woTierLabel(t),rows:groups[t]};})
+    .filter(function(g){return g.rows.length;});
+}
+window.groupWorkOrderBuilds=groupWorkOrderBuilds;
+
 function renderWorkOrder(){
   const builds=sortWorkOrderBuilds(Object.entries(S.workOrderBuilds||{}).map(([pn,qty])=>({pn,qty:parseInt(qty)||1})));
   const components=consolidateComponents(builds);
@@ -18472,12 +18518,15 @@ function renderWorkOrder(){
       </div>
       ${builds.length===0?'<div class="section-empty">No assemblies selected — click + Add Assembly</div>':''}
       <table><thead><tr><th>SKU</th><th>Description</th><th>Qty to Build</th><th>Max</th><th></th></tr></thead><tbody>
-      ${builds.map(({pn,qty})=>{
+      ${groupWorkOrderBuilds(builds).map(g=>`
+        <tr class="wo-tier-row"><td colspan="5" style="background:var(--bg2);font-size:var(--t-xs);font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--text3);padding:6px 10px">${g.label} <span style="font-weight:400;text-transform:none;letter-spacing:0">(${g.rows.length})</span></td></tr>
+        ${g.rows.map(({pn,qty,_deps,_depsDisp})=>{
         const a=S.assemblies.find(x=>x.pn===pn)||{};
         const b=buildability(pn);
         const maxB=b.maxBuild===Infinity?'∞':b.maxBuild;
-        return `<tr>
-          <td class="pn" style="color:var(--teal)">${a.pn?dispPn(a):pn}</td>
+        const _blocked=_deps&&_deps.length;
+        return `<tr${_blocked?' style="background:rgba(220,38,38,.05)"':''}>
+          <td class="pn" style="color:var(--teal)">${a.pn?dispPn(a):pn}${_blocked?`<div style="margin-top:2px"><span class="pill" style="background:var(--red);color:#fff;font-size:8.5px;font-weight:700">BUILD FIRST</span> <span class="t3xs" style="color:var(--red)">needs ${_depsDisp.join(', ')}</span></div>`:''}</td>
           <td class="t2s">${a.description||''}</td>
           <td><input class="qty-input" style="width:60px" type="number" min="1" value="${qty}" onchange="S.workOrderBuilds['${pn}']=Math.max(1,+this.value||1);render()"></td>
           <td class="money-neutral" style="color:${b.maxBuild>0?'var(--green)':'var(--red)'}">${maxB}</td>
@@ -18488,7 +18537,7 @@ function renderWorkOrder(){
             <button class="btn btn-teal btn-sm" onclick="woPackRow('${pn}','${a.id}')">Pack</button>
             <button class="action-btn" style="color:var(--red)" onclick="delete S.workOrderBuilds['${pn}'];render()">&#10005;</button>
           </td>
-        </tr>`;}).join('')}
+        </tr>`;}).join('')}`).join('')}
       </tbody></table>
     </div>
   </div>
@@ -18602,7 +18651,7 @@ body{font-family:Arial,sans-serif;font-size:var(--t-sm);color:#000;margin:0;padd
 
 <div class="section-title">Assemblies</div>
 <table><thead><tr><th class="check">&#10003;</th><th style="width:58px">Priority</th><th>SKU</th><th>Description</th><th>Qty to Build</th></tr></thead><tbody>
-${builds.map(({pn,qty,_p})=>{const a=S.assemblies.find(x=>x.pn===pn)||{};const _disp=a.pn?dispPn(a):pn;const _pp=_p||workOrderPriority(pn,qty);const _plab=workOrderPriorityLabel(_pp);const _sup=(a.use_new_sku&&a.new_sku&&a.pn!==_disp)?'<div style="font-size:8px;color:#999;font-weight:normal">'+escHtml(a.pn)+'</div>':'';return`<tr><td class="check">&#9744;</td><td style="font-size:8px;font-weight:700;letter-spacing:.04em">${_plab}${_pp.tier===5?`<div style="font-weight:400;color:#666">short ${_pp.shortBy}</div>`:''}</td><td><b>${escHtml(_disp)}</b>${_sup}</td><td>${escHtml(a.description||'')}</td><td><b>${qty}</b></td></tr>`;}).join('')}
+${groupWorkOrderBuilds(builds).map(g=>'<tr><td colspan="5" style="background:#f0f0f0;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:4px 8px;border-bottom:1px solid #999">'+escHtml(g.label)+'</td></tr>'+g.rows.map(({pn,qty,_p,_deps,_depsDisp})=>{const a=S.assemblies.find(x=>x.pn===pn)||{};const _disp=a.pn?dispPn(a):pn;const _pp=_p||workOrderPriority(pn,qty);const _plab=workOrderPriorityLabel(_pp);const _sup=(a.use_new_sku&&a.new_sku&&a.pn!==_disp)?'<div style="font-size:8px;color:#999;font-weight:normal">'+escHtml(a.pn)+'</div>':'';const _bf=(_deps&&_deps.length)?'<div style="font-size:8px;font-weight:700;color:#c00">BUILD FIRST: '+escHtml(_depsDisp.join(', '))+'</div>':'';return`<tr><td class="check">&#9744;</td><td style="font-size:8px;font-weight:700;letter-spacing:.04em">${_plab}${_pp.tier===5?`<div style="font-weight:400;color:#666">short ${_pp.shortBy}</div>`:''}</td><td><b>${escHtml(_disp)}</b>${_sup}${_bf}</td><td>${escHtml(a.description||'')}</td><td><b>${qty}</b></td></tr>`;}).join('')).join('')}
 </tbody></table>
 
 ${asmSections?`<div class="section-title">Component Pick Lists</div>${asmSections}`:'<p style="color:#999;font-style:italic">No assemblies with BOMs in this work order.</p>'}
