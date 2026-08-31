@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.58</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.59</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -457,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.58';
+const TGK_ERP_VERSION = 'v22.59';
 const TGK_ERP_BUILD_DATE = '2026-08-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -2648,6 +2648,7 @@ function renderParts(){
   </div>
   <div id="parts-bulk-bar" style="display:${selCount>0?'flex':'none'};align-items:center;gap:10px;padding:8px 12px;background:var(--teal-dim);border-radius:var(--r-md);margin-bottom:8px;flex-wrap:wrap">
     <span style="font-size:var(--t-md);font-weight:700;color:var(--teal)" id="parts-sel-label">${selCount} part${selCount!==1?'s':''} selected</span>
+    <button class="btn btn-primary btn-sm" onclick="createAssemblyFromParts()" title="Opens a new assembly with these parts already added to its BOM. Give it a SKU starting TGK-P for a Hardware Pack, or ##-#### for a Subassembly.">&#128230; Create Assembly from Selected</button>
     <button class="btn btn-primary btn-sm" onclick="startBulkEdit('parts')">&#9999; Bulk Edit Selected</button>
     <button class="btn btn-sm" style="color:var(--red);border-color:rgba(239,68,68,.3)" onclick="bulkDiscontinue('parts')">&#128196; Discontinue</button>
     <button class="btn btn-sm" onclick="S.selectedParts=new Set();render()">&#10005; Clear Selection</button>
@@ -11525,6 +11526,7 @@ function openModal(type,data){
     const discPNs=[...S.parts.filter(function(p){return p.discontinued;}).map(function(p){return p.pn;}),...S.assemblies.filter(function(a){return a.discontinued;}).map(function(a){return a.pn;})].sort();
     body=`<div class="form-row cols-2">${fi('m-pn','SKU',data.pn||'',data.id?'title="Edit SKU — renaming will update all BOM references"':'')}
     <div class="form-group"><label class="form-label">Category</label>${buildCatCascade('m-cat','assemblies',data.category||'')}</div></div>
+    ${!data.id?'<div style="font-size:var(--t-xs);color:var(--text3);margin:-8px 0 10px 2px">The SKU decides the type \u2014 there is no separate field for it: <b>TGK-P##</b> = Hardware Pack, <b>##-####</b> = Subassembly, anything else = Finished Good.</div>':''}
     <div class="form-row">${fi('m-desc','Description',data.description||'')}</div>
     <div class="form-row cols-2">
       <div class="form-group"><label class="form-label">New SKU <span style="font-size:var(--t-xs);font-weight:400;color:var(--text3)">(revised part number)</span></label><input class="form-input" id="m-new-sku" value="${escHtml(data.new_sku||'')}" placeholder="e.g. TGK-0405-01 (leave blank if none)"></div>
@@ -13021,12 +13023,10 @@ function bomPnFill(){
   }
 }
 
-function modalAddBOMRow(){
-  var pn=(document.getElementById('m-bom-pn')?.value||'').trim();
-  var qty=parseFloat(document.getElementById('m-bom-qty')?.value)||1;
-  var type=document.getElementById('m-bom-type')?.value||'part';
-  var costRaw=parseFloat(document.getElementById('m-bom-cost')?.value)||0;
-  if(!pn){toast('Enter a Part # or SKU');return;}
+// Shared by the manual "+ Add Line" flow and bulk-creating an assembly from selected parts, so
+// the pending-BOM row markup only ever exists in one place.
+function _bomLineAdd(pn,qty,type,costRaw){
+  qty=qty||1;type=type||'part';costRaw=costRaw||0;
   var part=_findPart(pn);
   var cost=costRaw;
   if(part){
@@ -13038,21 +13038,37 @@ function modalAddBOMRow(){
   }
   var item=_findPart(pn)||findAsm(pn);
   var desc=item?item.description||'':'(not yet in catalog)';
-  var idx=Date.now();
+  // A counter rather than Date.now(): adding several lines in one tight loop (bulk-create from
+  // selected parts) can execute within the same millisecond, which would hand two rows the same
+  // idx and make remove/qty-edit act on both.
+  var idx=(_bomLineAdd._seq=(_bomLineAdd._seq||0)+1);
   S.pendingBOMLines.push({pn:pn,qty:qty,type:type,cost:cost,idx:idx});
   var container=document.getElementById('m-bom-pending');
-  if(!container){toast('BOM section not visible — try reopening the modal');return;}
+  if(!container)return null;
   var row=document.createElement('div');
   row.id='m-bom-prow-'+idx;
   row.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 8px;background:var(--bg2);border:1px solid var(--teal);border-radius:var(--r-md);margin-bottom:4px';
   row.innerHTML='<span style="font-family:var(--mono);font-size:var(--t-sm);color:var(--teal);min-width:80px">'+escHtml(dispSku(pn))+'</span>'
     +'<span style="font-size:var(--t-xs);color:var(--text3);flex:1">'+escHtml(desc)+'</span>'
-    +'<span class="t2s">×'+qty+'</span>'
+    +'<span class="t2s">\u00d7'+qty+'</span>'
     +(cost>0?'<span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--green);font-weight:700">'+fc(cost)+'/ea</span>':'')
     +'<span style="font-size:var(--t-xs);background:var(--teal-dim);color:var(--teal);border-radius:var(--r-sm);padding:1px 6px">'+type+'</span>'
-    +'<button type="button" onclick="modalRemoveBOMRow('+idx+')" style="background:transparent;border:none;color:var(--text3);cursor:pointer;font-size:var(--t-xl);line-height:1.25;padding:2px" title="Remove">×</button>';
+    +'<button type="button" onclick="modalRemoveBOMRow('+idx+')" style="background:transparent;border:none;color:var(--text3);cursor:pointer;font-size:var(--t-xl);line-height:1.25;padding:2px 6px">\u00d7</button>';
   container.appendChild(row);
-  row.scrollIntoView({behavior:'smooth',block:'nearest'});
+  return idx;
+}
+
+function modalAddBOMRow(){
+  var pn=(document.getElementById('m-bom-pn')?.value||'').trim();
+  var qty=parseFloat(document.getElementById('m-bom-qty')?.value)||1;
+  var type=document.getElementById('m-bom-type')?.value||'part';
+  var costRaw=parseFloat(document.getElementById('m-bom-cost')?.value)||0;
+  if(!pn){toast('Enter a Part # or SKU');return;}
+  var container=document.getElementById('m-bom-pending');
+  if(!container){toast('BOM section not visible — try reopening the modal');return;}
+  _bomLineAdd(pn,qty,type,costRaw);
+  var row=document.getElementById('m-bom-prow-'+_bomLineAdd._seq);
+  if(row)row.scrollIntoView({behavior:'smooth',block:'nearest'});
   var pnIn=document.getElementById('m-bom-pn');var qtyIn=document.getElementById('m-bom-qty');var costIn=document.getElementById('m-bom-cost');
   if(pnIn){pnIn.value='';pnIn.focus();}
   if(qtyIn)qtyIn.value='1';
@@ -13063,6 +13079,25 @@ function modalRemoveBOMRow(idx){
   S.pendingBOMLines=S.pendingBOMLines.filter(function(l){return l.idx!==idx;});
   var el=document.getElementById('m-bom-prow-'+idx);if(el)el.remove();
 }
+
+// Create a new Hardware Pack or Subassembly from parts selected in the Parts Catalog. There is
+// no separate "type" field for this - the ERP already classifies an assembly purely by its SKU
+// pattern (TGK-P## = Hardware Pack, ##-#### = Subassembly, anything else = Finished Good), so
+// this opens the normal Add Assembly modal with the BOM pre-filled from the selection, and the
+// SKU the person types in is what actually decides which kind it becomes - exactly as it would
+// if they built the BOM by hand.
+function createAssemblyFromParts(){
+  const ids=[...S.selectedParts];
+  if(!ids.length){toast('Select at least one part first');return;}
+  const parts=S.parts.filter(function(p){return ids.includes(p.id);});
+  S.selectedParts=new Set();
+  openModal('addAsm',{});
+  setTimeout(function(){
+    parts.forEach(function(p){ _bomLineAdd(p.pn,1,'part',0); });
+    toast(parts.length+' part'+(parts.length!==1?'s':'')+' added to the BOM below \u2014 name the SKU and save',5000);
+  },60);
+}
+window.createAssemblyFromParts=createAssemblyFromParts;
 async function modalDeleteBOM(bomId,childPn,parentPn){
   var{error}=await db.from('bom_items').delete().eq('id',bomId);
   if(error){toast('Error: '+error.message);return;}
