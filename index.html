@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.59</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.60</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -457,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.59';
+const TGK_ERP_VERSION = 'v22.60';
 const TGK_ERP_BUILD_DATE = '2026-08-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -2218,6 +2218,18 @@ function setFilter(ns,k,val){
   }
   render();
 }
+// Shared by the Add/Edit Part modal (show box-dimension fields) and Log Shipping Box (which
+// parts qualify as candidate boxes). Anchored to the category's TOP-LEVEL segment, not a
+// substring scan across the whole path - a raw .includes('box') check would wrongly match a
+// real product category like "Products/Drivetrain/DUMPBOXES" just because the word "box"
+// happens to appear inside a product name, exactly the bug already found and fixed in
+// buildabilityForBackorder earlier. Same fix, same reasoning, applied here before it could bite
+// again.
+function _isBoxCat(category){
+  var top=(category||'').toLowerCase().split('/')[0].trim();
+  return top==='box'||top==='boxes'||top==='packaging'||top==='shipping';
+}
+
 function addAction(){const m={parts:'addPart',assemblies:'addAsm',purchases:'addPO',dealers:'addDealer',sales:'addSale'};if(m[S.view])openModal(m[S.view],{});}
 
 function renderDashboard(){
@@ -4745,10 +4757,8 @@ function _pendingBoxOrders(){
 function openShippingBoxModal(orderNum){
   var boxParts=S.parts.filter(function(p){
     if(p.discontinued)return false;
-    var cat=(p.category||'').toLowerCase();
     var pn=(p.pn||'').toLowerCase();
-    return cat.includes('box')||cat.includes('packaging')||cat.includes('shipping')
-      ||pn.includes('box')||pn.includes('pkg')||pn.includes('-ship');
+    return _isBoxCat(p.category)||pn.includes('box')||pn.includes('pkg')||pn.includes('-ship');
   }).sort(function(a,b){return (b.total_unpckgd||0)-(a.total_unpckgd||0);});
 
   var allOpts=S.parts.filter(function(p){return !p.discontinued;})
@@ -4783,6 +4793,7 @@ function openShippingBoxModal(orderNum){
       +'</div>'
       +'<button onclick="document.getElementById(\'shpbox-ov\').remove()" style="background:none;border:none;font-size:var(--t-2xl);cursor:pointer;color:var(--text3);line-height:1.25">\u00d7</button>'
     +'</div>'
+    +'<div id="shpbox-match-status" style="padding:10px 16px;border-bottom:1px solid var(--border);flex-shrink:0;font-size:var(--t-sm);color:var(--text3)">Checking ShipStation for this shipment\'s box dimensions\u2026</div>'
     +'<div style="padding:10px 16px;border-bottom:1px solid var(--border);flex-shrink:0">'
       +'<div style="font-size:var(--t-xs);font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text3);margin-bottom:6px">Or search any part</div>'
       +'<div style="display:flex;gap:8px;align-items:center">'
@@ -4822,6 +4833,97 @@ function openShippingBoxModal(orderNum){
       cf.onclick=function(){deductShippingBox(b.dataset.pn,ov.dataset.orderNum);};
     });
   });
+  _shpBoxAutoMatch(orderNum,boxParts);
+}
+
+// Compares two sets of three dimensions regardless of which axis is which - a box measured
+// 12x9x4 and one stored as 9x4x12 are the same box, just recorded in a different order. Within
+// a tolerance, since two people measuring the same physical box rarely land on the exact same
+// number to a tenth of an inch.
+function _dimsClose(d1,d2,tolIn){
+  tolIn=tolIn==null?0.5:tolIn;
+  var a=d1.slice().sort(function(x,y){return x-y;});
+  var b=d2.slice().sort(function(x,y){return x-y;});
+  return Math.abs(a[0]-b[0])<=tolIn&&Math.abs(a[1]-b[1])<=tolIn&&Math.abs(a[2]-b[2])<=tolIn;
+}
+function _dimsDelta(d1,d2){
+  var a=d1.slice().sort(function(x,y){return x-y;});
+  var b=d2.slice().sort(function(x,y){return x-y;});
+  return Math.abs(a[0]-b[0])+Math.abs(a[1]-b[1])+Math.abs(a[2]-b[2]);
+}
+
+// Every box-category part already sitting in the BOM of any SKU on this order - the set that,
+// if the shipment's actual box matches one of them, means nothing extra was used.
+function _orderBOMBoxParts(orderNum){
+  var lines=S.sales.filter(function(s){return(s.order_number||s.id)===orderNum;});
+  var seen={},out=[];
+  lines.forEach(function(line){
+    (S.boms[line.pn]||[]).forEach(function(b){
+      var part=S.parts.find(function(p){return p.pn===b.child_pn;});
+      if(!part||seen[part.pn])return;
+      var pnl=(part.pn||'').toLowerCase();
+      if(_isBoxCat(part.category)||pnl.includes('box')||pnl.includes('pkg')||pnl.includes('-ship')){
+        seen[part.pn]=true;out.push(part);
+      }
+    });
+  });
+  return out;
+}
+
+async function _shpBoxAutoMatch(orderNum,allBoxParts){
+  var statusEl=document.getElementById('shpbox-match-status');
+  if(!statusEl)return;
+  var d;
+  try{
+    var r=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'get_box_dimensions',orderNumber:String(orderNum).replace(/^#/,'')})});
+    d=await r.json();
+  }catch(e){
+    statusEl.innerHTML='<span style="color:var(--text3)">Couldn\'t reach ShipStation \u2014 pick the box manually below.</span>';
+    return;
+  }
+  if(!document.getElementById('shpbox-match-status'))return; // modal closed while we were waiting
+  if(d.error||!d.found){
+    statusEl.innerHTML='<span style="color:var(--text3)">'+(d.note||'No shipment on file for this order yet')+' \u2014 pick the box manually below.</span>';
+    return;
+  }
+  if(!d.hasDimensions){
+    statusEl.innerHTML='<span style="color:var(--text3)">ShipStation has this shipment but no box dimensions were entered \u2014 pick the box manually below.</span>';
+    return;
+  }
+  var shipDims=[d.length,d.width,d.height];
+  var orderBoxes=_orderBOMBoxParts(orderNum).filter(function(p){return p.box_length_in!=null&&p.box_width_in!=null&&p.box_height_in!=null;});
+  var dimsStr=d.length+'\u00d7'+d.width+'\u00d7'+d.height+' '+(d.units||'in');
+
+  var matchedInOrder=orderBoxes.find(function(p){
+    return _dimsClose(shipDims,[p.box_length_in,p.box_width_in,p.box_height_in]);
+  });
+  if(matchedInOrder){
+    statusEl.innerHTML='<span style="color:var(--green);font-weight:600">\u2713 ShipStation box ('+dimsStr+') matches '+esc(dispSku(matchedInOrder.pn))+', already in this order\u2019s BOM.</span> '
+      +'<span style="color:var(--text2)">No additional box was used \u2014 use Skip below.</span>';
+    var skipBtn=document.querySelector('[onclick^="skipShippingBox"]');
+    if(skipBtn){skipBtn.style.borderColor='var(--teal)';skipBtn.style.color='var(--teal)';skipBtn.style.fontWeight='700';}
+    return;
+  }
+
+  // Not a match to anything already in the order - a genuinely different, additional box was
+  // used. Find the closest thing in the catalog by dimension and pre-select it, but this still
+  // requires a click to confirm - a suggestion, not an automatic deduction.
+  var candidatesWithDims=(allBoxParts||[]).filter(function(p){return p.box_length_in!=null&&p.box_width_in!=null&&p.box_height_in!=null;});
+  var best=null,bestDelta=Infinity;
+  candidatesWithDims.forEach(function(p){
+    var delta=_dimsDelta(shipDims,[p.box_length_in,p.box_width_in,p.box_height_in]);
+    if(delta<bestDelta){bestDelta=delta;best=p;}
+  });
+  if(best&&bestDelta<=1.5){ // within 1.5in summed across all three dimensions
+    statusEl.innerHTML='<span style="color:var(--orange);font-weight:600">ShipStation box ('+dimsStr+') doesn\u2019t match anything already in this order.</span> '
+      +'<span style="color:var(--text2)">Closest catalog match: '+esc(dispSku(best.pn))+' \u2014 selected below, confirm to log it.</span>';
+    var opt=document.querySelector('.shpbox-opt[data-pn="'+best.pn+'"]');
+    if(opt)opt.dispatchEvent(new Event('click'));
+  }else{
+    statusEl.innerHTML='<span style="color:var(--orange);font-weight:600">ShipStation box ('+dimsStr+') doesn\u2019t match anything already in this order, and no close catalog match was found.</span> '
+      +'<span style="color:var(--text2)">Pick the box manually below.</span>';
+  }
 }
 
 function confirmShpBoxSearch(orderNum){
@@ -8171,6 +8273,36 @@ Deno.serve(async (req) =&gt; {
     }
     return json({ updated: results.length, results })
   }
+  if (body.action === 'get_box_dimensions') {
+    // Returns the actual box dimensions ShipStation has on file for this order's shipment.
+    // Multi-SKU orders always have these HAND-TYPED into ShipStation - there is no preset that
+    // covers a combined shipment, so unlike a single-item order this is real, trustworthy data
+    // rather than a generic package default.
+    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
+    const orderNumber = String(body.orderNumber || '')
+    if (!orderNumber) return json({ error: 'orderNumber is required' }, 400)
+    const auth = ssAuth()
+    try {
+      const res = await fetch('https://ssapi.shipstation.com/shipments?orderNumber=' + encodeURIComponent(orderNumber) + '&pageSize=5', {
+        headers: { Authorization: 'Basic ' + auth }
+      })
+      if (!res.ok) return json({ error: 'ShipStation request failed (' + res.status + ')' }, 502)
+      const payload = await res.json()
+      const ship = (payload.shipments || [])[0]
+      if (!ship) return json({ ok: true, found: false, note: 'No shipment on file yet for this order' })
+      const dims = ship.dimensions
+      if (!dims || !dims.length || !dims.width || !dims.height) {
+        return json({ ok: true, found: true, hasDimensions: false, note: 'ShipStation has this shipment but no dimensions were entered for it' })
+      }
+      return json({
+        ok: true, found: true, hasDimensions: true,
+        length: Number(dims.length), width: Number(dims.width), height: Number(dims.height),
+        units: dims.units || 'inches'
+      })
+    } catch (e) {
+      return json({ error: 'ShipStation lookup failed: ' + String((e as any)?.message || e) }, 500)
+    }
+  }
   if (body.action === 'create_return_label') {
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
     const auth = ssAuth()
@@ -11486,6 +11618,12 @@ function openModal(type,data){
     <div class="form-row cols-2">
     <div class="form-group"><label class="form-label">Category</label>${buildCatCascade('m-cat','parts',data.category||'')}</div>
     ${fi('m-cost','Base Unit Cost',data.unit_cost||0,'type="number" step="0.0001"')}</div>
+    ${_isBoxCat(data.category)?`<div class="form-row cols-3" id="m-box-dims-row">
+      ${fi('m-box-l','Box Length (in)',data.box_length_in||'','type="number" step="0.1" min="0"')}
+      ${fi('m-box-w','Box Width (in)',data.box_width_in||'','type="number" step="0.1" min="0"')}
+      ${fi('m-box-h','Box Height (in)',data.box_height_in||'','type="number" step="0.1" min="0"')}
+    </div>
+    <div style="font-size:var(--t-xs);color:var(--text3);margin:-8px 0 10px 2px">Used to auto-match this box against ShipStation's recorded package dimensions in Log Shipping Box.</div>`:''}
     ${partsHaveMsrp()?`<div class="form-row cols-2">${fi('m-pmsrp','MSRP (retail)',data.msrp||0,'type="number" step="0.01" title="Leave 0 to fall back to the calculated suggestion (unit cost x 1.6)"')}<div class="form-group"><label class="form-label">&nbsp;</label><div class="t3xs" style="padding-top:9px">Entered MSRP drives Profit in Master Lookup. 0 = use calculated.</div></div></div>`:''}
     <div class="form-row cols-2">${fi('m-lead','Lead Time (wks)',data.lead_time_weeks||1,'type="number" min="1"')} ${fi('m-avg','Avg Sales / Wk',data.avg_sales_wk||0,'type="number" step="0.01"')}</div>
     <div class="form-row cols-2">${fi('m-unpckgd','On Hand (Unpacked)',data.total_unpckgd||0,'type="number"')} ${fi('m-min','Min Stock (Reorder Point)',data.min_qty||0,'type="number" step="1"')}</div>
@@ -11934,6 +12072,12 @@ async function submitPart(eid){
   const newPn=$('m-pn').value.trim();if(!newPn){toast('Part # required');return;}
   const breaks=(S.pendingPriceBreaks||[]).filter(Boolean).sort(function(a,b){return a.qty-b.qty;}).map(function(b){return{qty:b.qty,price:b.price};});
   const payload={pn:newPn,vendor:$('m-vendor').value.trim(),description:$('m-desc').value.trim(),category:$('m-cat').value.trim(),unit_cost:parseFloat($('m-cost').value)||0,lead_time_weeks:parseInt($('m-lead').value)||1,avg_sales_wk:parseFloat($('m-avg').value)||0,total_unpckgd:parseInt($('m-unpckgd').value)||0,min_qty:parseFloat($('m-min').value)||0,max_qty:parseFloat($('m-max')?.value)||0,moq:parseFloat($('m-moq').value)||0,safety_stock:parseFloat($('m-safety')?.value)||0,price_breaks:breaks,location:$('m-loc').value.trim(),drawing_url:$('m-drawing').value.trim(),image_url:($('m-image')?.value||'').trim()||null,build_to_order:!!($('m-build-to-order')?.checked),notes:($('m-notes')?.value||'').trim()||null,discontinued:$('m-disc').checked,updated_at:new Date().toISOString()};
+  if(_isBoxCat(payload.category)){
+    var _bl=document.getElementById('m-box-l'),_bw=document.getElementById('m-box-w'),_bh=document.getElementById('m-box-h');
+    if(_bl)payload.box_length_in=_bl.value?parseFloat(_bl.value):null;
+    if(_bw)payload.box_width_in=_bw.value?parseFloat(_bw.value):null;
+    if(_bh)payload.box_height_in=_bh.value?parseFloat(_bh.value):null;
+  }
   if(partsHaveMsrp()&&document.getElementById('m-pmsrp'))payload.msrp=parseFloat($('m-pmsrp').value)||0;
   let error,data;
   if(eid){
