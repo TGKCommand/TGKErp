@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.60</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.61</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -457,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.60';
+const TGK_ERP_VERSION = 'v22.61';
 const TGK_ERP_BUILD_DATE = '2026-08-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -4873,6 +4873,7 @@ function _orderBOMBoxParts(orderNum){
 async function _shpBoxAutoMatch(orderNum,allBoxParts){
   var statusEl=document.getElementById('shpbox-match-status');
   if(!statusEl)return;
+  S._shpBoxMatchCtx=S._shpBoxMatchCtx||{};
   var d;
   try{
     var r=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -4880,15 +4881,18 @@ async function _shpBoxAutoMatch(orderNum,allBoxParts){
     d=await r.json();
   }catch(e){
     statusEl.innerHTML='<span style="color:var(--text3)">Couldn\'t reach ShipStation \u2014 pick the box manually below.</span>';
+    S._shpBoxMatchCtx[orderNum]='ShipStation lookup failed, picked manually';
     return;
   }
   if(!document.getElementById('shpbox-match-status'))return; // modal closed while we were waiting
   if(d.error||!d.found){
     statusEl.innerHTML='<span style="color:var(--text3)">'+(d.note||'No shipment on file for this order yet')+' \u2014 pick the box manually below.</span>';
+    S._shpBoxMatchCtx[orderNum]='No ShipStation shipment on file, picked manually';
     return;
   }
   if(!d.hasDimensions){
     statusEl.innerHTML='<span style="color:var(--text3)">ShipStation has this shipment but no box dimensions were entered \u2014 pick the box manually below.</span>';
+    S._shpBoxMatchCtx[orderNum]='ShipStation had no dimensions on file, picked manually';
     return;
   }
   var shipDims=[d.length,d.width,d.height];
@@ -4903,6 +4907,7 @@ async function _shpBoxAutoMatch(orderNum,allBoxParts){
       +'<span style="color:var(--text2)">No additional box was used \u2014 use Skip below.</span>';
     var skipBtn=document.querySelector('[onclick^="skipShippingBox"]');
     if(skipBtn){skipBtn.style.borderColor='var(--teal)';skipBtn.style.color='var(--teal)';skipBtn.style.fontWeight='700';}
+    S._shpBoxMatchCtx[orderNum]='ShipStation box '+dimsStr+' auto-matched '+matchedInOrder.pn+' already in order BOM (no extra box)';
     return;
   }
 
@@ -4920,9 +4925,11 @@ async function _shpBoxAutoMatch(orderNum,allBoxParts){
       +'<span style="color:var(--text2)">Closest catalog match: '+esc(dispSku(best.pn))+' \u2014 selected below, confirm to log it.</span>';
     var opt=document.querySelector('.shpbox-opt[data-pn="'+best.pn+'"]');
     if(opt)opt.dispatchEvent(new Event('click'));
+    S._shpBoxMatchCtx[orderNum]='ShipStation box '+dimsStr+' didn\'t match order BOM \u2014 auto-suggested closest catalog match '+best.pn+' (delta '+bestDelta.toFixed(1)+'in)';
   }else{
     statusEl.innerHTML='<span style="color:var(--orange);font-weight:600">ShipStation box ('+dimsStr+') doesn\u2019t match anything already in this order, and no close catalog match was found.</span> '
       +'<span style="color:var(--text2)">Pick the box manually below.</span>';
+    S._shpBoxMatchCtx[orderNum]='ShipStation box '+dimsStr+' didn\'t match order BOM or any catalog box within tolerance, picked manually';
   }
 }
 
@@ -4937,11 +4944,16 @@ async function deductShippingBox(pn,orderNum){
   var part=S.parts.find(function(p){return p.pn===pn;});
   if(!part){toast('Part '+pn+' not found');return;}
   var prev=part.total_unpckgd||0;
-  var _reason='Shipping box \u2014 multi-SKU order '+orderNum;
+  // Carries the match engine's verdict into the PERMANENT record - without this, the reasoning
+  // shown in the modal disappears the moment it closes, and an audit later has nothing to point
+  // to beyond "a box was deducted."
+  var _matchNote=(S._shpBoxMatchCtx&&S._shpBoxMatchCtx[orderNum])?(' \u2014 '+S._shpBoxMatchCtx[orderNum]):'';
+  var _reason='Shipping box \u2014 multi-SKU order '+orderNum+_matchNote;
   var newQty=await adjustStock('part',part,-1,{reason:_reason,source:'pack',skipSync:true});
   if(newQty===null){return;}
   if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
-  logAction('Shipping box '+pn+' deducted for order '+orderNum,'parts',pn,{total_unpckgd:prev},{total_unpckgd:newQty}).catch(function(){});
+  logAction('Shipping box '+pn+' deducted for order '+orderNum+_matchNote,'parts',pn,{total_unpckgd:prev},{total_unpckgd:newQty}).catch(function(){});
+  if(S._shpBoxMatchCtx)delete S._shpBoxMatchCtx[orderNum];
   document.getElementById('shpbox-ov')?.remove();
   toast('\u2713 '+pn+' logged \u2014 '+newQty+' remaining');
   render();
@@ -4949,10 +4961,12 @@ async function deductShippingBox(pn,orderNum){
 
 async function skipShippingBox(orderNum){
   if(!orderNum){document.getElementById('shpbox-ov')?.remove();return;}
-  var _reason='Shipping box \u2014 multi-SKU order '+orderNum+' (no outer box)';
+  var _matchNote=(S._shpBoxMatchCtx&&S._shpBoxMatchCtx[orderNum])?(' \u2014 '+S._shpBoxMatchCtx[orderNum]):'';
+  var _reason='Shipping box \u2014 multi-SKU order '+orderNum+' (no outer box)'+_matchNote;
   var _lines=S.sales.filter(function(s){return(s.order_number||s.id)===orderNum;});
   var _pn=(_lines.length&&_lines[0].pn)||null;
   S.corrections=[{pn:_pn,previous_qty:0,new_qty:0,adjustment:0,reason:_reason,source:'pack',created_at:new Date().toISOString()},...S.corrections];
+  if(S._shpBoxMatchCtx)delete S._shpBoxMatchCtx[orderNum];
   document.getElementById('shpbox-ov')?.remove();
   document.getElementById('pbox-ov')?.remove();
   toast('\u2713 Order '+orderNum+' \u2014 no outer box needed');
