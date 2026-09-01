@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.61</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.62</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -457,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.61';
+const TGK_ERP_VERSION = 'v22.62';
 const TGK_ERP_BUILD_DATE = '2026-08-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -4729,13 +4729,131 @@ function openPendingBoxModal(){
     +'</div>'
     +'<div style="overflow-y:auto;flex:1">'+rows+'</div>'
     +'<div style="padding:10px 16px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0">'
+      +'<div style="display:flex;gap:6px">'
+      +'<button class="btn btn-sm btn-teal" onclick="openBulkBoxMatch()" title="Checks ShipStation\'s recorded box dimensions against each order and pre-sorts them — nothing is deducted without you confirming">&#128269; Auto-Match All</button>'
       +'<button class="btn btn-sm" style="color:var(--text3)" onclick="skipAllPendingBoxes()">Skip All — no boxes needed</button>'
+      +'</div>'
       +'<button class="btn" onclick="document.getElementById(\'pbox-ov\').remove()">Done</button>'
     +'</div>'
   +'</div>';
   document.body.appendChild(ov);
   ov.addEventListener('click',function(e){if(e.target===ov)ov.remove();});
 }
+
+// Runs the same matching engine used by the single-order modal across EVERY pending order at
+// once. Sorted into three groups by risk: a matched order-BOM box changes no stock at all, so
+// those can be bulk-confirmed in one action; a suggested catalog match DOES deduct real stock,
+// so each of those still needs its own click - a wrong auto-suggestion at that step would be a
+// real inventory error, and this whole feature exists to protect stock accuracy, not trade it
+// for convenience. No-match orders fall through to the same manual flow as always.
+async function openBulkBoxMatch(){
+  var pending=_pendingBoxOrders();
+  if(!pending.length){toast('No pending box logs');return;}
+  document.getElementById('pbox-ov')?.remove();
+  var old=document.getElementById('bbm-ov');if(old)old.remove();
+  var ov=document.createElement('div');
+  ov.id='bbm-ov';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9150;display:flex;align-items:center;justify-content:center;padding:16px';
+  ov.innerHTML='<div style="background:var(--bg);border-radius:var(--r-md);max-width:640px;width:100%;max-height:84vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.4)">'
+    +'<div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-shrink:0">'
+      +'<span style="font-size:var(--t-xl)">&#128269;</span>'
+      +'<div style="flex:1"><div style="font-size:var(--t-lg);font-weight:700;color:var(--text)">Auto-Matching '+pending.length+' Order'+(pending.length!==1?'s':'')+'</div>'
+        +'<div id="bbm-status" style="font-size:var(--t-sm);color:var(--text3);margin-top:1px">Checking ShipStation for each shipment&hellip;</div></div>'
+      +'<button onclick="document.getElementById(\'bbm-ov\').remove()" style="background:none;border:none;font-size:var(--t-2xl);cursor:pointer;color:var(--text3);line-height:1.25">&times;</button>'
+    +'</div>'
+    +'<div id="bbm-body" style="overflow-y:auto;flex:1;padding:12px 16px"><div style="padding:30px;text-align:center;color:var(--text3)">Working&hellip;</div></div>'
+  +'</div>';
+  document.body.appendChild(ov);
+
+  var allBoxParts=S.parts.filter(function(p){
+    if(p.discontinued)return false;
+    var pn=(p.pn||'').toLowerCase();
+    return _isBoxCat(p.category)||pn.includes('box')||pn.includes('pkg')||pn.includes('-ship');
+  });
+
+  var results=[];
+  for(var i=0;i<pending.length;i++){
+    var statusEl=document.getElementById('bbm-status');
+    if(!statusEl)return; // panel closed mid-run
+    statusEl.textContent='Checking order '+(i+1)+' of '+pending.length+'&hellip;';
+    var v=await _shpBoxVerdict(pending[i],allBoxParts);
+    results.push({orderNum:pending[i],v:v});
+  }
+  if(!document.getElementById('bbm-body'))return;
+  _renderBulkBoxResults(results);
+}
+
+function _renderBulkBoxResults(results){
+  var matched=results.filter(function(r){return r.v.kind==='matched';});
+  var suggested=results.filter(function(r){return r.v.kind==='suggested';});
+  var none=results.filter(function(r){return r.v.kind==='nomatch'||r.v.kind==='nodata'||r.v.kind==='error';});
+  window._bbmResults=results;
+
+  var out='';
+  if(matched.length){
+    out+='<div style="margin-bottom:14px">'
+      +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">'
+        +'<div style="font-size:var(--t-xs);font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--green)">&#10003; No extra box needed ('+matched.length+')</div>'
+        +'<button class="btn btn-sm btn-teal" onclick="confirmBulkBoxMatches(\'matched\')">Confirm All — no stock changes</button>'
+      +'</div>'
+      +matched.map(function(r){
+        return '<div style="padding:7px 10px;background:var(--teal-dim);border-radius:var(--r-sm);margin-bottom:4px;font-size:var(--t-sm)">'
+          +'<b style="color:var(--teal)">'+escHtml(r.orderNum)+'</b> <span style="color:var(--text2)">— matches '+escHtml(dispSku(r.v.box.pn))+' already in this order\'s BOM ('+r.v.dimsStr+')</span></div>';
+      }).join('')
+    +'</div>';
+  }
+  if(suggested.length){
+    out+='<div style="margin-bottom:14px">'
+      +'<div style="font-size:var(--t-xs);font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--orange);margin-bottom:6px">Different box used — needs a look ('+suggested.length+')</div>'
+      +suggested.map(function(r){
+        return '<div style="display:flex;align-items:center;gap:10px;padding:7px 10px;background:var(--orange-dim);border-radius:var(--r-sm);margin-bottom:4px;font-size:var(--t-sm)">'
+          +'<div style="flex:1"><b style="color:var(--orange)">'+escHtml(r.orderNum)+'</b> <span style="color:var(--text2)">— '+r.v.dimsStr+', closest match '+escHtml(dispSku(r.v.box.pn))+' (\u00b1'+r.v.delta.toFixed(1)+'in)</span></div>'
+          +'<button class="btn btn-sm btn-teal" onclick="confirmSingleBulkBox(\''+escHtml(r.orderNum)+'\',\''+escHtml(r.v.box.pn)+'\')">Confirm</button>'
+          +'<button class="btn btn-sm" onclick="document.getElementById(\'bbm-ov\')?.remove();openShippingBoxModal(\''+escHtml(r.orderNum)+'\')">Review</button>'
+        +'</div>';
+      }).join('')
+    +'</div>';
+  }
+  if(none.length){
+    out+='<div><div style="font-size:var(--t-xs);font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--text3);margin-bottom:6px">No auto-match ('+none.length+')</div>'
+      +none.map(function(r){
+        return '<div style="display:flex;align-items:center;gap:10px;padding:7px 10px;background:var(--bg2);border-radius:var(--r-sm);margin-bottom:4px;font-size:var(--t-sm)">'
+          +'<div style="flex:1"><b>'+escHtml(r.orderNum)+'</b> <span style="color:var(--text3)">— '+escHtml(r.v.note||'no match')+'</span></div>'
+          +'<button class="btn btn-sm" onclick="document.getElementById(\'bbm-ov\')?.remove();openShippingBoxModal(\''+escHtml(r.orderNum)+'\')">Log Manually</button>'
+        +'</div>';
+      }).join('')
+    +'</div>';
+  }
+  var statusEl=document.getElementById('bbm-status');
+  if(statusEl)statusEl.textContent=matched.length+' need no box, '+suggested.length+' need a look, '+none.length+' no match';
+  document.getElementById('bbm-body').innerHTML=out||'<div style="padding:30px;text-align:center;color:var(--text3)">Nothing to show</div>';
+}
+
+async function confirmBulkBoxMatches(kind){
+  var rows=(window._bbmResults||[]).filter(function(r){return r.v.kind===kind;});
+  if(!rows.length)return;
+  S._shpBoxMatchCtx=S._shpBoxMatchCtx||{};
+  for(var i=0;i<rows.length;i++){
+    S._shpBoxMatchCtx[rows[i].orderNum]=rows[i].v.ctx;
+    await skipShippingBox(rows[i].orderNum);
+  }
+  window._bbmResults=(window._bbmResults||[]).filter(function(r){return r.v.kind!==kind;});
+  document.getElementById('pbox-ov')?.remove(); // skipShippingBox closes this if it happened to be open
+  if(document.getElementById('bbm-body'))_renderBulkBoxResults(window._bbmResults);
+  toast('\u2713 '+rows.length+' order'+(rows.length!==1?'s':'')+' confirmed — no box needed');
+}
+window.confirmBulkBoxMatches=confirmBulkBoxMatches;
+
+async function confirmSingleBulkBox(orderNum,pn){
+  var row=(window._bbmResults||[]).find(function(r){return r.orderNum===orderNum;});
+  S._shpBoxMatchCtx=S._shpBoxMatchCtx||{};
+  if(row)S._shpBoxMatchCtx[orderNum]=row.v.ctx;
+  await deductShippingBox(pn,orderNum);
+  window._bbmResults=(window._bbmResults||[]).filter(function(r){return r.orderNum!==orderNum;});
+  if(document.getElementById('bbm-body'))_renderBulkBoxResults(window._bbmResults);
+}
+window.confirmSingleBulkBox=confirmSingleBulkBox;
+window.openBulkBoxMatch=openBulkBoxMatch;
 
 function _pendingBoxOrders(){
   var cutoff=new Date();cutoff.setDate(cutoff.getDate()-7);
@@ -4870,67 +4988,73 @@ function _orderBOMBoxParts(orderNum){
   return out;
 }
 
-async function _shpBoxAutoMatch(orderNum,allBoxParts){
-  var statusEl=document.getElementById('shpbox-match-status');
-  if(!statusEl)return;
-  S._shpBoxMatchCtx=S._shpBoxMatchCtx||{};
+// The matching engine itself, with no DOM dependency - shared by the single-order modal
+// (_shpBoxAutoMatch) and the bulk review across every pending order. One source of truth for
+// what counts as a match, so the two paths can never disagree about the same order.
+async function _shpBoxVerdict(orderNum,allBoxParts){
   var d;
   try{
     var r=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({action:'get_box_dimensions',orderNumber:String(orderNum).replace(/^#/,'')})});
     d=await r.json();
   }catch(e){
-    statusEl.innerHTML='<span style="color:var(--text3)">Couldn\'t reach ShipStation \u2014 pick the box manually below.</span>';
-    S._shpBoxMatchCtx[orderNum]='ShipStation lookup failed, picked manually';
-    return;
+    return{kind:'error',note:'Couldn\u2019t reach ShipStation',ctx:'ShipStation lookup failed, picked manually'};
   }
-  if(!document.getElementById('shpbox-match-status'))return; // modal closed while we were waiting
-  if(d.error||!d.found){
-    statusEl.innerHTML='<span style="color:var(--text3)">'+(d.note||'No shipment on file for this order yet')+' \u2014 pick the box manually below.</span>';
-    S._shpBoxMatchCtx[orderNum]='No ShipStation shipment on file, picked manually';
-    return;
-  }
-  if(!d.hasDimensions){
-    statusEl.innerHTML='<span style="color:var(--text3)">ShipStation has this shipment but no box dimensions were entered \u2014 pick the box manually below.</span>';
-    S._shpBoxMatchCtx[orderNum]='ShipStation had no dimensions on file, picked manually';
-    return;
-  }
+  if(d.error||!d.found)return{kind:'nodata',note:d.note||'No shipment on file for this order yet',ctx:'No ShipStation shipment on file, picked manually'};
+  if(!d.hasDimensions)return{kind:'nodata',note:'ShipStation has this shipment but no box dimensions were entered',ctx:'ShipStation had no dimensions on file, picked manually'};
+
   var shipDims=[d.length,d.width,d.height];
-  var orderBoxes=_orderBOMBoxParts(orderNum).filter(function(p){return p.box_length_in!=null&&p.box_width_in!=null&&p.box_height_in!=null;});
   var dimsStr=d.length+'\u00d7'+d.width+'\u00d7'+d.height+' '+(d.units||'in');
+  var orderBoxes=_orderBOMBoxParts(orderNum).filter(function(p){return p.box_length_in!=null&&p.box_width_in!=null&&p.box_height_in!=null;});
 
-  var matchedInOrder=orderBoxes.find(function(p){
-    return _dimsClose(shipDims,[p.box_length_in,p.box_width_in,p.box_height_in]);
-  });
+  var matchedInOrder=orderBoxes.find(function(p){return _dimsClose(shipDims,[p.box_length_in,p.box_width_in,p.box_height_in]);});
   if(matchedInOrder){
-    statusEl.innerHTML='<span style="color:var(--green);font-weight:600">\u2713 ShipStation box ('+dimsStr+') matches '+esc(dispSku(matchedInOrder.pn))+', already in this order\u2019s BOM.</span> '
-      +'<span style="color:var(--text2)">No additional box was used \u2014 use Skip below.</span>';
-    var skipBtn=document.querySelector('[onclick^="skipShippingBox"]');
-    if(skipBtn){skipBtn.style.borderColor='var(--teal)';skipBtn.style.color='var(--teal)';skipBtn.style.fontWeight='700';}
-    S._shpBoxMatchCtx[orderNum]='ShipStation box '+dimsStr+' auto-matched '+matchedInOrder.pn+' already in order BOM (no extra box)';
-    return;
+    return{kind:'matched',dimsStr:dimsStr,box:matchedInOrder,
+      ctx:'ShipStation box '+dimsStr+' auto-matched '+matchedInOrder.pn+' already in order BOM (no extra box)'};
   }
 
-  // Not a match to anything already in the order - a genuinely different, additional box was
-  // used. Find the closest thing in the catalog by dimension and pre-select it, but this still
-  // requires a click to confirm - a suggestion, not an automatic deduction.
   var candidatesWithDims=(allBoxParts||[]).filter(function(p){return p.box_length_in!=null&&p.box_width_in!=null&&p.box_height_in!=null;});
   var best=null,bestDelta=Infinity;
   candidatesWithDims.forEach(function(p){
     var delta=_dimsDelta(shipDims,[p.box_length_in,p.box_width_in,p.box_height_in]);
     if(delta<bestDelta){bestDelta=delta;best=p;}
   });
-  if(best&&bestDelta<=1.5){ // within 1.5in summed across all three dimensions
-    statusEl.innerHTML='<span style="color:var(--orange);font-weight:600">ShipStation box ('+dimsStr+') doesn\u2019t match anything already in this order.</span> '
-      +'<span style="color:var(--text2)">Closest catalog match: '+esc(dispSku(best.pn))+' \u2014 selected below, confirm to log it.</span>';
-    var opt=document.querySelector('.shpbox-opt[data-pn="'+best.pn+'"]');
-    if(opt)opt.dispatchEvent(new Event('click'));
-    S._shpBoxMatchCtx[orderNum]='ShipStation box '+dimsStr+' didn\'t match order BOM \u2014 auto-suggested closest catalog match '+best.pn+' (delta '+bestDelta.toFixed(1)+'in)';
-  }else{
-    statusEl.innerHTML='<span style="color:var(--orange);font-weight:600">ShipStation box ('+dimsStr+') doesn\u2019t match anything already in this order, and no close catalog match was found.</span> '
-      +'<span style="color:var(--text2)">Pick the box manually below.</span>';
-    S._shpBoxMatchCtx[orderNum]='ShipStation box '+dimsStr+' didn\'t match order BOM or any catalog box within tolerance, picked manually';
+  if(best&&bestDelta<=1.5){
+    return{kind:'suggested',dimsStr:dimsStr,box:best,delta:bestDelta,
+      ctx:'ShipStation box '+dimsStr+' didn\'t match order BOM \u2014 auto-suggested closest catalog match '+best.pn+' (delta '+bestDelta.toFixed(1)+'in)'};
   }
+  return{kind:'nomatch',dimsStr:dimsStr,
+    ctx:'ShipStation box '+dimsStr+' didn\'t match order BOM or any catalog box within tolerance, picked manually'};
+}
+
+async function _shpBoxAutoMatch(orderNum,allBoxParts){
+  var statusEl=document.getElementById('shpbox-match-status');
+  if(!statusEl)return;
+  S._shpBoxMatchCtx=S._shpBoxMatchCtx||{};
+  statusEl.textContent='Checking ShipStation for this shipment\u2019s box dimensions\u2026';
+  var v=await _shpBoxVerdict(orderNum,allBoxParts);
+  if(!document.getElementById('shpbox-match-status'))return; // modal closed while we were waiting
+  S._shpBoxMatchCtx[orderNum]=v.ctx;
+  if(v.kind==='error'||v.kind==='nodata'){
+    statusEl.innerHTML='<span style="color:var(--text3)">'+esc(v.note)+' \u2014 pick the box manually below.</span>';
+    return;
+  }
+  if(v.kind==='matched'){
+    statusEl.innerHTML='<span style="color:var(--green);font-weight:600">\u2713 ShipStation box ('+v.dimsStr+') matches '+esc(dispSku(v.box.pn))+', already in this order\u2019s BOM.</span> '
+      +'<span style="color:var(--text2)">No additional box was used \u2014 use Skip below.</span>';
+    var skipBtn=document.querySelector('[onclick^="skipShippingBox"]');
+    if(skipBtn){skipBtn.style.borderColor='var(--teal)';skipBtn.style.color='var(--teal)';skipBtn.style.fontWeight='700';}
+    return;
+  }
+  if(v.kind==='suggested'){
+    statusEl.innerHTML='<span style="color:var(--orange);font-weight:600">ShipStation box ('+v.dimsStr+') doesn\u2019t match anything already in this order.</span> '
+      +'<span style="color:var(--text2)">Closest catalog match: '+esc(dispSku(v.box.pn))+' \u2014 selected below, confirm to log it.</span>';
+    var opt=document.querySelector('.shpbox-opt[data-pn="'+v.box.pn+'"]');
+    if(opt)opt.dispatchEvent(new Event('click'));
+    return;
+  }
+  statusEl.innerHTML='<span style="color:var(--orange);font-weight:600">ShipStation box ('+v.dimsStr+') doesn\u2019t match anything already in this order, and no close catalog match was found.</span> '
+    +'<span style="color:var(--text2)">Pick the box manually below.</span>';
 }
 
 function confirmShpBoxSearch(orderNum){
