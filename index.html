@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.64</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.65</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -457,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.64';
+const TGK_ERP_VERSION = 'v22.65';
 const TGK_ERP_BUILD_DATE = '2026-08-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -7285,7 +7285,7 @@ Deno.serve(async (req) => {
     return new Response(JSON.stringify({ok: true, held: false, errors: errs}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
 
-  if (body.action === 'set_variant_backorder') {
+    if (body.action === 'set_variant_backorder') {
     const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
     const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
     const sku = (body.sku || body.pn || '').trim()
@@ -7293,9 +7293,6 @@ Deno.serve(async (req) => {
     const restockDate = body.restock_date || ''
     if (!store || !key || !sku) return new Response(JSON.stringify({error:'Missing store, key or sku'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
     const H = {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'}
-    // Top-level GraphQL errors (access denied, unknown field, throttling) arrive in
-    // response.errors with data null -- NOT in userErrors. Capture them or the real cause
-    // of a failed mutation is invisible.
     const gqlTopErrors:string[] = []
     const gql = async (q) => {
       const r = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:H, body: JSON.stringify({query:q})}).then(x=>x.json())
@@ -7305,13 +7302,10 @@ Deno.serve(async (req) => {
       return r
     }
     const safe = sku.replace(/"/g, '')
-    // Find the exact variant (each SKU is its own variant) + its inventory item.
-    const find = await gql('{ productVariants(first: 10, query: "sku:' + safe + '") { edges { node { id sku inventoryItem { id } product { id } metafield(namespace: \"custom\", key: \"estimated_arrival_date\") { value } } } } }')
+    const find = await gql('{ productVariants(first: 10, query: "sku:' + safe + '") { edges { node { id sku inventoryItem { id } product { id } metafield(namespace: \\"custom\\", key: \\"estimated_arrival_date\\") { value } } } } }')
     const edges = find?.data?.productVariants?.edges || []
     const allMatches = edges.filter((e:any) => (e.node.sku || '').trim().toUpperCase() === sku.toUpperCase())
     if (!allMatches.length) return new Response(JSON.stringify({error:'No Shopify variant found for SKU: ' + sku, debug: edges.map((e:any)=>e.node.sku)}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
-    // A SKU can appear as a variant on several chassis products. Skip any that are on hold -
-    // those were deliberately stopped and must NOT be revived by a routine sync.
     let heldIds = new Set<string>()
     try {
       const hq = await db.from('variant_holds').select('shopify_variant_id').eq('sku', sku).eq('active', true)
@@ -7323,94 +7317,123 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({ok:true, skipped_all_held:true, held_count:skippedHeld,
         note:'every variant for this SKU is on hold; nothing to sync'}), {headers:{...CORS,'Content-Type':'application/json'}})
     }
-    const match = targets[0]
-    const variantId = match.node.id
-    const invItemId = match.node.inventoryItem?.id
-    const prodId = match.node.product?.id
-    // The variant's own metafield is the source of truth for the ETA. If it already holds a
-    // date, keep it: a repeat sync must never push the promised arrival further out.
-    const existingEta = String(match.node.metafield?.value || '').trim()
-    const effRestockDate = (backorder && existingEta) ? existingEta : restockDate
-    const eta_preserved = !!(backorder && existingEta && existingEta !== restockDate)
-    const errs:string[] = []
-    let actual_policy = null, actual_tracked = null
-    if (backorder) {
-      // Turn tracking ON for this variant only, zero its on-hand, and deny purchase when
-      // out of stock -> that variant shows sold out; sibling variants are untouched.
-      if (invItemId) {
-        const t = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: true}) { inventoryItem { tracked } userErrors { message } } }')
-        ;(t?.data?.inventoryItemUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
-        actual_tracked = t?.data?.inventoryItemUpdate?.inventoryItem?.tracked ?? actual_tracked
-        const loc = await gql('{ locations(first: 1) { edges { node { id } } } }')
-        const locId = loc?.data?.locations?.edges?.[0]?.node?.id
-        if (locId) {
-          const z = await gql('mutation { inventorySetOnHandQuantities(input: {reason: "correction", setQuantities: [{inventoryItemId: "' + invItemId + '", locationId: "' + locId + '", quantity: 0}]}) { userErrors { message } } }')
-          ;(z?.data?.inventorySetOnHandQuantities?.userErrors || []).forEach((u:any)=>errs.push(u.message))
-        }
-      }
-      // productVariantsBulkUpdate replaces the removed productVariantUpdate. Needs productId
-      // plus a variants array; returns the updated variants so verification still works.
-      const p = await gql('mutation { productVariantsBulkUpdate(productId: "' + prodId + '", variants: [{id: "' + variantId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
-      ;(p?.data?.productVariantsBulkUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
-      actual_policy = p?.data?.productVariantsBulkUpdate?.productVariants?.[0]?.inventoryPolicy ?? actual_policy
-      if (effRestockDate) {
-        const m = await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: "' + effRestockDate + '", type: "single_line_text_field"}]) { userErrors { message } } }')
-        ;(m?.data?.metafieldsSet?.userErrors || []).forEach((u:any)=>errs.push(u.message))
-      }
-    } else {
-      // Restock -> restore the made-to-order default: untrack the variant so it is always
-      // available again, and clear its restock date.
-      if (invItemId) {
-        const t = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: false}) { inventoryItem { tracked } userErrors { message } } }')
-        ;(t?.data?.inventoryItemUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
-        actual_tracked = t?.data?.inventoryItemUpdate?.inventoryItem?.tracked ?? actual_tracked
-      }
-      const p = await gql('mutation { productVariantsBulkUpdate(productId: "' + prodId + '", variants: [{id: "' + variantId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
-      ;(p?.data?.productVariantsBulkUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
-      actual_policy = p?.data?.productVariantsBulkUpdate?.productVariants?.[0]?.inventoryPolicy ?? actual_policy
-      await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
-    }
-    // actual_policy/actual_tracked come straight from each mutation's own response above
-    // (not a separate follow-up query), so there is no read-after-write race - Shopify
-    // guarantees the returned fields reflect exactly what that mutation just wrote.
-    const expected_policy = 'CONTINUE'
-    const policy_ok = actual_policy === expected_policy
-    let reason = ''
-    let failsafe_applied = false
-    // FAIL-SAFE: a backordered variant is only safe to leave TRACKED if we positively
-    // confirmed CONTINUE. tracked + anything-but-CONTINUE = customers cannot buy it, which
-    // violates the hard 'always orderable' requirement. If we could not confirm CONTINUE,
-    // untrack the variant again - an untracked variant is always purchasable in Shopify.
-    // Losing the backorder badge is strictly preferable to losing the sale.
-    if (backorder && !policy_ok) {
-      try {
+
+    // FIX: this used to take only targets[0] and silently leave every other variant sharing
+    // the SKU untouched - the exact bug behind a SKU showing correctly backordered on one
+    // chassis product page while a sibling page kept selling normally. A SKU sold across
+    // several chassis pages shares one inventory pool, so every page has to reflect the same
+    // stock reality - looping over every target is the actual fix, not an optimization.
+    const perVariant: any[] = []
+    const reconciledProducts = new Set<string>()
+    for (const match of targets) {
+      const variantId = match.node.id
+      const invItemId = match.node.inventoryItem?.id
+      const prodId = match.node.product?.id
+      const errs:string[] = []
+      let actual_policy = null, actual_tracked = null
+
+      const existingEta = String(match.node.metafield?.value || '').trim()
+      const effRestockDate = (backorder && existingEta) ? existingEta : restockDate
+      const eta_preserved = !!(backorder && existingEta && existingEta !== restockDate)
+
+      if (backorder) {
         if (invItemId) {
-          const rb = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: false}) { inventoryItem { tracked } userErrors { message } } }')
-          actual_tracked = rb?.data?.inventoryItemUpdate?.inventoryItem?.tracked ?? actual_tracked
-          failsafe_applied = true
+          const t = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: true}) { inventoryItem { tracked } userErrors { message } } }')
+          ;(t?.data?.inventoryItemUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+          actual_tracked = t?.data?.inventoryItemUpdate?.inventoryItem?.tracked ?? actual_tracked
+          const loc = await gql('{ locations(first: 1) { edges { node { id } } } }')
+          const locId = loc?.data?.locations?.edges?.[0]?.node?.id
+          if (locId) {
+            const z = await gql('mutation { inventorySetOnHandQuantities(input: {reason: "correction", setQuantities: [{inventoryItemId: "' + invItemId + '", locationId: "' + locId + '", quantity: 0}]}) { userErrors { message } } }')
+            ;(z?.data?.inventorySetOnHandQuantities?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+          }
         }
-        // Also clear the ETA metafield. The storefront draws its per-variant backorder
-        // marker from this field, so leaving a date behind on a variant we just reverted
-        // would make the marker contradict the ERP's own state.
+        const p = await gql('mutation { productVariantsBulkUpdate(productId: "' + prodId + '", variants: [{id: "' + variantId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
+        ;(p?.data?.productVariantsBulkUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+        actual_policy = p?.data?.productVariantsBulkUpdate?.productVariants?.[0]?.inventoryPolicy ?? actual_policy
+        if (effRestockDate) {
+          const m = await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: "' + effRestockDate + '", type: "single_line_text_field"}]) { userErrors { message } } }')
+          ;(m?.data?.metafieldsSet?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+        }
+      } else {
+        if (invItemId) {
+          const t = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: false}) { inventoryItem { tracked } userErrors { message } } }')
+          ;(t?.data?.inventoryItemUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+          actual_tracked = t?.data?.inventoryItemUpdate?.inventoryItem?.tracked ?? actual_tracked
+        }
+        const p = await gql('mutation { productVariantsBulkUpdate(productId: "' + prodId + '", variants: [{id: "' + variantId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
+        ;(p?.data?.productVariantsBulkUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+        actual_policy = p?.data?.productVariantsBulkUpdate?.productVariants?.[0]?.inventoryPolicy ?? actual_policy
         await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
-      } catch (e) { console.warn('[set_variant_backorder] failsafe untrack failed:', e) }
-      const allErrTxt = errs.concat(gqlTopErrors)
-      reason = 'Could not set inventoryPolicy to CONTINUE' + (actual_policy ? (' (Shopify reports ' + actual_policy + ')') : '') + '. '
-        + (allErrTxt.length ? ('SHOPIFY SAID: ' + allErrTxt.join(' | ') + '. ') : 'Shopify returned no error text. ')
-        + 'If it mentions a field not existing, the pinned Shopify API version has dropped that mutation - '
-        + 'the edge function needs updating. If it mentions access denied, regenerate the Admin API token. '
-        + (failsafe_applied ? 'Left the variant UNTRACKED so it stays orderable (no backorder badge).' : 'WARNING: variant may be unorderable - check it manually.')
+      }
+
+      const expected_policy = 'CONTINUE'
+      const policy_ok = actual_policy === expected_policy
+      let reason = ''
+      let failsafe_applied = false
+      if (backorder && !policy_ok) {
+        try {
+          if (invItemId) {
+            const rb = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: false}) { inventoryItem { tracked } userErrors { message } } }')
+            actual_tracked = rb?.data?.inventoryItemUpdate?.inventoryItem?.tracked ?? actual_tracked
+            failsafe_applied = true
+          }
+          await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
+        } catch (e) { console.warn('[set_variant_backorder] failsafe untrack failed:', e) }
+        const allErrTxt = errs.concat(gqlTopErrors)
+        reason = 'Could not set inventoryPolicy to CONTINUE' + (actual_policy ? (' (Shopify reports ' + actual_policy + ')') : '') + '. '
+          + (allErrTxt.length ? ('SHOPIFY SAID: ' + allErrTxt.join(' | ') + '. ') : 'Shopify returned no error text. ')
+          + 'If it mentions a field not existing, the pinned Shopify API version has dropped that mutation - '
+          + 'the edge function needs updating. If it mentions access denied, regenerate the Admin API token. '
+          + (failsafe_applied ? 'Left the variant UNTRACKED so it stays orderable (no backorder badge).' : 'WARNING: variant may be unorderable - check it manually.')
+      }
+
+      let template_result = null
+      if (policy_ok && prodId && !reconciledProducts.has(prodId)) {
+        reconciledProducts.add(prodId)
+        template_result = await reconcileProductTemplate(gql, prodId)
+      }
+
+      perVariant.push({
+        variant: variantId, product: prodId, ok: backorder ? policy_ok : true, errors: errs,
+        reason, actual_policy, actual_tracked, policy_ok, failsafe_applied,
+        restock_date: effRestockDate || null, eta_preserved, template: template_result,
+        orderable: (actual_tracked === false) || policy_ok
+      })
     }
-    // Keep the PRODUCT template in step with its variants automatically. Only when the
-    // variant write actually landed - reconciling off a failed update would be guessing.
-    let template_result = null
-    if (policy_ok && prodId) { template_result = await reconcileProductTemplate(gql, prodId) }
-    const effective_action = (backorder && !policy_ok) ? 'reverted' : (backorder ? 'backorder' : 'reverted')
-    try { await db.from('shopify_sync_log').insert({ pn: sku, action: effective_action, trigger_source: body.trigger_source || 'erp_manual', restock_date: (effective_action === 'backorder' ? (effRestockDate || null) : null) }) } catch (e) { console.warn('[set_variant_backorder] log failed:', e) }
-    const ok = backorder ? policy_ok : true
-    return new Response(JSON.stringify({ok, variant: variantId, backorder, errors: errs, graphql_errors: gqlTopErrors, reason, actual_policy, actual_tracked, expected_policy, policy_ok, failsafe_applied, restock_date: effRestockDate || null, eta_preserved, template: template_result, orderable: (actual_tracked === false) || policy_ok}), {headers:{...CORS,'Content-Type':'application/json'}})
+
+    const ok = perVariant.every((r:any) => r.ok)
+    // The badge on the ERP's own side (driven by shopify_sync_log) has to reflect whether
+    // backorder genuinely went into effect anywhere - "some succeeded, one page failed" is
+    // still a real backorder state, not a no-op, so it must not log as 'reverted' just because
+    // ok (which strictly means ALL succeeded, for the caller's own success/fail display) is
+    // false. Using perVariant.some() here instead of ok itself keeps those two concerns
+    // separate: ok tells the calling UI whether to show this as a clean success, the log tells
+    // the ERP's own badge whether real backorder action was actually taken.
+    const anySucceeded = perVariant.some((r:any) => r.ok)
+    const effective_action = backorder ? (anySucceeded ? 'backorder' : 'reverted') : 'reverted'
+    try { await db.from('shopify_sync_log').insert({ pn: sku, action: effective_action, trigger_source: body.trigger_source || 'erp_manual', restock_date: (effective_action === 'backorder' ? (restockDate || null) : null) }) } catch (e) { console.warn('[set_variant_backorder] log failed:', e) }
+    // Existing callers read this action's OLD single-variant response shape directly at the
+    // TOP level (d.template, d.reason, d.actual_policy, d.actual_tracked, d.failsafe_applied,
+    // d.errors) - one caller's own error-reporting depends on d.reason specifically, and its
+    // comment notes that was already fixed once before from exactly this kind of field going
+    // missing. Rather than risk quietly breaking that again, the first variant's own outcome is
+    // still spread at the top level (identical to today for the common single-variant case,
+    // since results[0] IS the only result there), with the FULL per-variant breakdown
+    // additionally available under variants_updated/results for anything that wants it.
+    const primary = perVariant[0] || {}
+    const flatErrors = perVariant.reduce((acc:string[], r:any) => acc.concat(r.errors || []), [])
+    return new Response(JSON.stringify({
+      ok, variant: primary.variant, backorder,
+      errors: flatErrors, graphql_errors: gqlTopErrors,
+      reason: primary.reason || '', actual_policy: primary.actual_policy, actual_tracked: primary.actual_tracked,
+      expected_policy: 'CONTINUE', policy_ok: primary.policy_ok, failsafe_applied: primary.failsafe_applied,
+      restock_date: primary.restock_date, eta_preserved: primary.eta_preserved, template: primary.template,
+      orderable: primary.orderable,
+      variants_updated: perVariant.length, held_skipped: skippedHeld, results: perVariant
+    }), {headers:{...CORS,'Content-Type':'application/json'}})
   }
-  if (body.action === 'list_product_templates') {
+if (body.action === 'list_product_templates') {
     const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
     const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
     if (!store || !key) return new Response(JSON.stringify({error:'Missing Shopify credentials'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
