@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.62</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.63</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -457,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.62';
+const TGK_ERP_VERSION = 'v22.63';
 const TGK_ERP_BUILD_DATE = '2026-08-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1845,6 +1845,15 @@ function backorderBadge(pn){
 }
 function findAsm(pn){
   if(!pn)return undefined;
+  // O(1) fast path: the index map already exists and is kept in lockstep with S.assemblies via
+  // the setter interceptor above, but this function - the single most-called lookup in the
+  // whole app - was still doing a full linear scan on every call instead of using it. Falls
+  // back to the scan only if the map genuinely has no entry (e.g. before the first
+  // buildLookupMaps() has ever run), so behavior is unchanged, just faster in the common case.
+  if(S._asmIdx){
+    var hit=S._asmIdx[pn];
+    if(hit)return hit;
+  }
   var a=S.assemblies.find(function(x){return x.pn===pn;});
   if(a)return a;
   return S.assemblies.find(function(x){return x.new_sku&&x.new_sku===pn;});
@@ -9756,8 +9765,15 @@ async function executeShopifyImport(){
 
   let existing=new Set();
   try{
-    const {data:existingRows,error}=await db.from('sales').select('order_number,pn').limit(500000);
-    if(!error&&existingRows) existing=new Set(existingRows.map(s=>(s.order_number||'')+'||'+(s.pn||'')));
+    // This used a single .limit(500000) call, which Supabase/PostgREST silently caps at its own
+    // configured max-rows setting (commonly 1000) regardless of what's asked for - on a sales
+    // table that has grown past that cap, this dedup check would quietly miss older orders,
+    // meaning the Shopify import could re-import orders that already exist. fetchAll already
+    // exists in this file for exactly this reason (used for bom_items) - using it here instead
+    // of a raw .limit() actually gets every row, not however many the server feels like capping
+    // the response at.
+    const existingRows=await fetchAll((f,t)=>db.from('sales').select('order_number,pn').range(f,t));
+    existing=new Set(existingRows.map(s=>(s.order_number||'')+'||'+(s.pn||'')));
   }catch(e){
     existing=new Set(S.sales.map(s=>(s.order_number||'')+'||'+(s.pn||'')));
     toast('<span class="ic ic-alert"></span>Could not query full DB for dedup — using in-memory (may miss older records)');
@@ -9986,7 +10002,7 @@ async function syncOrdersNow(){
             shipping_country:_sAddr.country_code||_sAddr.country||null,
             shopify_order_id:String(order.id||''),
             shopify_line_item_id:String(li.id||''),
-            discount_code:(order.discount_codes?.length?order.discount_codes[0].code:null)||(order.note_attributes?.find(a=>a.name==='discount_code')?.value)||null,
+            discount_code:(order.discount_codes?.length?order.discount_codes[0].code:null)||null,
             ...(salesHavePrice()?{unit_price:shopifyLineUnitPrice(li),price_source:'shopify'}:{}),
           }).select().single();
           if(data){
@@ -10201,7 +10217,7 @@ async function importOrdersFromShopify(){
             order_number:orderNum,pn,qty:li.quantity||1,
             source:'Shopify Import',fulfillment_status:fs,
             sale_date:(order.created_at||new Date().toISOString()).slice(0,10),
-            discount_code:(order.discount_codes?.length?order.discount_codes[0].code:null)||(order.note_attributes?.find(a=>a.name==='discount_code')?.value)||null,
+            discount_code:(order.discount_codes?.length?order.discount_codes[0].code:null)||null,
             ...(salesHavePrice()?{unit_price:shopifyLineUnitPrice(li),price_source:'shopify'}:{}),
           }).select().single();
           if(data){S.sales=[data,...S.sales];imported++;}
@@ -16064,6 +16080,14 @@ function _findPart(childPn){
   if(!childPn)return null;
   const raw=String(childPn);
   const clean=raw.trim().toUpperCase();
+  // O(1) fast path, same reasoning as findAsm above: buildLookupMaps() already indexes parts by
+  // raw pn, raw new_sku, and both uppercased - exactly the same variations this function's
+  // linear-scan chain re-derives by hand below. Falls back to that chain only if the map has no
+  // entry, so every existing match case still behaves identically.
+  if(S._partIdx){
+    var hit=S._partIdx[raw]||S._partIdx[clean];
+    if(hit)return hit;
+  }
   let p=S.parts.find(x=>x.pn===raw);if(p)return p;
   p=S.parts.find(x=>x.pn===clean);if(p)return p;
   p=S.parts.find(x=>(x.pn||'').toUpperCase()===clean);if(p)return p;
@@ -22069,7 +22093,17 @@ async function checkResolutionTracking(){
         S.warrantyClaims=(S.warrantyClaims||[]).map(function(w){return w.id===r.id?{...w,tracking_number:r.tracking,carrier:r.carrier,status:'Shipped'}:w;});
       } else {
         S.shipmentErrors=(S.shipmentErrors||[]).map(function(e){return e.id===r.id?{...e,tracking_number:r.tracking,carrier:r.carrier,status:e.status==='Open'?'Reshipping':e.status}:e;});
-        db.from('shipment_errors').update({status:'Reshipping'}).eq('id',r.id).eq('status','Open').then(function(){});
+        // Same class of bug found and fixed twice already this session (pack_log, the
+        // backorder log): a silent .then(function(){}) means an RLS rejection here would leave
+        // the LOCAL state saying "Reshipping" while the database still says "Open" - correct
+        // until the next reload, then it quietly reverts with no indication why.
+        db.from('shipment_errors').update({status:'Reshipping'}).eq('id',r.id).eq('status','Open')
+          .then(function(res){
+            if(res&&res.error){
+              console.warn('[tracking sync] shipment_errors status update failed:',res.error.message);
+              toast('Tracking found, but status update failed to save — check console',6000);
+            }
+          },function(e){console.warn('[tracking sync] shipment_errors status update threw:',e);});
       }
     });
     toast('Found tracking for '+updated.length+' order'+(updated.length!==1?'s':''),4000);
@@ -27090,11 +27124,16 @@ function setChatTab(tab){
     if(inputWrap)inputWrap.style.display='none';
     _renderChatAlerts();
     if(_chat.unread>0){
+      // Same silent-write class as pack_log/backorder-log/shipment_errors, lower stakes here
+      // (a read-receipt, not inventory) but the same fix: only mark things read locally once
+      // the write actually confirms - otherwise a failed write shows 0 unread now and the same
+      // alerts silently reappear as unread on the next reload, with no indication why.
       db.from('chat_notifications').update({read_at:new Date().toISOString()})
-        .eq('to_email',S.currentUser).is('read_at',null).then(function(){
+        .eq('to_email',S.currentUser).is('read_at',null).then(function(res){
+          if(res&&res.error){console.warn('[chat] mark-read failed:',res.error.message);return;}
           _chat.alerts.forEach(function(a){if(!a.read_at)a.read_at=new Date().toISOString();});
           _chat.unread=0;_updateChatBadge();
-        });
+        },function(e){console.warn('[chat] mark-read threw:',e);});
     }
   }
 }
