@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.63</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.64</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -457,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.63';
+const TGK_ERP_VERSION = 'v22.64';
 const TGK_ERP_BUILD_DATE = '2026-08-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -13545,6 +13545,15 @@ window.addEventListener('message', async function(event){
   // that manages to embed the ERP could inject one.
   if(event.origin!=='https://command.tgkmotorsport.com')return;
   var d=event.data;
+
+  if(d&&d.source==='TGK_CC'&&d.type==='SIGN_OUT'){
+    // The Command Center's OWN sign-out already asked "are you sure?" - this is the follow-
+    // through, not a fresh request, so it must not pop a second confirmation in here.
+    try{ if(typeof _doSignOutNow==='function')await _doSignOutNow(); }
+    catch(e){console.warn('[SSO] remote sign-out failed:',e);}
+    return;
+  }
+
   if(!d||d.source!=='TGK_CC'||d.type!=='AUTH_TOKEN'||!d.access_token)return;
   try{
     if(typeof db==='undefined'||!db||!db.auth){
@@ -13552,9 +13561,14 @@ window.addEventListener('message', async function(event){
       setTimeout(function(){try{window.dispatchEvent(new MessageEvent('message',{data:d,origin:event.origin}));}catch(_){}} ,600);
       return;
     }
-    // Already signed in: leave the working session alone rather than rebuilding it.
+    // Only skip when it is genuinely the SAME identity already active. The original version
+    // skipped whenever ANY session existed, which was right for a normal page load but wrong
+    // for exactly the case that matters here: someone signs out of the Command Center and back
+    // in as a different person while this iframe is still sitting open with the old session.
+    // That is a deliberate identity change and has to take effect, not be silently ignored.
     var cur=await db.auth.getSession();
-    if(cur&&cur.data&&cur.data.session){return;}
+    var curEmail=cur&&cur.data&&cur.data.session&&cur.data.session.user?(cur.data.session.user.email||'').toLowerCase():null;
+    if(curEmail&&d.email&&curEmail===String(d.email).toLowerCase()){return;}
     var res=await db.auth.setSession({
       access_token:d.access_token,
       refresh_token:d.refresh_token||''
@@ -13652,14 +13666,21 @@ async function doLogin(){
   if(window._appRestart)window._appRestart(1);
 }
 
-async function doLogout(){
-  if(!confirm('Sign out?'))return;
+// The actual sign-out work, separated from the confirmation prompt. A remote SIGN_OUT signal
+// from the Command Center means the person already confirmed intent there - popping a SECOND
+// "Sign out?" dialog inside this iframe for something they didn't directly click would be
+// confusing, not careful.
+async function _doSignOutNow(){
   await db.auth.signOut();
   S.currentUserId=null;S.currentUser=null;S.currentRole=null;S.currentFullName=null;
   const su=document.getElementById('sidebar-user');if(su)su.style.display='none';
   const un=document.getElementById('nav-users');if(un)un.style.display='none';
   const as=document.getElementById('admin-section');if(as)as.style.display='none';
   showAuthGate();
+}
+async function doLogout(){
+  if(!confirm('Sign out?'))return;
+  await _doSignOutNow();
 }
 
 async function doForgotPassword(){
