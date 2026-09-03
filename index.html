@@ -393,7 +393,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.66</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v22.67</span>
       <span class="t3xxs" id="erp-build-date">2026-07-21</span>
     </div>
   </div>
@@ -457,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.66';
+const TGK_ERP_VERSION = 'v22.67';
 const TGK_ERP_BUILD_DATE = '2026-08-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -3026,14 +3026,28 @@ window.openDiscountTracker=function(){
     if(!x||!x.discount_code)return;
     if(typeof isInternal==='function'&&isInternal(x.order_number))return;
     var code=String(x.discount_code).trim();if(!code)return;
-    var key=code.toUpperCase();
-    var m=map[key]||(map[key]={code:code,orders:{},units:0,gross:0,net:0,est:0,lines:0,dealer:null,dealerChecked:false});
+
+    // Dealers who order through TGK tack their own PO number onto the same reusable discount
+    // code every time (e.g. "ecs 1427546", "ecs 1420807") - parseDealerPO already exists to
+    // recognize this. It was only ever used here to look up the dealer's display name; the
+    // GROUPING key still used the full raw string, so every single order looked like a brand
+    // new one-time code instead of the same dealer code being reused. Grouping by the dealer's
+    // own id instead - rather than by whatever prefix text they happened to type - means this
+    // stays correct even if the prefix's exact casing or spacing varies between orders.
+    var parsedPO=null,key=code.toUpperCase(),groupCode=code;
+    if(typeof parseDealerPO==='function'&&Array.isArray(S.dealers)){
+      try{parsedPO=parseDealerPO(code,S.dealers);}catch(e){}
+    }
+    if(parsedPO&&parsedPO.dealer){
+      key='DEALERPO:'+parsedPO.dealer.id;
+      groupCode=(parsedPO.dealer.po_code_prefix||'').trim()||code;
+    }
+    var m=map[key]||(map[key]={code:groupCode,orders:{},units:0,gross:0,net:0,est:0,lines:0,dealer:null,dealerChecked:false,poNumbers:[]});
     if(!m.dealerChecked){
       m.dealerChecked=true;
-      if(typeof parseDealerPO==='function'&&Array.isArray(S.dealers)){
-        try{var pd=parseDealerPO(code,S.dealers);if(pd&&pd.dealer)m.dealer=pd.dealer.name||'Dealer';}catch(e){}
-      }
+      if(parsedPO&&parsedPO.dealer)m.dealer=parsedPO.dealer.name||'Dealer';
     }
+    if(parsedPO&&parsedPO.poNumber&&m.poNumbers.indexOf(parsedPO.poNumber)===-1)m.poNumbers.push(parsedPO.poNumber);
     var q=Number(x.qty)||1;
     var a=(S._asmIdx&&S._asmIdx[x.pn])?S._asmIdx[x.pn]:(typeof findAsm==='function'?findAsm(x.pn):null);
     var list=a?(typeof listPriceOf==='function'?listPriceOf(a):(Number(a.msrp)||0)):0;
@@ -3048,7 +3062,7 @@ window.openDiscountTracker=function(){
   });
   window._dtRows=Object.keys(map).map(function(k){
     var m=map[k];var orders=Object.keys(m.orders).length;var disc=Math.max(0,m.gross-m.net);
-    return{code:m.code,dealer:m.dealer,orders:orders,units:m.units,gross:m.gross,disc:disc,pct:m.gross>0?disc/m.gross:0,est:m.est,lines:m.lines};
+    return{code:m.code,dealer:m.dealer,orders:orders,units:m.units,gross:m.gross,disc:disc,pct:m.gross>0?disc/m.gross:0,est:m.est,lines:m.lines,poNumbers:m.poNumbers};
   });
   var old=document.getElementById('dt-overlay');if(old)old.remove();
   var ov=document.createElement('div');ov.id='dt-overlay';
@@ -3064,7 +3078,18 @@ window.openDiscountTracker=function(){
 };
 window._dtRender=function(sortKey){
   window._dtSort=sortKey;
-  var rows=(window._dtRows||[]).slice();
+  var searchBox=document.getElementById('dt-search');
+  var searchQ=(searchBox?searchBox.value:(window._dtSearch||'')).trim().toLowerCase();
+  window._dtSearch=searchQ;
+  var allRows=(window._dtRows||[]);
+  var rows=allRows.slice();
+  if(searchQ){
+    rows=rows.filter(function(r){
+      if(String(r.code||'').toLowerCase().indexOf(searchQ)>=0)return true;
+      if(String(r.dealer||'').toLowerCase().indexOf(searchQ)>=0)return true;
+      return (r.poNumbers||[]).some(function(po){return String(po).toLowerCase().indexOf(searchQ)>=0;});
+    });
+  }
   rows.sort(function(a,b){
     if(sortKey==='orders')return b.orders-a.orders||b.disc-a.disc;
     if(sortKey==='pct')return b.pct-a.pct||b.disc-a.disc;
@@ -3072,7 +3097,7 @@ window._dtRender=function(sortKey){
     return b.disc-a.disc;
   });
   var bodyEl=document.getElementById('dt-body');if(!bodyEl)return;
-  if(!rows.length){bodyEl.innerHTML='<div class="section-empty" style="padding:30px">No discount codes have been used on any orders yet.</div>';return;}
+  if(!allRows.length){bodyEl.innerHTML='<div class="section-empty" style="padding:30px">No discount codes have been used on any orders yet.</div>';return;}
   var totCodes=rows.length;
   var totOrders=rows.reduce(function(t,r){return t+r.orders;},0);
   var totDisc=rows.reduce(function(t,r){return t+r.disc;},0);
@@ -3082,29 +3107,37 @@ window._dtRender=function(sortKey){
   var kpi=function(label,val){return '<div style="flex:1;min-width:130px;background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:10px 12px"><div class="t3s">'+label+'</div><div style="font-size:var(--t-xl);font-weight:700;color:var(--text)">'+val+'</div></div>';};
   var sortBtn=function(key,label){return '<button class="filter-chip '+(window._dtSort===key?'on-teal':'')+'" onclick="_dtRender(\''+key+'\')">'+label+'</button>';};
   var body='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'
-    +kpi('Codes used',totCodes)
+    +kpi(searchQ?'Codes matching':'Codes used',totCodes)
     +kpi('Discounted orders',totOrders)
     +kpi('Units',totUnits.toLocaleString())
     +kpi('Total came off',fc(totDisc))
     +'</div>'
     +'<div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;flex-wrap:wrap">'
+    +'<input id="dt-search" type="text" placeholder="Search code, dealer, or PO #..." value="'+escHtml(searchBox?searchBox.value:(window._dtSearch||''))+'" '
+    +'oninput="_dtRender(window._dtSort||\'disc\')" style="flex:1;min-width:180px;padding:6px 10px;font-size:var(--t-sm);background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-md);color:var(--text)">'
     +'<span class="t3s">Sort:</span>'+sortBtn('disc','Amount off')+sortBtn('orders','Times used')+sortBtn('pct','Avg % off')+sortBtn('code','Code')
-    +'<button class="btn btn-sm" style="margin-left:auto;color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="_dtExport()" title="Download this table as CSV">Export CSV</button>'
+    +'<button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="_dtExport()" title="Download this table as CSV">Export CSV</button>'
     +'</div>'
-    +'<div style="background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden;max-height:52vh;overflow-y:auto">'
-    +'<table><thead class="sticky-header"><tr><th>Code</th><th>Type</th><th style="text-align:right">Times used</th><th style="text-align:right">Units</th><th style="text-align:right">List value</th><th style="text-align:right">Came off</th><th style="text-align:right">Avg % off</th></tr></thead><tbody>';
-  rows.forEach(function(r){
-    var type=r.dealer?('<span style="color:var(--orange)">Dealer: '+escHtml(r.dealer)+'</span>'):'<span style="color:var(--purple)">Promo</span>';
-    var estMark=r.est>0?'<span title="Some lines estimated - actual paid price not recorded" style="color:var(--text3)"> *</span>':'';
-    body+='<tr><td class="pn" style="color:var(--purple);font-weight:700">'+escHtml(r.code)+'</td>'
-      +'<td style="font-size:var(--t-sm)">'+type+'</td>'
-      +'<td style="text-align:right;font-weight:700">'+r.orders+'</td>'
-      +'<td style="text-align:right">'+r.units+'</td>'
-      +'<td style="text-align:right;color:var(--text3)">'+fc(r.gross)+'</td>'
-      +'<td style="text-align:right;font-weight:700;color:var(--red)">'+fc(r.disc)+estMark+'</td>'
-      +'<td style="text-align:right">'+(r.pct*100).toFixed(1)+'%</td></tr>';
-  });
-  body+='</tbody></table></div>';
+    +'<div style="background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden;max-height:52vh;overflow-y:auto">';
+  if(!rows.length){
+    body+='<div class="section-empty" style="padding:24px">No codes or PO numbers match "'+escHtml(searchQ)+'".</div>';
+  }else{
+    body+='<table><thead class="sticky-header"><tr><th>Code</th><th>Type</th><th style="text-align:right">Times used</th><th style="text-align:right">Units</th><th style="text-align:right">List value</th><th style="text-align:right">Came off</th><th style="text-align:right">Avg % off</th></tr></thead><tbody>';
+    rows.forEach(function(r){
+      var type=r.dealer?('<span style="color:var(--orange)">Dealer: '+escHtml(r.dealer)+'</span>'):'<span style="color:var(--purple)">Promo</span>';
+      var estMark=r.est>0?'<span title="Some lines estimated - actual paid price not recorded" style="color:var(--text3)"> *</span>':'';
+      var poTitle=(r.poNumbers&&r.poNumbers.length)?(' title="POs: '+escHtml(r.poNumbers.slice(0,20).join(', '))+(r.poNumbers.length>20?', +'+(r.poNumbers.length-20)+' more':'')+'"'):'';
+      body+='<tr><td class="pn" style="color:var(--purple);font-weight:700"'+poTitle+'>'+escHtml(r.code)+'</td>'
+        +'<td style="font-size:var(--t-sm)">'+type+'</td>'
+        +'<td style="text-align:right;font-weight:700">'+r.orders+'</td>'
+        +'<td style="text-align:right">'+r.units+'</td>'
+        +'<td style="text-align:right;color:var(--text3)">'+fc(r.gross)+'</td>'
+        +'<td style="text-align:right;font-weight:700;color:var(--red)">'+fc(r.disc)+estMark+'</td>'
+        +'<td style="text-align:right">'+(r.pct*100).toFixed(1)+'%</td></tr>';
+    });
+    body+='</tbody></table>';
+  }
+  body+='</div>';
   if(!hp||anyEst){
     body+='<div class="t3s" style="margin-top:10px;line-height:1.5">'
       +(!hp?'<b style="color:var(--orange)">Note:</b> actual paid prices are not recorded (sales.unit_price), so promo-code amounts are estimated from list price and dealer rates. Run the ROI tracking migration to capture exact figures. ':'')
@@ -3112,7 +3145,10 @@ window._dtRender=function(sortKey){
       +'</div>';
   }
   bodyEl.innerHTML=body;
+  var sb=document.getElementById('dt-search');
+  if(sb&&searchQ){ sb.focus(); var v=sb.value; sb.value=''; sb.value=v; }
 };
+
 window._dtExport=function(){
   var rows=(window._dtRows||[]).slice();
   if(!rows.length){toast('Nothing to export');return;}
@@ -4309,7 +4345,21 @@ function renderSales(){
   const q=(sf.search||S.searchQ||'').toLowerCase();
 
   let list=allGrouped;
-  if(q)list=list.filter(s=>s.pn.toLowerCase().includes(q)||(s.order_number||'').toLowerCase().includes(q)||(s.source||'').toLowerCase().includes(q)||(s.customer_name||'').toLowerCase().includes(q));
+  if(q)list=list.filter(s=>{
+    if(s.pn.toLowerCase().includes(q))return true;
+    if((s.order_number||'').toLowerCase().includes(q))return true;
+    if((s.source||'').toLowerCase().includes(q))return true;
+    if((s.customer_name||'').toLowerCase().includes(q))return true;
+    if((s.discount_code||'').toLowerCase().includes(q))return true;
+    // "PO#" on an order is parsed out of its discount code (dealer prefix + PO number, e.g.
+    // "ecs 1427546" -> PO 1427546) - a search for just the PO number itself, without the
+    // dealer's prefix, needs this same parsing or it would never match anything.
+    if(s.discount_code){
+      var _po=parseDealerPO(s.discount_code,S.dealers);
+      if(_po&&_po.poNumber&&_po.poNumber.toLowerCase().includes(q))return true;
+    }
+    return false;
+  });
   if(sf.fstatus){
     const allowed=new Set(sf.fstatus.split('|'));
     const _inclRef=allowed.has('Refunded');
@@ -14512,6 +14562,22 @@ function listValuationSnapshots(){
     .map(function(k){return S.settings[k];}).filter(function(v){return v&&v.date;})
     .sort(function(a,b){return b.date.localeCompare(a.date);});
 }
+var _rptSearchTimer=null;
+function _rptSearchDebounced(){
+  // A full render() on every keystroke would re-filter potentially thousands of rows each time
+  // - fine for a single click (date presets do this synchronously elsewhere in this same
+  // screen), too much for continuous typing. A short debounce keeps typing smooth without
+  // losing the "updates as you type" feel.
+  clearTimeout(_rptSearchTimer);
+  _rptSearchTimer=setTimeout(function(){
+    render();
+    // render() rebuilds this whole view's innerHTML, including the search box itself - without
+    // explicitly refocusing the freshly-created input, every debounced update would silently
+    // kick the person out of the field they were actively typing into.
+    var el=document.getElementById('rpt-search-input');
+    if(el){ el.focus(); var v=el.value; el.value=''; el.value=v; }
+  },180);
+}
 function renderReports(){
   const rs=S.rptState||{};
   const selId=rs.sel||null;
@@ -14522,7 +14588,7 @@ function renderReports(){
     const items=REPORT_DEFS.filter(d=>d.cat===cat);
     return `<div style="margin-bottom:14px">
       <div style="font-size:var(--t-xs);font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text3);margin-bottom:6px">${cat}</div>
-      ${items.map(d=>`<button onclick="S.rptState={...S.rptState,sel:'${d.id}',preview:null};render()" style="display:flex;align-items:center;gap:8px;width:100%;padding:8px 10px;border-radius:var(--r-md);border:1px solid ${selId===d.id?'rgba(13,148,136,.35)':'transparent'};background:${selId===d.id?'var(--teal-dim)':'transparent'};cursor:pointer;text-align:left;transition:all .12s;margin-bottom:2px" onmouseenter="if('${d.id}'!=='${selId||''}')this.style.background='var(--bg3)'" onmouseleave="if('${d.id}'!=='${selId||''}')this.style.background='transparent'">
+      ${items.map(d=>`<button onclick="S.rptState={...S.rptState,sel:'${d.id}',preview:null,search:''};render()" style="display:flex;align-items:center;gap:8px;width:100%;padding:8px 10px;border-radius:var(--r-md);border:1px solid ${selId===d.id?'rgba(13,148,136,.35)':'transparent'};background:${selId===d.id?'var(--teal-dim)':'transparent'};cursor:pointer;text-align:left;transition:all .12s;margin-bottom:2px" onmouseenter="if('${d.id}'!=='${selId||''}')this.style.background='var(--bg3)'" onmouseleave="if('${d.id}'!=='${selId||''}')this.style.background='transparent'">
         <span style="font-size:var(--t-xl);flex-shrink:0">${d.icon}</span>
         <div style="min-width:0">
           <div style="font-size:var(--t-md);font-weight:${selId===d.id?'700':'500'};color:${selId===d.id?'var(--teal)':'var(--text2)'}">${d.label}</div>
@@ -14566,7 +14632,15 @@ function renderReports(){
   if(!rs.preview){S.rptState={...S.rptState,preview:rows};}
 
   const hasRows=rows&&rows.data&&rows.data.length>0;
-  const previewData=hasRows?rows.data.slice(0,50):[];
+  // Reports had no search at all - the preview only ever showed the first 50 rows with no way
+  // to find anything past that short of exporting to CSV/Excel and searching there instead.
+  // Generic across every report type (dozens of different column sets) rather than hardcoding
+  // field names per report: stringify every cell in a row and check for a match, same approach
+  // as searching an object you don't know the shape of ahead of time.
+  const rptSearchQ=(rs.search||'').trim().toLowerCase();
+  const allData=hasRows?rows.data:[];
+  const filteredData=rptSearchQ?allData.filter(r=>Object.values(r).some(v=>String(v??'').toLowerCase().includes(rptSearchQ))):allData;
+  const previewData=filteredData.slice(0,50);
   const cols=hasRows?rows.cols:[];
   const CHARTABLE=["sales_by_month","sales_by_sku","sales_by_customer","sales_by_dealer","inv_valuation","inv_velocity","po_by_vendor"];
   const canChart=CHARTABLE.includes(def.id)&&hasRows;
@@ -14612,9 +14686,12 @@ function renderReports(){
 
       ${!hasRows?`<div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-md);padding:48px;text-align:center;color:var(--text3)">No data for this report with the current filters</div>`:canChart&&S.rptState.chartView?`<div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-md);padding:24px"><canvas id="rpt-chart-canvas" style="max-height:460px;width:100%"></canvas></div>` :`
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden">
-        <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
-          <span class="t3s">Preview — first ${Math.min(50,rows.data.length)} of ${rows.data.length.toLocaleString()} rows</span>
-          <span style="font-size:var(--t-sm);color:var(--teal);font-weight:600">Export includes all rows</span>
+        <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <input type="text" id="rpt-search-input" placeholder="Search this report\u2026" value="${escHtml(rs.search||'')}"
+            oninput="S.rptState={...S.rptState,search:this.value};_rptSearchDebounced()"
+            style="flex:1;min-width:180px;padding:6px 10px;font-size:var(--t-sm);background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);color:var(--text)">
+          <span class="t3s">${rptSearchQ?`${filteredData.length.toLocaleString()} of ${rows.data.length.toLocaleString()} rows match`:`Preview \u2014 first ${Math.min(50,rows.data.length)} of ${rows.data.length.toLocaleString()} rows`}</span>
+          <span style="font-size:var(--t-sm);color:var(--teal);font-weight:600" title="The search box above only filters what you see on screen \u2014 CSV/Excel export always includes every row regardless of any search.">Export includes all rows</span>
         </div>
         <div class="tbl-wrap" style="max-height:calc(100vh - 340px);overflow-y:auto;overflow-x:auto">
         <table><thead class="sticky-header"><tr>${cols.map(c=>`<th style="white-space:nowrap">${c}</th>`).join('')}</tr></thead><tbody>
