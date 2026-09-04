@@ -457,7 +457,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.70';
+const TGK_ERP_VERSION = 'v22.71';
 const TGK_ERP_BUILD_DATE = '2026-08-21';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -894,6 +894,76 @@ function toast(msg,ms,onClick){
   clearTimeout(el._t);
   el._t=setTimeout(()=>{el.classList.remove('show');el.onclick=null;el.style.cursor='';},ms||2500);
 }
+/* ---- Error logging: the ERP records its own failures to error_log (shared
+   with the Support Center). Captures uncaught errors, unhandled rejections, and
+   everything sent to console.error. Deduped, best-effort, never throws.
+   View with Ctrl+Shift+E or showErrorLog(). ---- */
+window._errSeen = window._errSeen || {};
+async function logError(message, detail){
+  try{
+    var msg=String(message||'').slice(0,600); if(!msg) return;
+    var sig=msg.slice(0,120), now=Date.now();
+    if(window._errSeen[sig] && (now-window._errSeen[sig])<60000) return;
+    window._errSeen[sig]=now;
+    if(typeof db==='undefined' || !db) return;
+    await db.from('error_log').insert({
+      user_email: (typeof S!=='undefined' && S.currentUser) ? String(S.currentUser) : null,
+      page: (typeof S!=='undefined' && S.view) ? String(S.view) : null,
+      message: msg,
+      detail: detail ? String(detail).slice(0,4000) : null,
+      url: (typeof location!=='undefined') ? location.href : null,
+      user_agent: (typeof navigator!=='undefined') ? navigator.userAgent : null,
+      app_version: (typeof ERP_VERSION!=='undefined') ? ('ERP '+ERP_VERSION) : 'ERP'
+    });
+  }catch(_e){ /* never let logging break the app */ }
+}
+window.logError=logError;
+window.addEventListener('error', function(ev){ try{ logError((ev&&(ev.message||(ev.error&&ev.error.message)))||'Uncaught error', ev&&ev.error&&ev.error.stack); }catch(_e){} });
+window.addEventListener('unhandledrejection', function(ev){ try{ var r=ev&&ev.reason; logError('Unhandled rejection: '+((r&&r.message)||r||''), r&&r.stack); }catch(_e){} });
+(function(){ var _ce=console.error.bind(console); console.error=function(){ try{ var a=Array.prototype.slice.call(arguments); logError(a.map(function(x){return x&&x.message?x.message:String(x);}).join(' '), null); }catch(_e){} return _ce.apply(null, arguments); }; })();
+document.addEventListener('keydown', function(e){ if((e.ctrlKey||e.metaKey)&&e.shiftKey&&(e.key==='E'||e.key==='e')){ e.preventDefault(); showErrorLog(); } });
+function showErrorLog(){
+  var ov=document.getElementById('errlog-overlay'); if(ov) ov.remove();
+  ov=document.createElement('div'); ov.id='errlog-overlay';
+  ov.style.cssText='position:fixed;inset:0;z-index:3000;background:rgba(10,14,16,.6);display:flex;align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto';
+  ov.addEventListener('click', function(e){ if(e.target===ov) ov.remove(); });
+  ov.innerHTML='<div style="background:#141618;color:#EDF1F0;border:1px solid #2a2e30;border-radius:12px;max-width:960px;width:100%;padding:18px;box-shadow:0 10px 40px rgba(0,0,0,.4)">'
+    +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px"><strong style="flex:1;font-size:16px">System Errors (last 100)</strong>'
+    +'<button onclick="loadErrorLogInto()" style="padding:5px 10px;border-radius:6px;border:1px solid #2a2e30;background:transparent;color:#EDF1F0;cursor:pointer">Refresh</button>'
+    +'<button onclick="clearErrorLogErp()" style="padding:5px 10px;border-radius:6px;border:1px solid #2a2e30;background:transparent;color:#e05555;cursor:pointer">Clear all</button>'
+    +'<button onclick="var o=document.getElementById(\'errlog-overlay\');if(o)o.remove()" style="padding:5px 10px;border-radius:6px;border:1px solid #2a2e30;background:transparent;color:#EDF1F0;cursor:pointer">Close</button></div>'
+    +'<div id="errlog-body" style="font-size:13px">Loading\u2026</div></div>';
+  document.body.appendChild(ov);
+  loadErrorLogInto();
+}
+window.showErrorLog=showErrorLog;
+async function loadErrorLogInto(){
+  var box=document.getElementById('errlog-body'); if(!box) return;
+  try{
+    var res=await db.from('error_log').select('*').order('created_at',{ascending:false}).limit(100);
+    if(res.error) throw res.error;
+    var rows=res.data||[];
+    if(!rows.length){ box.innerHTML='<div style="color:#7a8a86;padding:12px">No errors logged \u2014 all clear.</div>'; return; }
+    function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+    function ago(d){ var m=Math.floor((Date.now()-new Date(d).getTime())/60000); if(m<60)return m+'m ago'; var h=Math.floor(m/60); if(h<24)return h+'h ago'; return Math.floor(h/24)+'d ago'; }
+    box.innerHTML='<table style="width:100%;border-collapse:collapse">'
+      +'<thead><tr style="text-align:left;color:#7a8a86;font-size:11px"><th style="padding:4px">When</th><th>Where</th><th>User</th><th>Ver</th><th>Message</th></tr></thead><tbody>'
+      +rows.map(function(r){return '<tr style="border-top:1px solid #2a2e30">'
+        +'<td style="padding:4px;white-space:nowrap;color:#7a8a86">'+esc(ago(r.created_at))+'</td>'
+        +'<td style="color:#7a8a86">'+esc(r.page||'\u2014')+'</td>'
+        +'<td style="color:#7a8a86">'+esc(r.user_email||'\u2014')+'</td>'
+        +'<td style="color:#7a8a86">'+esc(r.app_version||'\u2014')+'</td>'
+        +'<td style="color:#e05555">'+esc(r.message||'')+(r.detail?'<div style="color:#7a8a86;font-size:11px;white-space:pre-wrap;margin-top:2px">'+esc(String(r.detail).slice(0,300))+'</div>':'')+'</td></tr>';}).join('')
+      +'</tbody></table>';
+  }catch(e){ box.innerHTML='<div style="color:#7a8a86;padding:12px">Could not load the error log'+(e&&e.message?(' ('+esc(e.message)+')'):'')+'. Run error_log_schema.sql if it is not created yet.</div>'; }
+}
+window.loadErrorLogInto=loadErrorLogInto;
+async function clearErrorLogErp(){
+  if(!confirm('Delete all logged errors?')) return;
+  try{ await db.from('error_log').delete().neq('id','00000000-0000-0000-0000-000000000000'); loadErrorLogInto(); }catch(e){ alert('Clear failed: '+e.message); }
+}
+window.clearErrorLogErp=clearErrorLogErp;
+
 function setSyncState(state){
   const d=$('sync-dot'),l=$('sync-label');
   d.className='sync-dot '+state;
