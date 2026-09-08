@@ -458,7 +458,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.80';
+const TGK_ERP_VERSION = 'v22.81';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -20102,9 +20102,47 @@ function renderBOMCountSearch(q){
   const matches=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&!a.is_subassembly&&(a.pn.toLowerCase().includes(ql)||(a.description||'').toLowerCase().includes(ql))).slice(0,10);
   if(!matches.length){el.innerHTML='<span class="t3s">No products found</span>';return;}
   el.innerHTML=matches.map(a=>{
-    const bomCount=(S.boms[a.pn]||[]).length;
+    // [FIX] Was (S.boms[a.pn]||[]).length - only the direct BOM line count, which understated
+    // (or simply mismatched) what createCycleCount('bom:...') actually creates now that it
+    // recurses into subassemblies' own components. _expandFgBomTree is the same function that
+    // builds the real count, so this preview always matches what you're about to commit to.
+    const bomCount=_expandFgBomTree(a.pn).length;
     return `<button class="filter-chip" onclick="createCycleCount('bom:${a.pn}')">${dispPn(a)} <span style="font-size:var(--t-xs);opacity:.7">${bomCount} components</span></button>`;
   }).join('');
+}
+
+// [FIX] Recursively walks the FULL BOM tree for a finished good - not just its direct BOM
+// lines. Before this, a finished good whose BOM contained a subassembly only pulled in that
+// subassembly itself, never the subassembly's OWN components, even though the cycle-count
+// screen has always been labeled "Count by Product + All Its BOM Components." Shared by
+// createCycleCount('bom:...') (which builds the actual count) and the search results badge
+// (which previews the count before you commit to it), so the preview always matches what
+// actually gets created. Guards against a circular BOM reference with a depth cap and a
+// seen-set, same pattern used by buildability()'s own recursive BOM walk.
+function _expandFgBomTree(bomPn){
+  var items=[];
+  var seenExpand=new Set();
+  function expand(parentPn,multiplier,depth){
+    if(depth>8||seenExpand.has(parentPn))return;
+    seenExpand.add(parentPn);
+    var bomLines=S.boms[parentPn]||[];
+    bomLines.forEach(function(line){
+      var cumQty=(line.qty||1)*multiplier;
+      if(line.item_type==='assembly'){
+        var sa=S.assemblies.find(function(a){return a.pn===line.child_pn&&!a.discontinued&&!isDev(a);});
+        if(sa){
+          items.push({pn:line.child_pn,desc:sa.description||'',exp:sa.total_on_hand||0,type:'assembly',section:'Subassemblies',bomQty:cumQty});
+          expand(line.child_pn,cumQty,depth+1); // pull in THIS subassembly's own components too
+        }
+      } else {
+        var p=S.parts.find(function(x){return x.pn===line.child_pn;});
+        if(!p||!p.discontinued) items.push({pn:line.child_pn,desc:(p&&p.description)||'',exp:(p&&p.total_unpckgd)||0,type:'part',section:'Components',bomQty:cumQty});
+      }
+    });
+  }
+  expand(bomPn,1,0);
+  var seen=new Set();
+  return items.filter(function(i){if(seen.has(i.pn))return false;seen.add(i.pn);return true;});
 }
 
 async function createCycleCount(cat) {
@@ -20123,16 +20161,9 @@ async function createCycleCount(cat) {
     const bomPn=cat.slice(4);
     const fgAsm=S.assemblies.find(a=>a.pn===bomPn&&!a.discontinued&&!isDev(a));
     if(fgAsm) items.push({pn:bomPn,desc:fgAsm.description||'',exp:fgAsm.total_on_hand||0,type:'assembly',section:'Finished Good'});
-    const bomLines=S.boms[bomPn]||[];
-    bomLines.forEach(line=>{
-      if(line.item_type==='assembly'){
-        const sa=S.assemblies.find(a=>a.pn===line.child_pn&&!a.discontinued&&!isDev(a));
-        if(sa) items.push({pn:line.child_pn,desc:sa.description||'',exp:sa.total_on_hand||0,type:'assembly',section:'Subassemblies',bomQty:line.qty});
-      } else {
-        const p=S.parts.find(x=>x.pn===line.child_pn);
-        if(!p||!p.discontinued) items.push({pn:line.child_pn,desc:p?.description||'',exp:p?.total_unpckgd||0,type:'part',section:'Components',bomQty:line.qty});
-      }
-    });
+    // [FIX] Now walks the full nested BOM tree (subassemblies-of-subassemblies included) via
+    // _expandFgBomTree, instead of stopping at the finished good's direct BOM line.
+    items=items.concat(_expandFgBomTree(bomPn));
     const seen=new Set(); items=items.filter(i=>{if(seen.has(i.pn))return false;seen.add(i.pn);return true;});
   }
   else items=liveParts.filter(p=>(p.category||'Uncategorized')===cat).map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}));
