@@ -458,7 +458,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.85';
+const TGK_ERP_VERSION = 'v22.86';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -16273,16 +16273,20 @@ async function submitPOCart(){
     if(shipping>0)lines.push({po_id:po.id,pn:'SHIPPING',description:'Shipping & Handling',qty_ordered:1,unit_cost:shipping,qty_received:0,status:'Pending'});
     const {data:insertedLines}=await db.from('po_lines').insert(lines).select();
     S.poLines[po.id]=insertedLines||lines;
-    S.purchases=[po,...S.purchases];
+    // [FIX] Was unconditional - a realtime INSERT event for this SAME just-created row can win a
+    // race against this optimistic local update (the realtime handler already guards against
+    // this on its side, but this line didn't guard on its side, so either order still let both
+    // paths add it). This is the exact bug behind a freshly-created PO showing as two identical
+    // rows with the same PO ID - guarding here too closes the race regardless of which side wins.
+    if(!S.purchases.some(function(x){return x.id===po.id;}))S.purchases=[po,...S.purchases];
     newPOIds.push(po.id);
   }
   S.poCart=[];S.poCartShipping={};saveCart();
   S.filters.po={status:'Draft'};
   toast('<span class="ic ic-check"></span>'+vendors.length+' Draft PO'+(vendors.length>1?'s':'')+' created — review and click "Approve" to place each order');
+  // [FIX] Was auto-opening the just-created PO's detail view for the single-PO case. Jon wants
+  // to land back on the Purchase Orders list after confirming, not jump into the detail page.
   nav('purchases');
-  if(newPOIds.length===1){
-    setTimeout(()=>{S.activePO=newPOIds[0];render();},100);
-  }
 }
 
 function renderPOBuilder(){
@@ -17710,7 +17714,9 @@ async function createPOFromSuggestion(pn, vendor, qty, cost, desc) {
   if(error){toast('Error: '+error.message);return;}
   const{data:lineData}=await db.from('po_lines').insert({po_id:data.id,pn,description:desc,qty_ordered:qty,unit_cost:cost,qty_received:0,status:'Pending'}).select().single();
   S.poLines[data.id]=lineData?[lineData]:[{po_id:data.id,pn,description:desc,qty_ordered:qty,unit_cost:cost,qty_received:0,status:'Pending'}];
-  S.purchases=[data,...S.purchases];
+  // [FIX] Same missing existence guard as the other three PO-creation paths - the fourth and
+  // last one that had this race against the realtime INSERT handler.
+  if(!S.purchases.some(function(x){return x.id===data.id;}))S.purchases=[data,...S.purchases];
   toast('PO created for '+pn+(moq>0&&qty>=moq?' <span class="ic ic-check"></span>meets MOQ':''));
 }
 
@@ -17766,9 +17772,13 @@ async function createVendorPO(vendor){
   if(error){toast('Error: '+error.message);return;}
   const lines=need.map(x=>({po_id:po.id,pn:x.p.pn,description:x.p.description||'',qty_ordered:x.qty,unit_cost:costForQty(x.p,x.qty),qty_received:0,status:'Pending'}));
   await db.from('po_lines').insert(lines);
-  S.purchases=[po,...S.purchases];
+  // [FIX] Same missing existence guard as submitPOCart - without it, a realtime INSERT event for
+  // this same just-created row can race this optimistic local update and add it twice.
+  if(!S.purchases.some(function(x){return x.id===po.id;}))S.purchases=[po,...S.purchases];
   toast('PO created: '+need.length+' lines for '+vendor);
-  openPODetail(po.id);nav('purchases');
+  // [FIX] Was auto-opening the detail view - stay on the list after creating, same as the other
+  // creation paths, per Jon's request.
+  nav('purchases');
 }
 
 async function createSuggestedPOs(){
@@ -17883,7 +17893,9 @@ async function confirmCreateSuggestedPOs(){
       const lines=items.map(x=>({po_id:po.id,pn:x.p.pn,description:x.p.description||'',qty_ordered:x.oq,unit_cost:x.cost,qty_received:0,status:'Pending'}));
       await db.from('po_lines').insert(lines);
       S.poLines[po.id]=lines.map((l,i)=>({...l,id:'local-'+i}));
-      S.purchases=[po,...S.purchases];
+      // [FIX] Same missing existence guard as submitPOCart/createVendorPO - closes the same race
+      // against the realtime INSERT handler for this table.
+      if(!S.purchases.some(function(x){return x.id===po.id;}))S.purchases=[po,...S.purchases];
     }
     created++;
   }
