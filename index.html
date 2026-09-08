@@ -458,7 +458,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.84';
+const TGK_ERP_VERSION = 'v22.85';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1167,7 +1167,15 @@ function setupRealtime(){
   if(_rtChannel){try{db.removeChannel(_rtChannel);}catch(e){try{_rtChannel.unsubscribe();}catch(_){}}}
   _rtChannel=db.channel('erp-live-'+Date.now())
     .on('postgres_changes',{event:'*',schema:'public',table:'parts'},p=>{
-      if(p.eventType==='INSERT')S.parts=[...S.parts,p.new].sort((a,b)=>a.pn.localeCompare(b.pn));
+      // [FIX] Was appending any INSERT payload unconditionally, unlike the 'sales' and
+      // 'bom_items' handlers just above/below, which already guard against exactly this:
+      // a redelivered realtime event, or a row that lands in this INSERT payload moments
+      // after already being caught by the initial page-load fetch, both put the same
+      // physical row into this in-memory array twice with zero duplication in the actual
+      // database - which is why Data Integrity's duplicate-SKU check (which reads this
+      // same in-memory list) never sees anything wrong. Guarding on id, same as sales/
+      // bom_items already do, closes this for good.
+      if(p.eventType==='INSERT'){if(!S.parts.some(function(x){return x.id===p.new.id;}))S.parts=[...S.parts,p.new].sort((a,b)=>a.pn.localeCompare(b.pn));}
       else if(p.eventType==='UPDATE')S.parts=S.parts.map(x=>x.id===p.new.id?p.new:x);
       else if(p.eventType==='DELETE')S.parts=S.parts.filter(x=>x.id!==p.old.id);
       buildLookupMaps();
@@ -1177,7 +1185,8 @@ function setupRealtime(){
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'assemblies'},p=>{
       const norm=a=>{const p=/^\d{2}-\d{4}/.test(a.pn||'')&&!isHWPack(a.pn);const d=a.is_subassembly;return{...a,is_subassembly:(d===true||d===false)?d:p};};
-      if(p.eventType==='INSERT')S.assemblies=[...S.assemblies,norm(p.new)].sort((a,b)=>dispPn(a).localeCompare(dispPn(b)));/* [FIX B] sort by display SKU */
+      // [FIX] Same missing guard as the parts handler above - see that comment.
+      if(p.eventType==='INSERT'){if(!S.assemblies.some(function(x){return x.id===p.new.id;}))S.assemblies=[...S.assemblies,norm(p.new)].sort((a,b)=>dispPn(a).localeCompare(dispPn(b)));}/* [FIX B] sort by display SKU */
       else if(p.eventType==='UPDATE')S.assemblies=S.assemblies.map(x=>x.id===p.new.id?norm(p.new):x);
       else if(p.eventType==='DELETE')S.assemblies=S.assemblies.filter(x=>x.id!==p.old.id);
       buildLookupMaps();
@@ -1222,8 +1231,13 @@ function setupRealtime(){
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'purchases'},p=>{
       if(p.eventType==='INSERT'){
-        S.purchases=[p.new,...S.purchases];
-        pushActivity({icon:'<span class="ic ic-doc"></span>',type:'po_created',text:'PO created — '+p.new.vendor,sub:(p.new.description||p.new.pn)+(p.new.status?' · '+p.new.status:''),ts:new Date().toISOString(),cls:'var(--orange)'});
+        // [FIX] Same missing existence guard as parts/assemblies above - without it, a
+        // redelivered INSERT event created a phantom second PO in memory (and, if the user
+        // acted on it, a real duplicate purchase order).
+        if(!S.purchases.some(function(x){return x.id===p.new.id;})){
+          S.purchases=[p.new,...S.purchases];
+          pushActivity({icon:'<span class="ic ic-doc"></span>',type:'po_created',text:'PO created — '+p.new.vendor,sub:(p.new.description||p.new.pn)+(p.new.status?' · '+p.new.status:''),ts:new Date().toISOString(),cls:'var(--orange)'});
+        }
       } else if(p.eventType==='UPDATE'){
         const prev=S.purchases.find(x=>x.id===p.new.id);
         S.purchases=S.purchases.map(x=>x.id===p.new.id?p.new:x);
@@ -1240,7 +1254,11 @@ function setupRealtime(){
         const poId=p.new?.po_id;
         if(poId){
           if(!S.poLines[poId])S.poLines[poId]=[];
-          if(p.eventType==='INSERT')S.poLines[poId]=[...S.poLines[poId],p.new];
+          // [FIX] Same missing existence guard as parts/assemblies/purchases above - this is the
+          // exact table behind a PO showing duplicate lines: a redelivered INSERT for a po_lines
+          // row appended it a second time into this in-memory array with no real duplicate in
+          // the database, matching Data Integrity finding nothing wrong.
+          if(p.eventType==='INSERT'){if(!S.poLines[poId].some(function(l){return l.id===p.new.id;}))S.poLines[poId]=[...S.poLines[poId],p.new];}
           else S.poLines[poId]=S.poLines[poId].map(l=>l.id===p.new.id?p.new:l);
         }
         if(S.view==='purchases'&&S.activePO===poId)scheduleRender();
@@ -1248,6 +1266,10 @@ function setupRealtime(){
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'inv_corrections'},p=>{
       if(p.eventType==='INSERT'){
+        // [FIX] Same missing existence guard as parts/assemblies/purchases/po_lines above -
+        // without it, a redelivered INSERT double-logged the same stock movement (and its
+        // matching toast/activity-feed entry) even though only one real correction happened.
+        if(S.corrections.some(function(r){return r.id===p.new.id;}))return;
         S.corrections=[p.new,...S.corrections].slice(0,1000);
         // Keep the Master Lookup per-item history cache live so stock movements show as they process
         if(S._itemCorrCache&&S._itemCorrCache[p.new.pn]&&S._itemCorrCache[p.new.pn].rows){var _ic=S._itemCorrCache[p.new.pn].rows;if(!_ic.some(function(r){return r.id===p.new.id;}))S._itemCorrCache[p.new.pn]={loading:false,rows:[p.new,..._ic].slice(0,40)};}
@@ -1267,7 +1289,12 @@ function setupRealtime(){
       rtRender(['cyclecounts']);   // repaint only the views that show this data
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'shipment_errors'},p=>{
-      if(p.eventType==='INSERT'){S.shipmentErrors=[p.new,...S.shipmentErrors];toast('\uD83D\uDCE8 New shipment error from Support \u2014 order #'+(p.new.order_number||'?')+(p.new.expected_pn?' \u00b7 reship '+p.new.expected_pn:'')+'. See the Warranty / Errors queue.',9000);if(p.new.tracking_number&&p.new.status!=='Resolved'&&p.new.status!=='Denied')_autoResolveOnTracking('shipment_errors',p.new.id);}
+      if(p.eventType==='INSERT'){
+        // [FIX] Same missing existence guard as the other INSERT handlers above - without it, a
+        // redelivered event re-showed the toast and could re-trigger _autoResolveOnTracking for
+        // a shipment error the ERP had already recorded once.
+        if(S.shipmentErrors.some(function(e){return e.id===p.new.id;}))return;
+        S.shipmentErrors=[p.new,...S.shipmentErrors];toast('\uD83D\uDCE8 New shipment error from Support \u2014 order #'+(p.new.order_number||'?')+(p.new.expected_pn?' \u00b7 reship '+p.new.expected_pn:'')+'. See the Warranty / Errors queue.',9000);if(p.new.tracking_number&&p.new.status!=='Resolved'&&p.new.status!=='Denied')_autoResolveOnTracking('shipment_errors',p.new.id);}
       else if(p.eventType==='UPDATE'){
         const prev=S.shipmentErrors.find(e=>e.id===p.new.id);
         S.shipmentErrors=S.shipmentErrors.map(e=>e.id===p.new.id?p.new:e);
@@ -1280,7 +1307,10 @@ function setupRealtime(){
       rtRender(['warranty','dashboard']);   // repaint only the views that show this data
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'warranty_claims'},p=>{
-      if(p.eventType==='INSERT'){S.warrantyClaims=[p.new,...S.warrantyClaims];toast('\uD83D\uDCE8 New warranty claim from Support \u2014 '+(p.new.pn||'')+' \u00b7 order #'+(p.new.order_number||'?')+'. See the Warranty queue.',9000);}
+      if(p.eventType==='INSERT'){
+        // [FIX] Same missing existence guard as the other INSERT handlers above.
+        if(S.warrantyClaims.some(function(w){return w.id===p.new.id;}))return;
+        S.warrantyClaims=[p.new,...S.warrantyClaims];toast('\uD83D\uDCE8 New warranty claim from Support \u2014 '+(p.new.pn||'')+' \u00b7 order #'+(p.new.order_number||'?')+'. See the Warranty queue.',9000);}
       else if(p.eventType==='UPDATE'){
         const prev=S.warrantyClaims.find(w=>w.id===p.new.id);
         S.warrantyClaims=S.warrantyClaims.map(w=>w.id===p.new.id?p.new:w);
