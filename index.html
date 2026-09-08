@@ -458,7 +458,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.74';
+const TGK_ERP_VERSION = 'v22.77';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -536,17 +536,31 @@ function _clearBomCostCache(){_bomCostCache={};}
 function buildLookupMaps(){
   _clearBomCostCache();
   const ai={},pi={};
+  // [FIX] Two full passes, not one interleaved loop. The old version set a.pn AND a.new_sku for
+  // EVERY assembly in a single pass, unconditionally overwriting - so whenever a pn/new_sku
+  // collision existed (e.g. a duplicate row created by an outside tool, reusing another
+  // assembly's active new_sku as its own literal pn), whichever assembly happened to sort LAST
+  // in the array silently won the index slot, regardless of whether its match came from the
+  // authoritative pn field or the fallback new_sku field. That silently disagreed with every
+  // other pn/new_sku lookup in the app (renderSales' local map, and the documented intent of
+  // findAsm()'s own linear-scan fallback: pn wins, first match wins, new_sku is only a
+  // fallback). Doing all pn claims first, then only letting new_sku fill gaps pn didn't already
+  // claim, makes this index agree with everywhere else pn/new_sku is resolved.
   S.assemblies.forEach(function(a){
-    ai[a.pn]=a;
-    if(a.new_sku)ai[a.new_sku]=a;
+    if(a.pn&&!ai[a.pn])ai[a.pn]=a;
     const u=(a.pn||'').toUpperCase();if(u&&!ai[u])ai[u]=a;
-    if(a.new_sku){const nu=a.new_sku.toUpperCase();if(nu&&!ai[nu])ai[nu]=a;}
+  });
+  S.assemblies.forEach(function(a){
+    if(a.new_sku&&!ai[a.new_sku])ai[a.new_sku]=a;
+    const nu=(a.new_sku||'').toUpperCase();if(nu&&!ai[nu])ai[nu]=a;
   });
   S.parts.forEach(function(p){
-    pi[p.pn]=p;
-    if(p.new_sku)pi[p.new_sku]=p;
+    if(p.pn&&!pi[p.pn])pi[p.pn]=p;
     const u=(p.pn||'').toUpperCase();if(u&&!pi[u])pi[u]=p;
-    if(p.new_sku){const nu=p.new_sku.toUpperCase();if(nu&&!pi[nu])pi[nu]=p;}
+  });
+  S.parts.forEach(function(p){
+    if(p.new_sku&&!pi[p.new_sku])pi[p.new_sku]=p;
+    const nu=(p.new_sku||'').toUpperCase();if(nu&&!pi[nu])pi[nu]=p;
   });
   S._asmIdx=ai;S._partIdx=pi;
 }
@@ -4556,7 +4570,12 @@ function renderSales(){
     // [BUILDABLE] List-view badge for single-SKU orders sitting at insufficient/zero stock - reuses the
     // shared-pool buildability() engine (same one the Production Queue uses) so it never disagrees with it.
     // Grouped multi-line orders skip this (perf: would mean a full BOM walk per line, per visible row).
-    const _buildInfo=(!s._grouped&&!canFill&&stock!==null&&asm)?buildability(s.pn):null;
+    // [FIX] buildability() reads S.boms keyed by the assembly's own canonical pn - it does not
+    // resolve new_sku itself. Passing the raw sales-row s.pn (which can be either the
+    // canonical pn or the active new_sku, depending on how the order came in) silently
+    // returned hasBOM:false whenever the two differed, hiding a real, valid BOM. asm.pn is
+    // the assembly record's own canonical field, so it always matches how S.boms is keyed.
+    const _buildInfo=(!s._grouped&&!canFill&&stock!==null&&asm)?buildability(asm.pn):null;
     const _isBuildable=!!(_buildInfo&&_buildInfo.hasBOM&&_buildInfo.maxBuild>0);
     const _buildCovers=_isBuildable&&_buildInfo.maxBuild>=(s.qty||1);
     const allOrderLines=s._grouped?(s._allLines||[]):[];
@@ -4783,7 +4802,10 @@ function renderSaleDetail(s){
     const lcanFill=lstock!==null&&lstock>=(line.qty||1);
     // [BUILDABLE] Only meaningful for FG assemblies with a BOM that are short on hand - reuses the
     // same shared-pool buildability() engine the Production Queue uses, so this never disagrees with it.
-    const lBuildInfo=(!lcanFill&&lstock!==null&&la)?buildability(line.pn):null;
+    // [FIX] Same reasoning as the list-view badge above - use la.pn (the resolved assembly's
+    // own canonical field), not the raw line.pn from the sales row, so this always matches
+    // how S.boms is keyed regardless of which SKU string the order happened to be recorded under.
+    const lBuildInfo=(!lcanFill&&lstock!==null&&la)?buildability(la.pn):null;
     const lIsBuildable=!!(lBuildInfo&&lBuildInfo.hasBOM&&lBuildInfo.maxBuild>0);
     const lBuildCovers=lIsBuildable&&lBuildInfo.maxBuild>=(line.qty||1);
     return `<tr>
@@ -4917,7 +4939,7 @@ async function openBulkBoxMatch(){
   for(var i=0;i<pending.length;i++){
     var statusEl=document.getElementById('bbm-status');
     if(!statusEl)return; // panel closed mid-run
-    statusEl.textContent='Checking order '+(i+1)+' of '+pending.length+'&hellip;';
+    statusEl.textContent='Checking order '+(i+1)+' of '+pending.length+'\u2026';
     var v=await _shpBoxVerdict(pending[i],allBoxParts);
     results.push({orderNum:pending[i],v:v});
   }
@@ -12453,6 +12475,9 @@ async function deletePart(pn, id){
   const{error}=await db.from('parts').delete().eq('id',id);
   if(error){toast('Error: '+error.message);return;}
   S.parts=S.parts.filter(p=>p.id!==id);
+  // [FIX] Same reasoning as deleteAsm() above - clear the Master Lookup selection so deleting a
+  // part from its dossier view returns to the search box instead of a stale "Not found" panel.
+  if(S.lookupSel&&S.lookupSel.type==='part'&&S.lookupSel.pn===pn){S.lookupSel=null;S.lookupQ='';}
   logAction('Deleted part '+pn,'parts',pn,null,null).catch(()=>{});
   toast('Part '+pn+' deleted');render();
 }
@@ -13149,6 +13174,10 @@ async function deleteAsm(pn, id){
   if(error){toast('Error: '+error.message);return;}
   S.assemblies=S.assemblies.filter(a=>a.id!==id);
   if(S.boms[pn])delete S.boms[pn];
+  // [FIX] Master Lookup now shows a Delete button too - without this, deleting from there left
+  // S.lookupSel pointed at a pn that no longer resolves, rendering a bare "Not found" panel
+  // instead of returning to the search box.
+  if(S.lookupSel&&S.lookupSel.type==='assembly'&&S.lookupSel.pn===pn){S.lookupSel=null;S.lookupQ='';}
   logAction('Deleted assembly '+pn,'assemblies',pn,null,null).catch(()=>{});
   toast('Assembly '+pn+' deleted');render();
 }
@@ -15501,7 +15530,13 @@ function tierPrices(a){
 }
 
 function assemblyDossier(pn){
-  const a=S.assemblies.find(x=>x.pn===pn)||S.assemblies.find(x=>(x.pn||'').toUpperCase()===String(pn).toUpperCase());
+  // [FIX] Was a raw pn-only scan that never checked new_sku at all - a SKU that only exists as
+  // another assembly's ACTIVE new_sku (the normal state after a rename) could never be found
+  // here, and if some other, unrelated row's pn happened to literally equal the search text
+  // (e.g. a duplicate created by an outside tool), Master Lookup would silently show that wrong
+  // row forever with no fallback. findAsm() already implements the correct, shared pn-then-
+  // new_sku precedence used everywhere else in the app.
+  const a=findAsm(pn)||findAsm(String(pn).toUpperCase());
   if(!a)return'<div class="panel section-empty">Not found</div>';
   const b=buildability(pn);
   const demand=openOrderDemand(pn);
@@ -15528,6 +15563,7 @@ function assemblyDossier(pn){
     <button class="btn btn-sm" onclick='openModal("editAsm",${JSON.stringify(a).replace(/'/g,"&#39;")})'>Edit</button>
     <button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="printBOM('${a.pn}')"><span class="ic ic-doc"></span>BOM</button>
     <button class="btn btn-sm" onclick="printAssemblyBOMs('${a.pn}')" title="Print this assembly's BOM + all sub-assembly BOMs nested inside it"><span class="ic ic-doc"></span>Print w/ Sub-BOMs</button>
+    <button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="deleteAsm('${a.pn}','${a.id}')" title="Delete this assembly record"><span class="ic ic-trash"></span>Delete</button>
   </div>
   <div class="kpi-grid kpi-grid-4">
     <div class="kpi ${(a.total_on_hand||0)<=0?'kpi-red':'kpi-teal'}"><div class="kpi-label">On Hand</div><div class="kpi-value">${Math.max(0,a.total_on_hand||0)}</div>${(a.total_on_hand||0)<0?`<div class="kpi-sub" style="color:var(--red)">${Math.abs(a.total_on_hand)} backordered</div>`:demand>0?`<div class="kpi-sub">${demand} on open orders</div>`:''}</div>
@@ -15662,6 +15698,7 @@ function partDossier(pn){
     <button class="btn btn-teal btn-sm" title="Add this part to the PO cart" onclick="openAddToPO('${p.pn}')"><span class="ic ic-cart"></span>Add to PO</button>
     <button class="btn btn-sm" onclick="openAssemblyScrap('${p.pn}','part')" title="Log scrapped units">Log Scrap</button>
     <button class="btn btn-sm" onclick="openReceivingDamage('','${escHtml(dispPn(p))}')" title="Log a part damaged on receiving">Log Damage</button>
+    <button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="deletePart('${p.pn}','${p.id}')" title="Delete this part record"><span class="ic ic-trash"></span>Delete</button>
   </div>
   <div class="kpi-grid kpi-grid-5">
     <div class="kpi ${(p.total_unpckgd||0)<=rp?'kpi-red':'kpi-teal'}"><div class="kpi-label">On Hand</div><div class="kpi-value">${fn(p.total_unpckgd||0)}</div><div class="kpi-sub">Bin: ${p.location||'unassigned'}</div></div>
@@ -18573,7 +18610,11 @@ function prodEditComponent(pn, isSub){
 window.prodEditComponent=prodEditComponent;
 
 function renderPackQueue(){
-  if(S.activeBuild){const asm=S.assemblies.find(a=>a.pn===S.activeBuild);if(asm)return renderBuildPlanner(asm);}
+  // [FIX] Was a raw pn-only find - never checked new_sku, so opening the Build Planner for an
+  // active new_sku (the normal post-rename state) could silently land on an unrelated duplicate
+  // row instead (or fail to resolve to the item with the real BOM/stock). findAsm() matches the
+  // shared pn-then-new_sku resolution used everywhere else.
+  if(S.activeBuild){const asm=findAsm(S.activeBuild);if(asm)return renderBuildPlanner(asm);}
   if(S.workOrderMode)return renderWorkOrder();
   if(S.customPackMode)return renderCustomPackList();
 
@@ -20839,6 +20880,36 @@ function _diBomResolution(){
   });
   return out.sort(function(a,b){return (a.status==='unresolved'?0:1)-(b.status==='unresolved'?0:1)||(a.parent<b.parent?-1:1);});
 }
+// [FIX] Catches the exact failure pattern found this session: a second part/assembly record whose
+// own pn (or new_sku) literally equals another record's ACTIVE new_sku. Both display as the same
+// SKU everywhere dispPn resolves them, but every raw pn-only lookup and every pn/new_sku index in
+// the app can silently disagree about which physical record that SKU string actually points to -
+// splitting stock, BOM, and incoming sales between the two. findDuplicateAssemblyPairs() already
+// catches the narrower assembly-vs-assembly case with a one-click merge tool; this check is the
+// general early-warning net across BOTH parts and assemblies so a fresh collision like this one
+// surfaces here on the next integrity run instead of only being found by comparing screens by hand.
+function _diPnSkuCollisions(){
+  var claims={};
+  var allItems=[].concat(
+    S.assemblies.map(function(a){return{item:a,type:'assembly'};}),
+    S.parts.map(function(p){return{item:p,type:'part'};})
+  );
+  allItems.forEach(function(rec){
+    var a=rec.item;
+    if(a.pn)(claims[a.pn]=claims[a.pn]||[]).push({pn:a.pn,type:rec.type,via:'pn',id:a.id});
+    if(a.new_sku&&a.new_sku!==a.pn)(claims[a.new_sku]=claims[a.new_sku]||[]).push({pn:a.pn,type:rec.type,via:'new_sku',id:a.id});
+  });
+  var out=[];
+  Object.keys(claims).forEach(function(key){
+    var rows=claims[key];
+    if(rows.length<2)return;
+    var uniq=[];
+    rows.forEach(function(r){if(!uniq.some(function(u){return u.id===r.id&&u.type===r.type;}))uniq.push(r);});
+    if(uniq.length<2)return;
+    out.push({sku:key,claimants:uniq});
+  });
+  return out.sort(function(a,b){return a.sku<b.sku?-1:1;});
+}
 
 async function runDataIntegrityChecks(){
   S._diLoading=true;render();
@@ -20919,6 +20990,7 @@ async function runDataIntegrityChecks(){
 
     // CHECK 9: BOM lines not referencing the canonical part number.
     results.bomResolution=_diBomResolution();
+    results.pnSkuCollisions=_diPnSkuCollisions();
     results.ranAt=new Date().toISOString();
   }catch(e){
     toast('<span class="ic ic-alert"></span>Data integrity check failed: '+e.message,6000);
@@ -20958,6 +21030,7 @@ function renderDIResults(r){
   ${section('Ledger Drift (corrections vs actual stock)',r.ledgerDrift||[],d=>`<div class="check-row" onclick="inspectSku('${escHtml(d.pn)}')" style="cursor:pointer"><span style="font-family:var(--mono);font-size:var(--t-sm);color:var(--teal)">${escHtml(d.pn)}</span><span style="flex:1;font-size:var(--t-sm);color:var(--text2)">ledger says ${d.ledger}, actual ${d.actual}</span><span class="pill pill-red" style="font-size:var(--t-xs)">${d.delta>0?'+':''}${d.delta} unexplained</span></div>`,'Every SKU with recent corrections matches its ledger exactly — no stock has changed outside the audit trail in the last 30 days.')}
   ${section('Negative On-Hand',r.negativeStock||[],d=>`<div class="check-row" onclick="inspectSku('${escHtml(d.pn)}')" style="cursor:pointer"><span style="font-family:var(--mono);font-size:var(--t-sm);color:var(--text2)">${escHtml(d.pn)}</span><span style="flex:1;font-size:var(--t-sm);color:var(--text3)">${d.type}${d.disc?' &middot; discontinued':''}</span><span class="pill pill-red" style="font-size:var(--t-xs)">${d.qty} on hand</span></div>`,'No parts or assemblies are currently negative.')}
   ${section('BOM Lines Not on Canonical SKU',r.bomResolution||[],d=>`<div class="check-row"><span style="font-family:var(--mono);font-size:var(--t-sm);color:var(--text2)">${escHtml(d.parent)}</span><span style="flex:1;font-size:var(--t-sm);color:var(--text3)">child ${escHtml(d.child)}${d.canonical?' &mdash; canonical is '+escHtml(d.canonical):''}</span><span class="pill ${d.status==='unresolved'?'pill-red':'pill-yellow'}" style="font-size:var(--t-xs)">${d.status}</span></div>`,'Every BOM line references its component by exact canonical part number.')}
+  ${section('Duplicate SKU / New-SKU Collisions',r.pnSkuCollisions||[],d=>`<div class="check-row" onclick="inspectSku('${escHtml(d.sku)}')" style="cursor:pointer"><span style="font-family:var(--mono);font-size:var(--t-sm);color:var(--teal)">${escHtml(d.sku)}</span><span style="flex:1;font-size:var(--t-sm);color:var(--text2)">claimed by ${d.claimants.length} different records \u2014 ${d.claimants.map(function(c){return escHtml(c.pn)+' ('+c.type+' via '+c.via+')';}).join(', ')}</span><span class="pill pill-red" style="font-size:var(--t-xs)">collision</span></div>`,'No SKU string is claimed as the pn or active new_sku by more than one part or assembly.')}
   `;
 }
 // ===================== v19.8: SKU inspector + integrity repairs =====================
