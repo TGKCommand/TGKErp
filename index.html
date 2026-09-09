@@ -459,7 +459,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.94';
+const TGK_ERP_VERSION = 'v22.95';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -998,12 +998,14 @@ function updateBadge(){
   const openSales=countPendingOrders();
   const sb=$('sales-badge');
   if(sb){sb.textContent=openSales;sb.style.display=openSales>0?'inline':'none';}
-  // Drop-Ship Queue badge: same detection rule as renderDropshipQueue() - a line still
-  // waiting on some action (not yet ordered, ordered but not shipped, or on hold) whose SKU
-  // isn't carried in ERP stock at all.
+  // Drop-Ship Queue badge: per Jon, this should reflect what still NEEDS action, not everything
+  // sitting in the pipeline. Once marked Ordered, it's out of his hands until ShipStation (or
+  // Shopify) reports it shipped - it doesn't need to keep pulling his attention via the badge.
+  // On Hold is similarly not something he can act on right now. Only genuinely un-ordered lines
+  // count here; renderDropshipQueue() still shows all three groups, just not all three counted.
   const dsCount=S.sales.filter(function(s){
     const fs=s.fulfillment_status||'Open';
-    if(fs!=='Open'&&fs!=='Ordered'&&fs!=='On Hold')return false;
+    if(fs!=='Open')return false;
     if(isInternal(s.order_number))return false;
     return !findAsm(s.pn)&&!S.parts.find(function(p){return p.pn===s.pn;});
   }).length;
@@ -21085,19 +21087,20 @@ function renderDropshipQueue(){
   // Same detection rule the existing per-line "Drop Ship" button already uses: a sales line
   // whose SKU matches neither an assembly nor a part - i.e. something not carried in ERP stock
   // at all, the classic drop-ship pattern.
-  // [FIX] Was Open/Ordered only - a drop-ship line that legitimately goes On Hold (e.g. one
-  // package of a split ShipStation order) simply vanished from this list with no trace, since
-  // nothing here showed On Hold status at all. Including it now, with its own status pill, so a
-  // held drop-ship item stays visible instead of silently disappearing.
   const lines=S.sales.filter(function(s){
     const fs=s.fulfillment_status||'Open';
     if(fs!=='Open'&&fs!=='Ordered'&&fs!=='On Hold')return false;
     if(isInternal(s.order_number))return false;
     return !findAsm(s.pn)&&!S.parts.find(function(p){return p.pn===s.pn;});
   }).sort(function(a,b){return String(a.sale_date||'').localeCompare(String(b.sale_date||''));});
-  // [FEATURE] Rewritten as a proper table (matching every other list page in the app) instead of
-  // stacked cards with vertically-stacked buttons - same information, far less visual noise, and
-  // actions sit in one compact row per line instead of a column of full-width buttons.
+  // [FEATURE] Split into three distinct groups instead of one flat list, per Jon: Not Yet
+  // Ordered is the only one that's actually actionable right now (and the only one counted in
+  // the nav badge - see updateBadge()), Ordered is just waiting on the vendor/ShipStation, and
+  // On Hold needs the hold cleared before anything else can happen. Keeping them visually
+  // separate makes it obvious at a glance which items genuinely need Jon to do something today.
+  const notOrdered=lines.filter(function(s){return(s.fulfillment_status||'Open')==='Open';});
+  const ordered=lines.filter(function(s){return s.fulfillment_status==='Ordered';});
+  const onHold=lines.filter(function(s){return s.fulfillment_status==='On Hold';});
   // Full shipping block, formatted for pasting straight into a vendor's order form - this is
   // the whole point of the copy button below: one click instead of hunting the address down.
   function _dropshipShipToText(s){
@@ -21111,7 +21114,7 @@ function renderDropshipQueue(){
     if(s.customer_phone)out.push(s.customer_phone);
     return out.join('\n');
   }
-  const rows=lines.map(function(s){
+  function _dropshipRow(s){
     const v=S.dropshipVendors[s.pn];
     const fs=s.fulfillment_status||'Open';
     const statusPill=fs==='On Hold'
@@ -21119,12 +21122,6 @@ function renderDropshipQueue(){
       :fs==='Ordered'
       ?`<span style="font-size:var(--t-xs);background:var(--orange-dim);color:var(--orange);border:1px solid rgba(234,88,12,.25);padding:1px 7px;border-radius:var(--r-md);font-weight:700">Ordered${s.dropship_order_ref?' \u00b7 #'+escHtml(s.dropship_order_ref):''}</span>`
       :`<span style="font-size:var(--t-xs);background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 7px;border-radius:var(--r-md);font-weight:600">Not yet ordered</span>`;
-    // [FIX] The separate icon-only edit button used class "ic-edit", which doesn't exist in this
-    // app's icon set (the real one is "ic-pencil") - an undefined mask-image class renders as a
-    // blank, empty box, which is exactly the mystery square in the screenshot. Folded the action
-    // into this cell instead of a separate column, per Jon: "+ Add" as a plain text link right
-    // next to "Not saved" when nothing's saved yet, a small pencil icon next to the vendor name
-    // when something is - no more floating disconnected button.
     const vendorCell=v
       ?`<div style="font-size:var(--t-sm);display:flex;align-items:center;gap:5px"><b style="color:var(--text)">${escHtml(v.vendor_name||'Vendor')}</b>${v.order_url?` \u00b7 <a href="${escHtml(v.order_url)}" target="_blank" rel="noopener" style="color:var(--teal)">Order \u2197</a>`:''}<span class="ic ic-pencil" style="cursor:pointer;color:var(--text3);width:.85em;height:.85em" title="Edit vendor info" onclick="openDropshipVendorModal('${escHtml(s.pn)}')"></span></div>
          ${(v.contact||v.instructions)?`<div style="font-size:var(--t-xs);color:var(--text3);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml([v.contact,v.instructions].filter(Boolean).join(' \u2014 '))}">${escHtml([v.contact,v.instructions].filter(Boolean).join(' \u2014 '))}</div>`:''}`
@@ -21153,16 +21150,27 @@ function renderDropshipQueue(){
         ${fs!=='On Hold'?`<button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" title="Shopify's own system marked this fulfilled, not ShipStation" onclick="openMarkShopifyFulfilledModal('${s.id}','${escHtml(s.pn)}',${s.qty||1})">Fulfilled via Shopify</button>`:''}
       </td>
     </tr>`;
-  }).join('');
+  }
+  function _dropshipSection(title,groupLines,accentColor){
+    if(!groupLines.length)return'';
+    return `<div style="margin-bottom:20px">
+      <div style="font-size:var(--t-xs);font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:${accentColor};margin-bottom:8px">${title} (${groupLines.length})</div>
+      <div class="tbl-wrap"><table><thead><tr>
+        <th>SKU</th><th>Qty</th><th>Order</th><th>Customer</th><th>Ship To</th><th>Vendor</th><th>Status</th><th></th>
+      </tr></thead><tbody>${groupLines.map(_dropshipRow).join('')}</tbody></table></div>
+    </div>`;
+  }
   return `<div style="padding:20px">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
       <div class="panel-title" style="flex:1;margin:0;border:0;padding:0">Drop-Ship Queue (${lines.length})</div>
       <button class="btn btn-sm" onclick="S._dropshipVendorsLoaded=false;loadDropshipVendors()" title="Reload vendor info">\u21ba Refresh</button>
     </div>
     <div style="font-size:var(--t-sm);color:var(--text3);margin-bottom:14px">Every SKU not carried in ERP stock, waiting to be ordered or shipped. Mark Ordered once you've placed it with the vendor - ShipStation picks up tracking normally from there and moves it to Shipped on its own. Save vendor info once and it auto-shows up the next time that SKU comes in.</div>
-    ${lines.length?`<div class="tbl-wrap"><table><thead><tr>
-      <th>SKU</th><th>Qty</th><th>Order</th><th>Customer</th><th>Ship To</th><th>Vendor</th><th>Status</th><th></th>
-    </tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="section-empty" style="padding:40px 0">No drop-ship items waiting right now.</div>'}
+    ${lines.length?(
+      _dropshipSection('Not Yet Ordered',notOrdered,'var(--orange)')
+      +_dropshipSection('Ordered',ordered,'var(--text3)')
+      +_dropshipSection('On Hold',onHold,'var(--red)')
+    ):'<div class="section-empty" style="padding:40px 0">No drop-ship items waiting right now.</div>'}
   </div>`;
 }
 
