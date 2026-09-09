@@ -459,7 +459,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.91';
+const TGK_ERP_VERSION = 'v22.92';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -998,11 +998,12 @@ function updateBadge(){
   const openSales=countPendingOrders();
   const sb=$('sales-badge');
   if(sb){sb.textContent=openSales;sb.style.display=openSales>0?'inline':'none';}
-  // Drop-Ship Queue badge: same detection rule as renderDropshipQueue() - an open or
-  // ordered-but-not-shipped line whose SKU isn't carried in ERP stock at all.
+  // Drop-Ship Queue badge: same detection rule as renderDropshipQueue() - a line still
+  // waiting on some action (not yet ordered, ordered but not shipped, or on hold) whose SKU
+  // isn't carried in ERP stock at all.
   const dsCount=S.sales.filter(function(s){
     const fs=s.fulfillment_status||'Open';
-    if(fs!=='Open'&&fs!=='Ordered')return false;
+    if(fs!=='Open'&&fs!=='Ordered'&&fs!=='On Hold')return false;
     if(isInternal(s.order_number))return false;
     return !findAsm(s.pn)&&!S.parts.find(function(p){return p.pn===s.pn;});
   }).length;
@@ -21031,53 +21032,79 @@ function renderDropshipQueue(){
   if(!S._dropshipVendorsLoaded&&!S._dropshipVendorsLoading){loadDropshipVendors();return'<div class="section-empty" style="padding:40px 0">Loading drop-ship vendor info\u2026</div>';}
   // Same detection rule the existing per-line "Drop Ship" button already uses: a sales line
   // whose SKU matches neither an assembly nor a part - i.e. something not carried in ERP stock
-  // at all, the classic drop-ship pattern. Includes 'Ordered' now too (not just 'Open') so a
-  // line stays visible in the queue through the full Open -> Ordered -> Shipped lifecycle,
-  // instead of disappearing the moment Jon marks it ordered.
+  // at all, the classic drop-ship pattern.
+  // [FIX] Was Open/Ordered only - a drop-ship line that legitimately goes On Hold (e.g. one
+  // package of a split ShipStation order) simply vanished from this list with no trace, since
+  // nothing here showed On Hold status at all. Including it now, with its own status pill, so a
+  // held drop-ship item stays visible instead of silently disappearing.
   const lines=S.sales.filter(function(s){
     const fs=s.fulfillment_status||'Open';
-    if(fs!=='Open'&&fs!=='Ordered')return false;
+    if(fs!=='Open'&&fs!=='Ordered'&&fs!=='On Hold')return false;
     if(isInternal(s.order_number))return false;
     return !findAsm(s.pn)&&!S.parts.find(function(p){return p.pn===s.pn;});
   }).sort(function(a,b){return String(a.sale_date||'').localeCompare(String(b.sale_date||''));});
+  // [FEATURE] Rewritten as a proper table (matching every other list page in the app) instead of
+  // stacked cards with vertically-stacked buttons - same information, far less visual noise, and
+  // actions sit in one compact row per line instead of a column of full-width buttons.
+  // Full shipping block, formatted for pasting straight into a vendor's order form - this is
+  // the whole point of the copy button below: one click instead of hunting the address down.
+  function _dropshipShipToText(s){
+    var out=[];
+    if(s.customer_name)out.push(s.customer_name);
+    if(s.shipping_address1)out.push(s.shipping_address1);
+    if(s.shipping_address2)out.push(s.shipping_address2);
+    var csz=[s.shipping_city,s.shipping_province].filter(Boolean).join(', ')+(s.shipping_zip?' '+s.shipping_zip:'');
+    if(csz.trim())out.push(csz.trim());
+    if(s.shipping_country)out.push(s.shipping_country);
+    if(s.customer_phone)out.push(s.customer_phone);
+    return out.join('\n');
+  }
   const rows=lines.map(function(s){
     const v=S.dropshipVendors[s.pn];
-    const isOrdered=(s.fulfillment_status||'Open')==='Ordered';
-    const statusPill=isOrdered
+    const fs=s.fulfillment_status||'Open';
+    const statusPill=fs==='On Hold'
+      ?`<span style="font-size:var(--t-xs);background:var(--orange-dim);color:var(--red);border:1px solid rgba(220,38,38,.3);padding:1px 7px;border-radius:var(--r-md);font-weight:700">On Hold</span>`
+      :fs==='Ordered'
       ?`<span style="font-size:var(--t-xs);background:var(--orange-dim);color:var(--orange);border:1px solid rgba(234,88,12,.25);padding:1px 7px;border-radius:var(--r-md);font-weight:700">Ordered${s.dropship_order_ref?' \u00b7 #'+escHtml(s.dropship_order_ref):''}</span>`
       :`<span style="font-size:var(--t-xs);background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 7px;border-radius:var(--r-md);font-weight:600">Not yet ordered</span>`;
-    const infoBlock=v?`<div style="font-size:var(--t-sm);color:var(--text2);margin-top:4px">
-        <b style="color:var(--text)">${escHtml(v.vendor_name||'Vendor')}</b>
-        ${v.order_url?` \u00b7 <a href="${escHtml(v.order_url)}" target="_blank" rel="noopener" style="color:var(--teal)">Order here \u2197</a>`:''}
-        ${v.contact?` \u00b7 ${escHtml(v.contact)}`:''}
-        ${v.instructions?`<div style="color:var(--text3);margin-top:2px">${escHtml(v.instructions)}</div>`:''}
-      </div>`
-      :`<div style="font-size:var(--t-sm);color:var(--orange);margin-top:4px">No vendor info saved yet for this SKU</div>`;
-    return `<div class="panel" style="padding:14px 18px;margin-bottom:10px;display:flex;align-items:flex-start;gap:14px">
-      <div style="flex:1;min-width:0">
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-          <span style="font-family:var(--mono);font-weight:700;color:var(--purple)">${escHtml(dispSku(s.pn))}</span>
-          <span style="font-size:var(--t-xs);color:var(--text3)">\u00d7${s.qty||1}</span>
-          <span style="font-size:var(--t-xs);color:var(--text3)">#${escHtml(s.order_number||'')}</span>
-          ${s.customer_name?`<span style="font-size:var(--t-xs);color:var(--text3)">${escHtml(s.customer_name)}</span>`:''}
-          ${statusPill}
+    const vendorCell=v
+      ?`<div style="font-size:var(--t-sm)"><b style="color:var(--text)">${escHtml(v.vendor_name||'Vendor')}</b>${v.order_url?` \u00b7 <a href="${escHtml(v.order_url)}" target="_blank" rel="noopener" style="color:var(--teal)">Order \u2197</a>`:''}</div>
+         ${(v.contact||v.instructions)?`<div style="font-size:var(--t-xs);color:var(--text3);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml([v.contact,v.instructions].filter(Boolean).join(' \u2014 '))}">${escHtml([v.contact,v.instructions].filter(Boolean).join(' \u2014 '))}</div>`:''}`
+      :`<span style="font-size:var(--t-sm);color:var(--orange)">Not saved</span>`;
+    const shipCsz=[s.shipping_city,s.shipping_province].filter(Boolean).join(', ')+(s.shipping_zip?' '+s.shipping_zip:'');
+    const shipCell=s.shipping_address1
+      ?`<div style="font-size:var(--t-xs);color:var(--text2)">${escHtml(s.shipping_address1)}</div><div style="font-size:var(--t-xs);color:var(--text3)">${escHtml(shipCsz)}</div>`
+      :`<span style="font-size:var(--t-xs);color:var(--text3)">\u2014</span>`;
+    const shipToText=_dropshipShipToText(s).replace(/'/g,"\\'").replace(/\n/g,'\\n');
+    return `<tr>
+      <td class="pn" style="color:var(--purple);font-weight:700">${escHtml(dispSku(s.pn))}</td>
+      <td class="money-neutral">\u00d7${s.qty||1}</td>
+      <td style="font-size:var(--t-sm);color:var(--text2)">#${escHtml(s.order_number||'')}</td>
+      <td style="font-size:var(--t-sm);color:var(--text2);max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(s.customer_name||'')}</td>
+      <td>
+        <div style="display:flex;align-items:flex-start;gap:6px">
+          <div style="min-width:0">${shipCell}</div>
+          ${s.shipping_address1?`<button class="action-btn" title="Copy full shipping address" onclick="copyText('${shipToText}',this)"><span class="ic ic-clipboard"></span></button>`:''}
         </div>
-        ${infoBlock}
-      </div>
-      <div style="display:flex;flex-direction:column;gap:6px;flex-shrink:0">
-        <button class="btn btn-sm" onclick="openDropshipVendorModal('${escHtml(s.pn)}')">${v?'Edit':'+ Add'} vendor info</button>
-        ${!isOrdered?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="openMarkDropshipOrderedModal('${s.id}','${escHtml(s.pn)}',${s.qty||1})">Mark Ordered</button>`:''}
-        <button class="btn btn-sm" style="color:var(--purple);border-color:rgba(124,58,237,.3)" onclick="openDropShipModal('${s.id}','${escHtml(s.pn)}',${s.qty||1})">\u2193 Mark Shipped</button>
-      </div>
-    </div>`;
+      </td>
+      <td>${vendorCell}</td>
+      <td>${statusPill}</td>
+      <td style="display:flex;gap:4px;flex-wrap:nowrap;white-space:nowrap">
+        <button class="action-btn" title="${v?'Edit':'Add'} vendor info" onclick="openDropshipVendorModal('${escHtml(s.pn)}')"><span class="ic ic-edit"></span></button>
+        ${fs==='Open'?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="openMarkDropshipOrderedModal('${s.id}','${escHtml(s.pn)}',${s.qty||1})">Mark Ordered</button>`:''}
+        ${fs!=='On Hold'?`<button class="btn btn-sm" style="color:var(--purple);border-color:rgba(124,58,237,.3)" onclick="openDropShipModal('${s.id}','${escHtml(s.pn)}',${s.qty||1})">\u2193 Mark Shipped</button>`:''}
+      </td>
+    </tr>`;
   }).join('');
   return `<div style="padding:20px">
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
       <div class="panel-title" style="flex:1;margin:0;border:0;padding:0">Drop-Ship Queue (${lines.length})</div>
       <button class="btn btn-sm" onclick="S._dropshipVendorsLoaded=false;loadDropshipVendors()" title="Reload vendor info">\u21ba Refresh</button>
     </div>
-    <div style="font-size:var(--t-sm);color:var(--text3);margin-bottom:14px">Every SKU not carried in ERP stock, waiting to be ordered or shipped. Mark Ordered once you've placed it with the vendor - ShipStation will pick up tracking normally from there and move it to Shipped on its own. Save vendor info once and it auto-shows up the next time that SKU comes in.</div>
-    ${lines.length?rows:'<div class="section-empty" style="padding:40px 0">No drop-ship items waiting right now.</div>'}
+    <div style="font-size:var(--t-sm);color:var(--text3);margin-bottom:14px">Every SKU not carried in ERP stock, waiting to be ordered or shipped. Mark Ordered once you've placed it with the vendor - ShipStation picks up tracking normally from there and moves it to Shipped on its own. Save vendor info once and it auto-shows up the next time that SKU comes in.</div>
+    ${lines.length?`<div class="tbl-wrap"><table><thead><tr>
+      <th>SKU</th><th>Qty</th><th>Order</th><th>Customer</th><th>Ship To</th><th>Vendor</th><th>Status</th><th></th>
+    </tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="section-empty" style="padding:40px 0">No drop-ship items waiting right now.</div>'}
   </div>`;
 }
 
