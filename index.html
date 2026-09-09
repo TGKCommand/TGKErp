@@ -350,6 +350,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 
     <div class="sidebar-section">Sales</div>
     <button class="nav-item" id="nav-sales" onclick="nav('sales')"><span class="nav-dot"></span>Sales Orders<span class="nav-badge" id="sales-badge" style="display:none">0</span></button>
+    <button class="nav-item" id="nav-dropship" onclick="nav('dropship')"><span class="nav-dot"></span>Drop-Ship Queue</button>
     <button class="nav-item" id="nav-warranty" onclick="navResolution('claims')"><span class="nav-dot"></span>Customer Resolution<span class="nav-badge" id="warranty-badge" style="display:none">0</span></button>
     <div class="sub-nav" id="sub-nav-resolution">
       <button class="nav-sub-item" id="subnav-claims" onclick="navResolution('claims')">Warranty</button>
@@ -458,7 +459,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.86';
+const TGK_ERP_VERSION = 'v22.89';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -488,6 +489,7 @@ const S = {
   pendingPriceBreaks:[],
   cycleCounts:[], activeCount:null, countLines:[], _ccSort:null, _ccSortDir:'asc', _ccCatFilter:'',
   corrections:[], auditLog:[], _auditLogLoaded:false, _auditLogLoading:false,
+  dropshipVendors:{}, _dropshipVendorsLoaded:false, _dropshipVendorsLoading:false,
   warrantyClaims:[],
   shipmentErrors:[],
   partFiles:{}, labelFiles:null, _filesLoading:new Set(),
@@ -1412,17 +1414,26 @@ function startRealtimeHealthCheck(){
   },90000);
 }
 
-const PAGE_TITLES={dashboard:'Dashboard',users:'Users & Permissions',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',fitments:'Fitment Guide',inventory:'Inventory',planning:'Purchasing',purchases:'Purchase Orders',vendors:'Vendors',sales:'Sales Orders',dealers:'Dealers',pricelist:'Master Price List',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Activity Log',warranty:'Customer Resolution',import:'Import Data',pobuilder:'PO Builder',reports:'Reports & Export'};
+const PAGE_TITLES={dropship:'Drop-Ship Queue',dashboard:'Dashboard',users:'Users & Permissions',parts:'Parts Catalog',assemblies:'Assemblies',boms:'Bill of Materials',fitments:'Fitment Guide',inventory:'Inventory',planning:'Purchasing',purchases:'Purchase Orders',vendors:'Vendors',sales:'Sales Orders',dealers:'Dealers',pricelist:'Master Price List',ai:'AI Assistant',lookup:'Master Lookup',packqueue:'Production & Packing',integrations:'Integrations',backups:'Backups & Undo',cyclecounts:'Cycle Counts',corrections:'Activity Log',warranty:'Customer Resolution',import:'Import Data',pobuilder:'PO Builder',reports:'Reports & Export'};
 
 function nav(v){
+  // [FIX] This reset block used to run ONLY when v!==S.view (switching to a genuinely
+  // different section). But clicking a left-nav item while already inside that section's
+  // detail view (e.g. clicking "Sales Orders" while looking at one specific order) never
+  // changes S.view at all - detail views are a sub-state (activeSale/activePO/activeBuild/
+  // activeCount), not a separate S.view - so the click did nothing. Moving the reset outside
+  // the v!==S.view guard makes every left-nav click a genuine "go to the top of this section"
+  // action, whether or not you were already nominally in that section. History is still only
+  // pushed on an actual view change, so re-clicking the section you're already in doesn't cost
+  // a Back press or record a redundant history entry.
   if(v!==S.view){
     S.navHistory=[...(S.navHistory||[]).slice(-29),{view:S.view,activePO:S.activePO,activeSale:S.activeSale,activeBuild:S.activeBuild,buildStack:[...(S.buildStack||[])],activeCount:S.activeCount,lookupSel:S.lookupSel,lookupQ:S.lookupQ,countMode:S.countMode,intTab:S.intTab}];if(typeof _navStampHist==='function')_navStampHist();
-    S.activePO=null;S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.buildStack=[];S.activeCount=null;
-    if(v==='users'){S._profilesLoaded=false;S._profilesLoading=false;S._profilesError=null;}
-    if(v==='corrections'){S._auditLogLoaded=false;S._auditLogLoading=false;}
-    if(v!=='packqueue'){S.workOrderMode=false;S.customPackMode=false;}
-    S.searchQ='';if(S.view==='reports')S.rptState={...S.rptState,preview:null};
   }
+  S.activePO=null;S.activeSale=null;S.activeBuild=null;S.buildQty=null;S.buildStack=[];S.activeCount=null;
+  if(v==='users'){S._profilesLoaded=false;S._profilesLoading=false;S._profilesError=null;}
+  if(v==='corrections'){S._auditLogLoaded=false;S._auditLogLoading=false;}
+  if(v!=='packqueue'){S.workOrderMode=false;S.customPackMode=false;}
+  S.searchQ='';if(S.view==='reports')S.rptState={...S.rptState,preview:null};
   S.view=v;
   document.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
   const el=$('nav-'+v);if(el)el.classList.add('active');
@@ -4618,15 +4629,25 @@ function renderSales(){
     const _discCode=s.discount_code||(s._grouped?allOrderLines.find(x=>x.discount_code)?.discount_code:null);
     const _dealerParsed=_discCode?parseDealerPO(_discCode,S.dealers):null;
     const _dealerTag=_dealerParsed?`<span style="display:inline-block;font-size:var(--t-xs);font-weight:700;color:var(--orange);background:var(--orange-dim);border-radius:var(--r-sm);padding:1px 5px;margin-top:2px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="Dealer order: ${escHtml(_dealerParsed.dealer.name)} · PO ${escHtml(_dealerParsed.poNumber)}">&#127978; ${escHtml(_dealerParsed.dealer.name)}</span>`:(_discCode?`<span style="display:inline-block;font-size:var(--t-xs);color:var(--purple);background:rgba(124,58,237,.1);border-radius:var(--r-sm);padding:1px 5px;margin-top:2px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="Discount code: ${escHtml(_discCode)}">&#127991; ${escHtml(_discCode)}</span>`:'')
-    return `<tr class="rowlink" data-order="${escHtml(s.order_number||s.id)}" onclick="rowClick(event,function(){S.activeSale='${s.id}';S._salesNavIdx=${_rowIdx};pushHist();render()})">
+    // [FIX] Was missing pushNavPage() before drilling into an order - openPODetail(), openCount(),
+    // and openBuild() all correctly checkpoint the list before opening a record, but this one
+    // never did. Without it, Back had no "you were on the Sales Orders list" entry to return to,
+    // so it fell through to whatever was recorded before you even arrived at Sales Orders (e.g.
+    // the Dashboard) - Back skipped the list entirely instead of landing on it.
+    return `<tr class="rowlink" data-order="${escHtml(s.order_number||s.id)}" onclick="rowClick(event,function(){pushNavPage();S.activeSale='${s.id}';S._salesNavIdx=${_rowIdx};pushHist();render()})">
     <td onclick="event.stopPropagation()" style="padding:4px 8px;text-align:center;width:34px"><input type="checkbox" class="sales-row-cb" data-okey="${escHtml(_okey)}" ${window._salesSel&&window._salesSel.has(_okey)?'checked':''} onchange="toggleBulkSel(event,this)" style="cursor:pointer;accent-color:#2ABFAA"></td>
     <td style="font-size:var(--t-xs);color:var(--text3);font-family:var(--mono);white-space:nowrap">${(()=>{const ts=s.sale_date||s.created_at;if(!ts)return'—';const d=new Date(ts);const dt=d.toLocaleDateString('en-US',{month:'2-digit',day:'2-digit',year:'2-digit'});const tm=(!s.sale_date&&s.created_at)?d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}):'';return dt+(tm?`<div style="font-size:var(--t-xs);opacity:.65">${tm}</div>`:'');})()}</td>
     <td class="pn">${(function(){const norm=(s.order_number||'').replace(/^#/,'');const lkd=S.syncLocked&&S.syncLocked.has(norm);
       // [FIX] Surface risk_flagged (set by shopify-orders' checkOrderRisk when Shopify marks an
       // order INVESTIGATE/CANCEL risk) - the column existed with nowhere to actually show it in
       // the UI, so a flagged order looked completely normal here even though the flag was set.
+      // [FIX] Was hardcoded "High Risk" regardless of what Shopify actually said - shows the raw
+      // risk_level value now (Shopify's own recommendation string) instead of a guessed label,
+      // since that recommendation field is a different, coarser signal than the Low/Medium/High
+      // risk level Shopify's own order page shows.
       const _riskFlag=s.risk_flagged||(s._grouped&&(s._allLines||[]).some(function(l){return l.risk_flagged;}));
-      const _riskBadge=_riskFlag?` <span title="Shopify flagged this order as high risk" style="font-size:var(--t-xs);background:var(--red-dim);color:var(--red);border:1px solid rgba(220,38,38,.3);padding:1px 6px;border-radius:var(--r-md);font-weight:700">&#128681; High Risk</span>`:'';
+      const _riskLevel=s.risk_level||(s._grouped&&(s._allLines||[]).find(function(l){return l.risk_level;})||{}).risk_level||'';
+      const _riskBadge=_riskFlag?` <span title="Shopify flagged this order (recommendation: ${escHtml(_riskLevel||'unknown')})" style="font-size:var(--t-xs);background:var(--red-dim);color:var(--red);border:1px solid rgba(220,38,38,.3);padding:1px 6px;border-radius:var(--r-md);font-weight:700">&#128681; Flagged${_riskLevel?': '+escHtml(_riskLevel):''}</span>`:'';
       return(s.order_number||'')+_riskBadge+(s._grouped?` <span style="font-size:var(--t-xs);background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 5px;border-radius:var(--r-md);font-family:var(--mono);font-weight:600">${s._lineCount} items</span>`:'')+(lkd?` <span title="Locked from Shopify sync. Click to unlock." style="font-size:var(--t-xs);color:var(--orange);cursor:pointer" onclick="event.stopPropagation();if(confirm('Unlock order ${escHtml(s.order_number||'')} from sync?'))unlockOrderFromSync('${escHtml(s.order_number||'')}')">&#128274;</span>` : '');})()}</td>
     <td style="font-size:var(--t-sm);color:var(--text2);max-width:130px"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(custName||'—')}</div>${_dealerTag}</td>
     <td class="pn" style="color:${s._grouped?'var(--text3)':'var(--teal)'}" title="${s._grouped?'':(()=>{var _src=asmByPn.get(s.pn)||partByPn.get(s.pn);return((_src&&_src.description)||'').replace(/"/g,'&quot;');})()}">${s._grouped?'Multiple SKUs':s.pn}</td>
@@ -4716,7 +4737,12 @@ function renderSaleDetail(s){
         ${isMulti?`<span style="font-size:var(--t-xs);background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 7px;border-radius:var(--r-md);font-family:var(--mono)">${allLines.length} items</span>`:''}
         ${isSplit?`<span style="font-size:var(--t-xs);background:var(--yellow-dim);color:var(--yellow);border:1px solid rgba(217,119,6,.25);padding:1px 7px;border-radius:var(--r-md);font-weight:700">&#10006; ${shippedLines.length} shipped &middot; ${pendingLines.length} pending</span>`:''}
         ${onHold&&!isSplit?`<span style="font-size:var(--t-xs);background:var(--orange-dim);color:var(--orange);border:1px solid rgba(234,88,12,.25);padding:1px 7px;border-radius:var(--r-md);font-weight:700">&#9208; On Hold</span>`:''}
-        ${(s.risk_flagged||allLines.some(function(l){return l.risk_flagged;}))?`<span style="font-size:var(--t-xs);background:var(--red-dim);color:var(--red);border:1px solid rgba(220,38,38,.3);padding:1px 7px;border-radius:var(--r-md);font-weight:700" title="Shopify flagged this order as high risk (INVESTIGATE or CANCEL recommendation)">&#128681; High Risk</span>`:''}
+        ${(function(){
+          const _rf=s.risk_flagged||allLines.some(function(l){return l.risk_flagged;});
+          if(!_rf)return'';
+          const _rl=s.risk_level||(allLines.find(function(l){return l.risk_level;})||{}).risk_level||'';
+          return `<span style="font-size:var(--t-xs);background:var(--red-dim);color:var(--red);border:1px solid rgba(220,38,38,.3);padding:1px 7px;border-radius:var(--r-md);font-weight:700" title="Shopify's own recommendation for this order">&#128681; Flagged${_rl?': '+escHtml(_rl):''}</span>`;
+        })()}
       </div>
       <div style="font-size:var(--t-sm);color:var(--text3);margin-top:2px">${s.sale_date?s.sale_date.slice(0,10):''} &middot; ${s.source||'&mdash;'}${financial?' &middot; <span style="color:var(--text2)">'+financial+'</span>':''}${allLines[0]?.customer_name?` &middot; <span style="color:var(--text2);font-weight:600">${escHtml(allLines[0].customer_name)}</span>`:''}</div>
     </div>
@@ -12148,7 +12174,22 @@ function openModal(type,data){
     const _dsLi=S.parts.find(p=>p.pn===data.pn)||S.assemblies.find(a=>a.pn===data.pn);
     const _dsDisp=_dsLi?dispPn(_dsLi):data.pn;
     title='↓ Drop Ship — '+_dsDisp;
-    body=`<div style="font-size:var(--t-md);color:var(--text2);margin-bottom:14px">
+    // [FEATURE] Drop-ship master list: show the saved vendor/ordering info for this SKU right
+    // here, before shipping it - the whole point being Jon never has to re-look-up or remember
+    // how to order the same drop-ship SKU twice. If nothing is saved yet, offer to add it now.
+    const _dsVendor=S.dropshipVendors[data.pn];
+    const _dsVendorBlock=_dsVendor?`<div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-md);padding:10px 12px;margin-bottom:14px;font-size:var(--t-sm)">
+        <div style="font-weight:700;color:var(--text)">${escHtml(_dsVendor.vendor_name||'Vendor')}</div>
+        ${_dsVendor.order_url?`<a href="${escHtml(_dsVendor.order_url)}" target="_blank" rel="noopener" style="color:var(--teal)">Order here ↗</a>`:''}
+        ${_dsVendor.contact?`<div style="color:var(--text3)">${escHtml(_dsVendor.contact)}</div>`:''}
+        ${_dsVendor.instructions?`<div style="color:var(--text2);margin-top:4px">${escHtml(_dsVendor.instructions)}</div>`:''}
+        <button class="btn btn-sm" style="margin-top:8px" onclick="openDropshipVendorModal('${escHtml(data.pn)}')">Edit vendor info</button>
+      </div>`
+      :`<div style="background:var(--orange-dim);border:1px solid rgba(234,88,12,.25);border-radius:var(--r-md);padding:10px 12px;margin-bottom:14px;font-size:var(--t-sm);color:var(--orange)">
+        No vendor info saved for this SKU yet.
+        <button class="btn btn-sm" style="margin-top:6px;display:block" onclick="openDropshipVendorModal('${escHtml(data.pn)}')">+ Add vendor info</button>
+      </div>`;
+    body=`${_dsVendorBlock}<div style="font-size:var(--t-md);color:var(--text2);margin-bottom:14px">
       <b style="color:var(--purple)">${data.qty}× ${_dsDisp}</b> is not in your ERP inventory — this item ships directly from your supplier.<br>
       <span style="color:var(--text3)">No stock will be deducted. An audit entry will be logged with source <code>dropship</code>.</span>
     </div>
@@ -12157,6 +12198,16 @@ function openModal(type,data){
       ${fi('ds-tracking','Tracking # (optional)','','placeholder="Leave blank if not yet available"')}
     </div>
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" style="background:var(--purple);border-color:var(--purple)" onclick="submitDropShipment('${data.saleId}','${data.pn}',${data.qty})">↓ Mark Drop-Shipped</button></div>`;
+  }
+  else if(type==='dropshipVendor'){
+    const _e=data.existing||{};
+    title=(data.existing?'Edit':'Add')+' Vendor Info — '+dispSku(data.pn);
+    body=`<div style="font-size:var(--t-sm);color:var(--text3);margin-bottom:12px">Saved once here, this shows up automatically every future time ${escHtml(dispSku(data.pn))} comes in as a drop-ship line.</div>
+    ${fi('dsv-vendor','Vendor Name',_e.vendor_name||'','placeholder="e.g. Acme Supply Co"')}
+    ${fi('dsv-url','Order URL (optional)',_e.order_url||'','placeholder="https://\u2026"')}
+    ${fi('dsv-contact','Contact (optional)',_e.contact||'','placeholder="Phone, email, rep name\u2026"')}
+    <div class="form-group"><label class="form-label">Instructions</label><textarea id="dsv-instructions" class="form-input" rows="4" placeholder="What to do to place this order\u2026">${escHtml(_e.instructions||'')}</textarea></div>
+    <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitDropshipVendor('${escHtml(data.pn)}')">Save</button></div>`;
   }
   else if(type==='dropShipAll'){
     title='↓ Drop Ship All — Order '+data.orderNum;
@@ -20895,6 +20946,86 @@ async function loadAuditLog(){
   render();
 }
 
+// Drop-ship "master list": per-SKU vendor/ordering instructions that auto-populate the next
+// time that same SKU shows up as a drop-ship line, instead of Jon having to remember or
+// re-look-up how to order it every time. Keyed by pn in memory for O(1) lookup from both the
+// queue page and the per-line drop-ship modal.
+async function loadDropshipVendors(){
+  if(S._dropshipVendorsLoading)return;
+  S._dropshipVendorsLoading=true;
+  const{data,error}=await db.from('dropship_vendors').select('*');
+  S._dropshipVendorsLoading=false;
+  S._dropshipVendorsLoaded=true;
+  if(error){console.warn('[dropship] load failed:',error.message);S.dropshipVendors={};render();return;}
+  const map={};(data||[]).forEach(function(r){map[r.pn]=r;});
+  S.dropshipVendors=map;
+  render();
+}
+
+async function submitDropshipVendor(pn){
+  const vendor=(document.getElementById('dsv-vendor')||{}).value||'';
+  const url=(document.getElementById('dsv-url')||{}).value||'';
+  const instructions=(document.getElementById('dsv-instructions')||{}).value||'';
+  const contact=(document.getElementById('dsv-contact')||{}).value||'';
+  if(!vendor.trim()&&!instructions.trim()){toast('Enter at least a vendor name or instructions');return;}
+  const row={pn,vendor_name:vendor.trim()||null,order_url:url.trim()||null,instructions:instructions.trim()||null,contact:contact.trim()||null,updated_at:new Date().toISOString()};
+  const{data,error}=await db.from('dropship_vendors').upsert(row,{onConflict:'pn'}).select().single();
+  if(error){toast('Error: '+error.message);return;}
+  S.dropshipVendors={...S.dropshipVendors,[pn]:data||row};
+  closeModal();
+  toast('Saved vendor info for '+dispSku(pn));
+  render();
+}
+
+function openDropshipVendorModal(pn){
+  openModal('dropshipVendor',{pn,existing:S.dropshipVendors[pn]||null});
+}
+
+function renderDropshipQueue(){
+  if(!S._dropshipVendorsLoaded&&!S._dropshipVendorsLoading){loadDropshipVendors();return'<div class="section-empty" style="padding:40px 0">Loading drop-ship vendor info\u2026</div>';}
+  // Same detection rule the existing per-line "Drop Ship" button already uses: an open sales
+  // line whose SKU matches neither an assembly nor a part - i.e. something not carried in ERP
+  // stock at all, the classic drop-ship pattern.
+  const lines=S.sales.filter(function(s){
+    if((s.fulfillment_status||'Open')!=='Open')return false;
+    if(isInternal(s.order_number))return false;
+    return !findAsm(s.pn)&&!S.parts.find(function(p){return p.pn===s.pn;});
+  }).sort(function(a,b){return String(a.sale_date||'').localeCompare(String(b.sale_date||''));});
+  const rows=lines.map(function(s){
+    const v=S.dropshipVendors[s.pn];
+    const infoBlock=v?`<div style="font-size:var(--t-sm);color:var(--text2);margin-top:4px">
+        <b style="color:var(--text)">${escHtml(v.vendor_name||'Vendor')}</b>
+        ${v.order_url?` \u00b7 <a href="${escHtml(v.order_url)}" target="_blank" rel="noopener" style="color:var(--teal)">Order here \u2197</a>`:''}
+        ${v.contact?` \u00b7 ${escHtml(v.contact)}`:''}
+        ${v.instructions?`<div style="color:var(--text3);margin-top:2px">${escHtml(v.instructions)}</div>`:''}
+      </div>`
+      :`<div style="font-size:var(--t-sm);color:var(--orange);margin-top:4px">No vendor info saved yet for this SKU</div>`;
+    return `<div class="panel" style="padding:14px 18px;margin-bottom:10px;display:flex;align-items:flex-start;gap:14px">
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span style="font-family:var(--mono);font-weight:700;color:var(--purple)">${escHtml(dispSku(s.pn))}</span>
+          <span style="font-size:var(--t-xs);color:var(--text3)">\u00d7${s.qty||1}</span>
+          <span style="font-size:var(--t-xs);color:var(--text3)">#${escHtml(s.order_number||'')}</span>
+          ${s.customer_name?`<span style="font-size:var(--t-xs);color:var(--text3)">${escHtml(s.customer_name)}</span>`:''}
+        </div>
+        ${infoBlock}
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px;flex-shrink:0">
+        <button class="btn btn-sm" onclick="openDropshipVendorModal('${escHtml(s.pn)}')">${v?'Edit':'+ Add'} vendor info</button>
+        <button class="btn btn-sm" style="color:var(--purple);border-color:rgba(124,58,237,.3)" onclick="openDropShipModal('${s.id}','${escHtml(s.pn)}',${s.qty||1})">\u2193 Mark Shipped</button>
+      </div>
+    </div>`;
+  }).join('');
+  return `<div style="padding:20px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+      <div class="panel-title" style="flex:1;margin:0;border:0;padding:0">Drop-Ship Queue (${lines.length})</div>
+      <button class="btn btn-sm" onclick="S._dropshipVendorsLoaded=false;loadDropshipVendors()" title="Reload vendor info">\u21ba Refresh</button>
+    </div>
+    <div style="font-size:var(--t-sm);color:var(--text3);margin-bottom:14px">Every open order line for a SKU not carried in ERP stock. Save vendor info once and it shows up automatically the next time that SKU comes in.</div>
+    ${lines.length?rows:'<div class="section-empty" style="padding:40px 0">No drop-ship items waiting right now.</div>'}
+  </div>`;
+}
+
 function renderAuditLog(){
   if(!S._auditLogLoaded&&!S._auditLogLoading){loadAuditLog();return'<div class="section-empty" style="padding:40px 0">Loading activity log\u2026</div>';}
   if(S._auditLogLoading)return'<div class="section-empty" style="padding:40px 0">Loading\u2026</div>';
@@ -24723,6 +24854,17 @@ async function submitLoss(kind){
       if(kind==='receiving'||itemType==='part'){ var pp=(S.parts||[]).find(function(x){return x.pn===pn;}); if(pp) pp.total_unpckgd=data.new_qty; }
       else { var aa=(S.assemblies||[]).find(function(x){return x.pn===pn;}); if(aa) aa.total_on_hand=data.new_qty; }
     }
+    // [FIX] Neither log_receiving_damage nor log_assembly_scrap ever surfaced in the Activity
+    // feed - they write to dedicated tables (receiving_damage/assembly_scrap) that have no
+    // realtime subscription wired up, and nothing here ever called pushActivity() either. So a
+    // logged loss vanished from view the moment the toast disappeared, with no record in the
+    // feed anyone would think to check. Skipped entirely for an idempotent replay (nothing new
+    // actually happened) so it doesn't log twice for one real event.
+    if(!data.idempotent&&typeof pushActivity==='function'){
+      pushActivity({icon:'<span class="ic ic-alert"></span>',type:kind==='receiving'?'receiving_damage':'assembly_scrap',
+        text:(kind==='receiving'?'Receiving damage logged':'Scrap logged')+' \u2014 '+pn,
+        sub:'-'+qty+(reason?' \u00b7 '+reason:''),ts:new Date().toISOString(),cls:'var(--red)'});
+    }
     toast(data.idempotent?'Already logged (no double-deduct)':((kind==='receiving'?'Damage':'Scrap')+' logged - '+pn+' x'+qty));
     var ov=document.getElementById('loss-ov'); if(ov) ov.remove();
     S._lossesLoaded=false;
@@ -24980,7 +25122,7 @@ window.fitCopyRun=async function(){
 function render(){
   S._onOrderMap=null; // invalidate per-render caches; renderPlanning re-primes when needed
   S._buildabilityCache={}; // [PERF] fresh per-render memo for buildability(); nulled after this pass so post-render calls recompute against live stock
-  const views={losses:renderLosses,dashboard:renderDashboard,users:renderUsers,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,fitments:renderFitments,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder,reports:renderReports,pricelist:renderPriceList,dataintegrity:renderDataIntegrity};
+  const views={losses:renderLosses,dashboard:renderDashboard,users:renderUsers,parts:renderParts,assemblies:renderAssemblies,boms:renderBOMs,fitments:renderFitments,inventory:renderInventory,planning:renderPlanning,purchases:renderPurchasesEnhanced,vendors:renderVendors,sales:renderSales,packqueue:renderPackQueue,dealers:renderDealers,integrations:renderIntegrations,ai:renderAI,lookup:renderLookup,backups:renderBackups,cyclecounts:renderCycleCounts,corrections:renderCorrections,warranty:renderWarranty,import:renderImport,pobuilder:renderPOBuilder,reports:renderReports,pricelist:renderPriceList,dataintegrity:renderDataIntegrity,dropship:renderDropshipQueue};
   if(!S.calc||S.calc.salesLen!==S.sales.length||S.calc.bomLen!==Object.keys(S.boms).length||S.calc.forecastWks!==(S.forecastWeeks||8)){S._seriesBump=(S._seriesBump||0)+1;S._sc=null;S._ssc={};S._odm=null;computeDemand();}
   const active=document.activeElement;
   let fkey=null,selS=0,selE=0;
@@ -25516,6 +25658,10 @@ function printPriceList(){
         if(app)app.style.display='';
         try{computeDemand();}catch(e){console.error('computeDemand:',e);}
         try{loadCart();}catch(e){console.error('loadCart:',e);} // restore PO cart from previous session
+        // Loaded at boot, not lazily on first visit to the queue page - the per-line "Drop Ship"
+        // button on the Sales page also needs this to show saved vendor info immediately, and
+        // that's the far more common entry point than the dedicated queue page.
+        try{loadDropshipVendors();}catch(e){console.error('loadDropshipVendors:',e);}
         try{setupRealtime();startRealtimeHealthCheck();}catch(e){console.error('setupRealtime:',e);}
         try{loadBackups();}catch(e){console.error('loadBackups:',e);}
         try{startAutoBackup();}catch(e){console.error('startAutoBackup:',e);}
