@@ -459,7 +459,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v22.95';
+const TGK_ERP_VERSION = 'v22.96';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -875,6 +875,32 @@ function _toastRender(el,msg){
 // Copy that actually reports what happened. The Clipboard API is permission-gated and
 // rejects silently in a cross-origin frame or on a non-secure origin, so a bare
 // writeText().then() button appears to do nothing at all when it fails.
+// [FIX] copyText() above reads/restores btn.textContent, which is EMPTY for an icon-only
+// button (the icon is a CSS mask on a bare <span>, not text) - so after the 2-second revert it
+// set textContent to that captured empty string, permanently wiping the icon out. This variant
+// swaps innerHTML (clipboard icon -> check icon -> back to clipboard icon) instead of ever
+// touching textContent, so an icon-only button actually reverts instead of going blank forever.
+window.copyIconBtn=function(text,btn,iconClass){
+  iconClass=iconClass||'ic-clipboard';
+  var revert=function(){if(btn)btn.innerHTML='<span class="ic '+iconClass+'"></span>';};
+  var ok=function(){if(btn){btn.innerHTML='<span class="ic ic-check"></span>';setTimeout(revert,1500);}else toast('\u2713 Copied to clipboard');};
+  var fail=function(){
+    try{
+      var ta=document.createElement('textarea');
+      ta.value=text;ta.setAttribute('readonly','');
+      ta.style.cssText='position:fixed;top:-9999px;left:-9999px;opacity:0';
+      document.body.appendChild(ta);ta.select();ta.setSelectionRange(0,ta.value.length);
+      var done=document.execCommand('copy');
+      document.body.removeChild(ta);
+      if(done){ok();return;}
+    }catch(e){}
+    toast('Could not copy \u2014 select the text and press Ctrl+C',6000);
+  };
+  try{
+    if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(text).then(ok).catch(fail);
+    else fail();
+  }catch(e){fail();}
+};
 window.copyText=function(text,btn){
   var label=btn?btn.textContent:null;
   var ok=function(){
@@ -21101,26 +21127,33 @@ function renderDropshipQueue(){
   const notOrdered=lines.filter(function(s){return(s.fulfillment_status||'Open')==='Open';});
   const ordered=lines.filter(function(s){return s.fulfillment_status==='Ordered';});
   const onHold=lines.filter(function(s){return s.fulfillment_status==='On Hold';});
-  // Full shipping block, formatted for pasting straight into a vendor's order form - this is
-  // the whole point of the copy button below: one click instead of hunting the address down.
+  // [FIX] Was including customer_name and customer_phone - Jon wants ONLY the address copied,
+  // not the full contact block.
   function _dropshipShipToText(s){
     var out=[];
-    if(s.customer_name)out.push(s.customer_name);
     if(s.shipping_address1)out.push(s.shipping_address1);
     if(s.shipping_address2)out.push(s.shipping_address2);
     var csz=[s.shipping_city,s.shipping_province].filter(Boolean).join(', ')+(s.shipping_zip?' '+s.shipping_zip:'');
     if(csz.trim())out.push(csz.trim());
     if(s.shipping_country)out.push(s.shipping_country);
-    if(s.customer_phone)out.push(s.customer_phone);
     return out.join('\n');
   }
   function _dropshipRow(s){
     const v=S.dropshipVendors[s.pn];
     const fs=s.fulfillment_status||'Open';
+    // [FEATURE] Multi-SKU vs standalone: how many lines share this order number, so Jon can see
+    // at a glance whether he needs to coordinate this drop-ship item with other items on the
+    // same order, or it's the only thing on it.
+    const orderLineCount=S.sales.filter(function(x){return x.order_number===s.order_number;}).length;
+    const multiSkuTag=orderLineCount>1
+      ?`<div style="font-size:var(--t-xs);color:var(--text3)">Multi-SKU (${orderLineCount})</div>`
+      :`<div style="font-size:var(--t-xs);color:var(--text3)">Single item</div>`;
+    // [FEATURE] Ordered pill now has its own edit pencil - openMarkDropshipOrderedModal already
+    // pre-fills the existing vendor order ref when re-opened, so this just needed a way back in.
     const statusPill=fs==='On Hold'
       ?`<span style="font-size:var(--t-xs);background:var(--orange-dim);color:var(--red);border:1px solid rgba(220,38,38,.3);padding:1px 7px;border-radius:var(--r-md);font-weight:700">On Hold</span>`
       :fs==='Ordered'
-      ?`<span style="font-size:var(--t-xs);background:var(--orange-dim);color:var(--orange);border:1px solid rgba(234,88,12,.25);padding:1px 7px;border-radius:var(--r-md);font-weight:700">Ordered${s.dropship_order_ref?' \u00b7 #'+escHtml(s.dropship_order_ref):''}</span>`
+      ?`<span style="font-size:var(--t-xs);background:var(--orange-dim);color:var(--orange);border:1px solid rgba(234,88,12,.25);padding:1px 7px;border-radius:var(--r-md);font-weight:700;display:inline-flex;align-items:center;gap:4px">Ordered${s.dropship_order_ref?' \u00b7 #'+escHtml(s.dropship_order_ref):''}<span class="ic ic-pencil" style="cursor:pointer;width:.8em;height:.8em" title="Edit order reference #" onclick="openMarkDropshipOrderedModal('${s.id}','${escHtml(s.pn)}',${s.qty||1})"></span></span>`
       :`<span style="font-size:var(--t-xs);background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 7px;border-radius:var(--r-md);font-weight:600">Not yet ordered</span>`;
     const vendorCell=v
       ?`<div style="font-size:var(--t-sm);display:flex;align-items:center;gap:5px"><b style="color:var(--text)">${escHtml(v.vendor_name||'Vendor')}</b>${v.order_url?` \u00b7 <a href="${escHtml(v.order_url)}" target="_blank" rel="noopener" style="color:var(--teal)">Order \u2197</a>`:''}<span class="ic ic-pencil" style="cursor:pointer;color:var(--text3);width:.85em;height:.85em" title="Edit vendor info" onclick="openDropshipVendorModal('${escHtml(s.pn)}')"></span></div>
@@ -21134,12 +21167,12 @@ function renderDropshipQueue(){
     return `<tr>
       <td class="pn" style="color:var(--purple);font-weight:700">${escHtml(dispSku(s.pn))}</td>
       <td class="money-neutral">\u00d7${s.qty||1}</td>
-      <td style="font-size:var(--t-sm);color:var(--text2)">#${escHtml(s.order_number||'')}</td>
+      <td style="font-size:var(--t-sm);color:var(--text2)">#${escHtml(s.order_number||'')}${multiSkuTag}</td>
       <td style="font-size:var(--t-sm);color:var(--text2);max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(s.customer_name||'')}</td>
       <td>
         <div style="display:flex;align-items:flex-start;gap:6px">
           <div style="min-width:0">${shipCell}</div>
-          ${s.shipping_address1?`<button class="action-btn" title="Copy full shipping address" onclick="copyText('${shipToText}',this)"><span class="ic ic-clipboard"></span></button>`:''}
+          ${s.shipping_address1?`<button class="action-btn" title="Copy address only" onclick="copyIconBtn('${shipToText}',this)"><span class="ic ic-clipboard"></span></button>`:''}
         </div>
       </td>
       <td>${vendorCell}</td>
