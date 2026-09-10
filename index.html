@@ -459,7 +459,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.00';
+const TGK_ERP_VERSION = 'v23.02';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1985,21 +1985,15 @@ function escHtml(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt
 function jsEsc(s){return String(s??'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r');}
 function dispPn(a){return(a&&a.use_new_sku&&a.new_sku)?a.new_sku:((a&&a.pn)||'');}
 function dispSku(pn){if(!pn)return pn||'';var li=findAsm(pn)||(S._partIdx&&S._partIdx[pn])||S.parts.find(function(p){return p.pn===pn||(p.new_sku&&p.new_sku===pn);});return li?dispPn(li):pn;}
-// [FIX] Companion to dispSku for the write path: sales.pn (and every findAsm()/BOM/inventory
-// lookup against it) must always store the canonical LEGACY pn, never the active new_sku, even
-// though the UI now displays the new_sku via dispSku. Resolves whatever was typed or left
-// untouched -- a pn, a new_sku, or an unrecognized freeform string for drop-ship items with no
-// inventory record at all -- back to that canonical pn (or returns it unchanged if unresolvable).
-// Named distinctly from resolveCanonicalPn (defined earlier, returns {type,pn} and is already
-// depended on by lookupGo/Master Lookup) -- an earlier pass at this fix reused that name and
-// silently overwrote it, since JS function declarations with the same name replace each other
-// for every caller in the file, not just the new one. That broke Master Lookup's click-through
-// (resolved.type/.pn read off a plain string came back undefined) until this was caught and
-// separated back out.
+// [FIX] Rewritten to delegate to the existing resolveCanonicalPn (defined above) instead of a
+// separate, thinner lookup -- the first version only did exact-case matching, so typing a real
+// SKU in the wrong case (e.g. "tgk-0409" for stored "TGK-0409") silently failed to resolve, even
+// though resolveCanonicalPn already has a documented case-insensitive fallback for exactly this.
+// One resolver, reused everywhere, instead of two that can drift out of sync.
 function pnFromDisplayValue(input){
   if(!input)return input;
-  var li=findAsm(input)||(S._partIdx&&S._partIdx[input])||S.parts.find(function(p){return p.pn===input||(p.new_sku&&p.new_sku===input);});
-  return li?li.pn:input;
+  var resolved=resolveCanonicalPn(input);
+  return resolved?resolved.pn:input;
 }
 function dispReason(reason){if(!reason)return reason||'';var out=String(reason).replace(/(\d+)\s*[×x]\s*([A-Za-z0-9._\/-]+)/g,function(m,n,sku){return n+'×'+dispSku(sku);});out=out.replace(/(:\s*)([A-Za-z0-9][A-Za-z0-9._\/-]{3,})(?=\s|$)/g,function(m,pre,sku){var d=dispSku(sku);return pre+(d||sku);});return out;} // resolve legacy SKUs embedded in 'N×SKU' correction reasons to their display SKU
 // [CUST] Resolve the best customer name/email for an order. customer_* live per-line, and multi-line
@@ -6153,9 +6147,14 @@ async function markDelivered(saleId){
 
 function eoUpdateDesc(el){
   var d=el.closest('tr')&&el.closest('tr').querySelector('[data-field="desc"]');
-  // [FIX] Was raw-pn-only against assemblies, so typing/selecting a valid new_sku (or a
-  // standalone part at all) left the description blank even though the SKU itself was fine.
-  if(d){var a=findAsm(el.value)||(S._partIdx&&S._partIdx[el.value])||S.parts.find(function(x){return x.pn===el.value||(x.new_sku&&x.new_sku===el.value);});d.textContent=a&&a.description||'';}
+  // [FIX] First version only did exact-case, pn-or-new_sku matching -- still missed a real SKU
+  // typed in the wrong case (e.g. "tgk-0409" for stored "TGK-0409"). Reusing resolveCanonicalPn
+  // (same resolver as the save path) gets its case-insensitive fallback for free.
+  if(d){
+    var resolved=resolveCanonicalPn(el.value);
+    var a=resolved?(resolved.type==='assembly'?findAsm(resolved.pn):S.parts.find(function(x){return x.pn===resolved.pn;})):null;
+    d.textContent=a&&a.description||'';
+  }
 }
 
 function openEditOrderModal(orderNumOrId){
@@ -6199,7 +6198,17 @@ function openEditOrderModal(orderNumOrId){
   overlay.id='edit-order-overlay';
   overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto';
 
-  const asmPNs=[...new Set([...S.assemblies.map(function(a){return a.pn;}),...S.parts.map(function(p){return p.pn;})])].sort(); // no cap
+  // [FIX] Only ever offered raw legacy pn as a suggestion -- an item whose ACTIVE identifier is
+  // its new_sku (the normal state after a rename) never showed up while typing, even though the
+  // underlying lookup (pnFromDisplayValue/eoUpdateDesc) could already resolve it once typed in
+  // full by hand. Including dispPn() alongside the raw pn means whichever one someone actually
+  // knows the item by will autocomplete.
+  const asmPNs=[...new Set([
+    ...S.assemblies.map(function(a){return a.pn;}),
+    ...S.assemblies.map(function(a){return dispPn(a);}),
+    ...S.parts.map(function(p){return p.pn;}),
+    ...S.parts.map(function(p){return dispPn(p);})
+  ])].sort(); // no cap
 
   overlay.innerHTML=''
     +'<div class="modal" style="width:900px;max-width:98vw;margin:auto">'
@@ -16831,7 +16840,7 @@ function catBomClass(cat){
   let h=0;for(const ch of cat)h=(h*31+ch.charCodeAt(0))&0xffff;
   return _CAT_CLASSES[h%_CAT_CLASSES.length];
 }
-function pnLabel(pn){const x=S.assemblies.find(a=>a.pn===pn)||S.parts.find(p=>p.pn===pn);return x?.description||'';}
+function pnLabel(pn){const x=findAsm(pn)||S.parts.find(p=>p.pn===pn||(p.new_sku&&p.new_sku===pn));return x?.description||'';}
 function pnOpt(pn){const d=pnLabel(pn);return`<option value="${escHtml(pn)}"${d?` label="${escHtml(pn+' — '+d)}"`:''}>`;}
 function pnOptDisc(pn){const d=pnLabel(pn);return`<option value="${escHtml(pn)}" label="${escHtml(pn+(d?' — '+d:'')+' (discontinued)')}">`;}
 
