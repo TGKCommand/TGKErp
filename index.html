@@ -459,7 +459,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.03';
+const TGK_ERP_VERSION = 'v23.04';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1996,6 +1996,22 @@ function dispSku(pn){if(!pn)return pn||'';var li=findAsm(pn)||(S._partIdx&&S._pa
 // etc., which DO carry real time/timezone info) are untouched and pass through as before.
 function localDateFromDateOnly(s){
   return /^\d{4}-\d{2}-\d{2}$/.test(s||'')?new Date(s+'T00:00:00'):new Date(s);
+}
+// [FIX] Root cause of "sales orders show the wrong date, we're in Central time": every order
+// sync/import path below was computing sale_date by slicing the first 10 characters off a raw
+// timestamp string -- (order.created_at || new Date().toISOString()).slice(0,10) -- which only
+// gives the correct calendar day if that timestamp happens to already be expressed in Central
+// time. Shopify's created_at (and ShipStation's orderDate) aren't guaranteed to be, and
+// new Date().toISOString() is always UTC regardless -- so any order landing after ~6-7pm Central
+// (whenever UTC has already rolled to the next calendar day) got stamped with tomorrow's date, or
+// depending on direction, showed as a day behind once combined with the earlier display fix.
+// This properly parses the timestamp as an absolute instant (respecting whatever offset it
+// carries, or none) and reads off the calendar date as OBSERVED in America/Chicago specifically
+// -- correct across the DST boundary too, unlike a fixed UTC-6/UTC-5 offset would be. Called with
+// no argument, it returns today's date in Central time the same correct way.
+function centralDateOnly(input){
+  var d=input?new Date(input):new Date();
+  return new Intl.DateTimeFormat('en-CA',{timeZone:'America/Chicago',year:'numeric',month:'2-digit',day:'2-digit'}).format(d);
 }
 // [FIX] Rewritten to delegate to the existing resolveCanonicalPn (defined above) instead of a
 // separate, thinner lookup -- the first version only did exact-case matching, so typing a real
@@ -7878,7 +7894,7 @@ if (body.action === 'list_product_templates') {
           source: 'Shopify',
           fulfillment_status: 'Open',
           financial_status: order.financial_status || 'pending',
-          sale_date: (order.created_at || new Date().toISOString()).slice(0, 10),
+          sale_date: centralDateOnly(order.created_at),
           customer_name: custName || null,
           customer_email: custEmail || null,
           customer_phone: shipAddr.phone || order.customer?.phone || null,
@@ -8709,7 +8725,7 @@ Deno.serve(async (req) =&gt; {
             order_number: order.orderNumber, pn,
             qty: item.quantity || 1, fulfillment_status: fs,
             source: 'ShipStation Import',
-            sale_date: (order.orderDate || new Date().toISOString()).slice(0, 10),
+            sale_date: centralDateOnly(order.orderDate),
             customer_name: order.shipTo?.name || null,
             customer_email: order.customerEmail || null, // [CUST]
             created_at: order.orderDate
@@ -8753,7 +8769,7 @@ Deno.serve(async (req) =&gt; {
           order_number: order.orderNumber, pn,
           qty: item.qty || 1, fulfillment_status: fs,
           source: 'ShipStation Import',
-          sale_date: order.date || new Date().toISOString().slice(0, 10),
+          sale_date: order.date || centralDateOnly(),
           customer_name: order.customer || null,
           tracking_number: order.tracking || null,
           carrier: order.carrier || null,
@@ -9044,7 +9060,7 @@ Deno.serve(async (req) =&gt; {
             source: 'ShipStation Manual',
             customer_name: order.shipTo?.name || null, // [CUST] NEW_ORDER previously set no customer at all
             customer_email: order.customerEmail || null,
-            sale_date: (order.orderDate || new Date().toISOString()).slice(0, 10)
+            sale_date: centralDateOnly(order.orderDate)
           })
         }
         console.log('[SS] NEW_ORDER: created', orderNum, 'from ShipStation (source:', source || 'manual', ')')
@@ -10414,7 +10430,7 @@ async function syncOrdersNow(){
           const{data}=await db.from('sales').insert({
             order_number:orderNum,pn,qty:li.quantity||1,
             fulfillment_status:fs,financial_status:order.financial_status||'pending',source:'Shopify Sync',
-            sale_date:(order.created_at||new Date().toISOString()).slice(0,10),
+            sale_date:centralDateOnly(order.created_at),
             customer_name:custName,
             customer_email:custEmail,
             customer_phone:_sAddr.phone||order.customer?.phone||null,
@@ -10640,7 +10656,7 @@ async function importOrdersFromShopify(){
           const{data}=await db.from('sales').insert({
             order_number:orderNum,pn,qty:li.quantity||1,
             source:'Shopify Import',fulfillment_status:fs,
-            sale_date:(order.created_at||new Date().toISOString()).slice(0,10),
+            sale_date:centralDateOnly(order.created_at),
             discount_code:(order.discount_codes?.length?order.discount_codes[0].code:null)||null,
             ...(salesHavePrice()?{unit_price:shopifyLineUnitPrice(li),price_source:'shopify'}:{}),
           }).select().single();
@@ -13476,7 +13492,7 @@ async function submitManualSale(){
   if(!pn){toast('Select a SKU');return;}
   const{data,error}=await db.from('sales').insert({
     pn,order_number:orderNum,qty,source,status:'Open',fulfillment_status:'Open',
-    sale_date:new Date().toISOString().slice(0,10),
+    sale_date:centralDateOnly(),
     customer_name:customerName||null,customer_email:customerEmail||null
   }).select().single();
   if(error){toast('Error: '+error.message);return;}
