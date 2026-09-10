@@ -459,7 +459,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.05';
+const TGK_ERP_VERSION = 'v23.06';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -9243,18 +9243,36 @@ function toggleDevPipeline(){localStorage.setItem('dev_pipeline_minimized',Strin
 async function loadDashBackorderNotice(){
   var el=document.getElementById('dash-bo-notice');
   if(!el)return;
+  // [FIX] This ran unconditionally via requestAnimationFrame on EVERY render while on the
+  // dashboard -- not once. Since it's an async network query, overlapping in-flight calls race
+  // each other: an empty response landing after a populated one (or the reverse) produced exactly
+  // the "appears, disappears, reappears" flicker reported. A loading guard plus a short throttle
+  // means at most one request in flight, and no more than one every few seconds, regardless of
+  // how many renders fire in that window.
+  if(S._dashBoNoticeLoading)return;
+  var now=Date.now();
+  if(S._dashBoNoticeLastRun&&(now-S._dashBoNoticeLastRun)<5000)return;
+  S._dashBoNoticeLoading=true;
+  S._dashBoNoticeLastRun=now;
   try{
     var cutoff=new Date(Date.now()-48*3600*1000).toISOString();
+    // [FIX] Was .eq('action','backorder') -- only ever checking whether a backorder EVENT
+    // existed in the window, never whether that SKU was later reverted (restocked). An item
+    // that went on backorder and came back off it minutes later kept showing here for the full
+    // 48h regardless -- the exact "misleading" complaint. Fetching every action in the window
+    // and keeping only the NEWEST row per SKU (data is already ordered newest-first, so first
+    // occurrence wins) means a SKU only appears if backorder is genuinely its current state, not
+    // just something that happened to it recently.
     var{data,error}=await db.from('shopify_sync_log')
-      .select('pn,created_at')
-      .eq('action','backorder')
+      .select('pn,action,created_at')
       .gte('created_at',cutoff)
       .order('created_at',{ascending:false});
     if(error||!data||!data.length){el.innerHTML='';return;}
-    var seen={};
-    data.forEach(function(r){if(!seen[r.pn])seen[r.pn]=r.created_at;});
-    var skus=Object.keys(seen);
-    var newest=seen[skus.reduce(function(a,b){return seen[a]>seen[b]?a:b;})];
+    var latestPerSku={};
+    data.forEach(function(r){if(!latestPerSku[r.pn])latestPerSku[r.pn]=r;});
+    var skus=Object.keys(latestPerSku).filter(function(pn){return latestPerSku[pn].action==='backorder';});
+    if(!skus.length){el.innerHTML='';return;}
+    var newest=latestPerSku[skus.reduce(function(a,b){return latestPerSku[a].created_at>latestPerSku[b].created_at?a:b;})].created_at;
     var dismissed=localStorage.getItem('bo_notice_dismissed_at');
     if(dismissed&&newest<=dismissed){el.innerHTML='';return;}
     var ago=Math.round((Date.now()-new Date(newest).getTime())/60000);
@@ -9265,13 +9283,15 @@ async function loadDashBackorderNotice(){
     el.innerHTML='<div class="panel" style="padding:10px 16px;border-left:3px solid #ef4444;margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
       +'<span style="font-size:var(--t-xl);flex-shrink:0">&#128308;</span>'
       +'<div style="flex:1;min-width:0">'
-        +'<div style="font-size:var(--t-md);font-weight:700;color:#ef4444;margin-bottom:4px">'+skus.length+' product'+(skus.length!==1?'s':'')+' put on backorder on Shopify in the last 48h</div>'
+        +'<div style="font-size:var(--t-md);font-weight:700;color:#ef4444;margin-bottom:4px">'+skus.length+' product'+(skus.length!==1?'s':'')+' currently backordered on Shopify (flagged in the last 48h)</div>'
         +'<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center">'+preview+'<span style="font-size:var(--t-xs);color:var(--text3);margin-left:4px">last: '+agoTxt+'</span></div>'
       +'</div>'
       +'<button class="btn btn-sm" style="flex-shrink:0;color:#ef4444;border-color:rgba(220,38,38,.35)" onclick="navInventory(\'backorderlog\')">View Log &rarr;</button>'
       +'<button class="btn btn-sm" style="flex-shrink:0;color:var(--text3);border-color:var(--border)" onclick="localStorage.setItem(\'bo_notice_dismissed_at\',\''+newest+'\');document.getElementById(\'dash-bo-notice\').innerHTML=\'\'">Dismiss</button>'
       +'</div>';
   }catch(e){
+  }finally{
+    S._dashBoNoticeLoading=false;
   }
 }
 function renderInventoryBackorderLog(){
