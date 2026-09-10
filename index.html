@@ -459,7 +459,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.06';
+const TGK_ERP_VERSION = 'v23.07';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -6096,6 +6096,37 @@ function openDropShipAllModal(orderNum){
   openModal('dropShipAll',{orderNum,lineCount:lines.length});
 }
 
+// [FEATURE] Drop-ship Mark Shipped used to only touch the ERP's own sales row -- ShipStation had
+// zero record of the shipment (since it never went through ShipStation's normal pack/ship flow),
+// and the Shopify order sat un-fulfilled indefinitely with the customer never getting a shipping
+// email, even though the item genuinely shipped. This pushes both: one Shopify fulfillment call
+// (with tracking + notifyCustomer:true, so Shopify sends its normal "your order has shipped"
+// email) covering every item passed in at once -- one email, not one per SKU -- and one
+// ShipStation shipment record for the same tracking number (notifyCustomer:false there
+// deliberately, since Shopify's email already covers it; ShipStation sending its own on top would
+// double the notification for one physical shipment). Fire-and-forget: called AFTER the ERP's own
+// status update has already succeeded, so a slow or failed external call never blocks or reverts
+// what already happened in the ERP -- failures are surfaced as a toast by the caller, not treated
+// as an error state here.
+async function pushDropshipFulfillment(orderNumber,shopifyOrderId,items,tracking,carrier){
+  const results={shopify:null,shipstation:null};
+  if(shopifyOrderId&&tracking&&items.length){
+    try{
+      const r=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({action:'create_fulfillment',shopify_order_id:shopifyOrderId,items:items.map(function(i){return{sku:dispSku(i.pn),qty:i.qty||1};}),tracking_number:tracking,carrier:carrier||''})});
+      results.shopify=await r.json().catch(function(){return{};});
+      if(!r.ok||results.shopify.error)console.warn('[dropship] Shopify fulfillment failed:',results.shopify.error||r.status);
+    }catch(e){console.warn('[dropship] Shopify fulfillment threw:',e);}
+  }
+  if(orderNumber&&tracking){
+    try{
+      const r2=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({action:'mark_shipped',orderNumber:orderNumber,trackingNumber:tracking,carrier:carrier||''})});
+      results.shipstation=await r2.json().catch(function(){return{};});
+      if(!r2.ok||results.shipstation.error)console.warn('[dropship] ShipStation mark-shipped failed:',results.shipstation.error||r2.status);
+    }catch(e){console.warn('[dropship] ShipStation mark-shipped threw:',e);}
+  }
+  return results;
+}
+
 async function submitDropShipAll(orderNum){
   const tracking=(document.getElementById('ds-tracking')?.value||'').trim();
   const carrier=document.getElementById('ds-carrier')?.value||'';
@@ -6103,6 +6134,7 @@ async function submitDropShipAll(orderNum){
   if(!lines.length){toast('No open lines to ship');return;}
   const now=new Date().toISOString();
   let shipped=0,errors=0;
+  const shippedItems=[]; // [FEATURE] only items that actually succeeded get pushed to Shopify/ShipStation below
   for(const line of lines){
     const{error}=await db.from('sales').update({
       fulfillment_status:'Shipped',tracking_number:tracking||null,carrier:carrier||null,shipped_at:now
@@ -6115,12 +6147,22 @@ async function submitDropShipAll(orderNum){
       user_email:S.currentUser||null,source:'dropship'
     });
     shipped++;
+    shippedItems.push({pn:line.pn,qty:line.qty||1});
   }
   closeModal();
   if(errors)toast('↓ Shipped '+shipped+' lines, '+errors+' errors');
   else toast('↓ Drop-shipped all '+shipped+' line'+(shipped!==1?'s':'')+' on '+orderNum+(tracking?' · '+tracking:''));
   if(shipped)pushActivity({icon:'↓<span class="ic ic-box"></span>',type:'order_status',text:'#'+orderNum+' → Shipped (drop-ship all)',sub:shipped+' line'+(shipped!==1?'s':''),tracking:tracking||'',carrier:carrier||'',ts:new Date().toISOString(),cls:'var(--teal)'});
   render();
+  // [FEATURE] One Shopify fulfillment call covering every line that shipped here (one shipping
+  // email, not one per SKU) plus one ShipStation shipment record for the shared tracking number.
+  if(tracking&&shippedItems.length){
+    const leadSale=lines[0];
+    pushDropshipFulfillment(orderNum,leadSale?.shopify_order_id,shippedItems,tracking,carrier).then(function(r){
+      if(leadSale?.shopify_order_id&&!(r.shopify&&r.shopify.ok))toast('⚠ Shopify fulfillment failed for order '+orderNum+' — check manually',6000);
+      if(!(r.shipstation&&r.shipstation.ok))toast('⚠ ShipStation record failed for #'+orderNum+' — check manually',6000);
+    });
+  }
 }
 
 async function submitDropShipment(saleId,pn,qty){
@@ -6145,6 +6187,14 @@ async function submitDropShipment(saleId,pn,qty){
   updateBadge();closeModal();
   toast('↓ Drop-shipped '+qty+'× '+pn+(tracking?' · '+tracking:''));
   render();
+  // [FEATURE] Push tracking to Shopify (customer gets the shipping email) and record the shipment
+  // in ShipStation, which otherwise has zero record of a drop-ship fulfillment.
+  if(tracking){
+    pushDropshipFulfillment(sale?.order_number,sale?.shopify_order_id,[{pn:pn,qty:qty}],tracking,carrier).then(function(r){
+      if(sale?.shopify_order_id&&!(r.shopify&&r.shopify.ok))toast('⚠ Shopify fulfillment failed for '+dispSku(pn)+' — check manually',6000);
+      if(!(r.shipstation&&r.shipstation.ok))toast('⚠ ShipStation record failed for #'+(sale?.order_number||'')+' — check manually',6000);
+    });
+  }
 }
 
 // [FEATURE] Distinct from Mark Shipped: this is for a drop-ship line Shopify itself marked
