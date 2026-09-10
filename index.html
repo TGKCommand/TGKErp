@@ -459,7 +459,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.02';
+const TGK_ERP_VERSION = 'v23.03';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1985,6 +1985,18 @@ function escHtml(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt
 function jsEsc(s){return String(s??'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r');}
 function dispPn(a){return(a&&a.use_new_sku&&a.new_sku)?a.new_sku:((a&&a.pn)||'');}
 function dispSku(pn){if(!pn)return pn||'';var li=findAsm(pn)||(S._partIdx&&S._partIdx[pn])||S.parts.find(function(p){return p.pn===pn||(p.new_sku&&p.new_sku===pn);});return li?dispPn(li):pn;}
+// [FIX] sale_date is stored as a bare 'YYYY-MM-DD' string with no time or timezone component --
+// it only ever meant to represent a calendar day. new Date('YYYY-MM-DD') parses that as UTC
+// MIDNIGHT per the JS spec; formatting it afterward with toLocaleDateString() then renders that
+// instant in the browser's LOCAL timezone. For any US timezone (all behind UTC), that silently
+// rolls the displayed date back one full day -- e.g. an order stamped 2026-09-10 shows as
+// 09/09/26 everywhere this pattern was used. Appending a bare (no Z, no offset) time-of-day makes
+// JS parse the WHOLE string as LOCAL time instead, which is the correct read for a value that
+// only ever represented a day, never a specific instant. Full timestamps (created_at, shipped_at
+// etc., which DO carry real time/timezone info) are untouched and pass through as before.
+function localDateFromDateOnly(s){
+  return /^\d{4}-\d{2}-\d{2}$/.test(s||'')?new Date(s+'T00:00:00'):new Date(s);
+}
 // [FIX] Rewritten to delegate to the existing resolveCanonicalPn (defined above) instead of a
 // separate, thinner lookup -- the first version only did exact-case matching, so typing a real
 // SKU in the wrong case (e.g. "tgk-0409" for stored "TGK-0409") silently failed to resolve, even
@@ -4693,7 +4705,7 @@ function renderSales(){
     // the Dashboard) - Back skipped the list entirely instead of landing on it.
     return `<tr class="rowlink" data-order="${escHtml(s.order_number||s.id)}" onclick="rowClick(event,function(){pushNavPage();S.activeSale='${s.id}';S._salesNavIdx=${_rowIdx};pushHist();render()})">
     <td onclick="event.stopPropagation()" style="padding:4px 8px;text-align:center;width:34px"><input type="checkbox" class="sales-row-cb" data-okey="${escHtml(_okey)}" ${window._salesSel&&window._salesSel.has(_okey)?'checked':''} onchange="toggleBulkSel(event,this)" style="cursor:pointer;accent-color:#2ABFAA"></td>
-    <td style="font-size:var(--t-xs);color:var(--text3);font-family:var(--mono);white-space:nowrap">${(()=>{const ts=s.sale_date||s.created_at;if(!ts)return'—';const d=new Date(ts);const dt=d.toLocaleDateString('en-US',{month:'2-digit',day:'2-digit',year:'2-digit'});const tm=(!s.sale_date&&s.created_at)?d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}):'';return dt+(tm?`<div style="font-size:var(--t-xs);opacity:.65">${tm}</div>`:'');})()}</td>
+    <td style="font-size:var(--t-xs);color:var(--text3);font-family:var(--mono);white-space:nowrap">${(()=>{const ts=s.sale_date||s.created_at;if(!ts)return'—';const d=localDateFromDateOnly(ts);const dt=d.toLocaleDateString('en-US',{month:'2-digit',day:'2-digit',year:'2-digit'});const tm=(!s.sale_date&&s.created_at)?d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}):'';return dt+(tm?`<div style="font-size:var(--t-xs);opacity:.65">${tm}</div>`:'');})()}</td>
     <td class="pn">${(function(){const norm=(s.order_number||'').replace(/^#/,'');const lkd=S.syncLocked&&S.syncLocked.has(norm);
       // [FIX] Surface risk_flagged (set by shopify-orders' checkOrderRisk when Shopify marks an
       // order INVESTIGATE/CANCEL risk) - the column existed with nowhere to actually show it in
@@ -26001,7 +26013,7 @@ function printInvoice(lines){
   if(!lines||!lines.length){toast('No order lines');return;}
   const lead=lines[0];
   const orderNum=lead.order_number||'(no #)';
-  const orderDate=lead.sale_date?new Date(lead.sale_date).toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'}):'';
+  const orderDate=lead.sale_date?localDateFromDateOnly(lead.sale_date).toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'}):'';
   const tracking=lines.find(function(l){return l.tracking_number;})?.tracking_number||'';
   const carrier=lines.find(function(l){return l.carrier;})?.carrier||'';
   const invNum='INV-'+orderNum.replace(/[^a-zA-Z0-9]/g,'');
@@ -26435,7 +26447,7 @@ function printPackingSlip(orderNum,saleId){
   if(!lines.length){toast('No order lines found');return;}
   var lead=lines[0];
   var oNum=lead.order_number||'(no #)';
-  var oDate=lead.sale_date?new Date(lead.sale_date).toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'}):'';
+  var oDate=lead.sale_date?localDateFromDateOnly(lead.sale_date).toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'}):'';
   var trackLine=lines.find(function(l){return l.tracking_number;})||{};
   var asmMap={};S.assemblies.forEach(function(a){asmMap[a.pn]=a;});
   var prtMap={};S.parts.forEach(function(p2){prtMap[p2.pn]=p2;});
