@@ -1704,7 +1704,7 @@ function showOrderAlert(orderNum, pn){
     if(buf[key].first===null)buf[key].first=pn;
     return;
   }
-  const _li=_findPart(pn)||findAsm(pn);
+  const _li=S.parts.find(p=>p.pn===pn)||S.assemblies.find(a=>a.pn===pn);
   buf[key]={items:1,first:_li?dispPn(_li):pn,timer:null};
   // Short settle window so all lines of the same order land before the alert is raised.
   buf[key].timer=setTimeout(function(){
@@ -1943,6 +1943,14 @@ function syncShopifyTemplate(pn,newOh){
     .then(function(r){return r.text().then(function(txt){
       var d=null;try{d=JSON.parse(txt);}catch(e){}
       if(d&&d.ok){_logSync();if(d.errors&&d.errors.length)console.warn('[Shopify variant BO]',shopSku,d.errors);}
+      else if(d&&d.skipped_all_held){
+        // [FIX] The edge function used to return ok:true here (nothing was actually synced --
+        // every Shopify variant for this SKU is on hold), which made _logSync() fire and write
+        // a false 'backorder' row for a SKU Shopify was never touched on. Now that it correctly
+        // reports ok:false, this branch just says so plainly instead of falling into the
+        // generic failure branch below and triggering a pointless product-template fallback.
+        console.log('[Shopify variant BO] '+shopSku+': skipped -- every matching Shopify variant is on hold ('+(d.held_count||0)+'). Release the hold if this SKU should sync normally.');
+      }
       else if((txt||'').trim()==='ok'||(txt||'').trim()==='pong'){console.log('[Shopify variant BO] action not deployed - product-template fallback for',shopSku);_productFallback();}
       else{console.warn('[Shopify variant BO]',shopSku,(d&&d.error)||r.status);_productFallback();}
     });}).catch(function(){_productFallback();});
@@ -4323,7 +4331,7 @@ function renderPurchases(){
       }
       return{pn:(function(){const _li=S.parts.find(p=>p.pn===lines[0].pn)||S.assemblies.find(a=>a.pn===lines[0].pn);return _li?dispPn(_li):lines[0].pn;})(),desc:desc0||headerDesc||'',qty:totalQty,unitCostHtml:fc(lines[0].unit_cost||0),extended:(lines[0].qty_ordered||0)*(lines[0].unit_cost||0),tooltip:''};
     }
-    const tip=lines.map(l=>{const _li=_findPart(l.pn)||findAsm(l.pn);const _ld=_li?dispPn(_li):l.pn;return `${_ld} ×${l.qty_ordered} @ ${fc(l.unit_cost||0)}`;}).join('&#10;');
+    const tip=lines.map(l=>{const _li=S.parts.find(p=>p.pn===l.pn)||S.assemblies.find(a=>a.pn===l.pn);const _ld=_li?dispPn(_li):l.pn;return `${_ld} ×${l.qty_ordered} @ ${fc(l.unit_cost||0)}`;}).join('&#10;');
     return{pn:'Multiple',desc:lines.length+' items',qty:totalQty,unitCostHtml:'—',extended:ext,tooltip:tip};
   }
 
@@ -4480,12 +4488,7 @@ function renderSales(){
   S.assemblies.forEach(a=>{ if(a.pn&&!asmByPn.has(a.pn))asmByPn.set(a.pn,a); });
   S.assemblies.forEach(a=>{ if(a.new_sku&&!asmByPn.has(a.new_sku))asmByPn.set(a.new_sku,a); });
   const partByPn=new Map();
-  // [FIX] Was missing the new_sku fallback pass entirely - asmByPn right above correctly has
-  // both passes (pn first, then new_sku only filling gaps), but this one only ever indexed by
-  // pn. A part referenced by its active new_sku would silently miss this map and get
-  // misclassified as drop-ship (no ERP stock record) even though it's genuinely stocked.
   S.parts.forEach(p=>{ if(p.pn&&!partByPn.has(p.pn))partByPn.set(p.pn,p); });
-  S.parts.forEach(p=>{ if(p.new_sku&&!partByPn.has(p.new_sku))partByPn.set(p.new_sku,p); });
   function fastReadiness(lines){
     const pend=(lines||[]).filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
     if(!pend.length)return null;
@@ -4722,7 +4725,7 @@ function salesLoadMore(){
 window.salesLoadMore = salesLoadMore;
 
 function renderSaleDetail(s){
-  const _dispResolve=pn=>{const li=_findPart(pn)||findAsm(pn);return li?dispPn(li):pn;};
+  const _dispResolve=pn=>{const li=S.parts.find(p=>p.pn===pn)||S.assemblies.find(a=>a.pn===pn);return li?dispPn(li):pn;};
   const allLines=s.order_number
     ? S.sales.filter(x=>x.order_number===s.order_number).sort((a,b)=>_dispResolve(a.pn).localeCompare(_dispResolve(b.pn)))
     : [s];
@@ -4902,11 +4905,7 @@ function renderSaleDetail(s){
   </tr></thead><tbody>
   ${allLines.map(line=>{
     const la=findAsm(line.pn);
-    // [FIX] Was S.parts.find(p=>p.pn===line.pn) - inconsistent with la's findAsm just above,
-    // which already checks new_sku. A part stored under its new_sku would fall through both
-    // checks and get misclassified as drop-ship (no ERP stock record) even though it genuinely
-    // is stocked, just under a different display SKU.
-    const lp=la?null:_findPart(line.pn);
+    const lp=la?null:S.parts.find(p=>p.pn===line.pn)||null;
     const lstock=la?(la.total_on_hand||0):lp?(lp.total_unpckgd||0):null;
     const lfs=line.fulfillment_status||'Open';
     const lcanFill=lstock!==null&&lstock>=(line.qty||1);
@@ -4948,7 +4947,7 @@ function renderSaleDetail(s){
   <div class="panel" style="padding:0"><div class="section-header">Stock movements — this order</div>
   ${moves.length===0?'<div class="section-empty">None</div>':moves.map(c=>`<div class="check-row">
     <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);min-width:70px">${new Date(c.created_at).toLocaleDateString()}</span>
-    <span class="pn" style="min-width:110px;color:var(--text)">${(function(){const _li=_findPart(c.pn)||findAsm(c.pn);return _li?dispPn(_li):c.pn;})()}</span>
+    <span class="pn" style="min-width:110px;color:var(--text)">${(function(){const _li=S.parts.find(p=>p.pn===c.pn)||S.assemblies.find(a=>a.pn===c.pn);return _li?dispPn(_li):c.pn;})()}</span>
     <span class="${c.adjustment>0?'money-vendor':'money-cost'}" style="font-weight:700;min-width:44px">${c.adjustment>0?'+':''}${c.adjustment}</span>
     <span style="flex:1;font-size:var(--t-sm);color:var(--text2)">${c.reason||c.source}</span>
   </div>`).join('')}</div>`;
@@ -5692,12 +5691,8 @@ async function submitReturnV2(orderNum){
   for(const l of lines){
     const pn=l.pn;const qty2=l.qty||1;
     if(condition==='Resellable'&&condition!=='PreERP'){
-      // [FIX] Was S.assemblies.find(a=>a.pn===pn)/S.parts.find(p=>p.pn===pn) - a sales line's pn
-      // can be the active new_sku rather than the canonical pn (this is the exact TGK-0313-01
-      // class of bug from earlier this session), which would silently fail to match either
-      // table and mark the return "Returned" without ever actually restocking anything.
-      const asm=findAsm(pn);
-      const prt=asm?null:_findPart(pn);
+      const asm=S.assemblies.find(a=>a.pn===pn);
+      const prt=S.parts.find(p=>p.pn===pn);
       if(asm){
         const newOh=await adjustStock('assembly',asm,qty2,{reason:'Return \u2014 '+reason+' (order '+orderNum+')',source:'return'});
         if(newOh!==null)results.push('+'+qty2+' '+pn);
@@ -5766,7 +5761,7 @@ async function submitReturnV2(orderNum){
     else console.warn('[TGK] warranty_claims insert failed:',wtyErr.message);
   }
 
-  logAction('Return '+lines.map(function(l){const _li=_findPart(l.pn)||findAsm(l.pn);return l.qty+'× '+(_li?dispPn(_li):l.pn);}).join(', ')+' on '+orderNum,'sales',orderNum,null,null).catch(function(){});
+  logAction('Return '+lines.map(function(l){const _li=S.parts.find(p=>p.pn===l.pn)||S.assemblies.find(a=>a.pn===l.pn);return l.qty+'× '+(_li?dispPn(_li):l.pn);}).join(', ')+' on '+orderNum,'sales',orderNum,null,null).catch(function(){});
   closeModal();
   await refreshSales();
   render();
@@ -5778,7 +5773,7 @@ async function submitReturnV2(orderNum){
 async function unshipLine(saleId, pn, qty){
   const line=S.sales.find(s=>s.id===saleId);
   if(!line||line.fulfillment_status!=='Shipped'){toast('Line is not Shipped');return;}
-  const _unshipLi=_findPart(pn)||findAsm(pn);
+  const _unshipLi=S.parts.find(p=>p.pn===pn)||S.assemblies.find(a=>a.pn===pn);
   const _unshipDisp=_unshipLi?dispPn(_unshipLi):pn;
 
   const targetStatus=confirm(
@@ -5788,10 +5783,7 @@ async function unshipLine(saleId, pn, qty){
   )?'Open':'On Hold';
 
   const asm=findAsm(pn);
-  // [FIX] Was S.parts.find(p=>p.pn===pn) - inconsistent with the assembly resolution right above
-  // it (findAsm already checks new_sku); a part stored under its new_sku would silently fail to
-  // match here even though findAsm correctly found nothing on the assembly side.
-  const prt=asm?null:_findPart(pn);
+  const prt=asm?null:S.parts.find(p=>p.pn===pn);
   const undoOps=[];
 
   if(asm){
@@ -5939,10 +5931,7 @@ async function markPacked(saleId,pn,qty){
   // submitShipment() already expects when it deducts at ship time). Falls back to the part
   // record so Pack works for both, matching what actually ships this order.
   const asm=findAsm(pn);
-  // [FIX] Was S.parts.find(p=>p.pn===pn) - inconsistent with the assembly resolution right above
-  // it (findAsm already checks new_sku); a part stored under its new_sku would silently fail to
-  // match here even though findAsm correctly found nothing on the assembly side.
-  const prt=asm?null:_findPart(pn);
+  const prt=asm?null:S.parts.find(p=>p.pn===pn);
   if(!asm&&!prt){toast('SKU '+pn+' not found in assemblies or parts');return;}
   const oh=asm?(asm.total_on_hand||0):(prt.total_unpckgd||0);
   if(oh<qty){
@@ -6025,10 +6014,7 @@ async function submitShipment(saleId,pn,qty){
   const tracking=document.getElementById('ship-tracking').value.trim();
   const carrier=document.getElementById('ship-carrier').value;
   const asm=findAsm(pn);
-  // [FIX] Was S.parts.find(p=>p.pn===pn) - inconsistent with the assembly resolution right above
-  // it (findAsm already checks new_sku); a part stored under its new_sku would silently fail to
-  // match here even though findAsm correctly found nothing on the assembly side.
-  const prt=asm?null:_findPart(pn);
+  const prt=asm?null:S.parts.find(p=>p.pn===pn);
   const asmPrev=asm?{...asm}:null;
   const prtPrev=prt?{...prt}:null;
   // [FIX A2] Defense-in-depth: never deduct a line that is already Shipped/Delivered/Cancelled/Refunded.
@@ -6155,7 +6141,7 @@ function eoUpdateDesc(el){
 }
 
 function openEditOrderModal(orderNumOrId){
-  const _eoDispResolve=pn=>{const li=_findPart(pn)||findAsm(pn);return li?dispPn(li):pn;};
+  const _eoDispResolve=pn=>{const li=S.parts.find(p=>p.pn===pn)||S.assemblies.find(a=>a.pn===pn);return li?dispPn(li):pn;};
   const lines=S.sales.filter(function(s){return s.order_number===orderNumOrId||s.id===orderNumOrId;}).sort(function(a,b){return _eoDispResolve(a.pn).localeCompare(_eoDispResolve(b.pn));});
   if(!lines.length){toast('Order not found');return;}
   const first=lines[0];
@@ -9361,7 +9347,7 @@ async function bulkSyncShopifyBackorder(){
     if(!(a.msrp>0))return false;
     return true;
   });
-  let done=0,backorderCount=0,inStockCount=0,errorCount=0;
+  let done=0,backorderCount=0,inStockCount=0,errorCount=0,skippedCount=0,partialCount=0;
   const restockDays=parseInt(S.settings.shopify_restock_days)||30;
   for(const a of fgs){
     const pn=dispPn(a);
@@ -9422,6 +9408,22 @@ async function bulkSyncShopifyBackorder(){
           restock_date:isBackorder?restockDate:null,
           user_email:S.currentUser||null
         }).then(function(r){ if(r&&r.error){console.warn('[backorder log] bulk write failed:',r.error.message);if(!S._boLogWarned){S._boLogWarned=true;toast('Backorder log write failed \u2014 badges will not update. '+(r.error.message||''),10000);}} },function(e){console.warn('[backorder log] bulk write threw:',e);});
+      } else if(d&&d.skipped_all_held){
+        // [FIX] Used to be ok:true from the edge function, so this counted as a silent success
+        // (backorderCount++) with NO log entry distinguishing it from a real sync -- a held SKU
+        // just looked identical to one that actually got backordered. Now it's its own line:
+        // visible, not counted as an error, and not logged as if Shopify was touched.
+        skippedCount++;
+        log.innerHTML+='<span style="color:var(--text3)">SKIPPED&nbsp;&nbsp;</span> '+escHtml(pn)+' — on hold ('+(d.held_count||0)+' variant'+(d.held_count===1?'':'s')+'), not synced<br>';
+      } else if(d&&d.logged_action==='partial'){
+        // [FIX] Some but not all of this SKU's Shopify variant instances (e.g. the same SKU
+        // listed on more than one chassis page) actually backordered -- one silently reverted.
+        // Previously this whole outcome collapsed into a plain success/backorder log entry with
+        // no visible sign one listing didn't take. Now flagged distinctly so it can be checked
+        // by hand rather than assumed fully applied everywhere.
+        partialCount++;
+        var _why2=d.reason||'one or more Shopify listings for this SKU did not apply the change';
+        log.innerHTML+='<span style="color:var(--amber)">PARTIAL&nbsp;&nbsp;&nbsp;</span> '+escHtml(pn)+' — backordered on some but not all Shopify listings ('+escHtml(String(_why2))+') — check manually<br>';
       } else {
         errorCount++;
         // Surface the real cause. A policy write that Shopify accepted (HTTP 200) but did not
@@ -9445,10 +9447,10 @@ async function bulkSyncShopifyBackorder(){
     log.scrollTop=log.scrollHeight;
     await new Promise(res=>setTimeout(res,150));
   }
-  log.innerHTML+='<br><strong>Done.</strong> '+inStockCount+' in stock, '+backorderCount+' backordered, '+errorCount+' errors.';
+  log.innerHTML+='<br><strong>Done.</strong> '+inStockCount+' in stock, '+backorderCount+' backordered'+(partialCount?', '+partialCount+' partial':'')+(skippedCount?', '+skippedCount+' skipped (on hold)':'')+', '+errorCount+' errors.';
   log.scrollTop=log.scrollHeight;
   btn.disabled=false;btn.textContent='⟳ Bulk Sync Backorder Status';
-  toast('✓ Bulk sync complete — '+backorderCount+' backorder, '+inStockCount+' in stock'+(errorCount?' | '+errorCount+' errors':''));
+  toast('✓ Bulk sync complete — '+backorderCount+' backorder, '+inStockCount+' in stock'+(partialCount?' | '+partialCount+' partial':'')+(skippedCount?' | '+skippedCount+' skipped':'')+(errorCount?' | '+errorCount+' errors':''));
 }
 async function syncShopifyImages(){
   if(!S.shopify||!S.shopify.store){toast('Configure Shopify store URL in Integrations first');return;}
@@ -10911,7 +10913,7 @@ async function sendAI(){
   const c=$('ai-chat');if(c)c.scrollTop=c.scrollHeight;
   const lowParts=S.parts.filter(p=>avgWk(p)>0&&wks(p)!==null&&wks(p)<4).map(p=>`${dispPn(p)}(${wks(p)}wk)`).join(', ');
   const critAsm=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&liveStatus(a)==='critical').map(a=>`${dispPn(a)}(${a.total_on_hand||0}oh)`).join(', ');
-  const openPOs=S.purchases.filter(p=>p.status!=='Received').map(p=>{const _li=_findPart(p.pn)||findAsm(p.pn);return `${_li?dispPn(_li):p.pn}@${p.vendor}(${p.status})`;}).join(', ');
+  const openPOs=S.purchases.filter(p=>p.status!=='Received').map(p=>{const _li=S.parts.find(x=>x.pn===p.pn)||S.assemblies.find(x=>x.pn===p.pn);return `${_li?dispPn(_li):p.pn}@${p.vendor}(${p.status})`;}).join(', ');
   const ctx=`You are the AI assistant for TGK Motorsport ERP. TGK builds performance Audi/Tesla parts. Live Supabase data: ${S.parts.length} parts, ${S.assemblies.length} assemblies. Low stock (under 4wks): ${lowParts||'none'}. Critical (zero/negative stock): ${critAsm||'none'}. Open POs: ${openPOs||'none'}. 7-day orders: ${S.sales.filter(s=>s.sale_date>=daysAgo(7)).length}. Be specific, actionable, concise.`;
   try{
     let data=null;
@@ -10976,7 +10978,7 @@ function approvePO(poId){
       </div>
       ${lines.length>0?`<div style="border-top:1px solid var(--border);padding-top:10px;max-height:160px;overflow-y:auto">
         ${lines.map(l=>`<div style="display:flex;align-items:center;gap:8px;padding:3px 0;font-size:var(--t-sm)">
-          <span class="pn" style="min-width:120px">${(function(){const _li=_findPart(l.pn)||findAsm(l.pn);return _li?dispPn(_li):l.pn;})()}</span>
+          <span class="pn" style="min-width:120px">${(function(){const _li=S.parts.find(p=>p.pn===l.pn)||S.assemblies.find(a=>a.pn===l.pn);return _li?dispPn(_li):l.pn;})()}</span>
           <span style="flex:1;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${l.description||''}</span>
           <span class="money-neutral">×${l.qty_ordered}</span>
           <span class="money-cost">${fc((l.qty_ordered||0)*(l.unit_cost||0))}</span>
@@ -12245,7 +12247,7 @@ function openModal(type,data){
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitAsm('${data.id||''}')">Save Assembly</button></div>`;
   }
   else if(type==='shipOrder'){
-    const _shipLi=_findPart(data.pn)||findAsm(data.pn);
+    const _shipLi=S.parts.find(p=>p.pn===data.pn)||S.assemblies.find(a=>a.pn===data.pn);
     const _shipDisp=_shipLi?dispPn(_shipLi):data.pn;
     title='Ship Order — '+_shipDisp;
     body=`<div style="font-size:var(--t-md);color:var(--text2);margin-bottom:14px">Shipping <b style="color:var(--teal)">${data.qty}× ${_shipDisp}</b>. Assembly stock will be deducted and logged automatically.</div>
@@ -12256,7 +12258,7 @@ function openModal(type,data){
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitShipment('${data.saleId}','${data.pn}',${data.qty})"><span class="ic ic-truck"></span>Confirm Shipment</button></div>`;
   }
   else if(type==='dropShip'){
-    const _dsLi=_findPart(data.pn)||findAsm(data.pn);
+    const _dsLi=S.parts.find(p=>p.pn===data.pn)||S.assemblies.find(a=>a.pn===data.pn);
     const _dsDisp=_dsLi?dispPn(_dsLi):data.pn;
     title='↓ Drop Ship — '+_dsDisp;
     // [FEATURE] Drop-ship master list: show the saved vendor/ordering info for this SKU right
@@ -16801,7 +16803,7 @@ function catBomClass(cat){
   let h=0;for(const ch of cat)h=(h*31+ch.charCodeAt(0))&0xffff;
   return _CAT_CLASSES[h%_CAT_CLASSES.length];
 }
-function pnLabel(pn){const x=findAsm(pn)||_findPart(pn);return x?.description||'';}
+function pnLabel(pn){const x=S.assemblies.find(a=>a.pn===pn)||S.parts.find(p=>p.pn===pn);return x?.description||'';}
 function pnOpt(pn){const d=pnLabel(pn);return`<option value="${escHtml(pn)}"${d?` label="${escHtml(pn+' — '+d)}"`:''}>`;}
 function pnOptDisc(pn){const d=pnLabel(pn);return`<option value="${escHtml(pn)}" label="${escHtml(pn+(d?' — '+d:'')+' (discontinued)')}">`;}
 
@@ -18229,7 +18231,7 @@ async function quickReceive(poId){
           </tr></thead><tbody>
           ${pending.map(l=>{const rem=(l.qty_ordered||0)-(l.qty_received||0);return `<tr style="border-bottom:1px solid var(--border)">
             <td style="padding:8px 6px"><input type="checkbox" id="qr-chk-${l.id}" checked></td>
-            <td style="padding:8px 6px;font-family:var(--mono);font-size:var(--t-sm);color:var(--teal)">${(function(){const _li=_findPart(l.pn)||findAsm(l.pn);return _li?dispPn(_li):l.pn;})()}</td>
+            <td style="padding:8px 6px;font-family:var(--mono);font-size:var(--t-sm);color:var(--teal)">${(function(){const _li=S.parts.find(p=>p.pn===l.pn)||S.assemblies.find(a=>a.pn===l.pn);return _li?dispPn(_li):l.pn;})()}</td>
             <td style="padding:8px 6px;font-size:var(--t-sm);color:var(--text2);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${l.description||''}</td>
             <td style="padding:8px 6px;text-align:right;font-size:var(--t-sm);color:var(--text3)">${rem}</td>
             <td style="padding:8px 6px;text-align:right"><input id="qr-qty-${l.id}" type="number" min="0" value="${rem}" style="width:70px;text-align:right;background:var(--bg4);border:1px solid var(--border);border-radius:var(--r-sm);color:var(--text);padding:4px 6px;font-size:var(--t-md);font-family:var(--mono)"></td>
@@ -18440,7 +18442,7 @@ function renderPODetail(po) {
     const pct=line.qty_ordered>0?Math.min(100,Math.round(((line.qty_received||0)/line.qty_ordered)*100)):0;
     return `<div class="check-row" style="background:${done?'rgba(13,148,136,.04)':'var(--bg2)'};border:1px solid var(--border);border-radius:var(--r-md);margin-bottom:8px;flex-wrap:wrap;gap:10px">
       <div style="display:flex;flex-direction:column;min-width:120px">
-        <span class="pn" style="color:var(--teal)">${(function(){const _li=_findPart(line.pn)||findAsm(line.pn);return _li?dispPn(_li):line.pn;})()}</span>
+        <span class="pn" style="color:var(--teal)">${(function(){const _li=S.parts.find(p=>p.pn===line.pn)||S.assemblies.find(a=>a.pn===line.pn);return _li?dispPn(_li):line.pn;})()}</span>
         <span style="font-size:var(--t-xs);color:var(--text3);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${line.description||''}</span>
         ${(function(){
           var older=((S._fifoMap||{})[line.pn])||[];
@@ -19257,7 +19259,7 @@ function printAllBOMs(pns){
     const profit=msrp-totalCost-(asm?.shipping_cost||10)-msrp*0.03;
     const margin=msrp?(profit/msrp*100):null;
     const trows=items.map((item,idx)=>{
-      const p2=_findPart(item.child_pn)||findAsm(item.child_pn);
+      const p2=S.parts.find(p=>p.pn===item.child_pn)||S.assemblies.find(a=>a.pn===item.child_pn);
       const childDisp=p2?dispPn(p2):item.child_pn;
       const childSup=(p2&&p2.use_new_sku&&p2.new_sku&&p2.pn!==childDisp)?' <span style="font-size:8px;color:#9ca3af">(was '+escHtml(p2.pn)+')</span>':'';
       return '<tr><td>'+(idx+1)+'</td><td style="font-family:monospace;color:#0891b2">'+escHtml(childDisp)+childSup+'</td><td>'+escHtml(p2?.description||'')+'</td><td style="color:var(--text3);font-size:var(--t-xs)">'+escHtml(item.item_type||'part')+'</td><td style="text-align:right">'+item.qty+'</td><td style="text-align:right;font-family:monospace">$'+lineUnitCost(item).toFixed(2)+'</td><td style="text-align:right;font-family:monospace;font-weight:700">$'+lineCost(item).toFixed(2)+'</td><td style="font-size:var(--t-xs);color:var(--text3)">'+escHtml((S.parts.find(p=>p.pn===item.child_pn)||{}).location||'')+'</td></tr>';
@@ -20717,7 +20719,7 @@ function renderWalkCount(){
     <div style="font-size:var(--t-xs);color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Recently counted</div>
     ${[...countedItems].reverse().slice(0,4).map(i=>`
     <div class="check-row" style="padding:6px 10px">
-      <span class="pn text-mono" style="min-width:120px">${(function(){const _li=_findPart(i.pn)||findAsm(i.pn);return _li?dispPn(_li):i.pn;})()}</span>
+      <span class="pn text-mono" style="min-width:120px">${(function(){const _li=S.parts.find(p=>p.pn===i.pn)||S.assemblies.find(a=>a.pn===i.pn);return _li?dispPn(_li):i.pn;})()}</span>
       <span class="t3s">expected ${i.exp}</span>
       <span style="flex:1"></span>
       <span class="money" style="color:${i.counted===i.exp?'var(--teal)':i.counted>i.exp?'var(--green)':'var(--red)'};font-weight:700">${i.counted} ${i.counted!==i.exp?'('+(i.counted-i.exp>0?'+':'')+(i.counted-i.exp)+')':''}</span>
@@ -21206,32 +21208,14 @@ function renderDropshipQueue(){
       </td>
     </tr>`;
   }
-  // [FEATURE] Tabs instead of three stacked sections, per Jon - click between them instead of
-  // scrolling past everything on one sheet. Reuses the same tab/setFilter pattern every other
-  // filtered list in the app already uses, rather than inventing a new mechanism.
-  const dsf=S.filters.dropship||{};
-  const activeTab=dsf.tab||'notordered';
-  const searchQ=(dsf.search||'').toLowerCase();
-  function _dropshipSearchMatch(s){
-    if(!searchQ)return true;
-    const v=S.dropshipVendors[s.pn];
-    const hay=[dispSku(s.pn),s.order_number,s.customer_name,v?v.vendor_name:''].filter(Boolean).join(' ').toLowerCase();
-    return hay.includes(searchQ);
-  }
-  const notOrderedF=notOrdered.filter(_dropshipSearchMatch);
-  const orderedF=ordered.filter(_dropshipSearchMatch);
-  const onHoldF=onHold.filter(_dropshipSearchMatch);
-  const tabDefs=[
-    {key:'notordered',label:'Not Yet Ordered',rows:notOrderedF,total:notOrdered.length,accent:'var(--orange)'},
-    {key:'ordered',label:'Ordered',rows:orderedF,total:ordered.length,accent:'var(--text3)'},
-    {key:'onhold',label:'On Hold',rows:onHoldF,total:onHold.length,accent:'var(--red)'}
-  ];
-  const activeDef=tabDefs.find(function(t){return t.key===activeTab;})||tabDefs[0];
-  function _dropshipTable(rows){
-    if(!rows.length)return `<div class="section-empty" style="padding:40px 0">${searchQ?'No matches in this tab.':'Nothing here right now.'}</div>`;
-    return `<div class="tbl-wrap"><table><thead><tr>
-      <th>SKU</th><th>Qty</th><th>Order</th><th>Customer</th><th>Ship To</th><th>Vendor</th><th>Status</th><th></th>
-    </tr></thead><tbody>${rows.map(_dropshipRow).join('')}</tbody></table></div>`;
+  function _dropshipSection(title,groupLines,accentColor){
+    if(!groupLines.length)return'';
+    return `<div style="margin-bottom:20px">
+      <div style="font-size:var(--t-xs);font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:${accentColor};margin-bottom:8px">${title} (${groupLines.length})</div>
+      <div class="tbl-wrap"><table><thead><tr>
+        <th>SKU</th><th>Qty</th><th>Order</th><th>Customer</th><th>Ship To</th><th>Vendor</th><th>Status</th><th></th>
+      </tr></thead><tbody>${groupLines.map(_dropshipRow).join('')}</tbody></table></div>
+    </div>`;
   }
   return `<div style="padding:20px">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
@@ -21239,11 +21223,11 @@ function renderDropshipQueue(){
       <button class="btn btn-sm" onclick="S._dropshipVendorsLoaded=false;loadDropshipVendors()" title="Reload vendor info">\u21ba Refresh</button>
     </div>
     <div style="font-size:var(--t-sm);color:var(--text3);margin-bottom:14px">Every SKU not carried in ERP stock, waiting to be ordered or shipped. Mark Ordered once you've placed it with the vendor - ShipStation picks up tracking normally from there and moves it to Shipped on its own. Save vendor info once and it auto-shows up the next time that SKU comes in.</div>
-    <div class="search-wrap" style="max-width:320px;margin-bottom:14px"><span class="search-icon"><span class="ic ic-search"></span></span><input placeholder="SKU, order #, customer, or vendor\u2026" value="${escHtml(dsf.search||'')}" oninput="setFilter('dropship','search',this.value)"></div>
-    <div class="tabs-row">
-      ${tabDefs.map(function(t){return `<div class="tab ${t.key===activeTab?'active':''}" style="${t.key===activeTab?'color:'+t.accent+';border-bottom-color:'+t.accent:''}" onclick="setFilter('dropship','tab','${t.key}')">${t.label} (${t.total})</div>`;}).join('')}
-    </div>
-    ${lines.length?_dropshipTable(activeDef.rows):'<div class="section-empty" style="padding:40px 0">No drop-ship items waiting right now.</div>'}
+    ${lines.length?(
+      _dropshipSection('Not Yet Ordered',notOrdered,'var(--orange)')
+      +_dropshipSection('Ordered',ordered,'var(--text3)')
+      +_dropshipSection('On Hold',onHold,'var(--red)')
+    ):'<div class="section-empty" style="padding:40px 0">No drop-ship items waiting right now.</div>'}
   </div>`;
 }
 
@@ -21435,8 +21419,8 @@ async function runDataIntegrityChecks(){
     // TGK-BOV-01 found this session — something restocked it without ever telling Shopify.
     const staleBackorders=[];
     Object.entries(S.currentBackorders||{}).forEach(([pn,bo])=>{
-      const asm=findAsm(pn);
-      const prt=asm?null:_findPart(pn);
+      const asm=S.assemblies.find(a=>a.pn===pn);
+      const prt=asm?null:S.parts.find(p=>p.pn===pn);
       const item=asm||prt;
       if(!item)return; // orphaned entries are caught separately below
       if(!eligibleForBackorderSync(item))return; // subassemblies / hardware packs / pre-order / discontinued / dev aren't Shopify-synced products, so a stale log row here isn't a real anomaly
@@ -22319,7 +22303,7 @@ function renderWarranty() {
     const wtyCarrier=carrierLabel(w.carrier||'');    return `<tr>
       <td style="font-size:var(--t-xs);color:var(--text3);font-family:var(--mono)">${new Date(w.created_at).toLocaleDateString()}</td>
       <td>${(()=>{const d=_ageDays(w);const done=w.status==='Resolved'||w.status==='Denied'||w.status==='Shipped';if(done)return '<span style="font-size:var(--t-xs);color:var(--text3)"'+(w.status==='Shipped'?' title="Replacement shipped — click \u2192 Resolved to close"':'')+'>'+d+'d</span>';const c=d>=14?'var(--red)':d>=7?'var(--orange)':'var(--text2)';const wgt=d>=7?'700':'400';return '<span style="font-size:var(--t-sm);color:'+c+';font-weight:'+wgt+'" title="Days since claim was logged">'+d+'d</span>';})()}</td>
-      <td class="pn" style="color:var(--teal)">${(function(){const _li=_findPart(w.pn)||findAsm(w.pn);return _li?dispPn(_li):w.pn;})()}</td>
+      <td class="pn" style="color:var(--teal)">${(function(){const _li=S.parts.find(p=>p.pn===w.pn)||S.assemblies.find(a=>a.pn===w.pn);return _li?dispPn(_li):w.pn;})()}</td>
       <td style="font-size:var(--t-sm)">${escHtml(w.customer_name||'—')}</td>
       <td class="pn">${w.order_number||'—'}</td>
       <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--t-sm)" title="${escHtml(w.issue)}">${escHtml(w.issue)}</td>
@@ -22407,8 +22391,8 @@ function renderShipmentErrors(){
       <td class="pn">${escHtml(e.order_number||'—')}</td>
       <td style="font-size:var(--t-sm)">${escHtml(e.customer_name||'—')}</td>
       <td><span class="pill" style="background:${etypeColor[e.error_type]||'var(--text3)'};color:#fff;font-size:var(--t-xs)">${etypeLabel[e.error_type]||e.error_type}</span></td>
-      <td style="font-size:var(--t-sm);color:var(--teal)" title="${(()=>{var _r=resolveCanonicalPn(e.expected_pn);var _src=_r?(findAsm(_r.pn)||_findPart(_r.pn)):null;return(_src?.description||'').replace(/"/g,'&quot;');})()}">${escHtml(e.expected_pn||'—')} ×${e.expected_qty||1}</td>
-      <td style="font-size:var(--t-sm);color:${wrongItem||wrongQty?'var(--orange)':'var(--text2)'}" title="${(()=>{var _r=resolveCanonicalPn(e.actual_pn||e.expected_pn);var _src=_r?(findAsm(_r.pn)||_findPart(_r.pn)):null;return(_src?.description||'').replace(/"/g,'&quot;');})()}">${e.error_type==='missing_item'?'<span style="color:var(--red);font-style:italic" title="This item was missing from the original shipment. The Tracking column shows the correction reship.">Missing from orig.</span>':`${escHtml(e.actual_pn||e.expected_pn||'—')} ×${e.actual_qty??e.expected_qty??1}`}</td>
+      <td style="font-size:var(--t-sm);color:var(--teal)" title="${(()=>{var _r=resolveCanonicalPn(e.expected_pn);var _src=_r?(S.assemblies.find(x=>x.pn===_r.pn)||S.parts.find(x=>x.pn===_r.pn)):null;return(_src?.description||'').replace(/"/g,'&quot;');})()}">${escHtml(e.expected_pn||'—')} ×${e.expected_qty||1}</td>
+      <td style="font-size:var(--t-sm);color:${wrongItem||wrongQty?'var(--orange)':'var(--text2)'}" title="${(()=>{var _r=resolveCanonicalPn(e.actual_pn||e.expected_pn);var _src=_r?(S.assemblies.find(x=>x.pn===_r.pn)||S.parts.find(x=>x.pn===_r.pn)):null;return(_src?.description||'').replace(/"/g,'&quot;');})()}">${e.error_type==='missing_item'?'<span style="color:var(--red);font-style:italic" title="This item was missing from the original shipment. The Tracking column shows the correction reship.">Missing from orig.</span>':`${escHtml(e.actual_pn||e.expected_pn||'—')} ×${e.actual_qty??e.expected_qty??1}`}</td>
       <td style="font-size:var(--t-sm)">${e.claim_cost>0?'<span class="money-cost" style="font-weight:700" title="Parts cost of correction shipment">'+fc(e.claim_cost)+'</span>':'<span style="color:var(--text3)">—</span>'}</td>
       <td style="font-size:var(--t-sm)">${resLabel[e.resolution]||e.resolution||'—'}${e.ss_order_id?`<div style="font-size:var(--t-xs);color:var(--teal);font-family:var(--mono)">SS#${e.ss_order_id}</div>`:''}${e.resolution==='return_required'?(e.return_received_at?'<div style="font-size:var(--t-xs);color:var(--green)"><span class="ic ic-arrow-back"></span>Returned '+new Date(e.return_received_at).toLocaleDateString()+'</div>':e.return_tracking?'<div style="font-size:var(--t-xs);color:var(--yellow)" title="Return label sent — not yet received"><span class="ic ic-arrow-back"></span>In transit: '+escHtml(e.return_tracking)+'</div>':'<div style="font-size:var(--t-xs);color:var(--orange);font-weight:700" title="Customer must return the item — no return tracking yet"><span class="ic ic-alert"></span>Awaiting return</div>'):''}</td>
       <td style="font-size:var(--t-xs)">${e.tracking_number?`<a href="${seTrackUrl}" target="_blank" style="color:var(--teal);text-decoration:none">${seCarrier?seCarrier+' ':''}<b>${e.tracking_number}</b> ↗</a>`:`<span style="color:var(--text3)">${e.ss_order_id?'Pending…':'—'}</span>`}</td>
@@ -23214,9 +23198,7 @@ function shipWarrantyReplacement(id){
       sd={name:_sale.customer_name||w.customer_name||'',street1:_sale.shipping_address1||'',street2:_sale.shipping_address2||'',city:_sale.shipping_city||'',state:_sale.shipping_province||'',postal_code:_sale.shipping_zip||'',country:_sale.shipping_country||'US'};
     }
   }
-  // [FIX] Was S.assemblies.find(a=>a.pn===w.pn) - a warranty claim's pn is support-entered, same
-  // risk class as sales.pn: it can be the active new_sku rather than the canonical pn.
-  const asm=findAsm(w.pn);
+  const asm=S.assemblies.find(a=>a.pn===w.pn);
   const overlay=document.createElement('div');
   overlay.id='wty-ship-overlay';
   overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1050;display:flex;align-items:center;justify-content:center;padding:20px';
