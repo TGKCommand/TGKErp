@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.14';
+const TGK_ERP_VERSION = 'v23.15';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1271,6 +1271,24 @@ function setupRealtime(){
     
       rtRender(['sales','dashboard','planning','lookup','packqueue','reports','production']);   // repaint only the views that show this data
     })
+    // [FIX] S.currentBackorders (every backorder badge in the app, including Master Lookup's
+    // header pill) was only ever built once at login from a one-time shopify_sync_log fetch --
+    // no realtime subscription, no periodic refresh, not even the manual "Refresh" button touched
+    // it. Any sync event that happened after the page loaded (a bulk sync, an automatic ship-time
+    // sync, a manual toggle) updated the database correctly but an already-open tab never learned
+    // about it -- the badge just silently stayed frozen at whatever it was at login, for the
+    // entire session, until a hard page reload. This keeps it live the same way sales/purchases
+    // already are.
+    .on('postgres_changes',{event:'INSERT',schema:'public',table:'shopify_sync_log'},p=>{
+      var r=p.new;
+      if(!r||!r.pn)return;
+      var _it=findAsm(r.pn)||_findPart(r.pn);
+      var key=_it?_it.pn:r.pn;
+      if(!S.currentBackorders)S.currentBackorders={};
+      if(r.action==='backorder')S.currentBackorders[key]={restock_date:r.restock_date||null,since:r.created_at};
+      else delete S.currentBackorders[key]; // reverted/partial -> no longer showing as backordered
+      rtRender(['lookup','dashboard','inventory','planning']);
+    })
     .on('postgres_changes',{event:'*',schema:'public',table:'purchases'},p=>{
       if(p.eventType==='INSERT'){
         // [FIX] Same missing existence guard as parts/assemblies above - without it, a
@@ -2059,6 +2077,24 @@ function backorderBadge(pn){
   const since=bo.since?new Date(bo.since).toLocaleDateString():'';
   const title='On backorder on Shopify'+(bo.restock_date?' — restock date '+bo.restock_date:'')+(since?' (since '+since+')':'');
   return '<span class="pill pill-red" style="font-size:8.5px;vertical-align:middle;margin-left:4px" title="'+escHtml(title)+'">&#8987; BACKORDERED</span>';
+}
+// [FEATURE] Separate from backorderBadge() deliberately - that function is also called once per
+// row in the bulk assemblies list (potentially hundreds of times per render), and buildability()
+// is only memoized per-render, not across repeated calls within one render, so adding this check
+// there would mean hundreds of real BOM-traversal computations on every list render. This is only
+// ever called once, for the single item on Master Lookup's own detail page, where that cost is
+// negligible. Flags the exact mismatch Jon described: genuinely zero-stock, zero-buildable, but
+// Shopify doesn't currently show it as backordered - previously nothing distinguished this from a
+// perfectly healthy in-stock item anywhere on this page.
+function backorderMismatchWarning(pn){
+  if(currentBackorderOf(pn))return''; // already correctly flagged - no mismatch to warn about
+  const item=findAsm(pn)||_findPart(pn);
+  if(!item||typeof eligibleForBackorderSync!=='function'||!eligibleForBackorderSync(item))return'';
+  const _oh=item.total_on_hand!=null?item.total_on_hand:(item.total_unpckgd||0);
+  if((_oh||0)>0)return'';
+  const _b=buildability(pn);
+  if(_b.hasBOM&&_b.maxBuild>0)return'';
+  return '<span class="pill" style="background:rgba(234,88,12,.12);color:var(--orange);border:1px solid rgba(234,88,12,.35);font-size:8.5px;vertical-align:middle;margin-left:4px;font-weight:700" title="Zero stock and not buildable from components, but Shopify does not currently show this as backordered. Re-run the backorder sync for this SKU to check.">! NOT SYNCED</span>';
 }
 function findAsm(pn){
   if(!pn)return undefined;
@@ -16375,7 +16411,7 @@ function assemblyDossier(pn){
   return `
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
     ${a.image_url?`<img src="${escHtml(a.image_url)}" style="width:68px;height:68px;object-fit:cover;border-radius:var(--r-md);border:1px solid var(--border);flex-shrink:0;cursor:zoom-in" onclick="openImageLightbox('${escHtml(a.image_url)}','${escHtml(a.pn)}')" onerror="this.style.display='none'" loading="lazy">`:`<button class="btn btn-sm" style="flex-shrink:0;width:68px;height:68px;border-radius:var(--r-md);border:1.5px dashed var(--border2);color:var(--text3);font-size:var(--t-xs);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;cursor:pointer" onclick="setAsmImageUrl('${escHtml(a.pn)}')"><div style="font-size:var(--t-2xl)">&#128247;</div>Add Photo</button>`}
-    <div style="flex:1"><div style="font-size:var(--t-xl);font-weight:700;color:var(--teal)">${dispPn(a)}${a.new_sku&&a.use_new_sku?` <span style="font-size:var(--t-xs);color:var(--text3);font-weight:400">(${escHtml(a.pn)})</span>`:''}  ${a.is_subassembly?'<span class="pill pill-orange" style="font-size:var(--t-xs);vertical-align:middle">SUBASSEMBLY</span>':''} ${a.build_to_order?'<span class="pill" style="font-size:var(--t-xs);vertical-align:middle;background:rgba(124,58,237,.1);color:var(--purple);border-color:rgba(124,58,237,.25)" title="Never stocked ahead of demand — built exactly when a finished good needs it">BUILD TO ORDER</span>':''} ${a.discontinued?'<span class="pill pill-red" style="font-size:var(--t-xs);vertical-align:middle">DISCONTINUED</span>':''}${backorderBadge(a.pn)}</div>
+    <div style="flex:1"><div style="font-size:var(--t-xl);font-weight:700;color:var(--teal)">${dispPn(a)}${a.new_sku&&a.use_new_sku?` <span style="font-size:var(--t-xs);color:var(--text3);font-weight:400">(${escHtml(a.pn)})</span>`:''}  ${a.is_subassembly?'<span class="pill pill-orange" style="font-size:var(--t-xs);vertical-align:middle">SUBASSEMBLY</span>':''} ${a.build_to_order?'<span class="pill" style="font-size:var(--t-xs);vertical-align:middle;background:rgba(124,58,237,.1);color:var(--purple);border-color:rgba(124,58,237,.25)" title="Never stocked ahead of demand — built exactly when a finished good needs it">BUILD TO ORDER</span>':''} ${a.discontinued?'<span class="pill pill-red" style="font-size:var(--t-xs);vertical-align:middle">DISCONTINUED</span>':''}${backorderBadge(a.pn)}${backorderMismatchWarning(a.pn)}</div>
     <div style="font-size:var(--t-md);color:var(--text2)">${a.description||''}</div></div>
     ${a.drawing_url?`<a href="${a.drawing_url}" target="_blank" class="btn btn-sm"><span class="ic ic-doc"></span>Drawing</a>`:''}
     <button class="btn btn-teal btn-sm" onclick="openBuild('${pn}')">Build Planner</button>
@@ -26162,7 +26198,7 @@ async function refreshAll(){
     if(toastMsg)toast(toastMsg,toastMs);
   }
   try{
-    const[parts,assemblies,sales,purchases,warrantyClaims,shipmentErrors,corrections,labelFilesRefresh]=await Promise.all([
+    const[parts,assemblies,sales,purchases,warrantyClaims,shipmentErrors,corrections,labelFilesRefresh,shopifySyncLogRefresh]=await Promise.all([
       db.from('parts').select('*').order('pn'),
       db.from('assemblies').select('*').order('pn'),
       fetchAll((f,t)=>db.from('sales').select('*').order('created_at',{ascending:false}).range(f,t)),
@@ -26171,6 +26207,7 @@ async function refreshAll(){
       db.from('shipment_errors').select('*').order('created_at',{ascending:false}).limit(1000),
       db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,user_email,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
       db.from('part_files').select('*').eq('category','Label'),
+      db.from('shopify_sync_log').select('*').order('created_at',{ascending:false}).limit(5000),
     ]);
     if(parts.data)S.parts=parts.data;
     if(assemblies.data)S.assemblies=normalizeAssemblies(assemblies.data);
@@ -26182,6 +26219,21 @@ async function refreshAll(){
     else if(shipmentErrors.error){console.error('refreshAll: shipment_errors',shipmentErrors.error);S._shipmentErrorsErr=shipmentErrors.error.message;}
     if(corrections.data)S.corrections=corrections.data;
     if(labelFilesRefresh.data){S.labelFiles={};labelFilesRefresh.data.forEach(function(lf){if(!S.labelFiles[lf.entity_pn])S.labelFiles[lf.entity_pn]=[];S.labelFiles[lf.entity_pn].push(lf);});}
+    // [FIX] The manual Refresh button never touched S.currentBackorders at all -- badges (Master
+    // Lookup's included) could sit stale for an entire session with no way to force-correct them
+    // short of a hard page reload, even after clicking this exact button. Backstop for the new
+    // realtime subscription above, same canonicalization rule (newest row wins per resolved item).
+    if(!shopifySyncLogRefresh.error){
+      S.currentBackorders={};
+      const seenBoRefresh=new Set();
+      (shopifySyncLogRefresh.data||[]).forEach(function(r){
+        const _it=findAsm(r.pn)||_findPart(r.pn);
+        const key=_it?_it.pn:r.pn;
+        if(seenBoRefresh.has(key))return;
+        seenBoRefresh.add(key);
+        if(r.action==='backorder')S.currentBackorders[key]={restock_date:r.restock_date||null,since:r.created_at};
+      });
+    }
     // NOTE: deliberately NOT calling setupRealtime() here. refreshAll() is triggered by the realtime
     // reconnect handler itself right after a channel just successfully subscribed — rebuilding it again
     // immediately would tear down a healthy connection for no reason and can create a reconnect/refresh
