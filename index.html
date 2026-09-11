@@ -416,6 +416,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
         <input type="text" placeholder="Search anything — parts, finished goods…" id="gsearch" oninput="onSearch(this.value)">
       </div>
       <button class="btn btn-sm" id="undo-btn" onclick="undo()" disabled title="Nothing to undo"><span class="ic ic-arrow-back"></span>Undo</button>
+      <button class="btn btn-sm" id="redo-btn" onclick="redo()" disabled title="Nothing to redo"><span class="ic ic-arrow-back" style="transform:scaleX(-1)"></span>Redo</button>
       <button class="btn btn-sm" id="refresh-btn" onclick="refreshAll()" title="Refresh all data from Supabase">↺</button>
       <button class="btn btn-teal btn-sm" onclick="nav('ai')"><span class="ic ic-sparkle"></span>AI</button>
       <button class="btn btn-sm" onclick="openBatchLookup()" title="Look up a batch code from a label, email or warranty claim"><span class="ic ic-search"></span>Batch</button>
@@ -459,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.08';
+const TGK_ERP_VERSION = 'v23.10';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -475,7 +476,7 @@ const S = {
   shipstation:{connected:false,key:'',secret:''},
   aiHistory:[{role:'assistant',text:'Hi — I\'m your TGK ERP assistant. Ask me about inventory levels, what needs reordering, BOM analysis, or pack planning.'}],
   aiLoading:false,
-  undoStack:[], backups:[], lastBackup:null, autoBackupTimer:null, autoRefreshTimer:null, autoHoldSyncTimer:null, autoDeliverySyncTimer:null, lastActivity:Date.now(), packSkipMissing:false,
+  undoStack:[], redoStack:[], backups:[], lastBackup:null, autoBackupTimer:null, autoRefreshTimer:null, autoHoldSyncTimer:null, autoDeliverySyncTimer:null, lastActivity:Date.now(), packSkipMissing:false,
   backupTableOk:null, // null=unknown, true=exists, false=missing
   backupError:null,   // last error string if backup failed
   forecastWeeks:4,
@@ -6410,6 +6411,7 @@ async function submitEditOrder(originalOrderNumOrId){
 
   let errors=0,saved=0,deleted=0,added=0;
   const invChanges=[];
+  const undoOps=[]; // [FEATURE] every line mutation below is collected here so the whole edit becomes one pushUndoMulti entry
 
   for(const row of rows){
     const lineId=row.dataset.lineId;
@@ -6434,12 +6436,19 @@ async function submitEditOrder(originalOrderNumOrId){
     if(isDeleted&&!isNew){
       const{error}=await db.from('sales').delete().eq('id',lineId);
       if(error){errors++;console.error('Delete',lineId,error.message);}
-      else{S.sales=S.sales.filter(function(s){return s.id!==lineId;});deleted++;}
+      else{
+        const origRow=lines.find(function(l){return l.id===lineId;});
+        if(origRow)undoOps.push({action:'delete',table:'sales',data:origRow});
+        S.sales=S.sales.filter(function(s){return s.id!==lineId;});deleted++;
+      }
     } else if(isNew){
       if(!pn)continue;
       const{data,error}=await db.from('sales').insert(Object.assign({},basePayload,{pn,qty,fulfillment_status:status,tracking_number:tracking,carrier:carrier||null})).select().single();
       if(error){errors++;console.error('Insert',error.message);}
-      else{S.sales=[...S.sales,data];added++;}
+      else{
+        undoOps.push({action:'insert',table:'sales',data:data});
+        S.sales=[...S.sales,data];added++;
+      }
     } else {
       const orig=origData[lineId];
       if(orig&&orig.pn!==pn){
@@ -6460,6 +6469,8 @@ async function submitEditOrder(originalOrderNumOrId){
       const{error}=await db.from('sales').update(payload).eq('id',lineId);
       if(error){errors++;console.error('Update',lineId,error.message);}
       else{
+        const origRow=lines.find(function(l){return l.id===lineId;});
+        if(origRow)undoOps.push({action:'update',table:'sales',data:Object.assign({id:lineId},payload),prev:origRow});
         S.sales=S.sales.map(function(s){return s.id===lineId?Object.assign({},s,payload):s;});saved++;
         if(status==='On Hold'&&orig&&orig.status!=='On Hold'){
           notifyHoldAlert({id:lineId,order_number:newOrderNum,pn:pn,customer_name:customer});
@@ -6472,7 +6483,11 @@ async function submitEditOrder(originalOrderNumOrId){
   // of a SKU swap (deduct new OR restore old), while _promptInvChanges()/_applyPendingInv() below applies
   // BOTH sides. Running both meant clicking "Yes" double-applied one side and "Skip" left the swap half
   // applied. _promptInvChanges is now the single source of truth for order-edit inventory changes.
-    document.getElementById('edit-order-overlay')?.remove();
+  document.getElementById('edit-order-overlay')?.remove();
+
+  // [FEATURE] One undo/redo entry for the whole edit, not per-line - matches how a person thinks
+  // about "I just edited this order," not "I made 3 separate database writes."
+  if(undoOps.length)pushUndoMulti('Edit order #'+newOrderNum+' ('+undoOps.length+' line change'+(undoOps.length!==1?'s':'')+')',undoOps);
 
   if(invChanges.length)_promptInvChanges(invChanges,newOrderNum,now);
 
@@ -7376,19 +7391,116 @@ supabase link --project-ref piamamighqiielfztgic</pre>
     <div style="font-size:var(--t-sm);color:var(--text3);margin:4px 0 6px;display:flex;align-items:center;gap:8px">Create <span class="pn">supabase/functions/shopify-orders/index.ts</span> and paste:<button class="btn btn-sm" style="margin-left:auto;font-size:var(--t-xs)" onclick="var pre=this.closest('div').nextElementSibling;copyText(pre?pre.textContent:'',this)">Copy</button></div>
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:12px;font-size:var(--t-xs);font-family:var(--mono);color:var(--text2);overflow-x:auto;max-height:280px">import { createClient } from 'npm:@supabase/supabase-js@2'
 const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
+// [FIX] Root cause of "sales orders show the wrong date, we're in Central time": sale_date was
+// computed by slicing the first 10 characters off order.created_at -- (order.created_at ||
+// new Date().toISOString()).slice(0, 10) -- which only gives the correct calendar day if that
+// timestamp happens to already be expressed in Central time. Shopify's created_at isn't
+// guaranteed to be, and new Date().toISOString() is always UTC regardless, so any order landing
+// after roughly 6-7pm Central (whenever UTC has already rolled to the next calendar day) got
+// stamped with the wrong date at the moment it was written, not just displayed wrong later.
+// Parses the timestamp as an absolute instant (respecting whatever offset it carries, or none)
+// and reads the calendar date as OBSERVED in America/Chicago -- correct across the DST boundary
+// too, unlike a fixed UTC offset would be. Mirrors the identical fix applied client-side in the
+// ERP's own sync/import paths.
+function centralDateOnly(input?: string | null): string {
+  const d = input ? new Date(input) : new Date()
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d)
+}
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-shopify-topic, x-shopify-hmac-sha256',
 }
 // Recompute a PRODUCT's template_suffix from the live state of ALL its variants.
 // Rule (must match the ERP's Theme Audit exactly):
-//   * single-variant product  -> backorder template if that variant is backordered
-//   * multi-variant product   -> backorder template ONLY if EVERY variant is backordered;
+//   * single-variant product  -&gt; backorder template if that variant is backordered
+//   * multi-variant product   -&gt; backorder template ONLY if EVERY variant is backordered;
 //                                if even one is buyable the product stays on default.
-// A variant counts as backordered when it is tracked and its quantity is <= 0.
+// A variant counts as backordered when it is tracked and its quantity is &lt;= 0.
 // Returns {changed, from, to, errors} and never throws -- template drift must never break
 // the inventory write that triggered it.
-async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise<any> {
+// Flag + notify on a high-risk Shopify order, per Jon: visual flag + notification only, does
+// NOT touch fulfillment_status (no auto-hold). Still needs: \`sales\` needs risk_flagged AND
+// risk_level columns - migration at the bottom of this file. The wiki_notifications insert
+// below matches the REAL schema (recipient/actor/page_id/block_id/kind/message), taken from
+// TGK Notes' own notify() function - not a guess.
+// [FIX] The GraphQL \`order.risk.recommendation\` field (PENDING/ACCEPT/INVESTIGATE/CANCEL) is a
+// coarser, different signal than the Low/Medium/High risk level Shopify's own order page shows
+// you - this was hardcoding every flagged order as "High Risk" regardless of which one Shopify
+// actually assigned, which is almost certainly why a Shopify-labeled "Medium" order showed up
+// in the ERP as "High Risk". Now stores and surfaces the raw recommendation value Shopify
+// returned instead of inventing a High/Medium translation I can't verify is correct.
+const HIGH_RISK_TAG = Deno.env.get('SHOPIFY_HIGH_RISK_TAG') || 'high-risk'
+// Comma-separated list of who gets notified - defaults to just Jon since that's the only
+// confirmed address; add Christian's (or anyone else's) once you have it.
+const RISK_ALERT_RECIPIENTS = (Deno.env.get('SHOPIFY_RISK_ALERT_RECIPIENTS') || 'jon@tgkmotorsport.com')
+  .split(',').map((s: string) =&gt; s.trim().toLowerCase()).filter(Boolean)
+async function checkOrderRisk(shopifyOrderId: string | number, orderName: string) {
+  try {
+    const store = (Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
+    const key = Deno.env.get('SHOPIFY_KEY') || ''
+    if (!store || !key || !shopifyOrderId || !orderName) return
+
+    // Idempotent: orders/create and a later orders/updated (if risk was assessed slightly
+    // after creation, e.g. by a third-party fraud app) can both fire for the same order -
+    // don't re-tag or re-notify one already flagged.
+    const { data: already } = await db.from('sales').select('id').eq('order_number', orderName).eq('risk_flagged', true).limit(1)
+    if (already?.length) return
+
+    const gid = 'gid://shopify/Order/' + shopifyOrderId
+    const H = { 'X-Shopify-Access-Token': key, 'Content-Type': 'application/json' }
+    const resp = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {
+      method: 'POST', headers: H,
+      body: JSON.stringify({ query: '{ order(id: "' + gid + '") { id tags risk { recommendation } } }' }),
+    }).then(r =&gt; r.json())
+    const order = resp?.data?.order
+    if (!order) { console.warn('[risk] order lookup failed for', shopifyOrderId, JSON.stringify(resp?.errors || resp)); return }
+
+    // Shopify's recommendation is one of PENDING / ACCEPT / INVESTIGATE / CANCEL. Treating
+    // INVESTIGATE and CANCEL both as high risk errs toward catching more than missing one -
+    // narrow to CANCEL only if that turns out too broad in practice.
+    const recommendation = order.risk?.recommendation || 'ACCEPT'
+    if (recommendation !== 'CANCEL' &amp;&amp; recommendation !== 'INVESTIGATE') return
+
+    // 1) Tag the order in Shopify so a ShipStation automation rule matching this tag holds it.
+    const existingTags: string[] = (order.tags || []).filter(Boolean)
+    if (!existingTags.some((t: string) =&gt; t.toLowerCase() === HIGH_RISK_TAG.toLowerCase())) {
+      const tagResp = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {
+        method: 'POST', headers: H,
+        body: JSON.stringify({ query: 'mutation { tagsAdd(id: "' + order.id + '", tags: ["' + HIGH_RISK_TAG + '"]) { userErrors { field message } } }' }),
+      }).then(r =&gt; r.json())
+      const tagErrors = tagResp?.data?.tagsAdd?.userErrors || []
+      if (tagErrors.length) console.warn('[risk] tagsAdd errors for', orderName, JSON.stringify(tagErrors))
+    }
+
+    // 2) Flag the matching sales row(s). Visual flag ONLY - fulfillment_status untouched.
+    // risk_level stores Shopify's own raw recommendation string, not a translated High/Medium
+    // label, so the ERP always shows exactly what Shopify actually said.
+    await db.from('sales').update({ risk_flagged: true, risk_level: recommendation }).eq('order_number', orderName)
+
+    // 3) Notify via wiki_notifications - same table and shape TGK Notes' notify() writes:
+    // recipient/actor/page_id/block_id/kind/message. page_id and block_id are null here since
+    // this alert isn't tied to a wiki page. actor is a synthetic address (not a real team
+    // member) purely so it renders sensibly wherever teamName(actor) is displayed - it'll show
+    // as "automation" since that won't match anyone on the team roster.
+    const alertMessage = 'Order ' + orderName + ' flagged by Shopify as ' + recommendation
+      + '. Tagged in Shopify (for any ShipStation rule matching that tag); visible in the ERP.'
+    for (const recipient of RISK_ALERT_RECIPIENTS) {
+      try {
+        await db.from('wiki_notifications').insert({
+          recipient, actor: 'automation@tgkmotorsport.com',
+          page_id: null, block_id: null,
+          kind: 'automation_alert', message: alertMessage,
+        })
+      } catch (e) { console.warn('[risk] wiki_notifications insert failed for', recipient, ':', e) }
+    }
+
+    console.log('[risk] flagged', orderName, 'as', recommendation)
+  } catch (e) {
+    console.warn('[risk] checkOrderRisk error for', orderName, e)
+  }
+}
+
+async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;any&gt; {
   // Typed explicitly: inferring from/to/skipped as the null type makes every later string
   // assignment a type error, which fails the Edge Function deploy outright.
   const out: {changed: boolean, from: string | null, to: string | null, skipped: string | null, errors: string[]} =
@@ -7398,11 +7510,11 @@ async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise<any
     const q = await gqlFn('{ product(id: "' + prodId + '") { templateSuffix variants(first: 100) { edges { node { id inventoryQuantity inventoryItem { tracked } } } } } }')
     const prod = q?.data?.product
     if (!prod) { out.errors.push('product lookup returned nothing'); return out }
-    const vs = (prod.variants?.edges || []).map((e: any) => e.node)
+    const vs = (prod.variants?.edges || []).map((e: any) =&gt; e.node)
     const n = vs.length
     if (!n) return out
-    const boCount = vs.filter((v: any) => v?.inventoryItem?.tracked && (Number(v.inventoryQuantity) || 0) <= 0).length
-    const shouldBO = (n <= 1) ? (boCount >= 1) : (boCount === n)
+    const boCount = vs.filter((v: any) =&gt; v?.inventoryItem?.tracked &amp;&amp; (Number(v.inventoryQuantity) || 0) &lt;= 0).length
+    const shouldBO = (n &lt;= 1) ? (boCount &gt;= 1) : (boCount === n)
     const boTpl = Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder'
     const desired = shouldBO ? boTpl : ''
     const current = prod.templateSuffix || ''
@@ -7412,25 +7524,25 @@ async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise<any
     const isDefaultTpl = (cnorm === '' || cnorm === 'default' || cnorm === 'default product')
     const currentEff = isDefaultTpl ? '' : current
     out.from = current; out.to = desired
-    // Only ever manage the default <-> backorder transition. Any other suffix (preorder,
+    // Only ever manage the default &lt;-&gt; backorder transition. Any other suffix (preorder,
     // or any bespoke template) is intentional merchandising - overwriting it would destroy
     // a deliberate setup, so leave those products completely alone.
-    if (currentEff !== '' && currentEff !== boTpl) { out.skipped = 'custom template "' + current + '" - not managed'; return out }
+    if (currentEff !== '' &amp;&amp; currentEff !== boTpl) { out.skipped = 'custom template "' + current + '" - not managed'; return out }
     if (currentEff === desired) return out
-    // productUpdate changed argument name across API versions (input: -> product:). We were
+    // productUpdate changed argument name across API versions (input: -&gt; product:). We were
     // already bitten once by a mutation shape disappearing, so try the modern form first and
     // fall back, rather than assuming either one.
     let applied = false
-    const tryUpdate = async (argName: string) => {
+    const tryUpdate = async (argName: string) =&gt; {
       const m = await gqlFn('mutation { productUpdate(' + argName + ': {id: "' + prodId + '", templateSuffix: "' + desired + '"}) { product { templateSuffix } userErrors { field message } } }')
-      const ue = (m?.data?.productUpdate?.userErrors || []).map((u: any) => u.message)
-      ue.forEach((x: string) => out.errors.push(x))
+      const ue = (m?.data?.productUpdate?.userErrors || []).map((u: any) =&gt; u.message)
+      ue.forEach((x: string) =&gt; out.errors.push(x))
       if (m?.data?.productUpdate?.product) { applied = true; return true }
       return false
     }
     if (!(await tryUpdate('product'))) { await tryUpdate('input') }
     out.changed = applied
-    if (applied) console.log('[template] product ' + prodId + ': "' + current + '" -> "' + desired + '" (' + boCount + '/' + n + ' variants backordered)')
+    if (applied) console.log('[template] product ' + prodId + ': "' + current + '" -&gt; "' + desired + '" (' + boCount + '/' + n + ' variants backordered)')
     else console.warn('[template] product ' + prodId + ': could NOT set templateSuffix to "' + desired + '"' + (out.errors.length ? (' - ' + out.errors.join('; ')) : ''))
   } catch (e) {
     out.errors.push(String((e as any)?.message || e))
@@ -7438,7 +7550,7 @@ async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise<any
   return out
 }
 
-Deno.serve(async (req) => {
+Deno.serve(async (req) =&gt; {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
   if (req.method === 'GET') return new Response('pong', { headers: CORS })
   let body: any = {}
@@ -7471,8 +7583,8 @@ Deno.serve(async (req) => {
     const since = body.since || new Date(Date.now() - 30*24*60*60*1000).toISOString()
     const page_info = body.page_info || ''
     const url = page_info
-      ? 'https://' + store + '/admin/api/2024-01/orders.json?limit=250&page_info=' + page_info
-      : 'https://' + store + '/admin/api/2024-01/orders.json?status=any&limit=250&updated_at_min=' + encodeURIComponent(since)
+      ? 'https://' + store + '/admin/api/2024-01/orders.json?limit=250&amp;page_info=' + page_info
+      : 'https://' + store + '/admin/api/2024-01/orders.json?status=any&amp;limit=250&amp;updated_at_min=' + encodeURIComponent(since)
     const shopRes = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
     if (!shopRes.ok) {
       return new Response(JSON.stringify({error:'Shopify ' + shopRes.status}), {status:shopRes.status, headers:{...CORS,'Content-Type':'application/json'}})
@@ -7481,7 +7593,7 @@ Deno.serve(async (req) => {
     let next_page_info = ''
     for (const part of link.split(',')) {
       if (part.includes('rel="next"')) {
-        const m = part.match(/page_info=([^&>"]+)/)
+        const m = part.match(/page_info=([^&amp;&gt;"]+)/)
         if (m) { next_page_info = m[1]; break }
       }
     }
@@ -7496,7 +7608,12 @@ Deno.serve(async (req) => {
     if (!store || !key || !sku) return new Response(JSON.stringify({error:'Missing store, key or pn'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
     const shopHeaders = {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'}
     const safeSku = sku.replace(/"/g, '')
-    const gqlQuery = '{ productVariants(first: 10, query: "sku:' + safeSku + '") { edges { node { id sku product { id legacyResourceId title } } } } }'
+    // [FIX] Unquoted sku:VALUE search tokenizes on hyphens (Shopify splits "TGK-0308-15" into
+    // "TGK"/"0308"/"15" and matches fuzzily), so a SKU family with many numbered siblings (this
+    // one has 17+) can easily crowd the exact match out of the first 10 results -- reported as
+    // "No Shopify variant found" for a SKU that genuinely exists. Quoting the value inside the
+    // search string forces Shopify to treat it as an exact phrase instead.
+    const gqlQuery = '{ productVariants(first: 10, query: "sku:\\\\"' + safeSku + '\\\\"") { edges { node { id sku product { id legacyResourceId title } } } } }'
     const gqlRes = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {
       method: 'POST',
       headers: shopHeaders,
@@ -7504,12 +7621,12 @@ Deno.serve(async (req) => {
     })
     if (!gqlRes.ok) return new Response(JSON.stringify({error:'GraphQL request failed: ' + gqlRes.status}), {status:gqlRes.status, headers:{...CORS,'Content-Type':'application/json'}})
     const gqlData = await gqlRes.json()
-    console.log('[shopify update_template] GraphQL result for SKU', sku, ':', JSON.stringify(gqlData?.data?.productVariants?.edges?.map((e:any)=>({sku:e.node.sku,productId:e.node.product?.legacyResourceId}))))
+    console.log('[shopify update_template] GraphQL result for SKU', sku, ':', JSON.stringify(gqlData?.data?.productVariants?.edges?.map((e:any)=&gt;({sku:e.node.sku,productId:e.node.product?.legacyResourceId}))))
     const edges = gqlData?.data?.productVariants?.edges || []
-    const match = edges.find((e: any) => (e.node.sku || '').trim().toUpperCase() === sku.toUpperCase())
+    const match = edges.find((e: any) =&gt; (e.node.sku || '').trim().toUpperCase() === sku.toUpperCase())
     if (!match) {
-      console.warn('[shopify update_template] GraphQL found no exact SKU match for', sku, '— edges:', JSON.stringify(edges.map((e:any)=>e.node.sku)))
-      return new Response(JSON.stringify({error:'No Shopify product found for SKU: ' + sku, debug: edges.map((e:any)=>({sku:e.node.sku,productId:e.node.product?.legacyResourceId}))}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
+      console.warn('[shopify update_template] GraphQL found no exact SKU match for', sku, '— edges:', JSON.stringify(edges.map((e:any)=&gt;e.node.sku)))
+      return new Response(JSON.stringify({error:'No Shopify product found for SKU: ' + sku, debug: edges.map((e:any)=&gt;({sku:e.node.sku,productId:e.node.product?.legacyResourceId}))}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
     }
     const productId = match.node.product.legacyResourceId
     // REST product writes have been retired by Shopify (same version drift that removed
@@ -7528,7 +7645,7 @@ Deno.serve(async (req) => {
       if (mres?.data?.productUpdate?.product) { tplApplied = true; break }
     }
     if (!tplApplied) return new Response(JSON.stringify({error:'Product template update failed' + (tplErrs.length ? (': ' + tplErrs.join('; ')) : ''), errors: tplErrs}), {status:502, headers:{...CORS,'Content-Type':'application/json'}})
-    console.log('[shopify update_template] set', sku, 'product', productId, 'template_suffix ->', templateSuffix || '(default)')
+    console.log('[shopify update_template] set', sku, 'product', productId, 'template_suffix -&gt;', templateSuffix || '(default)')
     try {
       await db.from('shopify_sync_log').insert({
         pn: sku,
@@ -7544,7 +7661,7 @@ Deno.serve(async (req) => {
     // Falling back to the variant's own metafield when the caller did not supply one keeps
     // both in agreement regardless of which path ran.
     let restockDate = body.restock_date || ''
-    if (!restockDate && templateSuffix) {
+    if (!restockDate &amp;&amp; templateSuffix) {
       try {
         const vfRes = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {
           method: 'POST', headers: shopHeaders,
@@ -7555,7 +7672,7 @@ Deno.serve(async (req) => {
         restockDate = vfData?.data?.productVariant?.metafield?.value || ''
       } catch (e) { console.warn('[shopify update_template] variant date lookup failed:', e) }
     }
-    if (templateSuffix && restockDate) {
+    if (templateSuffix &amp;&amp; restockDate) {
       try {
         const gid = 'gid://shopify/Product/' + productId
         const metaMutation = 'mutation { metafieldsSet(metafields: [{ownerId: "' + gid + '", namespace: "custom", key: "estimated_arrival_date", value: "' + restockDate + '", type: "single_line_text_field"}]) { metafields { id key value } userErrors { field message } } }'
@@ -7580,8 +7697,8 @@ Deno.serve(async (req) => {
     if (!store || !key) return new Response(JSON.stringify({error:'Missing Shopify credentials'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
     const page_info = body.page_info || ''
     const url = page_info
-      ? 'https://' + store + '/admin/api/2024-01/products.json?limit=250&page_info=' + page_info
-      : 'https://' + store + '/admin/api/2024-01/products.json?limit=250&fields=id,title,variants,images'
+      ? 'https://' + store + '/admin/api/2024-01/products.json?limit=250&amp;page_info=' + page_info
+      : 'https://' + store + '/admin/api/2024-01/products.json?limit=250&amp;fields=id,title,variants,images'
     const res = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
     if (!res.ok) return new Response(JSON.stringify({error:'Shopify ' + res.status + ' - check API key has read_products scope'}), {status:res.status, headers:{...CORS,'Content-Type':'application/json'}})
     const data = await res.json()
@@ -7590,13 +7707,13 @@ Deno.serve(async (req) => {
     for (const product of products) {
       const imgById: any = {}
       for (const img of (product.images || [])) {
-        if (img.id && img.src) imgById[img.id] = img.src
+        if (img.id &amp;&amp; img.src) imgById[img.id] = img.src
       }
       const defaultImg = product.images?.[0]?.src || ''
       for (const variant of (product.variants || [])) {
         const sku = (variant.sku || '').trim()
         if (!sku) continue
-        const img = (variant.image_id && imgById[variant.image_id]) ? imgById[variant.image_id] : defaultImg
+        const img = (variant.image_id &amp;&amp; imgById[variant.image_id]) ? imgById[variant.image_id] : defaultImg
         if (img) {
           skuMap[sku] = img
           skuMap[sku.toUpperCase()] = img
@@ -7609,7 +7726,7 @@ Deno.serve(async (req) => {
     const linkParts = link.split(',')
     for (const part of linkParts) {
       if (part.includes('rel="next"')) {
-        const m = part.match(/page_info=([^&>"]+)/)
+        const m = part.match(/page_info=([^&amp;&gt;"]+)/)
         if (m) { next_page_info = m[1]; break }
       }
     }
@@ -7621,8 +7738,8 @@ Deno.serve(async (req) => {
     if (!store || !key) return new Response(JSON.stringify({error:'Missing Shopify credentials'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
     const page_info = body.page_info || ''
     const url = page_info
-      ? 'https://' + store + '/admin/api/2024-01/products.json?limit=250&page_info=' + page_info
-      : 'https://' + store + '/admin/api/2024-01/products.json?limit=250&published_status=any&fields=id,title,handle,status,published_at,variants'
+      ? 'https://' + store + '/admin/api/2024-01/products.json?limit=250&amp;page_info=' + page_info
+      : 'https://' + store + '/admin/api/2024-01/products.json?limit=250&amp;published_status=any&amp;fields=id,title,handle,status,published_at,variants'
     const res = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
     if (!res.ok) return new Response(JSON.stringify({error:'Shopify ' + res.status + ' - check API key has read_products scope'}), {status:res.status, headers:{...CORS,'Content-Type':'application/json'}})
     const data = await res.json()
@@ -7638,7 +7755,7 @@ Deno.serve(async (req) => {
     const link = res.headers.get('link') || ''
     let next_page_info = ''
     for (const part of link.split(',')) {
-      if (part.includes('rel="next"')) { const m = part.match(/page_info=([^&>"]+)/); if (m) { next_page_info = m[1]; break } }
+      if (part.includes('rel="next"')) { const m = part.match(/page_info=([^&amp;&gt;"]+)/); if (m) { next_page_info = m[1]; break } }
     }
     return new Response(JSON.stringify({skus, count: products.length, next_page_info}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
@@ -7650,13 +7767,13 @@ Deno.serve(async (req) => {
     const sku = (body.sku || '').trim()
     if (!store || !key || !sku) return new Response(JSON.stringify({error:'Missing store, key or sku'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
     const H = {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'}
-    const gq = (q) => fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:H, body: JSON.stringify({query:q})}).then(r=>r.json())
+    const gq = (q) =&gt; fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:H, body: JSON.stringify({query:q})}).then(r=&gt;r.json())
     const safe = sku.replace(/"/g, '')
-    const r = await gq('{ productVariants(first: 50, query: "sku:' + safe + '") { edges { node { id sku title inventoryPolicy inventoryQuantity inventoryItem { id tracked } product { id title handle status } } } } }')
+    const r = await gq('{ productVariants(first: 50, query: "sku:\\\\"' + safe + '\\\\"") { edges { node { id sku title inventoryPolicy inventoryQuantity inventoryItem { id tracked } product { id title handle status } } } } }')
     const rows = (r?.data?.productVariants?.edges || [])
-      .map((e:any) => e.node)
-      .filter((n:any) => (n.sku || '').trim().toUpperCase() === sku.toUpperCase())
-      .map((n:any) => ({
+      .map((e:any) =&gt; e.node)
+      .filter((n:any) =&gt; (n.sku || '').trim().toUpperCase() === sku.toUpperCase())
+      .map((n:any) =&gt; ({
         variant_id: n.id, variant_title: n.title, sku: n.sku,
         product_id: n.product?.id, product_title: n.product?.title,
         handle: n.product?.handle, status: n.product?.status,
@@ -7668,9 +7785,9 @@ Deno.serve(async (req) => {
       const h = await db.from('variant_holds').select('shopify_variant_id,reason').eq('sku', sku).eq('active', true)
       held = h.data || []
     } catch (e) {}
-    const heldSet = new Set(held.map((x:any) => x.shopify_variant_id))
-    rows.forEach((x:any) => { x.held = heldSet.has(x.variant_id)
-      x.hold_reason = (held.find((h:any)=>h.shopify_variant_id===x.variant_id)||{}).reason || '' })
+    const heldSet = new Set(held.map((x:any) =&gt; x.shopify_variant_id))
+    rows.forEach((x:any) =&gt; { x.held = heldSet.has(x.variant_id)
+      x.hold_reason = (held.find((h:any)=&gt;h.shopify_variant_id===x.variant_id)||{}).reason || '' })
     return new Response(JSON.stringify({variants: rows, errors: r?.errors || null}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
 
@@ -7684,9 +7801,9 @@ Deno.serve(async (req) => {
     if (!store || !key || !variantId) return new Response(JSON.stringify({error:'Missing store, key or variant_id'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
     const H = {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'}
     const errs: string[] = []
-    const gq = async (q) => {
-      const r = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:H, body: JSON.stringify({query:q})}).then(x=>x.json())
-      ;(r?.errors || []).forEach((e:any)=>errs.push(e?.message || JSON.stringify(e)))
+    const gq = async (q) =&gt; {
+      const r = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:H, body: JSON.stringify({query:q})}).then(x=&gt;x.json())
+      ;(r?.errors || []).forEach((e:any)=&gt;errs.push(e?.message || JSON.stringify(e)))
       return r
     }
     const info = await gq('{ productVariant(id: "' + variantId + '") { id sku title inventoryItem { id } product { id title } } }')
@@ -7734,27 +7851,37 @@ Deno.serve(async (req) => {
     if (!store || !key || !sku) return new Response(JSON.stringify({error:'Missing store, key or sku'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
     const H = {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'}
     const gqlTopErrors:string[] = []
-    const gql = async (q) => {
-      const r = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:H, body: JSON.stringify({query:q})}).then(x=>x.json())
-      if (r && Array.isArray(r.errors) && r.errors.length) {
-        r.errors.forEach((e:any)=>gqlTopErrors.push(e?.message || JSON.stringify(e)))
+    const gql = async (q) =&gt; {
+      const r = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:H, body: JSON.stringify({query:q})}).then(x=&gt;x.json())
+      if (r &amp;&amp; Array.isArray(r.errors) &amp;&amp; r.errors.length) {
+        r.errors.forEach((e:any)=&gt;gqlTopErrors.push(e?.message || JSON.stringify(e)))
       }
       return r
     }
     const safe = sku.replace(/"/g, '')
-    const find = await gql('{ productVariants(first: 10, query: "sku:' + safe + '") { edges { node { id sku inventoryItem { id } product { id } metafield(namespace: \\"custom\\", key: \\"estimated_arrival_date\\") { value } } } } }')
+    // [FIX] Same exact-phrase fix as update_template/list_sku_variants above - this is the search
+    // that was actually producing "No Shopify variant found" for real SKUs in a large numbered
+    // family (TGK-0308-15/16/17, TGK-0409-10/13/15, etc.) whenever the true match fell outside
+    // the first 10 fuzzy-tokenized results.
+    const find = await gql('{ productVariants(first: 10, query: "sku:\\\\"' + safe + '\\\\"") { edges { node { id sku inventoryItem { id } product { id } metafield(namespace: \\"custom\\", key: \\"estimated_arrival_date\\") { value } } } } }')
     const edges = find?.data?.productVariants?.edges || []
-    const allMatches = edges.filter((e:any) => (e.node.sku || '').trim().toUpperCase() === sku.toUpperCase())
-    if (!allMatches.length) return new Response(JSON.stringify({error:'No Shopify variant found for SKU: ' + sku, debug: edges.map((e:any)=>e.node.sku)}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
-    let heldIds = new Set<string>()
+    const allMatches = edges.filter((e:any) =&gt; (e.node.sku || '').trim().toUpperCase() === sku.toUpperCase())
+    if (!allMatches.length) return new Response(JSON.stringify({error:'No Shopify variant found for SKU: ' + sku, debug: edges.map((e:any)=&gt;e.node.sku)}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
+    let heldIds = new Set()
     try {
       const hq = await db.from('variant_holds').select('shopify_variant_id').eq('sku', sku).eq('active', true)
-      heldIds = new Set((hq.data || []).map((r:any) => r.shopify_variant_id))
+      heldIds = new Set((hq.data || []).map((r:any) =&gt; r.shopify_variant_id))
     } catch (e) { console.warn('[set_variant_backorder] hold lookup failed:', e) }
-    const targets = allMatches.filter((e:any) => !heldIds.has(e.node.id))
+    const targets = allMatches.filter((e:any) =&gt; !heldIds.has(e.node.id))
     const skippedHeld = allMatches.length - targets.length
     if (!targets.length) {
-      return new Response(JSON.stringify({ok:true, skipped_all_held:true, held_count:skippedHeld,
+      // [FIX] ok was true here, which caused BOTH ERP callers to treat a fully-held SKU as a
+      // successful backorder sync -- the single-SKU caller's _logSync() wrote a 'backorder' row
+      // to shopify_sync_log for a SKU that was never actually touched on Shopify (every matching
+      // variant was on hold), and the bulk sync counted it toward backorderCount as if it had
+      // succeeded. skipped_all_held still tells the caller nothing went WRONG; ok:false just
+      // stops it from being recorded as if it went right.
+      return new Response(JSON.stringify({ok:false, skipped_all_held:true, held_count:skippedHeld,
         note:'every variant for this SKU is on hold; nothing to sync'}), {headers:{...CORS,'Content-Type':'application/json'}})
     }
 
@@ -7764,7 +7891,7 @@ Deno.serve(async (req) => {
     // several chassis pages shares one inventory pool, so every page has to reflect the same
     // stock reality - looping over every target is the actual fix, not an optimization.
     const perVariant: any[] = []
-    const reconciledProducts = new Set<string>()
+    const reconciledProducts = new Set()
     for (const match of targets) {
       const variantId = match.node.id
       const invItemId = match.node.inventoryItem?.id
@@ -7773,27 +7900,27 @@ Deno.serve(async (req) => {
       let actual_policy = null, actual_tracked = null
 
       const existingEta = String(match.node.metafield?.value || '').trim()
-      const effRestockDate = (backorder && existingEta) ? existingEta : restockDate
-      const eta_preserved = !!(backorder && existingEta && existingEta !== restockDate)
+      const effRestockDate = (backorder &amp;&amp; existingEta) ? existingEta : restockDate
+      const eta_preserved = !!(backorder &amp;&amp; existingEta &amp;&amp; existingEta !== restockDate)
 
       if (backorder) {
         if (invItemId) {
           const t = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: true}) { inventoryItem { tracked } userErrors { message } } }')
-          ;(t?.data?.inventoryItemUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+          ;(t?.data?.inventoryItemUpdate?.userErrors || []).forEach((u:any)=&gt;errs.push(u.message))
           actual_tracked = t?.data?.inventoryItemUpdate?.inventoryItem?.tracked ?? actual_tracked
           const loc = await gql('{ locations(first: 1) { edges { node { id } } } }')
           const locId = loc?.data?.locations?.edges?.[0]?.node?.id
           if (locId) {
             const z = await gql('mutation { inventorySetOnHandQuantities(input: {reason: "correction", setQuantities: [{inventoryItemId: "' + invItemId + '", locationId: "' + locId + '", quantity: 0}]}) { userErrors { message } } }')
-            ;(z?.data?.inventorySetOnHandQuantities?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+            ;(z?.data?.inventorySetOnHandQuantities?.userErrors || []).forEach((u:any)=&gt;errs.push(u.message))
           }
         }
         const p = await gql('mutation { productVariantsBulkUpdate(productId: "' + prodId + '", variants: [{id: "' + variantId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
-        ;(p?.data?.productVariantsBulkUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+        ;(p?.data?.productVariantsBulkUpdate?.userErrors || []).forEach((u:any)=&gt;errs.push(u.message))
         actual_policy = p?.data?.productVariantsBulkUpdate?.productVariants?.[0]?.inventoryPolicy ?? actual_policy
         if (effRestockDate) {
           const m = await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: "' + effRestockDate + '", type: "single_line_text_field"}]) { userErrors { message } } }')
-          ;(m?.data?.metafieldsSet?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+          ;(m?.data?.metafieldsSet?.userErrors || []).forEach((u:any)=&gt;errs.push(u.message))
           // The storefront theme reads this date from TWO places: the variant's own metafield
           // (updated above) and the PRODUCT's own copy of the same field, used by a separate
           // block on the page. reconcileProductTemplate only ever handles which template
@@ -7802,17 +7929,17 @@ Deno.serve(async (req) => {
           // manually, often stale), on every single product this runs for, not just this one.
           if (prodId) {
             const pm = await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + prodId + '", namespace: "custom", key: "estimated_arrival_date", value: "' + effRestockDate + '", type: "single_line_text_field"}]) { userErrors { message } } }')
-            ;(pm?.data?.metafieldsSet?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+            ;(pm?.data?.metafieldsSet?.userErrors || []).forEach((u:any)=&gt;errs.push(u.message))
           }
         }
       } else {
         if (invItemId) {
           const t = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: false}) { inventoryItem { tracked } userErrors { message } } }')
-          ;(t?.data?.inventoryItemUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+          ;(t?.data?.inventoryItemUpdate?.userErrors || []).forEach((u:any)=&gt;errs.push(u.message))
           actual_tracked = t?.data?.inventoryItemUpdate?.inventoryItem?.tracked ?? actual_tracked
         }
         const p = await gql('mutation { productVariantsBulkUpdate(productId: "' + prodId + '", variants: [{id: "' + variantId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
-        ;(p?.data?.productVariantsBulkUpdate?.userErrors || []).forEach((u:any)=>errs.push(u.message))
+        ;(p?.data?.productVariantsBulkUpdate?.userErrors || []).forEach((u:any)=&gt;errs.push(u.message))
         actual_policy = p?.data?.productVariantsBulkUpdate?.productVariants?.[0]?.inventoryPolicy ?? actual_policy
         await gql('mutation { metafieldsSet(metafields: [{ownerId: "' + variantId + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
         // Clear the product-level copy too, for the same reason it gets written above when
@@ -7825,7 +7952,7 @@ Deno.serve(async (req) => {
       const policy_ok = actual_policy === expected_policy
       let reason = ''
       let failsafe_applied = false
-      if (backorder && !policy_ok) {
+      if (backorder &amp;&amp; !policy_ok) {
         try {
           if (invItemId) {
             const rb = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: false}) { inventoryItem { tracked } userErrors { message } } }')
@@ -7847,7 +7974,7 @@ Deno.serve(async (req) => {
       }
 
       let template_result = null
-      if (policy_ok && prodId && !reconciledProducts.has(prodId)) {
+      if (policy_ok &amp;&amp; prodId &amp;&amp; !reconciledProducts.has(prodId)) {
         reconciledProducts.add(prodId)
         template_result = await reconcileProductTemplate(gql, prodId)
       }
@@ -7860,17 +7987,18 @@ Deno.serve(async (req) => {
       })
     }
 
-    const ok = perVariant.every((r:any) => r.ok)
-    // The badge on the ERP's own side (driven by shopify_sync_log) has to reflect whether
-    // backorder genuinely went into effect anywhere - "some succeeded, one page failed" is
-    // still a real backorder state, not a no-op, so it must not log as 'reverted' just because
-    // ok (which strictly means ALL succeeded, for the caller's own success/fail display) is
-    // false. Using perVariant.some() here instead of ok itself keeps those two concerns
-    // separate: ok tells the calling UI whether to show this as a clean success, the log tells
-    // the ERP's own badge whether real backorder action was actually taken.
-    const anySucceeded = perVariant.some((r:any) => r.ok)
-    const effective_action = backorder ? (anySucceeded ? 'backorder' : 'reverted') : 'reverted'
-    try { await db.from('shopify_sync_log').insert({ pn: sku, action: effective_action, trigger_source: body.trigger_source || 'erp_manual', restock_date: (effective_action === 'backorder' ? (restockDate || null) : null) }) } catch (e) { console.warn('[set_variant_backorder] log failed:', e) }
+    const ok = perVariant.every((r:any) =&gt; r.ok)
+    // [FIX] This used to log 'backorder' whenever ANY matching Shopify variant instance
+    // succeeded (anySucceeded), even if another instance for the SAME sku (e.g. the same SKU
+    // listed on a second chassis page) failed and was silently failsafe-reverted to normal/
+    // available. That's how a SKU could show "backordered" in the ERP and the sync log while
+    // one specific Shopify product page still sold it normally with no visible sign anything
+    // was wrong. 'partial' is now a distinct, honest third state: some but not all instances
+    // actually went into backorder, so the SKU needs a manual look, not a clean checkmark.
+    const allSucceeded = ok
+    const anySucceeded = perVariant.some((r:any) =&gt; r.ok)
+    const effective_action = backorder ? (allSucceeded ? 'backorder' : (anySucceeded ? 'partial' : 'reverted')) : 'reverted'
+    try { await db.from('shopify_sync_log').insert({ pn: sku, action: effective_action, trigger_source: body.trigger_source || 'erp_manual', restock_date: ((effective_action === 'backorder' || effective_action === 'partial') ? (restockDate || null) : null) }) } catch (e) { console.warn('[set_variant_backorder] log failed:', e) }
     // Existing callers read this action's OLD single-variant response shape directly at the
     // TOP level (d.template, d.reason, d.actual_policy, d.actual_tracked, d.failsafe_applied,
     // d.errors) - one caller's own error-reporting depends on d.reason specifically, and its
@@ -7880,9 +8008,10 @@ Deno.serve(async (req) => {
     // since results[0] IS the only result there), with the FULL per-variant breakdown
     // additionally available under variants_updated/results for anything that wants it.
     const primary = perVariant[0] || {}
-    const flatErrors = perVariant.reduce((acc:string[], r:any) => acc.concat(r.errors || []), [])
+    const flatErrors = perVariant.reduce((acc:string[], r:any) =&gt; acc.concat(r.errors || []), [])
     return new Response(JSON.stringify({
       ok, variant: primary.variant, backorder,
+      logged_action: effective_action, // 'backorder' | 'partial' | 'reverted' -- exactly what was written to shopify_sync_log above, so callers don't have to re-derive it from results[]
       errors: flatErrors, graphql_errors: gqlTopErrors,
       reason: primary.reason || '', actual_policy: primary.actual_policy, actual_tracked: primary.actual_tracked,
       expected_policy: 'CONTINUE', policy_ok: primary.policy_ok, failsafe_applied: primary.failsafe_applied,
@@ -7897,15 +8026,15 @@ if (body.action === 'list_product_templates') {
     if (!store || !key) return new Response(JSON.stringify({error:'Missing Shopify credentials'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
     const page_info = body.page_info || ''
     const url = page_info
-      ? 'https://' + store + '/admin/api/2024-01/products.json?limit=250&page_info=' + page_info
-      : 'https://' + store + '/admin/api/2024-01/products.json?limit=250&published_status=any&fields=id,title,handle,template_suffix,variants'
+      ? 'https://' + store + '/admin/api/2024-01/products.json?limit=250&amp;page_info=' + page_info
+      : 'https://' + store + '/admin/api/2024-01/products.json?limit=250&amp;published_status=any&amp;fields=id,title,handle,template_suffix,variants'
     const res = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
     if (!res.ok) return new Response(JSON.stringify({error:'Shopify ' + res.status + ' - check API key has read_products scope'}), {status:res.status, headers:{...CORS,'Content-Type':'application/json'}})
     const data = await res.json()
     const products = data.products || []
     const items: any[] = []
     for (const product of products) {
-      const variants = (product.variants || []).filter((v:any) => (v.sku || '').trim() !== '').map((v:any) => ({
+      const variants = (product.variants || []).filter((v:any) =&gt; (v.sku || '').trim() !== '').map((v:any) =&gt; ({
         sku: (v.sku || '').trim(),
         tracked: !!v.inventory_management,
         policy: v.inventory_policy || '',
@@ -7917,15 +8046,192 @@ if (body.action === 'list_product_templates') {
     const link = res.headers.get('link') || ''
     let next_page_info = ''
     for (const part of link.split(',')) {
-      if (part.includes('rel="next"')) { const m = part.match(/page_info=([^&>"]+)/); if (m) { next_page_info = m[1]; break } }
+      if (part.includes('rel="next"')) { const m = part.match(/page_info=([^&amp;&gt;"]+)/); if (m) { next_page_info = m[1]; break } }
     }
     return new Response(JSON.stringify({products: items, count: products.length, next_page_info}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
+
+  // [FEATURE] One-time backfill for orders written before centralDateOnly() existed. The raw
+  // Shopify order timestamp was never stored anywhere -- only the already-computed (and buggy)
+  // sale_date was -- so there's no way to recompute the correct date from what's already in the
+  // sales table. This re-fetches each distinct Shopify order directly from Shopify (the one place
+  // the real timestamp still exists), recomputes sale_date the same correct way the live webhook
+  // now does, and updates every sales row sharing that order. Paginated by offset (not a new
+  // tracking column) so repeated calls with an incrementing offset cover every order exactly
+  // once; the id lookup itself is page-fetched in 1000-row chunks rather than a single unbounded
+  // select, since Supabase/PostgREST caps an unbounded request at 1000 rows by default and this
+  // table can easily exceed that.
+  if (body.action === 'backfill_sale_dates') {
+    const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
+    const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
+    if (!store || !key) return new Response(JSON.stringify({error:'Missing Shopify credentials'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
+    const limit = Math.min(Math.max(parseInt(body.limit) || 20, 1), 50)
+    const offset = Math.max(parseInt(body.offset) || 0, 0)
+
+    let allIds: string[] = []
+    try {
+      const seen = new Set&lt;string&gt;()
+      let from = 0
+      const pageSize = 1000
+      while (true) {
+        const { data, error } = await db.from('sales')
+          .select('shopify_order_id')
+          .not('shopify_order_id', 'is', null)
+          .order('shopify_order_id', { ascending: true })
+          .range(from, from + pageSize - 1)
+        if (error) throw error
+        for (const r of (data || [])) if (r.shopify_order_id) seen.add(r.shopify_order_id)
+        if (!data || data.length &lt; pageSize) break
+        from += pageSize
+      }
+      allIds = [...seen].sort()
+    } catch (e) {
+      return new Response(JSON.stringify({error: 'Failed to list orders: ' + String((e as any)?.message || e)}), {status:500, headers:{...CORS,'Content-Type':'application/json'}})
+    }
+
+    const pageIds = allIds.slice(offset, offset + limit)
+    let updated = 0, unchanged = 0
+    const errors: string[] = []
+
+    for (const oid of pageIds) {
+      try {
+        const res = await fetch('https://' + store + '/admin/api/2024-01/orders/' + oid + '.json?fields=id,created_at', { headers: { 'X-Shopify-Access-Token': key } })
+        if (!res.ok) { errors.push(oid + ': Shopify ' + res.status); continue }
+        const j = await res.json()
+        const createdAt = j?.order?.created_at
+        if (!createdAt) { errors.push(oid + ': no created_at returned'); continue }
+        const correctDate = centralDateOnly(createdAt)
+        const { data: matchRows, error: selErr } = await db.from('sales').select('id, sale_date').eq('shopify_order_id', oid)
+        if (selErr) { errors.push(oid + ': ' + selErr.message); continue }
+        for (const row of (matchRows || [])) {
+          if (row.sale_date !== correctDate) {
+            const { error: upErr } = await db.from('sales').update({ sale_date: correctDate }).eq('id', row.id)
+            if (upErr) errors.push(oid + ' (row ' + row.id + '): ' + upErr.message)
+            else updated++
+          } else {
+            unchanged++
+          }
+        }
+        // Gentle pacing to stay well within Shopify's standard rate-limit bucket.
+        await new Promise(r =&gt; setTimeout(r, 550))
+      } catch (e) {
+        errors.push(oid + ': ' + String((e as any)?.message || e))
+      }
+    }
+
+    return new Response(JSON.stringify({
+      ok: true,
+      total_orders: allIds.length,
+      processed_this_batch: pageIds.length,
+      next_offset: offset + pageIds.length,
+      done: (offset + pageIds.length) &gt;= allIds.length,
+      updated, unchanged, errors
+    }), { headers: { ...CORS, 'Content-Type': 'application/json' } })
+  }
+
+  // [FEATURE] Drop-ship "Mark Shipped" needs to actually fulfill the real Shopify order -- today
+  // that flow only updates the ERP's own sales table, so the customer never gets Shopify's
+  // shipping-confirmation email and the order sits open in Shopify indefinitely even though it
+  // genuinely shipped. Creates a PARTIAL fulfillment covering only the given line item(s) (an
+  // order can have other, non-drop-ship lines that ship separately), with tracking attached and
+  // notifyCustomer:true so Shopify sends its normal "your order has shipped" email. Accepts an
+  // array of {sku, qty} so a multi-line drop-ship-all action can fulfill everything in ONE call --
+  // one email for the shipment, not one per SKU.
+  if (body.action === 'create_fulfillment') {
+    const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
+    const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
+    if (!store || !key) return new Response(JSON.stringify({error:'Missing Shopify credentials'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
+    const shopifyOrderId = String(body.shopify_order_id || '').trim()
+    const items: {sku:string, qty:number}[] = Array.isArray(body.items)
+      ? body.items.map((i: any) =&gt; ({ sku: String(i.sku || '').trim(), qty: Math.max(1, parseInt(i.qty) || 1) })).filter((i: any) =&gt; i.sku)
+      : []
+    const trackingNumber = String(body.tracking_number || '').trim()
+    const carrier = String(body.carrier || '').trim()
+    if (!shopifyOrderId || !items.length) {
+      return new Response(JSON.stringify({error:'shopify_order_id and at least one item (sku, qty) are required'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
+    }
+
+    const H = {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'}
+    const gqlErrs: string[] = []
+    const gql = async (q: string, vars?: any) =&gt; {
+      const r = await fetch('https://' + store + '/admin/api/2024-10/graphql.json', {
+        method: 'POST', headers: H, body: JSON.stringify(vars ? {query: q, variables: vars} : {query: q})
+      }).then(x =&gt; x.json())
+      if (r &amp;&amp; Array.isArray(r.errors) &amp;&amp; r.errors.length) r.errors.forEach((e: any) =&gt; gqlErrs.push(e?.message || JSON.stringify(e)))
+      return r
+    }
+
+    const orderGid = shopifyOrderId.startsWith('gid://') ? shopifyOrderId : ('gid://shopify/Order/' + shopifyOrderId)
+    const foRes = await gql(
+      \`query($id: ID!) { order(id: $id) { id fulfillmentOrders(first: 10) { edges { node {
+         id status lineItems(first: 50) { edges { node { id remainingQuantity lineItem { sku } } } }
+       } } } } }\`,
+      { id: orderGid }
+    )
+    const order = foRes?.data?.order
+    if (!order) {
+      return new Response(JSON.stringify({error: 'Shopify order not found for id ' + shopifyOrderId, graphql_errors: gqlErrs}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
+    }
+
+    // Match each requested SKU to its open FulfillmentOrderLineItem, grouped by which
+    // FulfillmentOrder it belongs to (normally all one order's lines share a single fulfillment
+    // order, but Shopify can split them -- e.g. across locations -- so this handles either case).
+    const byFO: Record&lt;string, {id: string, quantity: number}[]&gt; = {}
+    const notFoundSkus: string[] = []
+    for (const item of items) {
+      let found = false
+      for (const foEdge of (order.fulfillmentOrders?.edges || [])) {
+        const fo = foEdge.node
+        if (fo.status !== 'OPEN' &amp;&amp; fo.status !== 'IN_PROGRESS') continue
+        for (const liEdge of (fo.lineItems?.edges || [])) {
+          const li = liEdge.node
+          const liSku = (li.lineItem?.sku || '').trim().toUpperCase()
+          if (liSku === item.sku.toUpperCase() &amp;&amp; (li.remainingQuantity || 0) &gt; 0) {
+            const q = Math.min(item.qty, li.remainingQuantity)
+            if (!byFO[fo.id]) byFO[fo.id] = []
+            byFO[fo.id].push({ id: li.id, quantity: q })
+            found = true
+            break
+          }
+        }
+        if (found) break
+      }
+      if (!found) notFoundSkus.push(item.sku)
+    }
+    const foGroups = Object.keys(byFO)
+    if (!foGroups.length) {
+      return new Response(JSON.stringify({error: 'No open fulfillment-order line item found for any of: ' + items.map(i =&gt; i.sku).join(', ') + ' (already fulfilled, or SKU mismatch)', graphql_errors: gqlErrs}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
+    }
+
+    const fulfillmentInput: any = {
+      notifyCustomer: true,
+      lineItemsByFulfillmentOrder: foGroups.map(foId =&gt; ({ fulfillmentOrderId: foId, fulfillmentOrderLineItems: byFO[foId] }))
+    }
+    if (trackingNumber) fulfillmentInput.trackingInfo = { number: trackingNumber, company: carrier || undefined }
+
+    const fRes = await gql(
+      \`mutation($fulfillment: FulfillmentV2Input!) { fulfillmentCreateV2(fulfillment: $fulfillment) { fulfillment { id status } userErrors { field message } } }\`,
+      { fulfillment: fulfillmentInput }
+    )
+    const userErrors = fRes?.data?.fulfillmentCreateV2?.userErrors || []
+    if (userErrors.length) {
+      return new Response(JSON.stringify({error: userErrors.map((e: any) =&gt; e.message).join('; '), graphql_errors: gqlErrs}), {status:502, headers:{...CORS,'Content-Type':'application/json'}})
+    }
+    const fulfillment = fRes?.data?.fulfillmentCreateV2?.fulfillment
+    return new Response(JSON.stringify({
+      ok: true,
+      fulfillment_id: fulfillment?.id || null,
+      status: fulfillment?.status || null,
+      fulfilled_items: items.length - notFoundSkus.length,
+      not_found_skus: notFoundSkus
+    }), { headers: { ...CORS, 'Content-Type': 'application/json' } })
+  }
+
   let topic = req.headers.get('x-shopify-topic')
     || req.headers.get('X-Shopify-Topic')
     || ''
   if (!topic) {
-    if (body.line_items && body.id && body.order_number) {
+    if (body.line_items &amp;&amp; body.id &amp;&amp; body.order_number) {
       topic = body.cancelled_at ? 'orders/cancelled' : 'orders/create'
     } else if (body.cancel_reason !== undefined) {
       topic = 'orders/cancelled'
@@ -7961,11 +8267,31 @@ if (body.action === 'list_product_templates') {
           shipping_province: shipAddr.province_code || shipAddr.province || null,
           shipping_zip: shipAddr.zip || null,
           shipping_country: shipAddr.country_code || shipAddr.country || null,
-          discount_code: (order.discount_codes && order.discount_codes.length ? order.discount_codes[0].code : null),
+          discount_code: (order.discount_codes &amp;&amp; order.discount_codes.length ? order.discount_codes[0].code : null),
           shopify_order_id: String(order.id),
           shopify_line_item_id: String(li.id),
         })
         if (insErr) console.error('[shopify-orders] insert error:', insErr.message, insErr.details)
+      }
+      // Runs after the insert loop so it flags rows that already exist, rather than racing them.
+      await checkOrderRisk(order.id, order.name)
+
+      // [FIX] Closes the Support Center &lt;-&gt; Shopify loop: if this order came from a Support
+      // Center draft, create-draft-order attached email_id as a custom attribute on the draft,
+      // which Shopify copies verbatim into the completed order's note_attributes. Reading it
+      // back here and writing emails.shopify_order_id means the ERP flips from "Sent to
+      // Shopify" to "Shopify order" automatically the moment the customer pays the invoice (or
+      // staff completes the draft manually) - same field completeShopifyDraft() sets by hand,
+      // just no longer dependent on someone remembering to click it. Orders that did NOT come
+      // from a draft (no email_id attribute) simply skip this block, unaffected.
+      const emailIdAttr = (order.note_attributes || []).find((a: any) =&gt; a?.name === 'email_id')
+      if (emailIdAttr?.value) {
+        try {
+          const { error: linkErr } = await db.from('emails')
+            .update({ shopify_order_id: order.name, updated_at: new Date().toISOString() })
+            .eq('id', emailIdAttr.value)
+          if (linkErr) console.error('[shopify-orders] emails link-back error:', linkErr.message)
+        } catch (e) { console.warn('[shopify-orders] emails link-back failed:', e) }
       }
     } else if (topic === 'orders/cancelled') {
       // Only cancel lines that have NOT shipped. Flipping a shipped line to Cancelled leaves its
@@ -7975,7 +8301,7 @@ if (body.action === 'list_product_templates') {
         .eq('order_number', order.name)
         .in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
     } else if (topic === 'orders/updated') {
-      const updFields: Record<string,any> = {}
+      const updFields: Record&lt;string, any&gt; = {}
       if (fin === 'refunded' || fin === 'voided' || fin === 'partially_refunded') {
         updFields.fulfillment_status = 'Refunded'
         updFields.financial_status = fin
@@ -7993,6 +8319,50 @@ if (body.action === 'list_product_templates') {
       if (Object.keys(updFields).length) {
         await db.from('sales').update(updFields).eq('order_number', order.name)
       }
+      // Some fraud apps finish their risk assessment a moment after order creation - checking
+      // again here (idempotent, see checkOrderRisk) catches those without needing a dedicated
+      // webhook topic.
+      await checkOrderRisk(order.id, order.name)
+      // [FEATURE] Some drop-ship vendors fulfill directly in Shopify (their own app or a manual
+      // fulfillment) rather than ever passing through ShipStation. Those lines would otherwise
+      // sit in Open/Ordered forever, since nothing ShipStation-side ever sees them ship.
+      // Mirrors Shopify's own fulfillments array onto matching sales lines. Scoped to
+      // drop-ship lines ONLY (no assemblies/parts record for that SKU) - a real inventory SKU
+      // fulfilled this way still needs actual stock deduction, which this does not attempt, so
+      // it deliberately leaves those alone rather than silently skipping a deduction.
+      // Naturally idempotent: once a line is Shipped, the .in(['Open','Ordered']) filter below
+      // stops matching it, so a redelivered webhook is a harmless no-op.
+      if (Array.isArray(order.fulfillments) &amp;&amp; order.fulfillments.length) {
+        for (const f of order.fulfillments) {
+          const trackingNum = f.tracking_number || null
+          const trackingCo = f.tracking_company || null
+          const items = Array.isArray(f.line_items) ? f.line_items : []
+          for (const li of items) {
+            const pn = li.sku ? li.sku.trim().toUpperCase() : (li.title || '').trim()
+            if (!pn) continue
+            // [SKU] new_sku-aware existence check, same pattern used elsewhere in this file -
+            // a renamed real SKU must not be misclassified as drop-ship just because only its
+            // legacy pn (or only its new_sku) was checked.
+            let isRealItem = false
+            const { data: asmPn } = await db.from('assemblies').select('id').eq('pn', pn).limit(1)
+            if (asmPn?.length) isRealItem = true
+            if (!isRealItem) { const { data: asmSku } = await db.from('assemblies').select('id').eq('new_sku', pn).limit(1); if (asmSku?.length) isRealItem = true }
+            if (!isRealItem) { const { data: partPn } = await db.from('parts').select('id').eq('pn', pn).limit(1); if (partPn?.length) isRealItem = true }
+            if (!isRealItem) { const { data: partSku } = await db.from('parts').select('id').eq('new_sku', pn).limit(1); if (partSku?.length) isRealItem = true }
+            if (isRealItem) continue
+            // shopify_fulfilled: true - same flag the ERP's manual "Mark Fulfilled via Shopify"
+            // action sets, so a line fulfilled this way is always labeled the same regardless
+            // of whether Jon or this automatic detection is the one that caught it.
+            await db.from('sales').update({
+              fulfillment_status: 'Shipped',
+              shopify_fulfilled: true,
+              tracking_number: trackingNum,
+              carrier: trackingCo,
+              shipped_at: f.created_at || new Date().toISOString()
+            }).eq('order_number', order.name).eq('pn', pn).in('fulfillment_status', ['Open', 'Ordered'])
+          }
+        }
+      }
     }
     if (body.action === 'create_refund') {
     const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
@@ -8004,7 +8374,7 @@ if (body.action === 'list_product_templates') {
     if (!orderId || !autoAmount) {
       const lookupUrl = orderId
         ? 'https://' + store + '/admin/api/2024-01/orders/' + orderId + '.json?fields=id,line_items'
-        : 'https://' + store + '/admin/api/2024-01/orders.json?name=' + encodeURIComponent(orderName) + '&fields=id,line_items&status=any&limit=1'
+        : 'https://' + store + '/admin/api/2024-01/orders.json?name=' + encodeURIComponent(orderName) + '&amp;fields=id,line_items&amp;status=any&amp;limit=1'
       const lookupRes = await fetch(lookupUrl, {headers:{'X-Shopify-Access-Token':key}})
       if (lookupRes.ok) {
         const ld = await lookupRes.json()
@@ -8013,7 +8383,7 @@ if (body.action === 'list_product_templates') {
           if (!orderId) orderId = order.id
           if (!autoAmount) {
             const li = shopifyLineItemId
-              ? (order.line_items || []).find((l: any) => String(l.id) === String(shopifyLineItemId))
+              ? (order.line_items || []).find((l: any) =&gt; String(l.id) === String(shopifyLineItemId))
               : (order.line_items || [])[0]
             if (li) autoAmount = parseFloat(li.price || '0') * (Number(qty) || 1)
           }
@@ -8026,7 +8396,7 @@ if (body.action === 'list_product_templates') {
         notify: true,
         note: note || 'Return processed via TGK ERP',
         refund_line_items: shopifyLineItemId ? [{ line_item_id: Number(shopifyLineItemId), quantity: Number(qty) || 1, restock_type: 'no_restock' }] : [],
-        transactions: autoAmount > 0 ? [{ kind: 'refund', gateway: 'manual', amount: autoAmount.toFixed(2), currency: 'USD' }] : []
+        transactions: autoAmount &gt; 0 ? [{ kind: 'refund', gateway: 'manual', amount: autoAmount.toFixed(2), currency: 'USD' }] : []
       }
     }
     const refundRes = await fetch('https://' + store + '/admin/api/2024-01/orders/' + orderId + '/refunds.json', {
@@ -8041,7 +8411,13 @@ if (body.action === 'list_product_templates') {
     console.error('[shopify-orders] webhook error:', err)
   }
   return new Response('ok', { headers: CORS })
-})</pre>
+})
+
+/* Migration needed before the risk-flagging feature works:
+   ALTER TABLE sales ADD COLUMN IF NOT EXISTS risk_flagged boolean DEFAULT false;
+   ALTER TABLE sales ADD COLUMN IF NOT EXISTS risk_level text;
+*/
+</pre>
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">3 — ShipStation ship webhook (split shipments, tracking, on-hold)</div>
     <div style="font-size:var(--t-sm);color:var(--text3);margin:4px 0 6px;display:flex;align-items:center;gap:8px">Replace <span class="pn">supabase/functions/shipstation-ship/index.ts</span> with:<button class="btn btn-sm" style="margin-left:auto;font-size:var(--t-xs)" onclick="var pre=this.closest('div').nextElementSibling;copyText(pre?pre.textContent:'',this)">Copy</button></div>
@@ -14703,6 +15079,9 @@ async function adminResetPerms(userId){
 function pushUndo(action, table, data, prev, desc) {
   S.undoStack.push({action, table, data, prev, desc, ts:new Date()});
   if(S.undoStack.length > 50) S.undoStack.shift();
+  // [FEATURE] A genuinely new action invalidates any pending redo history -- the forward
+  // timeline just branched, so whatever was previously undone is no longer safe to reapply.
+  if(S.redoStack && S.redoStack.length){S.redoStack=[];updateRedoBtn();}
   updateUndoBtn();
   if(S.currentUserId) logAction(desc,table,data?.pn||null,prev,data).catch(()=>{});
 }
@@ -14721,9 +15100,24 @@ function updateUndoBtn() {
   }
 }
 
+function updateRedoBtn() {
+  const btn = document.getElementById('redo-btn');
+  if(!btn) return;
+  if(S.redoStack && S.redoStack.length) {
+    btn.disabled = false;
+    btn.title = 'Redo: ' + S.redoStack[S.redoStack.length-1].desc;
+    btn.textContent = 'Redo (' + S.redoStack.length + ')';
+  } else {
+    btn.disabled = true;
+    btn.title = 'Nothing to redo';
+    btn.textContent = 'Redo';
+  }
+}
+
 function pushUndoMulti(desc, ops){
   S.undoStack.push({action:'multi', ops, desc, ts:new Date()});
   if(S.undoStack.length > 50) S.undoStack.shift();
+  if(S.redoStack && S.redoStack.length){S.redoStack=[];updateRedoBtn();}
   updateUndoBtn();
   if(S.currentUserId) logAction(desc,ops?.[0]?.table||null,null,null,null).catch(()=>{});
 }
@@ -14748,6 +15142,25 @@ async function applyUndoOp(op){
   }
 }
 
+// [FEATURE] Redo. Mirrors applyUndoOp in the forward direction: an undone 'delete' gets
+// re-deleted, an undone 'insert' gets re-inserted (with its original id, so it's the same row,
+// not a new one), an undone 'update' gets its post-edit state (op.data) re-applied, and an
+// undone 'bom_delete' gets re-removed.
+async function applyRedoOp(op){
+  if(op.action === 'delete') {
+    await db.from(op.table).delete().eq('id', op.data.id);
+  } else if(op.action === 'insert') {
+    const {error} = await db.from(op.table).insert(stripMeta(op.data));
+    if(error) throw error;
+  } else if(op.action === 'update') {
+    const cur = stripMeta(op.data);
+    const {error} = await db.from(op.table).update(cur).eq('id', op.data.id);
+    if(error) throw error;
+  } else if(op.action === 'bom_delete') {
+    await db.from('bom_items').delete().eq('id', op.data.id);
+  }
+}
+
 async function undo() {
   const last = S.undoStack.pop();
   if(!last) return;
@@ -14758,12 +15171,43 @@ async function undo() {
     } else {
       await applyUndoOp(last);
     }
+    // [FEATURE] Park the just-undone action on the redo stack instead of discarding it, so
+    // undoing too far can be walked back with Redo rather than having to redo the work by hand.
+    if(!S.redoStack)S.redoStack=[];
+    S.redoStack.push(last);
+    if(S.redoStack.length > 50) S.redoStack.shift();
+    updateRedoBtn();
     await loadAll();
     toast('Undone: ' + last.desc);
   } catch(e) {
     toast('Undo failed: ' + e.message);
     S.undoStack.push(last);
     updateUndoBtn();
+  }
+}
+
+async function redo() {
+  if(!S.redoStack)S.redoStack=[];
+  const next = S.redoStack.pop();
+  if(!next) return;
+  updateRedoBtn();
+  try {
+    if(next.action === 'multi') {
+      for(const op of next.ops) await applyRedoOp(op);
+    } else {
+      await applyRedoOp(next);
+    }
+    // Goes back onto the undo stack (not treated as a "new" action, so this does NOT clear the
+    // redo stack -- only pushUndo/pushUndoMulti do that, for genuinely new work).
+    S.undoStack.push(next);
+    if(S.undoStack.length > 50) S.undoStack.shift();
+    updateUndoBtn();
+    await loadAll();
+    toast('Redone: ' + next.desc);
+  } catch(e) {
+    toast('Redo failed: ' + e.message);
+    S.redoStack.push(next);
+    updateRedoBtn();
   }
 }
 
@@ -16481,6 +16925,11 @@ function setCartQty(pn, qty){
   }
   saveCart();
   renderCartPanel();
+  // [FIX] This only ever refreshed the slide-out cart panel itself. The Purchasing/Planning
+  // list's "already on order" styling (Order Qty column, teal highlight) reads S.poCart directly
+  // but only recomputes on a full render() -- so removing an item here left that list showing
+  // it as still on order until something unrelated happened to trigger a re-render.
+  render();
 }
 function addAllReorder(vendorFilter){
   let added=0;
@@ -27462,6 +27911,7 @@ async function processReturn(saleId,action){
 
   document.querySelectorAll('#prm-overlay button[data-action]').forEach(function(b){b.disabled=true;});
   var errors=[],results=[];
+  var undoOps=[]; // [FEATURE] every mutation below (stock adjustment, sales status, warranty insert) collected for one undo/redo entry
 
   for(var i=0;i<linesToProcess.length;i++){
     var line=linesToProcess[i];
@@ -27473,7 +27923,10 @@ async function processReturn(saleId,action){
         return_reason:'Admin closed \u2014 inventory already corrected'+(notes?' \u2014 '+notes:''),
         updated_at:new Date().toISOString()
       }).eq('id',line.id);
-      if(!rc.error){S.sales=S.sales.map(function(s){return s.id===line.id?Object.assign({},s,{return_status:'corrected'}):s;});results.push(pn);}
+      if(!rc.error){
+        undoOps.push({action:'update',table:'sales',data:{id:line.id,return_status:'corrected'},prev:line});
+        S.sales=S.sales.map(function(s){return s.id===line.id?Object.assign({},s,{return_status:'corrected'}):s;});results.push(pn);
+      }
       else errors.push(pn+': '+rc.error.message);
 
     }else if(action==='returned'){
@@ -27482,13 +27935,14 @@ async function processReturn(saleId,action){
       var invOk=false;
       if(asm){
         var noh=await adjustStock('assembly',asm,qty,{reason:'Return to stock \u2014 order '+orderNum+(notes?' \u2014 '+notes:''),source:'return'});
-        if(noh!==null){invOk=true;results.push('+'+qty+' '+pn);}else errors.push(pn+': stock update failed');
+        if(noh!==null){invOk=true;results.push('+'+qty+' '+pn);undoOps.push({action:'update',table:'assemblies',data:{id:asm.id,total_on_hand:noh},prev:asm});}else errors.push(pn+': stock update failed');
       }else if(prt){
         var noh2=await adjustStock('part',prt,qty,{reason:'Return to stock \u2014 order '+orderNum+(notes?' \u2014 '+notes:''),source:'return'});
-        if(noh2!==null){invOk=true;results.push('+'+qty+' '+pn);}else errors.push(pn+': stock update failed');
+        if(noh2!==null){invOk=true;results.push('+'+qty+' '+pn);undoOps.push({action:'update',table:'parts',data:{id:prt.id,total_unpckgd:noh2},prev:prt});}else errors.push(pn+': stock update failed');
       }
       if(invOk||!asm&&!prt){
         await db.from('sales').update({return_status:'returned',updated_at:new Date().toISOString()}).eq('id',line.id);
+        undoOps.push({action:'update',table:'sales',data:{id:line.id,return_status:'returned'},prev:line});
         S.sales=S.sales.map(function(s){return s.id===line.id?Object.assign({},s,{return_status:'returned'}):s;});
       }
 
@@ -27501,13 +27955,17 @@ async function processReturn(saleId,action){
         created_at:new Date().toISOString()
       }).select().single();
       if(wres.data){
+        undoOps.push({action:'insert',table:'warranty_claims',data:wres.data});
         S.warrantyClaims=[wres.data,...(S.warrantyClaims||[])];
         await db.from('sales').update({return_status:'damaged',updated_at:new Date().toISOString()}).eq('id',line.id);
+        undoOps.push({action:'update',table:'sales',data:{id:line.id,return_status:'damaged'},prev:line});
         S.sales=S.sales.map(function(s){return s.id===line.id?Object.assign({},s,{return_status:'damaged'}):s;});
         results.push('Warranty: '+pn);
       }else if(wres.error)errors.push(pn+': '+wres.error.message);
     }
   }
+
+  if(undoOps.length)pushUndoMulti('Process return '+orderNum+' ('+linesToProcess.length+' item'+(linesToProcess.length!==1?'s':'')+')',undoOps);
 
   document.getElementById('prm-overlay')?.remove();
   if(errors.length&&!results.length){toast('\u26a0 Failed: '+errors[0]);}
