@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.11';
+const TGK_ERP_VERSION = 'v23.14';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -9681,24 +9681,21 @@ async function loadDashBackorderNotice(){
   S._dashBoNoticeLoading=true;
   S._dashBoNoticeLastRun=now;
   try{
+    // [FIX] Was computing its own simpler version of "what's currently backordered" independently
+    // from the Backorder Log page - didn't canonicalize renamed items (a SKU with log rows under
+    // both its old pn and new new_sku got counted twice), didn't exclude stale orphaned entries,
+    // and didn't exclude ineligible items (subassembly/hardware-pack/pre-order/discontinued/dev).
+    // That's exactly why this banner could show "33" while the Backorder Log page's more careful
+    // logic showed "14" for what's supposed to be the same question. Now both call the same
+    // shared function, so they can't independently disagree again - this banner just adds its own
+    // 48h "recent activity" framing on top of that shared, correct base set.
+    var cur=await getCurrentBackorderedItems();
+    if(cur.error||!cur.items.length){el.innerHTML='';return;}
     var cutoff=new Date(Date.now()-48*3600*1000).toISOString();
-    // [FIX] Was .eq('action','backorder') -- only ever checking whether a backorder EVENT
-    // existed in the window, never whether that SKU was later reverted (restocked). An item
-    // that went on backorder and came back off it minutes later kept showing here for the full
-    // 48h regardless -- the exact "misleading" complaint. Fetching every action in the window
-    // and keeping only the NEWEST row per SKU (data is already ordered newest-first, so first
-    // occurrence wins) means a SKU only appears if backorder is genuinely its current state, not
-    // just something that happened to it recently.
-    var{data,error}=await db.from('shopify_sync_log')
-      .select('pn,action,created_at')
-      .gte('created_at',cutoff)
-      .order('created_at',{ascending:false});
-    if(error||!data||!data.length){el.innerHTML='';return;}
-    var latestPerSku={};
-    data.forEach(function(r){if(!latestPerSku[r.pn])latestPerSku[r.pn]=r;});
-    var skus=Object.keys(latestPerSku).filter(function(pn){return latestPerSku[pn].action==='backorder';});
-    if(!skus.length){el.innerHTML='';return;}
-    var newest=latestPerSku[skus.reduce(function(a,b){return latestPerSku[a].created_at>latestPerSku[b].created_at?a:b;})].created_at;
+    var recent=cur.items.filter(function(it){return it.logRow.created_at>=cutoff;});
+    if(!recent.length){el.innerHTML='';return;}
+    var skus=recent.map(function(it){return it.pn;});
+    var newest=recent.reduce(function(a,b){return a.logRow.created_at>b.logRow.created_at?a:b;}).logRow.created_at;
     var dismissed=localStorage.getItem('bo_notice_dismissed_at');
     if(dismissed&&newest<=dismissed){el.innerHTML='';return;}
     var ago=Math.round((Date.now()-new Date(newest).getTime())/60000);
@@ -9743,6 +9740,31 @@ function renderInventoryBackorderLog(){
     <div style="font-size:var(--t-sm);color:var(--text3);padding:12px 0">Loading…</div>
   </div>`;
 }
+// [FEATURE] Single source of truth for "what's currently backordered on Shopify right now,"
+// used by BOTH the Dashboard notice and the Backorder Log page's "Currently Backordered" filter.
+// These used to be two independently-computed answers to the same question (the Dashboard's own
+// simpler version double-counted renamed items under both their old pn and new_sku, and didn't
+// exclude stale orphaned entries or ineligible items) - exactly the same class of drift already
+// found once this session between the ship-time and bulk-sync backorder logic. One function now,
+// so both callers agree by construction instead of by coincidence.
+async function getCurrentBackorderedItems(){
+  const res=await db.from('shopify_sync_log').select('*').order('created_at',{ascending:false}).limit(3000);
+  if(res.error||!res.data)return{items:[],error:res.error};
+  const seen=new Set();
+  const items=[];
+  res.data.forEach(function(r){
+    const _it=findAsm(r.pn)||_findPart(r.pn);
+    const key=_it?_it.pn:r.pn; // resolve legacy pn / new_sku to one canonical identity
+    if(seen.has(key))return; // keep only the first (=latest, since sorted desc) row per item
+    seen.add(key);
+    if(r.action!=='backorder')return;
+    if(!_it)return; // stale renamed-pn orphan - no longer corresponds to anything real
+    if(!eligibleForBackorderSync(_it))return; // subassembly/hardware-pack/pre-order/discontinued/dev
+    items.push({pn:key,logRow:r});
+  });
+  return{items,error:null};
+}
+
 async function loadInvBackorderLog(){
   var wrap=document.getElementById('inv-bo-log-wrap');
   if(!wrap)return;
@@ -9756,27 +9778,11 @@ async function loadInvBackorderLog(){
   try{
     var data,error;
     if(filter==='current'){
-      // "Currently backordered" isn't a single action value — a SKU could have a backorder row
-      // within any naive limit/filter window while ALSO having a later reverted row that got
-      // excluded from that same window. The only correct way to know current state is to look at
-      // enough history to find each SKU's true most-recent event, then keep only the ones where
-      // that latest event is a backorder.
-      var res=await db.from('shopify_sync_log').select('*').order('created_at',{ascending:false}).limit(3000);
-      error=res.error;
-      if(!error){
-        var seen=new Set();
-        data=(res.data||[]).filter(function(r){
-          var _it=findAsm(r.pn)||_findPart(r.pn);
-          var key=_it?_it.pn:r.pn; // resolve legacy pn / new_sku to one canonical identity (matches the badge)
-          if(seen.has(key))return false; // keep only the first (=latest, since sorted desc) row per item
-          seen.add(key);
-          if(r.action!=='backorder')return false;
-          // A PN with no current match is almost always a stale entry left behind by a SKU rename
-          // that happened before rename-propagation into this log existed — it no longer corresponds
-          // to anything real, so it can't be trusted as a genuine "currently backordered" item.
-          return !!_it; // must resolve to a real current part/assembly; stale renamed-PN orphans excluded
-        });
-      }
+      // Shared with the Dashboard notice - see getCurrentBackorderedItems() for why this needs to
+      // be one function, not two independently-maintained versions of the same question.
+      var cur=await getCurrentBackorderedItems();
+      error=cur.error;
+      if(!error)data=cur.items.map(function(it){return it.logRow;});
     }else{
       var q=db.from('shopify_sync_log').select('*').order('created_at',{ascending:false}).limit(250);
       if(filter==='backorder')q=q.eq('action','backorder');
@@ -16822,9 +16828,12 @@ async function aiSuggestMinMax(singlePn, pnList){
         const clean=txt.replace(/```json|```/g,'').trim();
         try{
           const arr=JSON.parse(clean);
+          const gotPn=new Set();
           arr.forEach(a=>{
             const b=chunk.find(x=>x.pn===a.pn);
             if(!b)return;
+            if(gotPn.has(b.pn))return; // [FIX] guard against Claude returning a duplicate entry for the same part in one chunk - would otherwise create a phantom duplicate row
+            gotPn.add(b.pn);
             const rawMin=Math.max(0,Math.round(a.min));
             const rawMax=Math.max(0,Math.round(a.max));
             const rawSafety=Math.max(0,Math.round(a.safety||b.safety));
@@ -16832,6 +16841,12 @@ async function aiSuggestMinMax(singlePn, pnList){
             const enforcedMax=moq>0?Math.ceil(rawMax/moq)*moq:rawMax;
             results.push({...b,min:rawMin,max:enforcedMax,safety:rawSafety,note:a.note||b.note,ai:true});
           });
+          // [FIX] Claude's response array can come back shorter than the chunk sent -- no error,
+          // just fewer entries than parts asked about. Without this, those specific parts silently
+          // vanished from the final suggestion count (the "447 selected, only 343 suggested, no
+          // explanation" symptom) instead of falling back to the statistical baseline like a fully
+          // failed chunk already does below.
+          chunk.forEach(b=>{if(!gotPn.has(b.pn))results.push(b);});
         }catch(e){chunk.forEach(b=>results.push(b));}
       }else{
         chunk.forEach(b=>results.push(b));
@@ -27487,16 +27502,17 @@ window.recNavControl=recNavControl;
 
 function recNavGo(dir){
   var rn=S._recNav;
-  if(!rn)return;
+  if(!rn){console.warn('[recnav] no active navigation context -- buttons should not even be visible here');return;}
   var cur=(typeof rn.currentGetter==='function')?rn.currentGetter():null;
   if(cur==null){
     // Work out the current record from whichever detail state is active.
     cur=S.activePO||S.activeSale||S.activeCount||null;
   }
+  if(cur==null){console.warn('[recnav] could not determine the currently-open record (S.activePO/activeSale/activeCount all null) -- kind:',rn.kind);return;}
   var i=rn.ids.indexOf(cur);
-  if(i<0)return;
+  if(i<0){console.warn('[recnav] current record',cur,'is not in the nav list ('+rn.ids.length+' ids, kind: '+rn.kind+') -- likely stale after a filter/sort change since this record was opened');return;}
   var next=Math.max(0,Math.min(rn.ids.length-1,i+dir));
-  if(next===i)return;
+  if(next===i)return; // already at the start/end of the list -- not an error, just a boundary
   try{rn.opener(rn.ids[next]);}catch(e){console.warn('[recnav]',e);}
   var content=document.getElementById('content');
   if(content)content.scrollTop=0;
