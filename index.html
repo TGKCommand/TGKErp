@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.15';
+const TGK_ERP_VERSION = 'v23.16';
 const TGK_ERP_BUILD_DATE = '2026-09-08';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1870,6 +1870,29 @@ function eligibleForBackorderSync(item){
   if((item.category||'')==='Pre-Order')return false;
   return true;
 }
+// [SHARED] Single definition of "this component is packaging/supply, not a real buildability
+// constraint." Extracted from buildabilityForBackorder's own inc() so cascadeShopifySync can apply
+// the identical rule -- a second, independently-written copy of this classification is exactly the
+// kind of thing that drifts apart silently (already happened once this session between the
+// ship-time and bulk-sync backorder logic).
+function isPackagingOrSupplyPart(childPn,itemType){
+  if(itemType==='packaging')return true;
+  if(!S._partIdx)buildLookupMaps();
+  var cp=S._partIdx?S._partIdx[childPn]:null;
+  if(!cp)return false;
+  // SUPPLY_CATS is declared with `const` later in this same script block -- referencing it before
+  // that line has executed throws a ReferenceError (temporal dead zone) rather than giving
+  // undefined, and this helper can be reached from inventory events early in the session. The
+  // typeof guard makes that impossible; the explicit packaging/shipping checks below still apply
+  // regardless, so an early call degrades to slightly-narrower matching rather than an exception.
+  var supplyLower=(typeof SUPPLY_CATS!=='undefined'&&SUPPLY_CATS?SUPPLY_CATS:[]).map(function(s){return s.toLowerCase();});
+  var catFull=(cp.category||'').toLowerCase();
+  var topLevel=catFull.split('/')[0].trim();
+  if(supplyLower.some(function(s){return catFull===s||topLevel===s;}))return true;
+  if(topLevel==='packaging'||topLevel==='shipping')return true;
+  return false;
+}
+
 function cascadeShopifySync(childPn){
   // Buildability is a DERIVED property — assembly B's max-buildable depends on component stock that
   // assembly A's packing can silently deplete. syncShopifyTemplate() only ever fires for whichever SKU
@@ -1878,8 +1901,21 @@ function cascadeShopifySync(childPn){
   // a part's stock changes for any reason, walk every assembly's BOM, find the ones using this part,
   // and re-check backorder status for any of them that are already sitting at zero on-hand.
   if(!childPn)return;
+  // [FIX] Packaging/supply components (cards, stickers, boxes, bulk consumables) are used by
+  // nearly every finished good, but buildabilityForBackorder() deliberately EXCLUDES them when
+  // computing maxBuild -- so their stock changing can never alter any assembly's backorder status.
+  // Cascading on them meant every pack/receive/correction touching a sticker fired a full Shopify
+  // round-trip for every zero-stock assembly sharing it (most of the catalog), producing constant
+  // redundant syncs -- and, with no in-flight guard, overlapping async calls for the same SKU that
+  // raced each other and could land on the wrong final answer. Skipping them removes the volume
+  // entirely without weakening the cascade for real components, which still works exactly as before.
+  if(isPackagingOrSupplyPart(childPn,null)){
+    return;
+  }
   Object.entries(S.boms||{}).forEach(([parentPn,lines])=>{
-    if(!lines.some(l=>l.child_pn===childPn))return;
+    var line=lines.find(l=>l.child_pn===childPn);
+    if(!line)return;
+    if(isPackagingOrSupplyPart(childPn,line.item_type))return; // also honors a BOM line explicitly typed as packaging
     const parent=S.assemblies.find(a=>a.pn===parentPn);
     if(!parent)return;
     if(!eligibleForBackorderSync(parent))return; // only genuine finished goods — never subassemblies, hardware packs, pre-order items, discontinued, or dev
@@ -1889,6 +1925,23 @@ function cascadeShopifySync(childPn){
 function syncShopifyTemplate(pn,newOh){
   if(!pn||!S.shopify||!S.shopify.store)return; // key now lives in edge function secrets
   if(S.settings.shopify_backorder_sync_enabled===false){console.log('[Shopify template] sync disabled — skipped for',pn);return;}
+  // [FIX] Nothing prevented the same SKU being re-synced repeatedly in quick succession -- and
+  // since each call is an async round-trip to Shopify, overlapping calls for one SKU raced each
+  // other, with whichever happened to resolve LAST silently winning. That's what produced log
+  // entries like partial-then-reverted one second apart for the same SKU. This suppresses only
+  // genuinely REDUNDANT repeats: same SKU at the same stock level within a short window. A sync
+  // where the stock number actually changed always goes through, so packing two orders back-to-
+  // back (1 -> 0) still syncs correctly rather than having the second, more-correct call dropped.
+  // Keyed per SKU, so unrelated items continue syncing in parallel.
+  if(!S._syncThrottle)S._syncThrottle={};
+  var _tk=String(pn);
+  var _now=Date.now();
+  var _prev=S._syncThrottle[_tk];
+  if(_prev&&(_now-_prev.at)<30000&&_prev.oh===newOh){
+    console.log('[Shopify template] '+pn+': skipped -- identical sync (oh='+newOh+') '+Math.round((_now-_prev.at)/1000)+'s ago');
+    return;
+  }
+  S._syncThrottle[_tk]={at:_now,oh:newOh};
   var _item=S.assemblies.find(function(a){return a.pn===pn||a.new_sku===pn;})||S.parts.find(function(p){return p.pn===pn||p.new_sku===pn;});
   if(_item&&!eligibleForBackorderSync(_item)){console.log('[Shopify template] skipped — not eligible (subassembly/hardware pack/pre-order/discontinued/dev):',pn);return;}
   // [SKU] Shopify variant SKUs are the customer-facing SKU (new_sku when use_new_sku). Callers hand us the
