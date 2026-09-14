@@ -1047,7 +1047,7 @@ async function fetchAll(query){
     const{data,error}=await query(from,from+PAGE-1);
     if(error)throw error;
     if(!data?.length)break;
-    rows=[...rows,...data];
+    for(let k=0;k<data.length;k++)rows.push(data[k]); // [PERF] was rows=[...rows,...data] — recopied the whole accumulator each page
     if(data.length<PAGE)break;
     from+=PAGE;
   }
@@ -1220,10 +1220,12 @@ function setupRealtime(){
       if(p.eventType==='INSERT'){if(!S.parts.some(function(x){return x.id===p.new.id;}))S.parts=[...S.parts,p.new].sort((a,b)=>a.pn.localeCompare(b.pn));}
       else if(p.eventType==='UPDATE')S.parts=S.parts.map(x=>x.id===p.new.id?p.new:x);
       else if(p.eventType==='DELETE')S.parts=S.parts.filter(x=>x.id!==p.old.id);
-      buildLookupMaps();
+      // [PERF] No explicit buildLookupMaps() here: assigning S.parts above goes through the
+      // property setter, which already rebuilds the maps in lockstep. Calling it again doubled the
+      // index rebuild (4 passes over parts + 4 over assemblies) on EVERY realtime event -- brutal
+      // during a Shopify bulk sync that fires hundreds of them. Same for the second rtRender below,
+      // which was a duplicate with an overlapping view list; the two lists are unioned here.
       updateBadge();rtRender(['parts','inventory','dashboard','planning','purchases','packqueue','lookup','cyclecounts','pobuilder','vendors','boms','production']);
-    
-      rtRender(['parts','lookup','planning','dashboard','inventory','boms','production']);   // repaint only the views that show this data
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'assemblies'},p=>{
       const norm=a=>{const p=/^\d{2}-\d{4}/.test(a.pn||'')&&!isHWPack(a.pn);const d=a.is_subassembly;return{...a,is_subassembly:(d===true||d===false)?d:p};};
@@ -1231,10 +1233,9 @@ function setupRealtime(){
       if(p.eventType==='INSERT'){if(!S.assemblies.some(function(x){return x.id===p.new.id;}))S.assemblies=[...S.assemblies,norm(p.new)].sort((a,b)=>dispPn(a).localeCompare(dispPn(b)));}/* [FIX B] sort by display SKU */
       else if(p.eventType==='UPDATE')S.assemblies=S.assemblies.map(x=>x.id===p.new.id?norm(p.new):x);
       else if(p.eventType==='DELETE')S.assemblies=S.assemblies.filter(x=>x.id!==p.old.id);
-      buildLookupMaps();
+      // [PERF] See the parts handler above -- the S.assemblies setter already rebuilds the lookup
+      // maps, and the second rtRender was a duplicate. View lists unioned into the single call.
       rtRender(['assemblies','dashboard','inventory','planning','purchases','packqueue','lookup','cyclecounts','pobuilder','boms','pricelist','production']);
-    
-      rtRender(['assemblies','lookup','planning','dashboard','inventory','boms','packqueue','production']);   // repaint only the views that show this data
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'sales'},p=>{
       if(p.eventType==='INSERT'){
@@ -1267,9 +1268,8 @@ function setupRealtime(){
       } else if(p.eventType==='DELETE'){
         S.sales=S.sales.filter(s=>s.id!==p.old.id);
       }
-      updateBadge();rtRender(['sales','dashboard','packqueue','lookup','warranty','reports']);
-    
-      rtRender(['sales','dashboard','planning','lookup','packqueue','reports','production']);   // repaint only the views that show this data
+      // [PERF] Was two rtRender calls per event with overlapping view lists -- unioned into one.
+      updateBadge();rtRender(['sales','dashboard','planning','packqueue','lookup','warranty','reports','production']);
     })
     // [FIX] S.currentBackorders (every backorder badge in the app, including Master Lookup's
     // header pill) was only ever built once at login from a one-time shopify_sync_log fetch --
@@ -1813,6 +1813,21 @@ function resolveFitmentPn(rawPn){
 function resolveCanonicalPn(pn){
   if(!pn)return null;
   var up=String(pn).toUpperCase();
+  // [PERF] Index fast path. This function did EIGHT unconditional full scans (four over
+  // S.assemblies, four over S.parts) and never touched the lookup maps -- even though
+  // buildLookupMaps() already indexes precisely these four variants (pn, new_sku, and the
+  // uppercase form of each) for both tables. The maps also claim pn before new_sku, so routing
+  // through them makes this agree with findAsm()/_findPart() instead of quietly disagreeing on
+  // pn/new_sku collisions, which is what the buildLookupMaps comment says the index is for.
+  // Priority preserved at the level that matters: assembly beats part, exact case beats folded.
+  if(!S._asmIdx||!S._partIdx){try{buildLookupMaps();}catch(e){}}
+  if(S._asmIdx&&S._partIdx){
+    var _ae=S._asmIdx[pn];  if(_ae)return{type:'assembly',pn:_ae.pn};
+    var _pe=S._partIdx[pn]; if(_pe)return{type:'part',pn:_pe.pn};
+    var _au=S._asmIdx[up];  if(_au)return{type:'assembly',pn:_au.pn};
+    var _pu=S._partIdx[up]; if(_pu)return{type:'part',pn:_pu.pn};
+    return null;
+  }
   // Exact matches first (fast path, preserves original priority)
   var asm=S.assemblies.find(function(a){return a.pn===pn;});
   if(asm)return{type:'assembly',pn:asm.pn};
@@ -2156,9 +2171,17 @@ function findAsm(pn){
   // whole app - was still doing a full linear scan on every call instead of using it. Falls
   // back to the scan only if the map genuinely has no entry (e.g. before the first
   // buildLookupMaps() has ever run), so behavior is unchanged, just faster in the common case.
+  // [PERF] Build the index on demand rather than falling through to a scan.
+  if(!S._asmIdx){try{buildLookupMaps();}catch(e){}}
   if(S._asmIdx){
-    var hit=S._asmIdx[pn];
-    if(hit)return hit;
+    // The index keys pn, new_sku and the uppercase form of each -- exactly the two cases the
+    // linear fallback below re-derives, with the same pn-wins/first-wins priority. So once the
+    // index exists a miss here is a genuine miss, and the fallback can only burn two full passes
+    // over S.assemblies to return undefined. That negative-lookup cost was the expensive half:
+    // computeDemand() runs _canonItem() (findAsm || _findPart) per sale row, so every line whose
+    // SKU no longer resolves -- deleted part, renamed SKU, raw Shopify SKU -- paid seven full
+    // array scans, twice per recompute.
+    return S._asmIdx[pn];
   }
   var a=S.assemblies.find(function(x){return x.pn===pn;});
   if(a)return a;
@@ -2936,6 +2959,35 @@ function imgThumb(it,size){
   var u=escHtml(it.image_url), p=escHtml(it.pn||'');
   return '<img src="'+u+'" loading="lazy" onerror="this.style.display=\'none\'" style="width:'+size+'px;height:'+size+'px;object-fit:cover;border-radius:var(--r-sm);border:1px solid var(--border);cursor:zoom-in;flex-shrink:0;vertical-align:middle" onclick="event.stopPropagation();openImageLightbox(\''+u+'\',\''+p+'\')">';
 }
+/* [PERF] Shared row-chunking for the big grids. renderParts and renderAssemblies each emitted one
+   <tr> per record for the ENTIRE filtered list on every render, as a single innerHTML string --
+   on every filter change, sort, realtime event and debounced keystroke. That cost scales with the
+   catalogue, which is why the app got slower as data accumulated rather than being slow at launch.
+   gridPage() caps what a render actually builds and remembers the cap per grid; changing any
+   filter resets it, and Load More raises it. Counts shown elsewhere still reflect the full list. */
+const _gridLimits={};
+function gridPage(key,list,sig){
+  const isMobile=!!(window.matchMedia&&window.matchMedia('(max-width:768px)').matches);
+  const step=isMobile?100:200;
+  const st=_gridLimits[key];
+  if(!st||st.sig!==sig)_gridLimits[key]={sig:sig,limit:step,step:step};
+  else st.step=step;
+  const lim=_gridLimits[key].limit;
+  const visible=list.slice(0,lim);
+  return{visible:visible,hidden:Math.max(0,list.length-visible.length),step:step};
+}
+function gridLoadMore(key){
+  const st=_gridLimits[key];
+  if(!st)return;
+  st.limit+=st.step;
+  render();
+}
+window.gridLoadMore=gridLoadMore;
+function gridMoreBtn(key,page){
+  if(!page||!page.hidden)return '';
+  return '<div style="text-align:center;padding:14px 0 4px"><button class="btn btn-sm" style="min-width:190px" onclick="gridLoadMore(\''+key+'\')">Load '+Math.min(page.hidden,page.step)+' more &middot; '+page.hidden+' hidden</button></div>';
+}
+
 function renderParts(){
   if(S.bulkEditMode==='parts')return renderBulkEdit('parts');
   const sf=S.filters.parts||{};
@@ -2951,6 +3003,7 @@ function renderParts(){
   else list=[...list].sort((a,b)=>dispPn(a).localeCompare(dispPn(b)));
   const selCount=S.selectedParts.size;
   S._navCtx={type:'part',pns:list.map(function(p){return p.pn;})};
+  const _page=gridPage('parts',list,JSON.stringify([sf.search||'',sf.cat||'',sf.vendor||'',sortBy]));
   return `
   <div class="filter-bar">
     <div class="search-wrap"><span class="search-icon">&#8981;</span>
@@ -2989,7 +3042,7 @@ function renderParts(){
   ${(()=>{
     let _lastGrp=null;
     const _rows=[];
-    list.forEach(p=>{
+    _page.visible.forEach(p=>{
       if(sortBy==='cat'||sortBy==='vendor'){
         const grp=sortBy==='cat'?(p.category||'(No Category)'):(p.vendor||'(No Vendor)');
         if(grp!==_lastGrp){
@@ -3020,7 +3073,7 @@ function renderParts(){
     });
     return _rows.join('');
   })()}
-  </tbody></table></div>`;
+  </tbody></table></div>${gridMoreBtn('parts',_page)}`;
 }
 
 function findEmptyAssemblyRecords(){
@@ -3088,6 +3141,7 @@ function renderAssemblies(){
   const asmSelCount=S.selectedAsms.size;
   const _showWeb=(sf.kind==='dev');
   S._navCtx={type:'assembly',pns:list.map(function(a){return a.pn;})};
+  const _page=gridPage('assemblies',list,JSON.stringify([sf.search||'',sf.cat||'',sf.kind||'',sf.status||'',!!sf.showDisc]));
   return `
   <div class="filter-bar">
     <div class="search-wrap"><span class="search-icon"><span class="ic ic-search"></span></span>
@@ -3131,7 +3185,7 @@ function renderAssemblies(){
     <th>MSRP</th><th>On Hand</th><th>Bin</th><th>Avg/Wk</th><th>Status</th>
     <th title="Lifecycle stage">Stage</th><th title="Command Center project">CC Project</th>${_showWeb?'<th title="Ticked when the dev product has been entered on the website (may not be live yet)">Website</th>':''}<th></th>
   </tr></thead><tbody>
-  ${list.map(a=>{
+  ${_page.visible.map(a=>{
     const asmSel=S.selectedAsms.has(a.id);
     return `<tr class="rowlink ${asmSel?'row-selected':''}" style="${a.discontinued?'opacity:.55':isDev(a)?'background:rgba(124,58,237,.04)':''}" onclick="rowClick(event,function(){lookupGo('assembly','${a.pn}')})">
     <td onclick="event.stopPropagation()"><input type="checkbox" ${asmSel?'checked':''} onchange="toggleAsmSel('${a.id}',this.checked)"></td>
@@ -3158,7 +3212,7 @@ function renderAssemblies(){
       <button class="action-btn del" onclick="deleteAsm('${a.pn}','${a.id}')">&#10005;</button>
     </td>
   </tr>`;}).join('')}
-  </tbody></table></div>`;
+  </tbody></table></div>${gridMoreBtn('assemblies',_page)}`;
 }
 
 async function toggleAsmWebsite(id,checked){
@@ -4679,12 +4733,18 @@ function renderSales(){
     });
   }
   if(sf.readiness==='split')list=list.filter(s=>s._grouped&&readinessFor(s)?.level==='split');
-  // ---- mobile: render in chunks so a huge list doesn't build thousands of DOM rows at once (desktop still renders all)
+  // ---- [PERF] Render in chunks on EVERY viewport, not just mobile. Desktop used to pass list.length
+  // here, so each render rebuilt one <tr> per order for the whole (unbounded, ever-growing) sales
+  // table as a single innerHTML string -- on every filter click, sort, realtime event and debounced
+  // keystroke. That cost scales with the sales table, which is exactly why the page got slower over
+  // time rather than being slow from day one. The chunking machinery (Load More / _salesHidden /
+  // salesLoadMore) was already here and viewport-agnostic; desktop just wasn't using it.
   const _salesIsMobile = !!(window.matchMedia && window.matchMedia('(max-width:768px)').matches);
-  const _SALES_PAGE = 100;
+  const _SALES_PAGE = _salesIsMobile ? 100 : 200;
   const _salesSig = JSON.stringify([q, sf.fstatus||'', sf.readiness||'']);
   if(window._salesMobileSig !== _salesSig){ window._salesMobileSig = _salesSig; window._salesMobileLimit = _SALES_PAGE; }
-  const _salesLimit = _salesIsMobile ? (window._salesMobileLimit||_SALES_PAGE) : list.length;
+  window._salesPageSize = _SALES_PAGE;
+  const _salesLimit = window._salesMobileLimit || _SALES_PAGE;
   const _salesVisible = list.slice(0, _salesLimit);
   const _salesHidden = list.length - _salesVisible.length;
 
@@ -4854,7 +4914,8 @@ function renderSales(){
 }
 
 function salesLoadMore(){
-  window._salesMobileLimit = (window._salesMobileLimit||100) + 100;
+  var _step = window._salesPageSize || 100;
+  window._salesMobileLimit = (window._salesMobileLimit||_step) + _step;
   render();
 }
 window.salesLoadMore = salesLoadMore;
@@ -10092,6 +10153,12 @@ async function syncShopifyImages(){
     Object.keys(skuMap).forEach(function(sku){var k=norm(sku);if(!normMap[k])normMap[k]={img:skuMap[sku],sku:sku};});
     var updated=0,alreadyCurrent=0,colMissing=false;
     var unmatchedPns=[];
+    // [PERF] Collect image patches by id and apply them in ONE assignment after each loop. Both
+    // loops used to do `S.assemblies = S.assemblies.map(...)` per matched row, inside a loop over
+    // every assembly -- and every such assignment fires the property setter, which rebuilds the
+    // whole lookup index. So a sync of N matches cost N full array rebuilds plus N index rebuilds
+    // over parts AND assemblies: quadratic in catalogue size for a job that should be linear.
+    var _asmImgPatch={},_partImgPatch={};
     for(var i=0;i<S.assemblies.length;i++){
       var asm=S.assemblies[i];
       // [SKU] Shopify variant SKUs are the customer-facing SKU (new_sku when use_new_sku). Match the display
@@ -10104,9 +10171,12 @@ async function syncShopifyImages(){
         else{
           var r=await db.from('assemblies').update({image_url:img}).eq('id',asm.id);
           if(r.error){if(r.error.message.includes('image_url')||r.error.code==='42703'){colMissing=true;break;}}
-          else{S.assemblies=S.assemblies.map(function(a){return a.id===asm.id?Object.assign({},a,{image_url:img}):a;});updated++;}
+          else{_asmImgPatch[asm.id]=img;updated++;}
         }
       }else{unmatchedPns.push(asm.pn);}
+    }
+    if(Object.keys(_asmImgPatch).length){
+      S.assemblies=S.assemblies.map(function(a){return _asmImgPatch[a.id]!==undefined?Object.assign({},a,{image_url:_asmImgPatch[a.id]}):a;});
     }
     if(colMissing){toast('Column missing - run: ALTER TABLE assemblies ADD COLUMN IF NOT EXISTS image_url text; in Supabase SQL Editor',8000);return;}
     for(var j=0;j<S.parts.length;j++){
@@ -10116,8 +10186,11 @@ async function syncShopifyImages(){
       for(var _pi=0;_pi<_pcands.length&&!pimg;_pi++){var _pc=_pcands[_pi];pimg=skuMap[_pc]||skuMap[_pc.toUpperCase()]||skuMap[_pc.toLowerCase()]||(normMap[norm(_pc)]&&normMap[norm(_pc)].img)||null;}
       if(pimg&&pimg!==pt.image_url){
         var pr=await db.from('parts').update({image_url:pimg}).eq('id',pt.id);
-        if(!pr.error){S.parts=S.parts.map(function(p){return p.id===pt.id?Object.assign({},p,{image_url:pimg}):p;});updated++;}
+        if(!pr.error){_partImgPatch[pt.id]=pimg;updated++;}
       }
+    }
+    if(Object.keys(_partImgPatch).length){
+      S.parts=S.parts.map(function(p){return _partImgPatch[p.id]!==undefined?Object.assign({},p,{image_url:_partImgPatch[p.id]}):p;});
     }
     render();
     if(updated>0){
@@ -15458,8 +15531,14 @@ function startAutoRefresh(){
       }
     }catch(e){console.warn('[TGK] Auto delivery sync failed:',e.message);}
   },2*60*60*1000);
-  const resetIdle=()=>S.lastActivity=Date.now();
-  ['mousedown','keydown','touchstart','scroll'].forEach(e=>document.addEventListener(e,resetIdle,{passive:true}));
+  // [PERF] Bind the idle listeners ONCE. startAutoRefresh() is called from the loadAll success
+  // path, so any reconnect within the same page life used to add a second (third, fourth...) set
+  // of listeners on four high-frequency events -- scroll included -- with no way to remove them.
+  if(!S._idleListenersBound){
+    S._idleListenersBound=true;
+    const resetIdle=()=>S.lastActivity=Date.now();
+    ['mousedown','keydown','touchstart','scroll'].forEach(e=>document.addEventListener(e,resetIdle,{passive:true}));
+  }
   const IDLE_MS=5*60*1000; // 5 min — background refresh trigger
   const LOGOUT_MS=8*60*60*1000; // 8 hours — hard logout
   const WARN_MS=LOGOUT_MS-2*60*1000; // warn 2 min before
@@ -15502,7 +15581,11 @@ function startAutoRefresh(){
     }catch(e){console.warn('[TGK] Auto-refresh failed:',e.message);}
   }, 60*1000); // check every 60s, only refresh if idle ≥ 5 min
 
-  setInterval(async function(){
+  // [PERF] Held in S so a second startAutoRefresh() clears it instead of stacking another poller.
+  // The three timers above were already cleared by handle at the top of this function; this one
+  // was anonymous, so every reconnect left a permanent extra 30s query against `sales` running.
+  if(S.newSalesPollTimer)clearInterval(S.newSalesPollTimer);
+  S.newSalesPollTimer=setInterval(async function(){
     if(!S.currentUserId)return;
     if(Date.now()-S.lastActivity>IDLE_MS)return; // idle path handled by full refresh above
     try{
@@ -17272,9 +17355,14 @@ function _findPart(childPn){
   // raw pn, raw new_sku, and both uppercased - exactly the same variations this function's
   // linear-scan chain re-derives by hand below. Falls back to that chain only if the map has no
   // entry, so every existing match case still behaves identically.
+  // [PERF] Build the index on demand rather than falling through to a scan.
+  if(!S._partIdx){try{buildLookupMaps();}catch(e){}}
   if(S._partIdx){
-    var hit=S._partIdx[raw]||S._partIdx[clean];
-    if(hit)return hit;
+    // All five fallback cases below are already covered by the index keys (pn, upper(pn),
+    // new_sku, upper(new_sku)) probed as raw and clean. Once the index exists, a miss here is a
+    // genuine miss -- and the fallback chain costs FIVE full passes over S.parts to return null.
+    // See the findAsm note above for why that negative-lookup path was so hot.
+    return S._partIdx[raw]||S._partIdx[clean]||null;
   }
   let p=S.parts.find(x=>x.pn===raw);if(p)return p;
   p=S.parts.find(x=>x.pn===clean);if(p)return p;
@@ -26925,30 +27013,46 @@ async function bulkMarkShipped() {
   if (!confirm('Mark ' + keys.length + ' order' + (keys.length > 1 ? 's' : '') + ' as Shipped?\n\nThis will also deduct inventory for each line, same as shipping them individually.')) return;
   var now = new Date().toISOString();
   var done = 0, errors = 0;
+  // [PERF] This loop reassigned S.assemblies / S.parts / S.sales once per LINE. Each of those is a
+  // full array copy, and the assemblies/parts ones additionally fire the property setter that
+  // rebuilds the whole lookup index -- so bulk-shipping 40 orders meant dozens of full index
+  // rebuilds and array copies. Accumulate patches here, apply once after the loop. The pending
+  // quantities are read back out of the accumulator so repeat SKUs across lines still decrement
+  // cumulatively, exactly as the per-line reassignment used to make them.
+  var _asmQtyPatch = {}, _partQtyPatch = {}, _salePatch = {};
+  // Map, not a plain object — order numbers are user data and must not collide with
+  // Object.prototype keys. Replaces a full S.sales.filter() per selected order.
+  var _keySet = new Map(); keys.forEach(function(k){ _keySet.set(k, []); });
+  S.sales.forEach(function(s) {
+    var bucket = _keySet.get(s.order_number || s.id);
+    if (bucket && !['Shipped','Delivered','Cancelled','Refunded'].includes(s.fulfillment_status || 'Open')) bucket.push(s);
+  });
+  var _partByPn = new Map();
+  S.parts.forEach(function(p) { if (p.pn && !_partByPn.has(p.pn)) _partByPn.set(p.pn, p); });
   for (var i = 0; i < keys.length; i++) {
     var oKey = keys[i];
-    var lines = S.sales.filter(function(s) {
-      return (s.order_number || s.id) === oKey && !['Shipped','Delivered','Cancelled','Refunded'].includes(s.fulfillment_status || 'Open');
-    });
+    var lines = _keySet.get(oKey) || [];
     for (var j = 0; j < lines.length; j++) {
       var line = lines[j];
       var lineQty = line.qty || 1;
       // Deduct inventory BEFORE flipping status — same logic submitShipment uses for a single order,
       // just applied per-line here since this bulk action was skipping it entirely.
       var asm = findAsm(line.pn);
-      var prt = asm ? null : S.parts.find(function(p) { return p.pn === line.pn; });
+      var prt = asm ? null : _partByPn.get(line.pn);
       if (asm) {
-        var aPrev = asm.total_on_hand || 0;
+        // Keyed by id, not pn: findAsm() also resolves by new_sku, and the old `a.pn === line.pn`
+        // patch silently matched nothing in that case, leaving local stock stale after the ship.
+        var aPrev = (_asmQtyPatch[asm.id] !== undefined) ? _asmQtyPatch[asm.id] : (asm.total_on_hand || 0);
         var aNew = aPrev - lineQty; // allow negative — same backorder convention as every other ship path
         await db.from('assemblies').update({ total_on_hand: aNew, updated_at: now }).eq('id', asm.id);
-        S.assemblies = S.assemblies.map(function(a) { return a.pn === line.pn ? Object.assign({}, a, { total_on_hand: aNew }) : a; });
+        _asmQtyPatch[asm.id] = aNew;
         await db.from('inv_corrections').insert({ pn: line.pn, previous_qty: aPrev, new_qty: aNew, adjustment: -lineQty, reason: 'Bulk mark Shipped — order ' + oKey, user_email: S.currentUser || null, source: 'shipment' });
         syncShopifyTemplate(line.pn, aNew);
       } else if (prt) {
-        var pPrev = prt.total_unpckgd || 0;
+        var pPrev = (_partQtyPatch[prt.id] !== undefined) ? _partQtyPatch[prt.id] : (prt.total_unpckgd || 0);
         var pNew = pPrev - lineQty;
         await db.from('parts').update({ total_unpckgd: pNew, updated_at: now }).eq('id', prt.id);
-        S.parts = S.parts.map(function(p) { return p.pn === line.pn ? Object.assign({}, p, { total_unpckgd: pNew }) : p; });
+        _partQtyPatch[prt.id] = pNew;
         await db.from('inv_corrections').insert({ pn: line.pn, previous_qty: pPrev, new_qty: pNew, adjustment: -lineQty, reason: 'Bulk mark Shipped — order ' + oKey, user_email: S.currentUser || null, source: 'shipment' });
         cascadeShopifySync(line.pn);
       }
@@ -26957,11 +27061,20 @@ async function bulkMarkShipped() {
       var res = await db.from('sales').update(payload).eq('id', line.id);
       if (res.error) { errors++; console.warn('[bulk ship]', res.error.message); }
       else {
-        var lid = line.id;
-        S.sales = S.sales.map(function(s) { return s.id === lid ? Object.assign({}, s, payload) : s; });
+        _salePatch[line.id] = payload;
         done++;
       }
     }
+  }
+  // Single pass each, so the lookup index rebuilds once instead of once per line.
+  if (Object.keys(_asmQtyPatch).length) {
+    S.assemblies = S.assemblies.map(function(a) { return _asmQtyPatch[a.id] !== undefined ? Object.assign({}, a, { total_on_hand: _asmQtyPatch[a.id] }) : a; });
+  }
+  if (Object.keys(_partQtyPatch).length) {
+    S.parts = S.parts.map(function(p) { return _partQtyPatch[p.id] !== undefined ? Object.assign({}, p, { total_unpckgd: _partQtyPatch[p.id] }) : p; });
+  }
+  if (Object.keys(_salePatch).length) {
+    S.sales = S.sales.map(function(s) { return _salePatch[s.id] ? Object.assign({}, s, _salePatch[s.id]) : s; });
   }
   window._salesSel.clear();
   toast((errors ? '\u26a0 ' : '\u2713 ') + done + ' line' + (done !== 1 ? 's' : '') + ' marked Shipped, inventory deducted' + (errors ? ' \u00b7 ' + errors + ' errors' : ''));
