@@ -460,8 +460,8 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.16';
-const TGK_ERP_BUILD_DATE = '2026-09-08';
+const TGK_ERP_VERSION = 'v23.17';
+const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
   var vb=document.getElementById('erp-version-badge');if(vb)vb.textContent=TGK_ERP_VERSION;
@@ -957,7 +957,7 @@ async function logError(message, detail){
       detail: detail ? String(detail).slice(0,4000) : null,
       url: (typeof location!=='undefined') ? location.href : null,
       user_agent: (typeof navigator!=='undefined') ? navigator.userAgent : null,
-      app_version: (typeof ERP_VERSION!=='undefined') ? ('ERP '+ERP_VERSION) : 'ERP'
+      app_version: (typeof TGK_ERP_VERSION!=='undefined') ? ('ERP '+TGK_ERP_VERSION) : 'ERP'
     });
   }catch(_e){ /* never let logging break the app */ }
 }
@@ -8582,6 +8582,20 @@ function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { ...CORS, 'Content-Type': 'application/json' } })
 }
 function stripHash(s: string): string { return s.replace(/^#/, '').replace(/^Manual_/i, '') }
+
+// [FIX] centralDateOnly was CALLED in three places (NEW_ORDER, ss_order_audit import,
+// ss_import_batch) but never defined anywhere in this file. NEW_ORDER therefore threw a
+// ReferenceError and returned 500 on every non-Shopify order, so ShipStation-created manual
+// orders never imported. ss_import_batch only broke when order.date was falsy, because || short
+// circuits before evaluating it.
+// NOTE: the -6h offset assumes CST. It does NOT handle daylight saving; during CDT an order
+// placed between 00:00 and 01:00 Central will land on the previous day. Verify against a known
+// order and switch to an Intl.DateTimeFormat with timeZone:'America/Chicago' if that matters.
+function centralDateOnly(d?: string): string {
+  const dt = d ? new Date(d) : new Date()
+  return new Date(dt.getTime() - 6 * 60 * 60 * 1000).toISOString().slice(0, 10)
+}
+
 async function buildOrderMap() {
   const { data } = await db.from('sales')
     // [FIX 3a] added \`qty\` — bulk_sync now needs per-line quantity to deduct inventory, not just flip status
@@ -8599,11 +8613,99 @@ async function buildOrderMap() {
     if (!map[key]) map[key] = []
     map[key].push(line)
   }
+  // [SPLIT] Alias known split children onto their parent's lines so bulk_sync stops counting them
+  // as notFound and hold_sync/cancel_sync can see them at all. NOTE this is coarse: a child maps to
+  // the parent's WHOLE line array, so holding one child marks every open line on the parent On Hold.
+  // That is the same coarseness this function already had for un-split orders. The precise version
+  // filters by ss_order_links.child_skus — worth doing only if partial holds on split orders come up.
+  const { data: links } = await db.from('ss_order_links').select('ss_order_number,erp_order_number')
+  for (const l of (links || [])) {
+    const parentKey = stripHash(l.erp_order_number || '')
+    const childKey = stripHash(l.ss_order_number || '')
+    if (childKey &amp;&amp; !map[childKey] &amp;&amp; map[parentKey]) map[childKey] = map[parentKey]
+  }
   return map
 }
 function ssAuth(): string {
   const k = Deno.env.get('SS_KEY') || '', s = Deno.env.get('SS_SECRET') || ''
   return btoa(k + ':' + s)
+}
+
+// ── SPLIT-ORDER RESOLUTION ───────────────────────────────────────────────────────────────────
+// A ShipStation split creates a NEW order with its own orderNumber (typically the parent's number
+// plus a suffix) and its own orderId. The only durable pointer back to the original is
+// advancedOptions.parentId, which is an orderId rather than an order number — so resolving it costs
+// one GET /orders/{id}. That happens once, at split time; the result is cached in ss_order_links and
+// every later webhook for the child is a plain table lookup.
+//
+// Before this existed, a split child arrived with an order number matching nothing in \`sales\`, which
+// left erpLines empty -&gt; allErpPns empty -&gt; matchedPns empty -&gt; the no-SKU-match branch ran an UPDATE
+// against an order number that does not exist. Silent no-op: no status change, no deduction, no error.
+
+async function fetchSSOrder(orderId: number | string): Promise&lt;any | null&gt; {
+  try {
+    const r = await fetch('https://ssapi.shipstation.com/orders/' + orderId, {
+      headers: { Authorization: 'Basic ' + ssAuth() }
+    })
+    if (!r.ok) { console.warn('[SS][split] GET /orders/' + orderId + ' -&gt; ' + r.status); return null }
+    return await r.json()
+  } catch (e) { console.warn('[SS][split] GET /orders/' + orderId + ' threw:', e); return null }
+}
+
+// The ERP order_number for this raw number, honouring the '#' prefix variant. Null if unknown.
+async function erpOrderNumberFor(rawNum: string): Promise&lt;string | null&gt; {
+  if (!rawNum) return null
+  const { data: a } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
+  if (a?.length) return rawNum
+  const { data: b } = await db.from('sales').select('id').eq('order_number', '#' + rawNum).limit(1)
+  if (b?.length) return '#' + rawNum
+  return null
+}
+
+// Called when a webhook arrives for an order number the ERP has never seen. If it is a split child,
+// records the child-&gt;parent link, flags the parent as split, and returns the parent's ERP
+// order_number. Returns null for anything that genuinely is not ours.
+async function linkSplitChild(order: any): Promise&lt;string | null&gt; {
+  const childNum = stripHash(order?.orderNumber || '')
+  if (!childNum) return null
+  const { data: known } = await db.from('ss_order_links')
+    .select('erp_order_number').eq('ss_order_number', childNum).limit(1)
+  if (known?.[0]?.erp_order_number) return known[0].erp_order_number
+  const adv = order?.advancedOptions || {}
+  // parentId is the documented field; parentOrderId is covered in case the payload differs.
+  // Confirm against a real split payload in the logs before trusting either name.
+  const parentId = adv.parentId ?? adv.parentOrderId ?? null
+  if (!parentId) return null
+  const parent = await fetchSSOrder(parentId)
+  if (!parent?.orderNumber) return null
+  const erpNum = await erpOrderNumberFor(stripHash(parent.orderNumber))
+  if (!erpNum) { console.warn('[SS][split] child', childNum, 'parent', parent.orderNumber, 'not in ERP either'); return null }
+  const childSkus = (order.items || [])
+    .map((i: any) =&gt; String(i.sku || i.name || '').trim().toUpperCase()).filter(Boolean)
+  await db.from('ss_order_links').upsert({
+    ss_order_number: childNum,
+    erp_order_number: erpNum,
+    ss_order_id: order.orderId ?? null,
+    parent_ss_order_id: parentId,
+    child_skus: childSkus,
+  }, { onConflict: 'ss_order_number' })
+  await db.from('sales').update({ is_split_shipment: true }).eq('order_number', erpNum)
+  console.log('[SS][split] linked', childNum, '-&gt; ERP', erpNum, 'skus', JSON.stringify(childSkus))
+  return erpNum
+}
+
+// Resolution used by SHIP_NOTIFY, where we hold a shipment object rather than an order object.
+async function resolveShipmentOrder(salesNum: string, ship: any): Promise&lt;{ num: string | null, viaSplit: boolean }&gt; {
+  const direct = await erpOrderNumberFor(salesNum)
+  if (direct) return { num: direct, viaSplit: false }
+  const { data: lk } = await db.from('ss_order_links')
+    .select('erp_order_number').eq('ss_order_number', salesNum).limit(1)
+  if (lk?.[0]?.erp_order_number) return { num: lk[0].erp_order_number, viaSplit: true }
+  if (ship?.orderId) {
+    const ssOrder = await fetchSSOrder(ship.orderId)
+    if (ssOrder) { const n = await linkSplitChild(ssOrder); if (n) return { num: n, viaSplit: true } }
+  }
+  return { num: null, viaSplit: false }
 }
 
 // [FIX 5a] Ported from the ERP reference copy — only genuine finished goods should ever have their
@@ -8612,7 +8714,7 @@ function ssAuth(): string {
 // discontinued/dev items shouldn't be actively managed. The deployed function was missing this gate,
 // so it could clobber the template on those SKUs.
 function isHWPackServer(pn: string): boolean {
-  return /^TGK-P\\d/i.test(pn || '')
+  return /^TGK-P\d/i.test(pn || '')
 }
 // Recompute a PRODUCT's template_suffix from the live state of ALL its variants.
 // Rule (must match the ERP's Theme Audit exactly):
@@ -8813,13 +8915,13 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
   try {
     const isBO = template !== ''
     const gqlTopErrorsBO:string[] = []
-    const gqlBO = async (q) =&gt; {
+    const gqlBO = async (q: string) =&gt; {
       const r = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:{'X-Shopify-Access-Token':key,'Content-Type':'application/json'}, body: JSON.stringify({query:q})}).then(x =&gt; x.json())
       if (r &amp;&amp; Array.isArray(r.errors) &amp;&amp; r.errors.length) r.errors.forEach((e:any)=&gt;gqlTopErrorsBO.push(e?.message || JSON.stringify(e)))
       return r
     }
     const safeBO = shopSkuBO.replace(/"/g, '')
-    const findBO = await gqlBO('{ productVariants(first: 10, query: "sku:' + safeBO + '") { edges { node { id sku inventoryItem { id } product { id } metafield(namespace: \"custom\", key: \"estimated_arrival_date\") { value } } } } }')
+    const findBO = await gqlBO('{ productVariants(first: 10, query: "sku:' + safeBO + '") { edges { node { id sku inventoryItem { id } product { id } metafield(namespace: "custom", key: "estimated_arrival_date") { value } } } } }')
     const edgesBO = findBO?.data?.productVariants?.edges || []
     const mBO = edgesBO.find((e:any) =&gt; (e.node.sku || '').trim().toUpperCase() === shopSkuBO.toUpperCase())
     if (!mBO) { console.warn('[SS-&gt;Shopify] no variant for SKU', shopSkuBO, '(from canonical ' + pn + ')'); return }
@@ -8840,7 +8942,7 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
       }
       const pBO = await gqlBO('mutation { productVariantsBulkUpdate(productId: "' + pId + '", variants: [{id: "' + vId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
       const polBO = pBO?.data?.productVariantsBulkUpdate?.productVariants?.[0]?.inventoryPolicy || null
-      const polErrsBO = (pBO?.data?.productVariantsBulkUpdate?.userErrors || []).map((u:any)=>u.message)
+      const polErrsBO = (pBO?.data?.productVariantsBulkUpdate?.userErrors || []).map((u:any)=&gt;u.message)
       if (polBO !== 'CONTINUE') {
         // FAIL-SAFE: tracked + anything-but-CONTINUE means customers cannot buy it, which
         // violates the hard 'always orderable' rule. Could not confirm CONTINUE, so untrack
@@ -9293,7 +9395,16 @@ Deno.serve(async (req) =&gt; {
       const { data: rows } = await db.from('sales').select('order_number').in('order_number', bothForms).limit(bothForms.length)
       for (const r of (rows || [])) erpFound.add(stripH(r.order_number || ''))
     }
-    const missing = uniqueSSOrders.filter((o: any) =&gt; !erpFound.has(stripH(o.orderNumber || '')))
+    // [SPLIT] A split child is NOT a missing order — its lines already exist under the parent.
+    // Importing one would insert duplicate sales rows and double-count demand in planning, so
+    // they are excluded from \`missing\` entirely and reported separately.
+    const { data: knownLinks } = await db.from('ss_order_links').select('ss_order_number')
+    const linkedChildren = new Set((knownLinks || []).map((l: any) =&gt; stripH(l.ss_order_number || '')))
+    const splitChildren = uniqueSSOrders.filter((o: any) =&gt;
+      linkedChildren.has(stripH(o.orderNumber || '')) || o?.advancedOptions?.parentId || o?.advancedOptions?.parentOrderId)
+    const splitChildNums = new Set(splitChildren.map((o: any) =&gt; stripH(o.orderNumber || '')))
+    const missing = uniqueSSOrders.filter((o: any) =&gt;
+      !erpFound.has(stripH(o.orderNumber || '')) &amp;&amp; !splitChildNums.has(stripH(o.orderNumber || '')))
     let imported = 0
     if (doImport) {
       const fsMap: any = { awaiting_shipment: 'Open', on_hold: 'On Hold', shipped: 'Shipped', cancelled: 'Cancelled', awaiting_payment: 'Open', pending_fulfillment: 'Open' }
@@ -9323,6 +9434,8 @@ Deno.serve(async (req) =&gt; {
       ssTotal: uniqueSSOrders.length,
       erpFound: erpFound.size,
       missingCount: missing.length,
+      splitChildCount: splitChildren.length,
+      splitChildren: splitChildren.map((o: any) =&gt; ({ orderNumber: o.orderNumber, parentId: o?.advancedOptions?.parentId ?? o?.advancedOptions?.parentOrderId ?? null })),
       imported,
       missing: missing.map((o: any) =&gt; ({
         orderNumber: o.orderNumber,
@@ -9437,7 +9550,7 @@ Deno.serve(async (req) =&gt; {
     if (!orderNumber) return json({ error: 'orderNumber is required' }, 400)
     const auth = ssAuth()
     try {
-      const res = await fetch('https://ssapi.shipstation.com/shipments?orderNumber=' + encodeURIComponent(orderNumber) + '&pageSize=5', {
+      const res = await fetch('https://ssapi.shipstation.com/shipments?orderNumber=' + encodeURIComponent(orderNumber) + '&amp;pageSize=5', {
         headers: { Authorization: 'Basic ' + auth }
       })
       if (!res.ok) return json({ error: 'ShipStation request failed (' + res.status + ')' }, 502)
@@ -9529,7 +9642,7 @@ Deno.serve(async (req) =&gt; {
         const seRes = String(seRow?.resolution || '').toLowerCase()
         const seShipsNothing = (seRes === 'refund' || seRes === 'refunded' || seRes === 'write_off' || seRes === 'no_action')
         if (!seShipsNothing) {
-          const seItems = (Array.isArray(seRow?.line_items) && seRow.line_items.length)
+          const seItems = (Array.isArray(seRow?.line_items) &amp;&amp; seRow.line_items.length)
             ? seRow.line_items
             : (seRow?.expected_pn ? [{ pn: seRow.expected_pn, qty: seRow.expected_qty }] : [])
           for (const it of seItems) {
@@ -9551,8 +9664,8 @@ Deno.serve(async (req) =&gt; {
         // Only resolutions that actually send goods move stock - a refund ships nothing.
         const wRes = String(wRow?.resolution_type || '').toLowerCase()
         const wShips = (wRes === 'replacement' || wRes === 'repair' || wRes === '')
-        if (wRow && wShips) {
-          const items = (Array.isArray(wRow.claim_items) && wRow.claim_items.length)
+        if (wRow &amp;&amp; wShips) {
+          const items = (Array.isArray(wRow.claim_items) &amp;&amp; wRow.claim_items.length)
             ? wRow.claim_items
             : (wRow.pn ? [{ pn: wRow.pn, qty: 1 }] : [])
           for (const it of items) {
@@ -9564,13 +9677,23 @@ Deno.serve(async (req) =&gt; {
         continue
       }
       const salesNum = (orderNum || '').replace(/^Manual_/i, '')
-      const { data: orderLines } = await db.from('sales').select('id,pn,fulfillment_status,qty').eq('order_number', salesNum)
-      const erpLines = orderLines?.length ? orderLines : (await db.from('sales').select('id,pn,fulfillment_status,qty').eq('order_number', '#' + salesNum)).data ?? []
-      const resolvedOrderNum = erpLines.length &amp;&amp; !orderLines?.length ? '#' + salesNum : salesNum
+      // [SPLIT] Resolve through the link table before giving up. A split child arrives with a
+      // suffixed order number that matches nothing in \`sales\`, which previously left erpLines empty
+      // -&gt; allErpPns empty -&gt; matchedPns empty -&gt; the no-SKU-match branch below ran an UPDATE against
+      // an order number that does not exist. Silent no-op: no status change, no deduction, no error.
+      const { num: resolvedOrderNumOrNull, viaSplit } = await resolveShipmentOrder(salesNum, ship)
+      if (!resolvedOrderNumOrNull) {
+        console.warn('[SS] order not in ERP and not a known split child:', salesNum, '- skipping')
+        continue
+      }
+      const resolvedOrderNum = resolvedOrderNumOrNull
+      const { data: erpLinesRaw } = await db.from('sales')
+        .select('id,pn,fulfillment_status,qty').eq('order_number', resolvedOrderNum)
+      const erpLines = erpLinesRaw ?? []
       const allErpPns = erpLines.map((l: any) =&gt; l.pn as string)
       const norm = (s: string) =&gt; s.trim().toUpperCase()
       const matchedPns = allErpPns.filter(erpPn =&gt; rawSkus.some((ssSku: string) =&gt; { const e=norm(erpPn),s=norm(ssSku); return e===s||e.includes(s)||s.includes(e) }))
-      console.log('[SS] matchedPns', JSON.stringify(matchedPns), 'of', JSON.stringify(allErpPns))
+      console.log('[SS] matchedPns', JSON.stringify(matchedPns), 'of', JSON.stringify(allErpPns), viaSplit ? '(via split link)' : '')
       const isSplit = matchedPns.length &gt; 0 &amp;&amp; matchedPns.length &lt; allErpPns.length
 
       // [FIX 2] Duplicate-webhook idempotency guard. ShipStation redelivers the same webhook event
@@ -9599,12 +9722,19 @@ Deno.serve(async (req) =&gt; {
             }
           }
         }
+      } else if (viaSplit) {
+        // [SPLIT] Never blanket-ship a parent order from a split child. If the child's SKUs don't
+        // match anything on the parent, the safe failure is to touch nothing and say so — marking
+        // every remaining line Shipped would close out product still sitting on the shelf.
+        console.warn('[SS] split child', salesNum, 'matched no SKU on parent', resolvedOrderNum, '- refusing blanket update, no lines touched')
       } else {
         console.warn('[SS] WARNING: no SKU match for order', resolvedOrderNum, '- updating all non-terminal lines')
         // Includes On Hold / Pre-Order for the same reason as the deduction gate below.
         await db.from('sales').update({ fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt }).eq('order_number', resolvedOrderNum).in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
       }
-      const pnsToDeduct = (matchedPns.length &gt; 0 ? matchedPns : allErpPns)
+      // [SPLIT] A split child that matched nothing deducts nothing — falling back to allErpPns here
+      // would pull stock for the parent's entire order off the back of one partial shipment.
+      const pnsToDeduct = (matchedPns.length &gt; 0 ? matchedPns : (viaSplit ? [] : allErpPns))
       for (const pn of pnsToDeduct) {
         const line = erpLines.find((l: any) =&gt; l.pn === pn)
         // Deduct for any NON-TERMINAL line. Listing allowed statuses here silently skipped
@@ -9630,6 +9760,14 @@ Deno.serve(async (req) =&gt; {
     const orderNum = order.orderNumber
     const source = (order.orderSource || order.advancedOptions?.source || '').toLowerCase()
     const isShopify = source.includes('shopify') || source.includes('api')
+    // [SPLIT] A split child is not a new order. Without this, splitting a manually-created
+    // ShipStation order inserts duplicate sales rows for lines that already exist under the parent,
+    // double-counting demand in computeDemand and the planning views. Link it and stop.
+    if (order?.advancedOptions?.parentId || order?.advancedOptions?.parentOrderId) {
+      await linkSplitChild(order)
+      console.log('[SS] NEW_ORDER: split child', orderNum, '- linked to parent, not imported')
+      return ok('ok')
+    }
     if (!isShopify &amp;&amp; orderNum) {
       const salesNum = (orderNum || '').replace(/^Manual_/i, '')
       const { data: existing } = await db.from('sales').select('id').eq('order_number', salesNum).limit(1)
@@ -9655,11 +9793,18 @@ Deno.serve(async (req) =&gt; {
     for (const order of orders) {
       if (!order.orderNumber) continue
       const rawNum = stripHash(order.orderNumber)
-      const { data: ex1 } = await db.from('sales').select('id,fulfillment_status').eq('order_number', '#' + rawNum).limit(1)
-      const { data: ex2 } = await db.from('sales').select('id,fulfillment_status').eq('order_number', rawNum).limit(1)
-      const erpLines = [...(ex1 || []), ...(ex2 || [])]
+      // [SPLIT] This is where splits used to fall on the floor: ORDER_NOTIFY fires for the new child
+      // order, the lookup finds nothing, and \`continue\` discards it silently. The full order object is
+      // right here, so linkSplitChild needs no extra fetch beyond the one parent lookup. This fires at
+      // SPLIT time rather than at label time, which is the whole point — the ERP learns about the split
+      // while you are still deciding what ships, not after a label already exists.
+      let resolvedNum = await erpOrderNumberFor(rawNum)
+      if (!resolvedNum) resolvedNum = await linkSplitChild(order)
+      if (!resolvedNum) continue
+      const { data: erpLinesRaw } = await db.from('sales')
+        .select('id,fulfillment_status').eq('order_number', resolvedNum)
+      const erpLines = erpLinesRaw ?? []
       if (!erpLines.length) continue
-      const resolvedNum = ex1?.length ? '#' + rawNum : rawNum
       if (order.orderStatus === 'cancelled') {
         await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('order_number', resolvedNum).in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
         console.log('[SS] ORDER_NOTIFY → Cancelled:', resolvedNum)
