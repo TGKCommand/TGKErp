@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.19';
+const TGK_ERP_VERSION = 'v23.20';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -13210,6 +13210,38 @@ function openModal(type,data){
     </div>
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" style="background:var(--purple);border-color:var(--purple)" onclick="submitDropShipAll('${data.orderNum}')">↓ Mark All Shipped</button></div>`;
   }
+  else if(type==='dropshipOrderedGroup'){
+    const _dsogLines=data.lines||[];
+    const _dsogSkuList=_dsogLines.map(function(l){return dispSku(l.pn)+' \u00d7'+(l.qty||1);}).join(', ');
+    title='Mark All Ordered \u2014 Order '+data.orderNum;
+    body=`<div style="font-size:var(--t-md);color:var(--text2);margin-bottom:14px">
+      You've placed the order with <b style="color:var(--purple)">${escHtml(data.vendorName||'this vendor')}</b> for all <b>${_dsogLines.length}</b> line${_dsogLines.length!==1?'s':''} on order <b style="color:var(--teal)">${escHtml(data.orderNum)}</b>:<br>
+      <span style="color:var(--text3)">${escHtml(_dsogSkuList)}</span><br><br>
+      This does <b>not</b> mark them Shipped \u2014 ShipStation picks up tracking the normal way once the vendor ships, same as a single line.
+    </div>
+    ${fi('dso-ref','Vendor Order # (optional, applies to all lines)','','placeholder="Confirmation # from the vendor, for your own reference"')}
+    <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" style="background:var(--orange);border-color:var(--orange)" onclick="submitMarkDropshipOrderedGroup('${escHtml(data.orderNum)}','${_dsJsEsc(data.vendorKey)}')">Mark All Ordered</button></div>`;
+  }
+  else if(type==='dropShipGroup'){
+    title='\u2193 Drop Ship \u2014 Order '+data.orderNum;
+    body=`<div style="font-size:var(--t-md);color:var(--text2);margin-bottom:14px">
+      All <b style="color:var(--purple)">${data.lineCount} line${data.lineCount!==1?'s':''}</b> in this vendor group on order <b style="color:var(--teal)">${escHtml(data.orderNum)}</b> will be marked Shipped together.<br>
+      <span style="color:var(--text3)">No stock will be deducted. One shared tracking number covers the whole group \u2014 one Shopify fulfillment email, one ShipStation shipment record, instead of one per SKU.</span>
+    </div>
+    <div class="form-row cols-2">
+      <div class="form-group"><label class="form-label">Carrier</label><select id="ds-carrier" class="form-input"><option value="">\u2014 Unknown \u2014</option><option>USPS</option><option>UPS</option><option>FedEx</option><option>DHL</option><option>Other</option></select></div>
+      ${fi('ds-tracking','Tracking # (optional)','','placeholder="Leave blank if not yet available"')}
+    </div>
+    <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" style="background:var(--purple);border-color:var(--purple)" onclick="submitDropShipGroup('${escHtml(data.orderNum)}','${_dsJsEsc(data.vendorKey)}','${data.status}')">\u2193 Mark All Shipped</button></div>`;
+  }
+  else if(type==='shopifyFulfilledGroup'){
+    title='Mark Fulfilled via Shopify \u2014 Order '+data.orderNum;
+    body=`<div style="font-size:var(--t-md);color:var(--text2);margin-bottom:14px">
+      <b style="color:var(--purple)">${data.lineCount} line${data.lineCount!==1?'s':''}</b> in this vendor group on order <b style="color:var(--teal)">${escHtml(data.orderNum)}</b> were fulfilled directly through Shopify \u2014 not tracked through ShipStation.<br>
+      <span style="color:var(--text3)">This marks all of them Shipped and flags them as fulfilled via Shopify, not a normal ShipStation shipment.</span>
+    </div>
+    <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" style="background:var(--teal);border-color:var(--teal)" onclick="submitMarkShopifyFulfilledGroup('${escHtml(data.orderNum)}','${_dsJsEsc(data.vendorKey)}','${data.status}')">Mark All Fulfilled</button></div>`;
+  }
   else if(type==='addSale'){
     const skus=S.assemblies.filter(a=>!a.discontinued).map(a=>a.pn).sort();
     const discSkus=S.assemblies.filter(a=>a.discontinued).map(a=>a.pn).sort();
@@ -22258,6 +22290,117 @@ function openDropshipVendorModal(pn){
   openModal('dropshipVendor',{pn,existing:S.dropshipVendors[pn]||null});
 }
 
+// [FEATURE] Grouping key for clustering drop-ship lines that share both order_number and vendor
+// into one actionable card in the queue, instead of forcing staff to act on each SKU separately
+// when a single vendor is shipping several items together on the same order. Case-insensitive,
+// trimmed - same normalization already used for vendor-name autofill matching above. A SKU with
+// no saved vendor returns '' and is never grouped (nothing shared to act on as a group).
+function _dsVendorKey(pn){
+  var v=S.dropshipVendors[pn];
+  return v&&v.vendor_name?String(v.vendor_name).trim().toLowerCase():'';
+}
+// Re-derives the exact set of lines for a group at call time (same pattern openDropShipAllModal/
+// submitDropShipAll already use for the "100% drop-ship order" case) rather than passing an array
+// of sale ids through an onclick attribute - keeps the group always in sync with current data and
+// avoids serializing arrays into inline HTML attributes.
+function _dsGroupLines(orderNum,vendorKey,status){
+  return S.sales.filter(function(s){return s.order_number===orderNum&&_dsVendorKey(s.pn)===vendorKey&&(s.fulfillment_status||'Open')===status;});
+}
+// Escapes a value for safe embedding inside a single-quoted JS string literal within an onclick
+// attribute - needed here (unlike most other onclick usages elsewhere in this file) because vendor
+// names are free text and commonly contain apostrophes (e.g. "Sam's Racing").
+function _dsJsEsc(x){return String(x==null?'':x).replace(/\\/g,'\\\\').replace(/'/g,"\\'");}
+
+function openMarkDropshipOrderedGroupModal(orderNum,vendorKey){
+  const lines=_dsGroupLines(orderNum,vendorKey,'Open');
+  if(!lines.length){toast('No open lines found for this group');return;}
+  openModal('dropshipOrderedGroup',{orderNum,vendorKey,lines,vendorName:(S.dropshipVendors[lines[0].pn]||{}).vendor_name||''});
+}
+async function submitMarkDropshipOrderedGroup(orderNum,vendorKey){
+  const orderRef=((document.getElementById('dso-ref')||{}).value||'').trim();
+  const lines=_dsGroupLines(orderNum,vendorKey,'Open');
+  if(!lines.length){toast('No open lines found for this group');closeModal();return;}
+  let ok=0,errors=0;
+  for(const line of lines){
+    const{error}=await db.from('sales').update({fulfillment_status:'Ordered',dropship_order_ref:orderRef||null}).eq('id',line.id);
+    if(error){errors++;continue;}
+    S.sales=S.sales.map(function(s){return s.id===line.id?{...s,fulfillment_status:'Ordered',dropship_order_ref:orderRef||null}:s;});
+    ok++;
+  }
+  closeModal();updateBadge();
+  if(errors)toast('Marked '+ok+' ordered, '+errors+' error'+(errors!==1?'s':''));
+  else toast('Marked '+ok+' line'+(ok!==1?'s':'')+' ordered'+(orderRef?' \u00b7 '+orderRef:''));
+  if(ok)pushActivity({icon:'<span class="ic ic-doc"></span>',type:'order_status',text:'#'+orderNum+' \u2192 Ordered (drop-ship group)',sub:ok+' line'+(ok!==1?'s':'')+(orderRef?' \u00b7 vendor order #'+orderRef:''),ts:new Date().toISOString(),cls:'var(--orange)'});
+  render();
+}
+
+function openDropShipGroupModal(orderNum,vendorKey,status){
+  const lines=_dsGroupLines(orderNum,vendorKey,status);
+  if(!lines.length){toast('No lines found for this group');return;}
+  openModal('dropShipGroup',{orderNum,vendorKey,status,lineCount:lines.length});
+}
+async function submitDropShipGroup(orderNum,vendorKey,status){
+  const tracking=(document.getElementById('ds-tracking')?.value||'').trim();
+  const carrier=document.getElementById('ds-carrier')?.value||'';
+  const lines=_dsGroupLines(orderNum,vendorKey,status);
+  if(!lines.length){toast('No lines found for this group');closeModal();return;}
+  const now=new Date().toISOString();
+  let shipped=0,errors=0;
+  const shippedItems=[];
+  for(const line of lines){
+    const{error}=await db.from('sales').update({
+      fulfillment_status:'Shipped',tracking_number:tracking||null,carrier:carrier||null,shipped_at:now
+    }).eq('id',line.id);
+    if(error){errors++;continue;}
+    S.sales=S.sales.map(function(s){return s.id===line.id?{...s,fulfillment_status:'Shipped',tracking_number:tracking||null,carrier:carrier||null,shipped_at:now}:s;});
+    await db.from('inv_corrections').insert({
+      pn:line.pn,previous_qty:0,new_qty:0,adjustment:0,
+      reason:'Drop-ship group \u2014 order '+orderNum+(tracking?' \u00b7 '+tracking:''),
+      user_email:S.currentUser||null,source:'dropship'
+    });
+    shipped++;
+    shippedItems.push({pn:line.pn,qty:line.qty||1});
+  }
+  closeModal();updateBadge();
+  if(errors)toast('\u2193 Shipped '+shipped+' lines, '+errors+' error'+(errors!==1?'s':''));
+  else toast('\u2193 Drop-shipped '+shipped+' line'+(shipped!==1?'s':'')+' on '+orderNum+(tracking?' \u00b7 '+tracking:''));
+  if(shipped)pushActivity({icon:'\u2193<span class="ic ic-box"></span>',type:'order_status',text:'#'+orderNum+' \u2192 Shipped (drop-ship group)',sub:shipped+' line'+(shipped!==1?'s':''),tracking:tracking||'',carrier:carrier||'',ts:new Date().toISOString(),cls:'var(--teal)'});
+  render();
+  // [FEATURE] One Shopify fulfillment call covering every line in the group (one shipping email,
+  // not one per SKU) plus one ShipStation shipment record for the shared tracking number - same
+  // multi-item helper submitDropShipAll already uses for the "whole order" case.
+  if(tracking&&shippedItems.length){
+    const leadSale=lines[0];
+    pushDropshipFulfillment(orderNum,leadSale?.shopify_order_id,shippedItems,tracking,carrier).then(function(r){
+      if(leadSale?.shopify_order_id&&!(r.shopify&&r.shopify.ok))toast('\u26a0 Shopify fulfillment failed for order '+orderNum+' \u2014 check manually',6000);
+      if(!(r.shipstation&&r.shipstation.ok))toast('\u26a0 ShipStation record failed for #'+orderNum+' \u2014 check manually',6000);
+    });
+  }
+}
+
+function openMarkShopifyFulfilledGroupModal(orderNum,vendorKey,status){
+  const lines=_dsGroupLines(orderNum,vendorKey,status);
+  if(!lines.length){toast('No lines found for this group');return;}
+  openModal('shopifyFulfilledGroup',{orderNum,vendorKey,status,lineCount:lines.length});
+}
+async function submitMarkShopifyFulfilledGroup(orderNum,vendorKey,status){
+  const lines=_dsGroupLines(orderNum,vendorKey,status);
+  if(!lines.length){toast('No lines found for this group');closeModal();return;}
+  const now=new Date().toISOString();
+  let ok=0,errors=0;
+  for(const line of lines){
+    const{error}=await db.from('sales').update({fulfillment_status:'Shipped',shopify_fulfilled:true,shipped_at:now}).eq('id',line.id);
+    if(error){errors++;continue;}
+    S.sales=S.sales.map(function(s){return s.id===line.id?{...s,fulfillment_status:'Shipped',shopify_fulfilled:true,shipped_at:now}:s;});
+    ok++;
+  }
+  closeModal();updateBadge();
+  if(errors)toast('Marked '+ok+' fulfilled, '+errors+' error'+(errors!==1?'s':''));
+  else toast('Marked '+ok+' line'+(ok!==1?'s':'')+' fulfilled via Shopify');
+  if(ok)pushActivity({icon:'<span class="ic ic-check"></span>',type:'order_status',text:'#'+orderNum+' \u2192 Shipped (fulfilled via Shopify, group)',sub:ok+' line'+(ok!==1?'s':''),ts:now,cls:'var(--teal)'});
+  render();
+}
+
 // [FEATURE] Two-step drop-ship workflow: "Mark Ordered" records that Jon has placed the order
 // with the vendor (with an optional vendor order # for his own reference) without touching
 // fulfillment_status to Shipped yet. The line sits in 'Ordered' - a non-terminal status the
@@ -22358,6 +22501,87 @@ function renderDropshipQueue(){
       </td>
     </tr>`;
   }
+  // [FEATURE] Group same-order + same-vendor drop-ship lines into one actionable card instead of
+  // forcing staff to click Mark Ordered/Mark Shipped once per SKU when a vendor is shipping
+  // several items together on the same order (see JXB Performance example on order #10497 - 3
+  // SKUs, one vendor, one shipment). Grouping only ever happens within a single tab's rows, which
+  // are already filtered to one fulfillment_status, so a group is always homogeneous in status by
+  // construction. A SKU with no saved vendor, or whose vendor differs from its order-mates, is
+  // left as an individual row exactly as before - nothing to safely act on as a group.
+  function _groupDropshipRows(rows){
+    const counts={};
+    rows.forEach(function(s){
+      const vk=_dsVendorKey(s.pn);
+      if(!vk)return;
+      const key=(s.order_number||'')+'||'+vk;
+      counts[key]=(counts[key]||0)+1;
+    });
+    const seen={};
+    const items=[];
+    rows.forEach(function(s){
+      const vk=_dsVendorKey(s.pn);
+      const key=vk?(s.order_number||'')+'||'+vk:null;
+      if(key&&counts[key]>1){
+        if(seen[key])return;
+        seen[key]=true;
+        items.push({group:true,vendorKey:vk,lines:rows.filter(function(x){return(x.order_number||'')+'||'+_dsVendorKey(x.pn)===key;})});
+      }else{
+        items.push({group:false,line:s});
+      }
+    });
+    return items;
+  }
+  function _dropshipGroupActions(orderNumber,vendorKey,status){
+    if(status==='On Hold')return '';
+    const ve=_dsJsEsc(vendorKey);
+    const btns=[];
+    if(status==='Open')btns.push(`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="openMarkDropshipOrderedGroupModal('${escHtml(orderNumber)}','${ve}')">Mark All Ordered</button>`);
+    btns.push(`<button class="btn btn-sm" style="color:var(--purple);border-color:rgba(124,58,237,.3)" onclick="openDropShipGroupModal('${escHtml(orderNumber)}','${ve}','${status}')">\u2193 Mark All Shipped</button>`);
+    btns.push(`<button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" title="Shopify's own system marked these fulfilled, not ShipStation" onclick="openMarkShopifyFulfilledGroupModal('${escHtml(orderNumber)}','${ve}','${status}')">Fulfilled (All)</button>`);
+    return btns.join('');
+  }
+  function _dropshipGroupRow(lines,vendorKey,status){
+    const lead=lines[0];
+    const v=S.dropshipVendors[lead.pn];
+    const n=lines.length;
+    const orderLineCount=S.sales.filter(function(x){return x.order_number===lead.order_number;}).length;
+    const ve=_dsJsEsc(vendorKey);
+    const statusPill=status==='On Hold'
+      ?`<span style="font-size:var(--t-xs);background:var(--orange-dim);color:var(--red);border:1px solid rgba(220,38,38,.3);padding:1px 7px;border-radius:var(--r-md);font-weight:700">On Hold</span>`
+      :status==='Ordered'
+      ?`<span style="font-size:var(--t-xs);background:var(--orange-dim);color:var(--orange);border:1px solid rgba(234,88,12,.25);padding:1px 7px;border-radius:var(--r-md);font-weight:700;display:inline-flex;align-items:center;gap:4px">Ordered${lead.dropship_order_ref?' \u00b7 #'+escHtml(lead.dropship_order_ref):''}<span class="ic ic-pencil" style="cursor:pointer;width:.8em;height:.8em" title="Edit order reference # (applies to all lines in this group)" onclick="openMarkDropshipOrderedGroupModal('${escHtml(lead.order_number)}','${ve}')"></span></span>`
+      :`<span style="font-size:var(--t-xs);background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:1px 7px;border-radius:var(--r-md);font-weight:600">Not yet ordered</span>`;
+    const vendorCell=v
+      ?`<div style="font-size:var(--t-sm);display:flex;align-items:center;gap:5px"><b style="color:var(--text)">${escHtml(v.vendor_name||'Vendor')}</b>${v.order_url?` \u00b7 <a href="${escHtml(v.order_url)}" target="_blank" rel="noopener" style="color:var(--teal)">Order \u2197</a>`:''}</div>
+         ${(v.contact||v.instructions)?`<div style="font-size:var(--t-xs);color:var(--text3);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml([v.contact,v.instructions].filter(Boolean).join(' \u2014 '))}">${escHtml([v.contact,v.instructions].filter(Boolean).join(' \u2014 '))}</div>`:''}`
+      :`<span style="font-size:var(--t-sm);color:var(--orange)">Not saved</span>`;
+    const shipCsz=[lead.shipping_city,lead.shipping_province].filter(Boolean).join(', ')+(lead.shipping_zip?' '+lead.shipping_zip:'');
+    const shipCell=lead.shipping_address1
+      ?`<div style="font-size:var(--t-xs);color:var(--text2)">${escHtml(lead.shipping_address1)}</div><div style="font-size:var(--t-xs);color:var(--text3)">${escHtml(shipCsz)}</div>`
+      :`<span style="font-size:var(--t-xs);color:var(--text3)">\u2014</span>`;
+    const shipToText=_dropshipShipToText(lead).replace(/'/g,"\\'").replace(/\n/g,'\\n');
+    const actions=_dropshipGroupActions(lead.order_number,vendorKey,status);
+    const headTd=`
+      <td rowspan="${n}" style="font-size:var(--t-sm);color:var(--text2);vertical-align:top;border-left:3px solid var(--purple)">${escHtml(lead.order_number||'')}<div style="font-size:var(--t-xs);color:var(--purple);font-weight:700;margin-top:2px">${n} items grouped${orderLineCount>n?' \u00b7 '+orderLineCount+' on order':''}</div></td>
+      <td rowspan="${n}" style="vertical-align:top;font-size:var(--t-sm);color:var(--text2);max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(lead.customer_name||'')}</td>
+      <td rowspan="${n}" style="vertical-align:top">
+        <div style="display:flex;align-items:flex-start;gap:6px">
+          <div style="min-width:0">${shipCell}</div>
+          ${lead.shipping_address1?`<button class="action-btn" title="Copy address only" onclick="copyIconBtn('${shipToText}',this)"><span class="ic ic-clipboard"></span></button>`:''}
+        </div>
+      </td>
+      <td rowspan="${n}" style="vertical-align:top">${vendorCell}</td>
+      <td rowspan="${n}" style="vertical-align:top">${statusPill}</td>
+      <td rowspan="${n}" style="vertical-align:top;display:flex;gap:4px;flex-wrap:wrap">${actions}</td>`;
+    return lines.map(function(s,i){
+      const handleSeparately=status==='On Hold'?'':`<div style="margin-top:2px"><a href="javascript:void(0)" onclick="${status==='Open'?`openMarkDropshipOrderedModal('${s.id}','${escHtml(s.pn)}',${s.qty||1})`:`openDropShipModal('${s.id}','${escHtml(s.pn)}',${s.qty||1})`}" style="font-size:10px;color:var(--text3)">Handle separately</a></div>`;
+      return `<tr style="background:var(--bg2)">
+      <td class="pn" style="color:var(--purple);font-weight:700;border-left:3px solid var(--purple)">${escHtml(dispSku(s.pn))}</td>
+      <td class="money-neutral">\u00d7${s.qty||1}${handleSeparately}</td>
+      ${i===0?headTd:''}
+    </tr>`;
+    }).join('');
+  }
   // [FEATURE] Tabs instead of three stacked sections, per Jon - click between them instead of
   // scrolling past everything on one sheet. Reuses the same tab/setFilter pattern every other
   // filtered list in the app already uses, rather than inventing a new mechanism.
@@ -22374,16 +22598,17 @@ function renderDropshipQueue(){
   const orderedF=ordered.filter(_dropshipSearchMatch);
   const onHoldF=onHold.filter(_dropshipSearchMatch);
   const tabDefs=[
-    {key:'notordered',label:'Not Yet Ordered',rows:notOrderedF,total:notOrdered.length,accent:'var(--orange)'},
-    {key:'ordered',label:'Ordered',rows:orderedF,total:ordered.length,accent:'var(--text3)'},
-    {key:'onhold',label:'On Hold',rows:onHoldF,total:onHold.length,accent:'var(--red)'}
+    {key:'notordered',label:'Not Yet Ordered',rows:notOrderedF,total:notOrdered.length,accent:'var(--orange)',status:'Open'},
+    {key:'ordered',label:'Ordered',rows:orderedF,total:ordered.length,accent:'var(--text3)',status:'Ordered'},
+    {key:'onhold',label:'On Hold',rows:onHoldF,total:onHold.length,accent:'var(--red)',status:'On Hold'}
   ];
   const activeDef=tabDefs.find(function(t){return t.key===activeTab;})||tabDefs[0];
-  function _dropshipTable(rows){
+  function _dropshipTable(rows,status){
     if(!rows.length)return `<div class="section-empty" style="padding:40px 0">${searchQ?'No matches in this tab.':'Nothing here right now.'}</div>`;
+    const items=_groupDropshipRows(rows);
     return `<div class="tbl-wrap"><table><thead><tr>
       <th>SKU</th><th>Qty</th><th>Order</th><th>Customer</th><th>Ship To</th><th>Vendor</th><th>Status</th><th></th>
-    </tr></thead><tbody>${rows.map(_dropshipRow).join('')}</tbody></table></div>`;
+    </tr></thead><tbody>${items.map(function(it){return it.group?_dropshipGroupRow(it.lines,it.vendorKey,status):_dropshipRow(it.line);}).join('')}</tbody></table></div>`;
   }
   return `<div style="padding:20px">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
@@ -22395,7 +22620,7 @@ function renderDropshipQueue(){
     <div class="tabs-row">
       ${tabDefs.map(function(t){return `<div class="tab ${t.key===activeTab?'active':''}" style="${t.key===activeTab?'color:'+t.accent+';border-bottom-color:'+t.accent:''}" onclick="setFilter('dropship','tab','${t.key}')">${t.label} (${t.total})</div>`;}).join('')}
     </div>
-    ${lines.length?_dropshipTable(activeDef.rows):'<div class="section-empty" style="padding:40px 0">No drop-ship items waiting right now.</div>'}
+    ${lines.length?_dropshipTable(activeDef.rows,activeDef.status):'<div class="section-empty" style="padding:40px 0">No drop-ship items waiting right now.</div>'}
   </div>`;
 }
 
