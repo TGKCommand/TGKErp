@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.20';
+const TGK_ERP_VERSION = 'v23.21';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -4957,21 +4957,19 @@ function renderSaleDetail(s){
     : [s];
   const isMulti=allLines.length>1;
   const fsMap=FS_MAP;
-  const rank={'Delivered':5,'Shipped':4,'Packed':3,'On Hold':2,'Partial':2,'Open':1,'Refunded':0,'Cancelled':0};
-
-  const orderFs=allLines.reduce((best,x)=>
-    (rank[x.fulfillment_status||'Open']||0)>(rank[best]||0)?x.fulfillment_status:best,
-    allLines[0].fulfillment_status||'Open');
 
   const shippedLines=allLines.filter(x=>x.fulfillment_status==='Shipped'||x.fulfillment_status==='Delivered');
   const openLines=allLines.filter(x=>(x.fulfillment_status||'Open')==='Open');
   const heldLines=allLines.filter(x=>x.fulfillment_status==='On Hold');
   const packedLines=allLines.filter(x=>x.fulfillment_status==='Packed');
   const pendingLines=allLines.filter(x=>!['Shipped','Delivered','Cancelled','Refunded'].includes(x.fulfillment_status||'Open'));
-  const isSplit=shippedLines.length>0&&pendingLines.length>0;
-  const detailOrderFs=isSplit?'Partial':allLines.reduce((best,x)=>
-    (rank[x.fulfillment_status||'Open']||0)>(rank[best]||0)?x.fulfillment_status:best,
-    allLines[0].fulfillment_status||'Open');
+  // [FIX] This page used to compute its own copy of the isSplit/rank logic right here, instead of
+  // the shared computeEffectiveOrderStatus() the rest of the app already consolidated around
+  // specifically to stop the same order showing different aggregate statuses in different views.
+  // This copy had ALSO drifted from that one (missing its allPendingOnHold special case, on top
+  // of both sharing the Open-vs-On-Hold bug now fixed in computeEffectiveOrderStatus itself) -
+  // using the shared function directly means this page can't independently drift again.
+  const{status:detailOrderFs,isPartial:isSplit}=computeEffectiveOrderStatus(allLines);
 
   const uniqueTrackings=[...new Set(allLines.filter(x=>x.tracking_number).map(x=>x.tracking_number))];
   const uniqueCarriers=[...new Set(allLines.filter(x=>x.tracking_number).map(x=>x.carrier||''))];
@@ -26253,8 +26251,18 @@ function computeEffectiveOrderStatus(lines){
   const pending=lines.filter(l=>!['Shipped','Delivered','Cancelled','Refunded'].includes(l.fulfillment_status||'Open'));
   const allPendingOnHold=pending.length>0&&pending.every(l=>l.fulfillment_status==='On Hold');
   const isPartial=shipped.length>0&&pending.length>0&&!allPendingOnHold;
-  const status=allPendingOnHold?'On Hold':isPartial?'Partial':
-    lines.reduce((best,x)=>(rank[x.fulfillment_status||'Open']||0)>(rank[best]||0)?x.fulfillment_status:best,lines[0].fulfillment_status||'Open');
+  // [FIX] Per Jon: if ANY line in the order is still Open, the order-level status should read
+  // Open, not On Hold. The fallback below used to rank across EVERY line, and On Hold outranked
+  // Open there, so an order with 7 open lines and 2 genuinely-held lines (see #10497) showed as
+  // fully "On Hold" even though most of it was ready to pack and ship right now. Excluding On
+  // Hold lines from this pick fixes that; it still wins when it's the ONLY status present, since
+  // the allPendingOnHold branch above already covers that case, and Packed/Shipped/Delivered
+  // still outrank Open exactly as before - this only changes the Open-vs-On-Hold tiebreak.
+  const status=allPendingOnHold?'On Hold':isPartial?'Partial':(function(){
+    const cands=lines.filter(l=>(l.fulfillment_status||'Open')!=='On Hold');
+    const pool=cands.length?cands:lines;
+    return pool.reduce((best,x)=>(rank[x.fulfillment_status||'Open']||0)>(rank[best]||0)?x.fulfillment_status:best,pool[0].fulfillment_status||'Open');
+  })();
   return{status,shipped,pending,allPendingOnHold,isPartial};
 }
 function rtBlocked(){
