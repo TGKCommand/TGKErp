@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.21';
+const TGK_ERP_VERSION = 'v23.22';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -29337,10 +29337,12 @@ async function initChat(){
           ? (window._chatDM==null)                                   // team msg, team view
           : ((p.new.user_email===S.currentUser&&r===window._chatDM)  // my DM to them
              ||(r===S.currentUser&&p.new.user_email===window._chatDM)); // their DM to me
-        // A DM addressed to me while I am elsewhere still deserves a nudge.
+        // A DM addressed to me while I am elsewhere still deserves a nudge. The unread count
+        // itself is no longer bumped here - every DM now guarantees a chat_notifications row
+        // (see sendChatMessage), and the chat-notif channel below already counts that. Bumping
+        // it here too double-counted every single DM by one the moment that guarantee landed.
         if(r===S.currentUser&&p.new.user_email!==S.currentUser&&window._chatDM!==p.new.user_email){
           toast('\u{1F4AC} Direct message from '+(p.new.user_name||p.new.user_email),6000);
-          _chat.unread=(_chat.unread||0)+1; if(typeof _updateChatBadge==='function')_updateChatBadge();
         }
         if(!mine)return;
         if(!_chat.msgs.find(function(m){return m.id===p.new.id;})){
@@ -29575,11 +29577,16 @@ window.chatOpenDMPicker=async function(){
   var rows='<button type="button" class="btn btn-sm" style="width:100%;justify-content:flex-start;margin-bottom:4px'
     +(_chatDM===null?';border-color:var(--teal);color:var(--teal);font-weight:700':'')+'" '
     +'onclick="chatSetDM(null)">'+(_chatDM===null?'\u2713 ':'')+'Team channel</button>';
+  // [FIX] The picker had no way to show WHICH person's channel had something new in it - only a
+  // single global bubble count for everything combined. Now that every DM guarantees a
+  // chat_notifications row (see sendChatMessage), an unread dot can be shown per person here.
   rows+=users.map(function(u,i){
     var on=(_chatDM===u.email);
-    return '<button type="button" class="btn btn-sm" style="width:100%;justify-content:flex-start;margin-bottom:4px'
+    var hasUnread=_chat.alerts.some(function(a){return !a.read_at&&a.from_email===u.email;});
+    var dot=hasUnread?'<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--teal);margin-left:6px;flex-shrink:0"></span>':'';
+    return '<button type="button" class="btn btn-sm" style="width:100%;justify-content:flex-start;margin-bottom:4px;display:flex;align-items:center'
       +(on?';border-color:var(--teal);color:var(--teal);font-weight:700':'')+'" '
-      +'onclick="chatSetDMIdx('+i+')">'+(on?'\u2713 ':'')+escHtml(u.name||u.email)+'</button>';
+      +'onclick="chatSetDMIdx('+i+')">'+(on?'\u2713 ':'')+escHtml(u.name||u.email)+dot+'</button>';
   }).join('')||'<div class="t3s" style="padding:8px">No other team members found.</div>';
   pop.innerHTML=rows;
   window._chatDMUsers=users;
@@ -29598,6 +29605,23 @@ window.chatSetDM=function(email){
   _renderChatMessages();
   chatLoadMessages();
   _chatUpdateHeader();
+  // [FIX] Opening someone's DM thread is reading it - their unread notifications should clear
+  // right away rather than only when the separate Alerts tab happens to be opened. Only THIS
+  // sender's notifications are touched, so other people's unread dots stay exactly as they were.
+  if(email){
+    var _toClear=_chat.alerts.filter(function(a){return !a.read_at&&a.from_email===email;});
+    if(_toClear.length){
+      db.from('chat_notifications').update({read_at:new Date().toISOString()})
+        .eq('to_email',S.currentUser).eq('from_email',email).is('read_at',null).then(function(res){
+          if(res&&res.error){console.warn('[chat] mark-read (DM) failed:',res.error.message);return;}
+          var now=new Date().toISOString();
+          _chat.alerts.forEach(function(a){if(!a.read_at&&a.from_email===email)a.read_at=now;});
+          _chat.unread=Math.max(0,_chat.unread-_toClear.length);
+          _updateChatBadge();
+          if(_chat.tab==='alerts')_renderChatAlerts();
+        },function(e){console.warn('[chat] mark-read (DM) threw:',e);});
+    }
+  }
 };
 window._chatUpdateHeader=function(){
   var el=document.getElementById('chat-dm-label');
@@ -29776,22 +29800,34 @@ async function sendChatMessage(){
     inp.value=msg; // restore
     return;
   }
+  var _hadImage=!!window._chatPendingImg;
   window._chatPendingImg=null;
   _chat.msgs=_chat.msgs.map(function(m){return m.id===tmpId?ins.data:m;});
   var names=[]; msg.replace(/@([\w._]+)/g,function(_,n){names.push(n.toLowerCase());});
-  if(names.length){
-    var mentioned=_chat.team.filter(function(t){
-      var dn=(t.display_name||'').toLowerCase().replace(/\s+/g,'_');
-      var em=t.email.split('@')[0].toLowerCase();
-      return t.email!==S.currentUser&&names.some(function(n){return dn.startsWith(n)||em.startsWith(n);});
-    });
-    for(var i=0;i<mentioned.length;i++){
-      try{
-        await db.from('chat_notifications').insert({
-          message_id:ins.data.id,to_email:mentioned[i].email,from_name:myName,snippet:msg.slice(0,100)
-        });
-      }catch(e){console.warn('[chat] notif insert:',e);}
-    }
+  var mentioned=_chat.team.filter(function(t){
+    var dn=(t.display_name||'').toLowerCase().replace(/\s+/g,'_');
+    var em=t.email.split('@')[0].toLowerCase();
+    return t.email!==S.currentUser&&names.some(function(n){return dn.startsWith(n)||em.startsWith(n);});
+  });
+  // [FIX] A direct message got no persisted notification at all unless the text happened to
+  // @-mention the recipient by name - which is not how anyone actually writes a DM, so sending
+  // someone a plain "hey, check this order" DM left them with zero notification, no unread
+  // badge, and no alert once they weren't already watching that exact channel live. A DM is
+  // inherently directed at its recipient the same way an @-mention is directed at whoever it
+  // names, so it now guarantees exactly one notification - deduped against the @-mention list
+  // just below so a DM that ALSO happens to @-mention the same person doesn't double up.
+  var notifyTargets=mentioned.slice();
+  if(window._chatDM&&!notifyTargets.some(function(t){return t.email===window._chatDM;})){
+    var _dmRow=_chat.team.find(function(t){return t.email===window._chatDM;});
+    notifyTargets.push({email:window._chatDM,display_name:(_dmRow&&_dmRow.display_name)||window._chatDM});
+  }
+  for(var i=0;i<notifyTargets.length;i++){
+    try{
+      await db.from('chat_notifications').insert({
+        message_id:ins.data.id,to_email:notifyTargets[i].email,from_email:S.currentUser,from_name:myName,
+        snippet:msg.slice(0,100)||(_hadImage?'\uD83D\uDDBC\uFE0F Image':'')
+      });
+    }catch(e){console.warn('[chat] notif insert:',e);}
   }
 }
 window.sendChatMessage=sendChatMessage;
