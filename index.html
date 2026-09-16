@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.22';
+const TGK_ERP_VERSION = 'v23.24';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -17582,6 +17582,38 @@ function calcForecast(pn){
 const HW_CATS=['Bolts/Washers/Nuts','Orings','Fittings','Heims & Sphericals','Suspension Hardware','Hardware'];
 const SUPPLY_CATS=['Shipping','Bulk Pieces'];
 const PACK_CATS=['Box','Boxes','Packaging','Packing','Carton','Cartons','Label','Labels'];
+// [FIX] Backorder buildability (buildabilityForBackorder, used both here and by the edge
+// function's bomMaxBuild to decide whether a product goes on backorder on the live Shopify
+// storefront) and shared-component analysis (isRawComponent) each kept their OWN separate "is
+// this packaging/supply, not a real component" list - and neither one actually included PACK_CATS
+// (Box/Boxes/Packing/Carton/Cartons/Label/Labels), only SUPPLY_CATS (Shipping/Bulk Pieces) plus a
+// hardcoded 'packaging' check. A part categorized as "Boxes" or "Labels" or "Cartons" was
+// therefore NOT excluded from either buildability decision - if that supply item ran out, the
+// finished good could be marked backordered on the live storefront over a shipping box or a
+// label, not an actual missing component. This is now the one shared list and one shared check
+// every such decision in the app uses - combines PACK_CATS, SUPPLY_CATS, and the marketing/
+// consumable categories isRawComponent already knew about that neither of the others did.
+const NONRAW_SUPPLY_CATS=PACK_CATS.concat(SUPPLY_CATS,['Sticker','Stickers','Decal','Decals','Rebate','Rebate Card','Rebate Cards','Marketing','Insert','Inserts','Literature','Card','Cards','Flyer','Flyers','Brochure','Brochures']);
+const NONRAW_SUPPLY_KW=['sticker','decal','rebate','flyer','brochure','mailer','pamphlet'];
+// True if this BOM child is packaging/supply/marketing material rather than a real component.
+// Checked via item_type first (the reliable, structured BOM-line signal), then category - both an
+// exact full-string match (for a flat category value) and a top-level "Category/Subcategory"
+// segment match (this catalog also stores hierarchical paths, and a naive substring scan across
+// the WHOLE path previously excluded real products whose name merely CONTAINED a word like "box" -
+// e.g. "Products/Drivetrain/DUMPBOXES" is a real tracked part, not packaging) - then a
+// description/pn keyword fallback for items like rebate cards or stickers that are not always
+// cleanly categorized.
+function isNonRawSupplyItem(itemType,category,description,pn){
+  if(itemType==='packaging')return true;
+  var catFull=((category||'')+'').toLowerCase().trim();
+  var listLower=NONRAW_SUPPLY_CATS.map(function(c){return c.toLowerCase();});
+  if(catFull){
+    var top=catFull.split('/')[0].trim();
+    if(listLower.indexOf(catFull)!==-1||listLower.indexOf(top)!==-1)return true;
+  }
+  var hay=(((description||'')+' '+(pn||''))+'').toLowerCase();
+  return NONRAW_SUPPLY_KW.some(function(k){return hay.indexOf(k)!==-1;});
+}
 
 function _getBreaks(p){
   if(!p)return[];
@@ -19833,24 +19865,15 @@ function buildabilityForBackorder(pn){
   if(!bom.length)return buildability(pn); // no BOM — fall through to standard logic
   if(!S._partIdx||!S._asmIdx)buildLookupMaps();
   var pm=S._partIdx,am=S._asmIdx;
-  var supplyLower=(SUPPLY_CATS||[]).map(function(s){return s.toLowerCase();});
+  // [FIX] Was checking against SUPPLY_CATS plus a hardcoded 'packaging'/'shipping' top-level match
+  // only - missing PACK_CATS entirely (Box/Boxes/Packing/Carton/Cartons/Label/Labels) and the
+  // marketing/sticker/rebate categories isRawComponent already knew about. Now routes through the
+  // one shared, comprehensive check every such decision in the app uses (see isNonRawSupplyItem
+  // above) - same top-level-segment matching this function already got right, just against the
+  // full combined list instead of a narrower one.
   function inc(i){ // ignore packaging/supply so a FG isn't called un-buildable over a box or bulk consumable
-    if(i.item_type==='packaging')return false;
     var cp=pm[i.child_pn];
-    if(cp){
-      // Match on the TOP-LEVEL category segment only, not a substring scan across the whole
-      // path. "Products/Drivetrain/DUMPBOXES" contains "box" as part of a real product name -
-      // a raw .includes('box') check was excluding an actual tracked component (a Dumpbox
-      // fitting) as if it were a shipping box, purely because of that name collision. The
-      // category taxonomy here is Category/Subcategory/Leaf, so the first segment is the
-      // reliable signal: "Packaging/Bags" is packaging, "Products/..." never is, regardless of
-      // what the leaf happens to be named.
-      var catFull=(cp.category||'').toLowerCase();
-      var topLevel=catFull.split('/')[0].trim();
-      if(supplyLower.some(function(s){return catFull===s||topLevel===s;}))return false;
-      if(topLevel==='packaging'||topLevel==='shipping')return false;
-    }
-    return true;
+    return !isNonRawSupplyItem(i.item_type,(cp&&cp.category),(cp&&cp.description),i.child_pn);
   }
   if(!bom.some(inc))return{maxBuild:Infinity,hasBOM:true}; // nothing but packaging/supply -> not meaningfully constrained
   // [SHARED] recurses into build-to-order subassemblies AND respects shared part pools
@@ -20944,18 +20967,16 @@ function renderBuildPlanner(asm){
 function isRawComponent(childPn, itemType){
   // Shared-component analysis should only consider genuine raw parts and (sub)assemblies -- never
   // packaging, boxes, shipping supplies, stickers, rebate cards or other marketing/consumable inserts.
+  // [FIX] Consolidated onto the shared isNonRawSupplyItem check (see its definition above) instead
+  // of keeping its own separate inline category list - the two lists had already diverged from
+  // each other (this one had marketing/sticker/rebate categories buildabilityForBackorder was
+  // missing) and there is no reason for "is this packaging/supply" to have more than one answer
+  // depending which part of the app asks.
   const t=itemType||'part';
-  if(t==='packaging')return false;
   if(t==='assembly'||t==='subassembly')return true;
   if(bomBucket(childPn,itemType).label==='PACKAGING')return false; // box/bag/tape/label/carton + PACK_CATS
   const p=(S._partIdx&&S._partIdx[childPn])||partByPn(childPn);
-  const cat=(((p&&p.category)||'')+'').toLowerCase().trim();
-  const NONRAW_CATS=['box','boxes','packaging','packing','carton','cartons','label','labels','shipping','sticker','stickers','decal','decals','rebate','rebate card','rebate cards','marketing','insert','inserts','literature','card','cards','flyer','flyers','brochure','brochures'];
-  if(NONRAW_CATS.indexOf(cat)!==-1)return false;
-  const hay=((((p&&p.description)||'')+' '+childPn)+'').toLowerCase();
-  const NONRAW_KW=['sticker','decal','rebate','flyer','brochure','mailer','pamphlet'];
-  if(NONRAW_KW.some(function(k){return hay.indexOf(k)!==-1;}))return false;
-  return true;
+  return !isNonRawSupplyItem(t,(p&&p.category),(p&&p.description),childPn);
 }
 
 function buildPlannerSharedPanel(asm){
@@ -29325,6 +29346,7 @@ async function initChat(){
     await chatLoadMessages();
     var {data:_nlist}=await db.from('chat_notifications').select('*').eq('to_email',S.currentUser).order('created_at',{ascending:false}).limit(50);
     _chat.alerts=_nlist||[];
+    await _chatEnrichAlerts(_chat.alerts);
     _chat.unread=_chat.alerts.filter(function(n){return !n.read_at;}).length;
     _updateChatBadge();
     if(_chatLiveChannel){try{_chatLiveChannel.unsubscribe();}catch(e){}}
@@ -29362,6 +29384,13 @@ async function initChat(){
         _chat.alerts.unshift(p.new);
         _chat.unread++;_updateChatBadge();
         if(_chat.open&&_chat.tab==='alerts')_renderChatAlerts();
+        // Resolve whether this one is a DM (and who from) the same way the initial load does,
+        // then re-render so the "Direct message" label and click target appear on a live-arriving
+        // alert too, not only after a reload.
+        _chatEnrichAlerts([p.new]).then(function(){
+          if(_chat.open&&_chat.tab==='alerts')_renderChatAlerts();
+          if(document.getElementById('chat-dm-pop'))_chatRefreshDMDots();
+        });
         if(window.Notification&&Notification.permission==='granted'){
           try{new Notification('TGK — '+(p.new.from_name||'Someone'),{body:p.new.snippet||'',tag:'tgk-chat'});}catch(e){}
         }
@@ -29430,6 +29459,38 @@ function setChatTab(tab){
 }
 window.setChatTab=setChatTab;
 
+// [FEATURE] An alert row alone cannot tell you whether it came from the team channel or from
+// somebody's private DM thread - chat_notifications only stores who it is FOR, not which channel
+// it happened in. Rather than add another column (and another migration to remember to run), this
+// derives it from the authoritative source that already records it: the chat_messages row the
+// notification points at, whose recipient_email is null for the team channel and set for a DM.
+// Annotates each alert in memory with _isDm and _fromEmail so the renderer and the DM-unread dot
+// can rely on them without depending on the chat_notifications.from_email column being present.
+// Deliberately non-fatal: on any failure the alerts still render exactly as they did before, just
+// without the DM labelling.
+async function _chatEnrichAlerts(alerts){
+  try{
+    var ids=(alerts||[]).map(function(a){return a.message_id;}).filter(Boolean);
+    if(!ids.length)return;
+    var r=await db.from('chat_messages').select('id,user_email,user_name,recipient_email').in('id',ids);
+    if(r.error){console.warn('[chat] alert enrich failed:',r.error.message);return;}
+    var byId={};(r.data||[]).forEach(function(m){byId[m.id]=m;});
+    (alerts||[]).forEach(function(a){
+      var m=byId[a.message_id];
+      if(!m)return;
+      a._isDm=!!m.recipient_email;
+      a._fromEmail=m.user_email||a.from_email||null;
+      if(!a.from_name&&m.user_name)a.from_name=m.user_name;
+    });
+  }catch(e){console.warn('[chat] alert enrich threw:',e);}
+}
+
+window.chatOpenAlertDM=function(email){
+  if(!email)return;
+  setChatTab('msgs');
+  chatSetDM(email);
+};
+
 function _renderChatAlerts(){
   var el=document.getElementById('chat-alerts');
   if(!el)return;
@@ -29442,18 +29503,29 @@ function _renderChatAlerts(){
     el.innerHTML='<div style="padding:32px;text-align:center;color:var(--text3);font-size:var(--t-md)">No alerts yet</div>';
     return;
   }
-  el.innerHTML=_chat.alerts.map(function(a){
+  el.innerHTML=_chat.alerts.map(function(a,idx){
     var d=new Date(a.created_at);
     var timeStr=d.toLocaleDateString(undefined,{month:'short',day:'numeric'})+' · '+d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});
     var isOrderAlert=a.from_name==='Order Alert';
+    // A DM alert is distinguished from a team-channel @-mention (see _chatEnrichAlerts) and made
+    // clickable - clicking jumps straight to that person's DM thread, so the alert answers "who
+    // is this from" and takes you to the conversation rather than leaving you to hunt for it in
+    // the person picker.
+    var isDm=!!a._isDm&&!isOrderAlert;
+    var dmEmail=a._fromEmail||a.from_email||null;
+    var clickable=isDm&&dmEmail;
     var icon=isOrderAlert?'<span class="ic ic-bell"></span>':'<span class="ic ic-chat"></span>';
-    return '<div style="padding:10px 14px;border-bottom:1px solid var(--border);'+(a.read_at?'':'background:rgba(13,148,136,.05)')+'">'
+    return '<div style="padding:10px 14px;border-bottom:1px solid var(--border);'+(a.read_at?'':'background:rgba(13,148,136,.05)')+(clickable?';cursor:pointer':'')+'"'
+      +(clickable?' title="Open direct message" onclick="chatOpenAlertDM(\''+_dsJsEsc(dmEmail)+'\')"':'')+'>'
       +'<div style="display:flex;align-items:flex-start;gap:8px">'
       +'<span style="font-size:var(--t-lg);flex-shrink:0">'+icon+'</span>'
       +'<div style="flex:1;min-width:0">'
-      +'<div style="font-size:var(--t-sm);font-weight:700;color:'+(isOrderAlert?'var(--orange)':'var(--teal)')+'">'+escHtml(a.from_name||'')+'</div>'
+      +'<div style="font-size:var(--t-sm);font-weight:700;color:'+(isOrderAlert?'var(--orange)':'var(--teal)')+';display:flex;align-items:center;gap:6px;flex-wrap:wrap">'
+      +'<span>'+escHtml(a.from_name||dmEmail||'')+'</span>'
+      +(isDm?'<span style="font-size:var(--t-xs);font-weight:700;background:var(--bg4);color:var(--text3);border:1px solid var(--border);padding:0 6px;border-radius:var(--r-md)">Direct message</span>':'')
+      +'</div>'
       +'<div style="font-size:var(--t-md);color:var(--text);line-height:1.4;margin-top:2px;word-break:break-word">'+escHtml(a.snippet||'')+'</div>'
-      +'<div style="font-size:var(--t-xs);color:var(--text3);margin-top:4px">'+timeStr+'</div>'
+      +'<div style="font-size:var(--t-xs);color:var(--text3);margin-top:4px">'+timeStr+(clickable?' \u00b7 <span style="color:var(--teal)">Open conversation</span>':'')+'</div>'
       +'</div></div></div>';
   }).join('');
 }
@@ -29582,7 +29654,7 @@ window.chatOpenDMPicker=async function(){
   // chat_notifications row (see sendChatMessage), an unread dot can be shown per person here.
   rows+=users.map(function(u,i){
     var on=(_chatDM===u.email);
-    var hasUnread=_chat.alerts.some(function(a){return !a.read_at&&a.from_email===u.email;});
+    var hasUnread=_chat.alerts.some(function(a){return !a.read_at&&a._isDm&&(a._fromEmail||a.from_email)===u.email;});
     var dot=hasUnread?'<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--teal);margin-left:6px;flex-shrink:0"></span>':'';
     return '<button type="button" class="btn btn-sm" style="width:100%;justify-content:flex-start;margin-bottom:4px;display:flex;align-items:center'
       +(on?';border-color:var(--teal);color:var(--teal);font-weight:700':'')+'" '
@@ -29593,6 +29665,10 @@ window.chatOpenDMPicker=async function(){
   var host=document.getElementById('chat-panel')||document.body;
   if(getComputedStyle(host).position==='static')host.style.position='relative';
   host.appendChild(pop);
+};
+window._chatRefreshDMDots=function(){
+  var pop=document.getElementById('chat-dm-pop');
+  if(pop){pop.remove();chatOpenDMPicker();}
 };
 window.chatSetDMIdx=function(i){
   var u=(window._chatDMUsers||[])[i];
@@ -29609,13 +29685,17 @@ window.chatSetDM=function(email){
   // right away rather than only when the separate Alerts tab happens to be opened. Only THIS
   // sender's notifications are touched, so other people's unread dots stay exactly as they were.
   if(email){
-    var _toClear=_chat.alerts.filter(function(a){return !a.read_at&&a.from_email===email;});
+    var _toClear=_chat.alerts.filter(function(a){return !a.read_at&&a._isDm&&(a._fromEmail||a.from_email)===email;});
     if(_toClear.length){
+      // Targets the exact alert ids rather than filtering on a from_email column server-side, so
+      // this keeps working regardless of whether that column exists - the ids are already known
+      // locally, and the to_email guard still scopes the write to this user's own notifications.
+      var _ids=_toClear.map(function(a){return a.id;});
       db.from('chat_notifications').update({read_at:new Date().toISOString()})
-        .eq('to_email',S.currentUser).eq('from_email',email).is('read_at',null).then(function(res){
+        .eq('to_email',S.currentUser).in('id',_ids).then(function(res){
           if(res&&res.error){console.warn('[chat] mark-read (DM) failed:',res.error.message);return;}
           var now=new Date().toISOString();
-          _chat.alerts.forEach(function(a){if(!a.read_at&&a.from_email===email)a.read_at=now;});
+          _chat.alerts.forEach(function(a){if(_ids.indexOf(a.id)!==-1)a.read_at=now;});
           _chat.unread=Math.max(0,_chat.unread-_toClear.length);
           _updateChatBadge();
           if(_chat.tab==='alerts')_renderChatAlerts();
