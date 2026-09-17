@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.31';
+const TGK_ERP_VERSION = 'v23.33';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1904,12 +1904,23 @@ function trackingUrl(carrier, tracking){
   if(c.includes('LSO'))return'https://www.lso.com/go/track?tracking_id='+t;
   return'https://track.aftership.com/'+encodeURIComponent(tracking);
 }
+// [FIX] See the matching note in shipstation-ship.ts: the automation was managing non-TGK resale
+// products (Brisk, Denso, etc.) because nothing restricted it to TGK's own manufactured goods.
+// Checks pn AND new_sku because of the legacy/new SKU duality - a TGK product may be keyed on
+// either, and carrying the prefix on either one is enough to manage it.
+function isTgkManagedSku(pn,newSku){
+  var prefix='TGK';
+  var a=String(pn||'').trim().toUpperCase();
+  var b=String(newSku||'').trim().toUpperCase();
+  return a.indexOf(prefix)===0||b.indexOf(prefix)===0;
+}
 function eligibleForBackorderSync(item){
   // Only genuine finished goods should ever have their Shopify listing touched by the automated
   // backorder sync. Subassemblies and hardware packs aren't standalone Shopify products in the same
   // sense; Pre-Order items use their own separate Shopify template that this automation must never
   // overwrite; discontinued and dev-stage items shouldn't be actively managed at all.
   if(!item)return false;
+  if(!isTgkManagedSku(item.pn,item.new_sku))return false; // never manage non-TGK resale/vendor products
   if(item.discontinued||isDev(item))return false;
   if(item.is_subassembly||isHWPack(item.pn))return false;
   if((item.category||'')==='Pre-Order')return false;
@@ -2074,6 +2085,12 @@ function syncShopifyTemplate(pn,newOh){
         // product template DIRECTLY, overwriting the very pre-order template the edge function
         // just refused to touch. Handled explicitly so the fallback never runs for these.
         console.log('[Shopify variant BO] '+shopSku+': skipped -- on a pre-order/custom Shopify template ('+((d.skipped_templates||[]).map(function(x){return x.template;}).join(', ')||'custom')+'). Backorder automation does not manage those.');
+      }
+      else if(d&&d.skipped_not_managed){
+        // Same load-bearing reason as the pre-order branch above: without this, a non-TGK SKU
+        // falls through to _productFallback(), which writes the product template directly -
+        // re-applying to a vendor product exactly what the edge function just refused to do.
+        console.log('[Shopify variant BO] '+shopSku+': skipped -- not a TGK-prefixed product; backorder automation does not manage resale/vendor items.');
       }
       else if((txt||'').trim()==='ok'||(txt||'').trim()==='pong'){console.log('[Shopify variant BO] action not deployed - product-template fallback for',shopSku);_productFallback();}
       else{console.warn('[Shopify variant BO]',shopSku,(d&&d.error)||r.status);_productFallback();}
@@ -7814,6 +7831,16 @@ async function checkOrderRisk(shopifyOrderId: string | number, orderName: string
 // and metafield writes that are what actually break the pre-order presentation. This is the same
 // rule applied earlier and to the whole operation, in both directions - reverting would untrack a
 // pre-order variant just as wrongly as backordering it.
+// [FIX] See the matching note in shipstation-ship.ts. This action is called DIRECTLY by the ERP's
+// manual and bulk backorder sync, so gating only the webhook path would leave the biggest caller
+// unprotected - a bulk sync would happily keep pushing non-TGK resale items into backorder.
+function isTgkManagedSku(pn: string | null | undefined, newSku?: string | null): boolean {
+  const prefix = (Deno.env.get('BACKORDER_SKU_PREFIX') || 'TGK').trim().toUpperCase()
+  if (!prefix) return true
+  const a = String(pn || '').trim().toUpperCase()
+  const b = String(newSku || '').trim().toUpperCase()
+  return a.startsWith(prefix) || b.startsWith(prefix)
+}
 function isManagedBackorderTemplate(templateSuffix: string | null | undefined): boolean {
   const cur = String(templateSuffix || '').trim().toLowerCase()
   const boTpl = (Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder').trim().toLowerCase()
@@ -8170,6 +8197,24 @@ Deno.serve(async (req) =&gt; {
     const backorder = !!body.backorder
     const restockDate = body.restock_date || ''
     if (!store || !key || !sku) return new Response(JSON.stringify({error:'Missing store, key or sku'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
+    // Resolve the ERP record first so the prefix rule can consider BOTH pn and new_sku - the sku
+    // arriving here is whichever alias the caller had, and a TGK product may be keyed on either.
+    // A sku with no catalog record at all is a resale/drop-ship item and is judged on the sku
+    // string alone, which is what stops non-TGK vendor products being managed.
+    {
+      let rec: any = null
+      const { data: a1 } = await db.from('assemblies').select('pn,new_sku').eq('pn', sku).limit(1)
+      if (a1?.length) rec = a1[0]
+      if (!rec) { const { data: a2 } = await db.from('assemblies').select('pn,new_sku').eq('new_sku', sku).limit(1); if (a2?.length) rec = a2[0] }
+      if (!rec) { const { data: p1 } = await db.from('parts').select('pn,new_sku').eq('pn', sku).limit(1); if (p1?.length) rec = p1[0] }
+      if (!rec) { const { data: p2 } = await db.from('parts').select('pn,new_sku').eq('new_sku', sku).limit(1); if (p2?.length) rec = p2[0] }
+      const managed = rec ? isTgkManagedSku(rec.pn, rec.new_sku) : isTgkManagedSku(sku)
+      if (!managed) {
+        console.log('[set_variant_backorder] skipped', sku, '- not a managed-prefix SKU (non-TGK resale/vendor product)')
+        return new Response(JSON.stringify({ok:false, skipped_not_managed:true,
+          note:'SKU is not a managed-prefix (TGK) product; backorder automation does not manage resale/vendor items'}), {headers:{...CORS,'Content-Type':'application/json'}})
+      }
+    }
     const H = {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'}
     const gqlTopErrors:string[] = []
     const gql = async (q) =&gt; {
@@ -8362,6 +8407,95 @@ Deno.serve(async (req) =&gt; {
   // is the input rather than a hand-built list. Writes NOTHING - safe to run at any time.
   // Paginated by offset with deliberate pacing, same shape as backfill_sale_dates, because this
   // is one Shopify call per SKU and the rate limit is real.
+  // [REPAIR] Undoes what the backorder automation did to products deliberately merchandised on a
+  // pre-order template. Scope is deliberately minimal: it sets tracked:false on the affected
+  // variants (an untracked variant is always purchasable, which is what a pre-order needs and what
+  // the known-good variants in this store already look like) and optionally clears the ETA
+  // metafield. It does NOT touch templateSuffix - the audit confirmed every affected product kept
+  // its product-preorder template, so there is nothing to restore there and writing one would risk
+  // breaking a product that is currently fine.
+  //
+  // clear_eta controls the metafield, because the data cannot tell an ERP-written date from one a
+  // human set: the automation only ever writes an ETA when the variant has none, so a present date
+  // may be either. Options:
+  //   'none' (default) - leave every ETA exactly as-is; untrack only.
+  //   'iso'            - clear only strict YYYY-MM-DD values, which is the ONLY shape this
+  //                      automation ever writes. Free-text like "Middle / end of July" is
+  //                      unambiguously human and is preserved.
+  //   'all'            - clear every ETA on the affected variants and their products.
+  // Dry run unless apply:true, and it reports the exact per-variant plan either way.
+  if (body.action === 'repair_preorder_variants') {
+    const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
+    const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
+    if (!store || !key) return new Response(JSON.stringify({error:'Missing Shopify credentials'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
+    const applyIt = body.apply === true
+    const clearEta = ['none','iso','all'].includes(String(body.clear_eta || 'none')) ? String(body.clear_eta || 'none') : 'none'
+    const skus: string[] = Array.isArray(body.skus) &amp;&amp; body.skus.length ? body.skus.map((x: any) =&gt; String(x).trim()).filter(Boolean) : []
+    if (!skus.length) return new Response(JSON.stringify({error:'skus array is required (the pre-order SKUs from audit_backorder_state)'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
+
+    const H = {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'}
+    const errs: string[] = []
+    const gq = async (q: string) =&gt; {
+      const r = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:H, body: JSON.stringify({query:q})}).then(x =&gt; x.json())
+      ;(r?.errors || []).forEach((e: any) =&gt; errs.push(e?.message || JSON.stringify(e)))
+      return r
+    }
+    const isIsoDate = (v: string) =&gt; /^\\d{4}-\\d{2}-\\d{2}$/.test(String(v || '').trim())
+    const plan: any[] = []
+
+    for (const sku of skus) {
+      const safe = sku.replace(/"/g, '')
+      const q = '{ productVariants(first: 10, query: "sku:\\\\"' + safe + '\\\\"") { edges { node { '
+        + 'id sku inventoryItem { id tracked } '
+        + 'metafield(namespace: "custom", key: "estimated_arrival_date") { value } '
+        + 'product { id title templateSuffix metafield(namespace: "custom", key: "estimated_arrival_date") { value } } '
+        + '} } } }'
+      const r = await gq(q)
+      const matches = (r?.data?.productVariants?.edges || [])
+        .map((e: any) =&gt; e.node)
+        .filter((n: any) =&gt; (n.sku || '').trim().toUpperCase() === sku.toUpperCase())
+      if (!matches.length) { plan.push({ sku, skipped: 'no Shopify variant with this SKU' }); continue }
+      for (const n of matches) {
+        const tpl = n.product?.templateSuffix || ''
+        // Hard safety rail: only ever touch a variant that is genuinely on a pre-order template.
+        // Passing a wrong SKU in the list therefore cannot damage a normal product.
+        if (!/pre[-_ ]?order/i.test(tpl)) {
+          plan.push({ sku, variant: n.id, product_title: n.product?.title, template_suffix: tpl, skipped: 'not on a pre-order template - left untouched' })
+          continue
+        }
+        const vEta = String(n.metafield?.value || '').trim()
+        const pEta = String(n.product?.metafield?.value || '').trim()
+        const willUntrack = !!n.inventoryItem?.tracked
+        const clearV = clearEta === 'all' ? !!vEta : (clearEta === 'iso' ? isIsoDate(vEta) : false)
+        const clearP = clearEta === 'all' ? !!pEta : (clearEta === 'iso' ? isIsoDate(pEta) : false)
+        const row: any = { sku, variant: n.id, product: n.product?.id, product_title: n.product?.title,
+          template_suffix: tpl, currently_tracked: !!n.inventoryItem?.tracked,
+          will_untrack: willUntrack, variant_eta: vEta, product_eta: pEta,
+          will_clear_variant_eta: clearV, will_clear_product_eta: clearP }
+        if (applyIt) {
+          if (willUntrack &amp;&amp; n.inventoryItem?.id) {
+            const t = await gq('mutation { inventoryItemUpdate(id: "' + n.inventoryItem.id + '", input: {tracked: false}) { inventoryItem { tracked } userErrors { message } } }')
+            row.untracked_ok = t?.data?.inventoryItemUpdate?.inventoryItem?.tracked === false
+          }
+          if (clearV) await gq('mutation { metafieldsSet(metafields: [{ownerId: "' + n.id + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
+          if (clearP &amp;&amp; n.product?.id) await gq('mutation { metafieldsSet(metafields: [{ownerId: "' + n.product.id + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
+          await new Promise(r2 =&gt; setTimeout(r2, 400))
+        }
+        plan.push(row)
+      }
+    }
+    const toUntrack = plan.filter((x: any) =&gt; x.will_untrack).length
+    return new Response(JSON.stringify({
+      ok: true, apply: applyIt, clear_eta: clearEta,
+      summary: { variants_seen: plan.length, will_untrack: toUntrack,
+        will_clear_variant_eta: plan.filter((x: any) =&gt; x.will_clear_variant_eta).length,
+        will_clear_product_eta: plan.filter((x: any) =&gt; x.will_clear_product_eta).length,
+        skipped: plan.filter((x: any) =&gt; x.skipped).length },
+      graphql_errors: errs, plan,
+      note: applyIt ? 'Applied.' : 'Dry run - nothing written. Re-send with apply:true to execute exactly this plan.'
+    }), { headers: { ...CORS, 'Content-Type': 'application/json' } })
+  }
+
   if (body.action === 'audit_backorder_state') {
     const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
     const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
@@ -9157,8 +9291,26 @@ async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;
   return out
 }
 
+// [FIX] The backorder automation was managing NON-TGK products - resale/vendor items such as
+// BIK-ER10S (Brisk plugs) and DNP-* (Denso) showed up in shopify_sync_log having been tracked,
+// zeroed and templated by it. Two separate holes caused that:
+//   1. No prefix rule at all: nothing restricted the automation to TGK's own manufactured goods.
+//   2. Every caller wrote \`if (eligItem &amp;&amp; !isEligibleForBackorderSync(eligItem))\`, so a SKU that
+//      exists in NEITHER assemblies nor parts produced no eligItem and skipped the gate entirely -
+//      precisely the case for a pure resale item the ERP does not build or stock-manage.
+// Checked against pn AND new_sku because of this catalog's legacy/new SKU duality: a TGK product
+// may be keyed on either, and it should be managed if either one carries the prefix. The prefix is
+// env-configurable rather than hardcoded so it can change without a code edit.
+function isTgkManagedSku(pn: string | null | undefined, newSku?: string | null): boolean {
+  const prefix = (Deno.env.get('BACKORDER_SKU_PREFIX') || 'TGK').trim().toUpperCase()
+  if (!prefix) return true
+  const a = String(pn || '').trim().toUpperCase()
+  const b = String(newSku || '').trim().toUpperCase()
+  return a.startsWith(prefix) || b.startsWith(prefix)
+}
 function isEligibleForBackorderSync(item: any): boolean {
   if (!item) return false
+  if (!isTgkManagedSku(item.pn, item.new_sku)) return false
   if (item.discontinued || item.stage === 'dev') return false
   if (item.is_subassembly || isHWPackServer(item.pn)) return false
   if ((item.category || '') === 'Pre-Order') return false
@@ -9296,8 +9448,16 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
   if (!asmCheck?.length) { const _r = await db.from('assemblies').select('pn,new_sku,use_new_sku,discontinued,stage,is_subassembly,category,force_backorder').eq('new_sku', pn).limit(1); asmCheck = _r.data }
   const { data: partCheck } = asmCheck?.length ? { data: null } : await db.from('parts').select('pn,new_sku,use_new_sku,discontinued,category').eq('pn', pn).limit(1)
   const eligItem = asmCheck?.[0] || partCheck?.[0]
-  if (eligItem &amp;&amp; !isEligibleForBackorderSync(eligItem)) {
-    console.log('[SS-&gt;Shopify] skipped - not eligible (subassembly/hardware pack/pre-order/discontinued/dev):', pn)
+  if (!eligItem) {
+    // No assemblies/parts record at all - a resale or drop-ship SKU the ERP neither builds nor
+    // stocks. Previously this bypassed the gate entirely (the check was guarded on eligItem being
+    // truthy), which is how non-TGK vendor products ended up managed by this automation.
+    if (!isTgkManagedSku(pn)) {
+      console.log('[SS-&gt;Shopify] skipped - no ERP catalog record and not a managed prefix SKU:', pn)
+      return
+    }
+  } else if (!isEligibleForBackorderSync(eligItem)) {
+    console.log('[SS-&gt;Shopify] skipped - not eligible (non-managed prefix/subassembly/hardware pack/pre-order/discontinued/dev):', pn)
     return
   }
   const shopSkuBO = (eligItem &amp;&amp; eligItem.use_new_sku &amp;&amp; eligItem.new_sku) ? eligItem.new_sku : pn
@@ -9386,7 +9546,7 @@ async function cascadeShopifyBackorder(childPn: string): Promise&lt;void&gt; {
   const { data: boms } = await db.from('bom_items').select('parent_pn').eq('child_pn', childPn)
   const parentPns = [...new Set((boms || []).map((b: any) =&gt; b.parent_pn))]
   if (!parentPns.length) return
-  const { data: parents } = await db.from('assemblies').select('pn,total_on_hand,discontinued,stage,is_subassembly,category').in('pn', parentPns)
+  const { data: parents } = await db.from('assemblies').select('pn,new_sku,total_on_hand,discontinued,stage,is_subassembly,category').in('pn', parentPns)
   for (const parent of (parents || [])) {
     if (!isEligibleForBackorderSync(parent)) continue
     if ((parent.total_on_hand || 0) &lt;= 0) await syncShopifyBackorder(parent.pn, parent.total_on_hand || 0)
@@ -10930,6 +11090,9 @@ async function bulkSyncShopifyBackorder(){
         // counted as an error nor logged as though Shopify was actually changed.
         skippedCount++;
         log.innerHTML+='<span style="color:var(--text3)">SKIPPED&nbsp;&nbsp;</span> '+escHtml(pn)+' — pre-order template, not managed by backorder sync<br>';
+      } else if(d&&d.skipped_not_managed){
+        skippedCount++;
+        log.innerHTML+='<span style="color:var(--text3)">SKIPPED&nbsp;&nbsp;</span> '+escHtml(pn)+' — not a TGK product, not managed by backorder sync<br>';
       } else if(d&&d.logged_action==='partial'){
         // [FIX] Some but not all of this SKU's Shopify variant instances (e.g. the same SKU
         // listed on more than one chassis page) actually backordered -- one silently reverted.
