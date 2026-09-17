@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.27';
+const TGK_ERP_VERSION = 'v23.30';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -2067,6 +2067,13 @@ function syncShopifyTemplate(pn,newOh){
         // reports ok:false, this branch just says so plainly instead of falling into the
         // generic failure branch below and triggering a pointless product-template fallback.
         console.log('[Shopify variant BO] '+shopSku+': skipped -- every matching Shopify variant is on hold ('+(d.held_count||0)+'). Release the hold if this SKU should sync normally.');
+      }
+      else if(d&&d.skipped_all_preorder){
+        // [FIX] This branch is load-bearing, not cosmetic: without it a pre-order SKU fell into
+        // the generic failure branch below, which calls _productFallback() - and that writes the
+        // product template DIRECTLY, overwriting the very pre-order template the edge function
+        // just refused to touch. Handled explicitly so the fallback never runs for these.
+        console.log('[Shopify variant BO] '+shopSku+': skipped -- on a pre-order/custom Shopify template ('+((d.skipped_templates||[]).map(function(x){return x.template;}).join(', ')||'custom')+'). Backorder automation does not manage those.');
       }
       else if((txt||'').trim()==='ok'||(txt||'').trim()==='pong'){console.log('[Shopify variant BO] action not deployed - product-template fallback for',shopSku);_productFallback();}
       else{console.warn('[Shopify variant BO]',shopSku,(d&&d.error)||r.status);_productFallback();}
@@ -5304,8 +5311,13 @@ function _renderBulkBoxResults(results){
     out+='<div style="margin-bottom:14px">'
       +'<div style="font-size:var(--t-xs);font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--orange);margin-bottom:6px">Different box used — needs a look ('+suggested.length+')</div>'
       +suggested.map(function(r){
+        // A mailer row has no dimsStr/delta (there are no real dimensions - that IS the finding),
+        // so it gets its own wording rather than rendering "undefined, closest match ... (NaNin)".
+        var _sugTxt=(r.v.kind==='mailer')
+          ? '0\u2033 \u00d7 0\u2033 \u00d7 0\u2033 (no rigid box) \u2014 suggested mailer '+escHtml(dispSku(r.v.box.pn))
+          : r.v.dimsStr+', closest match '+escHtml(dispSku(r.v.box.pn))+' (\u00b1'+r.v.delta.toFixed(1)+'in)';
         return '<div style="display:flex;align-items:center;gap:10px;padding:7px 10px;background:var(--orange-dim);border-radius:var(--r-sm);margin-bottom:4px;font-size:var(--t-sm)">'
-          +'<div style="flex:1"><b style="color:var(--orange)">'+escHtml(r.orderNum)+'</b> <span style="color:var(--text2)">— '+r.v.dimsStr+', closest match '+escHtml(dispSku(r.v.box.pn))+' (\u00b1'+r.v.delta.toFixed(1)+'in)</span></div>'
+          +'<div style="flex:1"><b style="color:var(--orange)">'+escHtml(r.orderNum)+'</b> <span style="color:var(--text2)">— '+_sugTxt+'</span></div>'
           +'<button class="btn btn-sm btn-teal" onclick="confirmSingleBulkBox(\''+escHtml(r.orderNum)+'\',\''+escHtml(r.v.box.pn)+'\')">Confirm</button>'
           +'<button class="btn btn-sm" onclick="document.getElementById(\'bbm-ov\')?.remove();openShippingBoxModal(\''+escHtml(r.orderNum)+'\')">Review</button>'
         +'</div>';
@@ -5498,6 +5510,38 @@ function _orderBOMBoxParts(orderNum){
   return out;
 }
 
+// Finds the catalog part that represents a bubble mailer. Keyword-based on purpose: a hardcoded
+// PN would silently stop working the moment the part is renamed or re-numbered, and this catalog
+// already treats "mailer" as a recognised packaging keyword elsewhere (NONRAW_SUPPLY_KW). Prefers
+// an explicit "bubble" match, then any mailer, then a poly/padded envelope, and prefers parts
+// actually in stock so it does not suggest something nobody can pull off the shelf.
+function _findMailerPart(allBoxParts){
+  function hay(p){return ((p.pn||'')+' '+(p.description||'')).toLowerCase();}
+  var tiers=[
+    function(p){var h=hay(p);return h.indexOf('bubble')!==-1&&h.indexOf('mailer')!==-1;},
+    function(p){return hay(p).indexOf('mailer')!==-1;},
+    function(p){var h=hay(p);return h.indexOf('envelope')!==-1&&(h.indexOf('poly')!==-1||h.indexOf('padded')!==-1||h.indexOf('bubble')!==-1);}
+  ];
+  // Searches the modal's box-parts shortlist FIRST, then falls back to the whole catalog. The real
+  // mailer (S-22393 "Bubble Mailer") has a Uline-style PN with no 'box'/'pkg'/'-ship' token in it,
+  // so whether it lands in that shortlist depends entirely on how its category happens to be set -
+  // searching only the shortlist would miss it on any catalog where it isn't categorised as a box,
+  // and silently report "no mailer part found" for a part that plainly exists.
+  var pools=[];
+  if(allBoxParts&&allBoxParts.length)pools.push(allBoxParts);
+  pools.push((S.parts||[]));
+  for(var pi=0;pi<pools.length;pi++){
+    for(var i=0;i<tiers.length;i++){
+      var hits=pools[pi].filter(function(p){return p&&!p.discontinued&&tiers[i](p);});
+      if(hits.length){
+        hits.sort(function(a,b){return (b.total_unpckgd||0)-(a.total_unpckgd||0);});
+        return hits[0];
+      }
+    }
+  }
+  return null;
+}
+
 // The matching engine itself, with no DOM dependency - shared by the single-order modal
 // (_shpBoxAutoMatch) and the bulk review across every pending order. One source of truth for
 // what counts as a match, so the two paths can never disagree about the same order.
@@ -5511,6 +5555,19 @@ async function _shpBoxVerdict(orderNum,allBoxParts){
     return{kind:'error',note:'Couldn\u2019t reach ShipStation',ctx:'ShipStation lookup failed, picked manually'};
   }
   if(d.error||!d.found)return{kind:'nodata',note:d.note||'No shipment on file for this order yet',ctx:'No ShipStation shipment on file, picked manually'};
+  // [FEATURE] An explicit 0 x 0 x 0 from ShipStation means the shipment went out with no rigid box
+  // - in practice a bubble mailer - which is different information from "nobody typed dimensions
+  // in" and shouldn't be thrown away as a generic no-data. The mailer is identified by keyword
+  // rather than a hardcoded PN so it keeps working if the part is renamed or re-numbered; if no
+  // mailer-looking part exists in the catalog the verdict still reports the 0x0x0 finding rather
+  // than silently falling back, so the reason for the manual pick is never lost.
+  if(d.zeroDimensions){
+    var mailer=_findMailerPart(allBoxParts);
+    if(mailer)return{kind:'mailer',box:mailer,
+      ctx:'ShipStation reported 0x0x0 (no rigid box) - auto-suggested bubble mailer '+mailer.pn};
+    return{kind:'nodata',note:'ShipStation reported 0\u2033 \u00d7 0\u2033 \u00d7 0\u2033 (no rigid box \u2014 likely a mailer), but no mailer part was found in the catalog',
+      ctx:'ShipStation reported 0x0x0 but no mailer part exists in the catalog, picked manually'};
+  }
   if(!d.hasDimensions)return{kind:'nodata',note:'ShipStation has this shipment but no box dimensions were entered',ctx:'ShipStation had no dimensions on file, picked manually'};
 
   var shipDims=[d.length,d.width,d.height];
@@ -5560,6 +5617,20 @@ async function _shpBoxAutoMatch(orderNum,allBoxParts){
       +'<span style="color:var(--text2)">No additional box was used \u2014 use Skip below.</span>';
     var skipBtn=document.querySelector('[onclick^="skipShippingBox"]');
     if(skipBtn){skipBtn.style.borderColor='var(--teal)';skipBtn.style.color='var(--teal)';skipBtn.style.fontWeight='700';}
+    return;
+  }
+  if(v.kind==='mailer'){
+    statusEl.innerHTML='<span style="color:var(--orange);font-weight:600">ShipStation reported 0\u2033 \u00d7 0\u2033 \u00d7 0\u2033 \u2014 no rigid box, so this shipped in a mailer.</span> '
+      +'<span style="color:var(--text2)">Suggested: '+escHtml(dispSku(v.box.pn))+' \u2014 selected below, confirm to log it.</span>';
+    var mOpt=document.querySelector('.shpbox-opt[data-pn="'+v.box.pn+'"]');
+    if(mOpt)mOpt.dispatchEvent(new Event('click'));
+    else{
+      // The mailer exists in the catalog but isn't in the box-parts shortlist rendered in this
+      // modal (its category may not be a box category). Put it in the search field so the Log
+      // button right next to it works without hunting for the PN.
+      var sIn=document.getElementById('shpbox-search');
+      if(sIn)sIn.value=v.box.pn;
+    }
     return;
   }
   if(v.kind==='suggested'){
@@ -7735,6 +7806,21 @@ async function checkOrderRisk(shopifyOrderId: string | number, orderName: string
   }
 }
 
+// [FIX] See the matching note in shipstation-ship.ts. A product deliberately merchandised on a
+// PRE-ORDER template in Shopify was still being pushed into backorder by this automation: the only
+// guard was the ERP's own category field literally equalling 'Pre-Order', so a product set up as
+// pre-order on the Shopify side alone had nothing protecting it. reconcileProductTemplate below
+// already refuses to overwrite a bespoke template, but that runs AFTER the variant-level inventory
+// and metafield writes that are what actually break the pre-order presentation. This is the same
+// rule applied earlier and to the whole operation, in both directions - reverting would untrack a
+// pre-order variant just as wrongly as backordering it.
+function isManagedBackorderTemplate(templateSuffix: string | null | undefined): boolean {
+  const cur = String(templateSuffix || '').trim().toLowerCase()
+  const boTpl = (Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder').trim().toLowerCase()
+  if (cur === '' || cur === 'default' || cur === 'default product') return true
+  return cur === boTpl
+}
+
 async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;any&gt; {
   // Typed explicitly: inferring from/to/skipped as the null type makes every later string
   // assignment a type error, which fails the Edge Function deploy outright.
@@ -8098,7 +8184,7 @@ Deno.serve(async (req) =&gt; {
     // that was actually producing "No Shopify variant found" for real SKUs in a large numbered
     // family (TGK-0308-15/16/17, TGK-0409-10/13/15, etc.) whenever the true match fell outside
     // the first 10 fuzzy-tokenized results.
-    const find = await gql('{ productVariants(first: 10, query: "sku:\\\\"' + safe + '\\\\"") { edges { node { id sku inventoryItem { id } product { id } metafield(namespace: \\"custom\\", key: \\"estimated_arrival_date\\") { value } } } } }')
+    const find = await gql('{ productVariants(first: 10, query: "sku:\\\\"' + safe + '\\\\"") { edges { node { id sku inventoryItem { id } product { id templateSuffix } metafield(namespace: \\"custom\\", key: \\"estimated_arrival_date\\") { value } } } } }')
     const edges = find?.data?.productVariants?.edges || []
     const allMatches = edges.filter((e:any) =&gt; (e.node.sku || '').trim().toUpperCase() === sku.toUpperCase())
     if (!allMatches.length) return new Response(JSON.stringify({error:'No Shopify variant found for SKU: ' + sku, debug: edges.map((e:any)=&gt;e.node.sku)}), {status:404, headers:{...CORS,'Content-Type':'application/json'}})
@@ -8107,8 +8193,21 @@ Deno.serve(async (req) =&gt; {
       const hq = await db.from('variant_holds').select('shopify_variant_id').eq('sku', sku).eq('active', true)
       heldIds = new Set((hq.data || []).map((r:any) =&gt; r.shopify_variant_id))
     } catch (e) { console.warn('[set_variant_backorder] hold lookup failed:', e) }
-    const targets = allMatches.filter((e:any) =&gt; !heldIds.has(e.node.id))
-    const skippedHeld = allMatches.length - targets.length
+    const notHeld = allMatches.filter((e:any) =&gt; !heldIds.has(e.node.id))
+    const skippedHeld = allMatches.length - notHeld.length
+    // Pre-order / bespoke-template products are intentional merchandising - excluded before any
+    // write happens, not merely left out of the template reconciliation at the end.
+    const targets = notHeld.filter((e:any) =&gt; isManagedBackorderTemplate(e.node.product?.templateSuffix))
+    const skippedTemplates = notHeld
+      .filter((e:any) =&gt; !isManagedBackorderTemplate(e.node.product?.templateSuffix))
+      .map((e:any) =&gt; ({ variant: e.node.id, product: e.node.product?.id, template: e.node.product?.templateSuffix || '' }))
+    if (skippedTemplates.length) console.log('[set_variant_backorder]', sku, '- skipped', skippedTemplates.length, 'variant(s) on a pre-order/custom template:', JSON.stringify(skippedTemplates.map((x:any)=&gt;x.template)))
+    if (!targets.length &amp;&amp; skippedTemplates.length) {
+      // Same honesty rule as the all-held case below: nothing was actually changed on Shopify, so
+      // this must not be logged or counted as a successful backorder sync.
+      return new Response(JSON.stringify({ok:false, skipped_all_preorder:true, skipped_templates:skippedTemplates,
+        note:'every variant for this SKU is on a pre-order/custom template; backorder automation does not manage those'}), {headers:{...CORS,'Content-Type':'application/json'}})
+    }
     if (!targets.length) {
       // [FIX] ok was true here, which caused BOTH ERP callers to treat a fully-held SKU as a
       // successful backorder sync -- the single-SKU caller's _logSync() wrote a 'backorder' row
@@ -8252,7 +8351,8 @@ Deno.serve(async (req) =&gt; {
       expected_policy: 'CONTINUE', policy_ok: primary.policy_ok, failsafe_applied: primary.failsafe_applied,
       restock_date: primary.restock_date, eta_preserved: primary.eta_preserved, template: primary.template,
       orderable: primary.orderable,
-      variants_updated: perVariant.length, held_skipped: skippedHeld, results: perVariant
+      variants_updated: perVariant.length, held_skipped: skippedHeld,
+      preorder_skipped: skippedTemplates.length, skipped_templates: skippedTemplates, results: perVariant
     }), {headers:{...CORS,'Content-Type':'application/json'}})
   }
 if (body.action === 'list_product_templates') {
@@ -9062,6 +9162,26 @@ async function bomMaxBuild(pn: string): Promise&lt;{ hasBOM: boolean, maxBuild: 
   return { hasBOM: true, maxBuild: lo }
 }
 
+// [FIX] A product deliberately put on a PRE-ORDER template in Shopify was still being forced into
+// backorder by this automation. The only guard that existed was isEligibleForBackorderSync, which
+// checks the ERP's OWN category field for the literal string 'Pre-Order' - so a product merchandised
+// as pre-order purely on the Shopify side (its template_suffix set there, which is how it's actually
+// done) had nothing stopping it: the variant got tracked, zeroed and stamped with a backorder ETA,
+// overwriting the pre-order presentation the customer was meant to see.
+// reconcileProductTemplate already refuses to touch a bespoke template ("custom template - not
+// managed"), but that only ever protected the PRODUCT's template field - not the variant-level
+// inventory/metafield writes that happen before it, which are what actually break a pre-order.
+// This applies the same rule one level earlier and to the whole operation: if the product is
+// sitting on any template that isn't the default or the backorder template, it is intentional
+// merchandising (pre-order or otherwise) and the backorder automation leaves it completely alone,
+// in BOTH directions - "revert to available" would untrack a pre-order variant just as wrongly.
+function isManagedBackorderTemplate(templateSuffix: string | null | undefined): boolean {
+  const cur = String(templateSuffix || '').trim().toLowerCase()
+  const boTpl = (Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder').trim().toLowerCase()
+  if (cur === '' || cur === 'default' || cur === 'default product') return true
+  return cur === boTpl
+}
+
 async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&gt; {
   const { data: toggleRow } = await db.from('settings').select('value').eq('key', 'shopify_backorder_sync_enabled').limit(1)
   const syncEnabled = toggleRow?.[0]?.value
@@ -9108,10 +9228,15 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
       return r
     }
     const safeBO = shopSkuBO.replace(/"/g, '')
-    const findBO = await gqlBO('{ productVariants(first: 10, query: "sku:' + safeBO + '") { edges { node { id sku inventoryItem { id } product { id } metafield(namespace: "custom", key: "estimated_arrival_date") { value } } } } }')
+    const findBO = await gqlBO('{ productVariants(first: 10, query: "sku:' + safeBO + '") { edges { node { id sku inventoryItem { id } product { id templateSuffix } metafield(namespace: "custom", key: "estimated_arrival_date") { value } } } } }')
     const edgesBO = findBO?.data?.productVariants?.edges || []
     const mBO = edgesBO.find((e:any) =&gt; (e.node.sku || '').trim().toUpperCase() === shopSkuBO.toUpperCase())
     if (!mBO) { console.warn('[SS-&gt;Shopify] no variant for SKU', shopSkuBO, '(from canonical ' + pn + ')'); return }
+    // Pre-order (or any other bespoke template) is deliberate merchandising - never override it.
+    if (!isManagedBackorderTemplate(mBO.node.product?.templateSuffix)) {
+      console.log('[SS-&gt;Shopify] skipped', pn, '- product is on the "' + (mBO.node.product?.templateSuffix || '') + '" template (pre-order/custom), not managed by backorder automation')
+      return
+    }
     const vId = mBO.node.id
     const iId = mBO.node.inventoryItem?.id
     const pId = mBO.node.product?.id
@@ -9989,6 +10114,18 @@ Deno.serve(async (req) =&gt; {
       const ship = (payload.shipments || [])[0]
       if (!ship) return json({ ok: true, found: false, note: 'No shipment on file yet for this order' })
       const dims = ship.dimensions
+      // [FEATURE] 0" x 0" x 0" is NOT the same as "nobody entered dimensions". ShipStation records
+      // an explicit all-zero size when a shipment went out in something with no rigid box
+      // dimensions to speak of - in practice, a bubble mailer. Both cases previously collapsed to
+      // the same hasDimensions:false result (0 is falsy, so the old check could not tell them
+      // apart), which meant the ERP could only ever say "no dimensions on file, pick manually".
+      // Flagging the all-zero case separately lets the Log Box modal suggest the mailer directly.
+      const _dl = Number(dims?.length) || 0, _dw = Number(dims?.width) || 0, _dh = Number(dims?.height) || 0
+      if (dims &amp;&amp; _dl === 0 &amp;&amp; _dw === 0 &amp;&amp; _dh === 0) {
+        return json({ ok: true, found: true, hasDimensions: false, zeroDimensions: true,
+          units: dims.units || 'inches',
+          note: 'ShipStation recorded this shipment as 0 x 0 x 0 - no rigid box' })
+      }
       if (!dims || !dims.length || !dims.width || !dims.height) {
         return json({ ok: true, found: true, hasDimensions: false, note: 'ShipStation has this shipment but no dimensions were entered for it' })
       }
@@ -10685,6 +10822,11 @@ async function bulkSyncShopifyBackorder(){
         // visible, not counted as an error, and not logged as if Shopify was touched.
         skippedCount++;
         log.innerHTML+='<span style="color:var(--text3)">SKIPPED&nbsp;&nbsp;</span> '+escHtml(pn)+' — on hold ('+(d.held_count||0)+' variant'+(d.held_count===1?'':'s')+'), not synced<br>';
+      } else if(d&&d.skipped_all_preorder){
+        // Pre-order is deliberate merchandising - reported as its own outcome so it is neither
+        // counted as an error nor logged as though Shopify was actually changed.
+        skippedCount++;
+        log.innerHTML+='<span style="color:var(--text3)">SKIPPED&nbsp;&nbsp;</span> '+escHtml(pn)+' — pre-order template, not managed by backorder sync<br>';
       } else if(d&&d.logged_action==='partial'){
         // [FIX] Some but not all of this SKU's Shopify variant instances (e.g. the same SKU
         // listed on more than one chassis page) actually backordered -- one silently reverted.
