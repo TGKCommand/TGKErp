@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.24';
+const TGK_ERP_VERSION = 'v23.26';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -7591,6 +7591,56 @@ function centralDateOnly(input?: string | null): string {
   const d = input ? new Date(input) : new Date()
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d)
 }
+
+// [FIX] Root cause of a brand-new single-line order showing up TWICE in the ERP (order #10516):
+// both the orders/create insert loop and the orders/updated "new line" insert (added earlier this
+// session) follow a check-then-insert pattern with no atomicity - read whether a row already
+// exists, then insert if not. Shopify commonly REDELIVERS orders/create itself if a response is
+// slow or non-2xx (the same behavior ShipStation's webhooks already have a documented guard for
+// elsewhere in this file), and if the second delivery's existence check runs before the first
+// delivery's insert has committed, both slip through and both insert. No amount of narrowing that
+// check-then-insert window in application code can fully close a true race - a database-level
+// unique constraint would be the airtight fix, but adding one requires first cleaning up whatever
+// duplicates already exist from this bug, which is a deliberate step for Jon to take with eyes
+// open, not something to do silently mid-webhook. Until that constraint exists, this closes the
+// loop defensively instead: right after any insert that could have raced, re-check for siblings
+// sharing the same order and the same CANONICAL item (matching pn OR new_sku on assemblies/parts,
+// same resolution used elsewhere in this file) and collapse back down to one, keeping whichever
+// row is oldest. Both concurrent invocations doing this converges to the same correct end state
+// regardless of which one gets there first or whether both run it - deleting a row that is already
+// gone is a no-op, not a new race.
+async function _canonicalPnFor(pn: string): Promise&lt;string&gt; {
+  const n = pn.trim().toUpperCase()
+  let { data: a } = await db.from('assemblies').select('pn').eq('pn', pn).limit(1)
+  if (a?.length) return a[0].pn
+  ;({ data: a } = await db.from('assemblies').select('pn').eq('new_sku', pn).limit(1))
+  if (a?.length) return a[0].pn
+  let { data: p } = await db.from('parts').select('pn').eq('pn', pn).limit(1)
+  if (p?.length) return p[0].pn
+  ;({ data: p } = await db.from('parts').select('pn').eq('new_sku', pn).limit(1))
+  if (p?.length) return p[0].pn
+  return n
+}
+async function dedupeSalesLine(orderName: string, pn: string): Promise&lt;void&gt; {
+  try {
+    const canon = await _canonicalPnFor(pn)
+    const { data: rows } = await db.from('sales').select('id,pn,created_at').eq('order_number', orderName)
+    if (!rows || rows.length &lt; 2) return
+    const matching: any[] = []
+    for (const r of rows) {
+      if (!r.pn) continue
+      const rc = await _canonicalPnFor(r.pn)
+      if (rc === canon) matching.push(r)
+    }
+    if (matching.length &lt; 2) return
+    matching.sort((x: any, y: any) =&gt; String(x.created_at || x.id).localeCompare(String(y.created_at || y.id)))
+    const dupes = matching.slice(1)
+    for (const d of dupes) {
+      await db.from('sales').delete().eq('id', d.id)
+      console.warn('[shopify-orders] dedupe: removed race-duplicate sales row', d.id, 'for', orderName, pn, '- kept', matching[0].id)
+    }
+  } catch (e) { console.warn('[shopify-orders] dedupeSalesLine failed:', e) }
+}
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-shopify-topic, x-shopify-hmac-sha256',
@@ -8432,13 +8482,17 @@ if (body.action === 'list_product_templates') {
       for (const li of (order.line_items || [])) {
         const pn = li.sku ? li.sku.trim().toUpperCase() : (li.title || '').trim()
         if (!pn) continue
+        // [FIX] Same falsy-zero trap as the orders/updated reconciliation below - a line that
+        // arrives already zeroed out is not part of the order and must not be inserted as qty 1.
+        const _createQty = (li.quantity === undefined || li.quantity === null) ? 1 : Number(li.quantity)
+        if (_createQty &lt;= 0) { console.log('[shopify-orders] orders/create: skipping zero-quantity line', order.name, pn); continue }
         const { data: existing } = await db.from('sales').select('id').eq('order_number', order.name).eq('pn', pn).limit(1)
         if (existing?.length) { console.log('[shopify-orders] skipping duplicate', order.name, pn); continue }
         const shipAddr = order.shipping_address || {}
         const { error: insErr } = await db.from('sales').insert({
           order_number: order.name,
           pn,
-          qty: li.quantity || 1,
+          qty: _createQty,
           source: 'Shopify',
           fulfillment_status: 'Open',
           financial_status: order.financial_status || 'pending',
@@ -8457,6 +8511,7 @@ if (body.action === 'list_product_templates') {
           shopify_line_item_id: String(li.id),
         })
         if (insErr) console.error('[shopify-orders] insert error:', insErr.message, insErr.details)
+        else await dedupeSalesLine(order.name, pn)
       }
       // Runs after the insert loop so it flags rows that already exist, rather than racing them.
       await checkOrderRisk(order.id, order.name)
@@ -8504,6 +8559,133 @@ if (body.action === 'list_product_templates') {
       if (Object.keys(updFields).length) {
         await db.from('sales').update(updFields).eq('order_number', order.name)
       }
+
+      // [FIX] Root cause of a removed/edited line item never updating in the ERP: this handler
+      // previously never looked at order.line_items again after the order was first created, so
+      // deleting a SKU from an existing multi-SKU order (in Shopify admin) or changing its
+      // quantity had NO code path reacting to it at all - the sales row just sat there forever
+      // with stale data. orders/updated fires on exactly this kind of edit (in addition to the
+      // more specific orders/edited topic, which carries an edit-delta payload instead of the
+      // full order - reconciling against this handler's full current snapshot is simpler and
+      // reuses the exact matching/insert logic orders/create already relies on, rather than
+      // hand-parsing Shopify's separate addition/removal delta shape).
+      //
+      // Three cases, each mirroring an existing convention elsewhere in this file:
+      //   - SKU present before but missing now -&gt; cancel that line (same convention
+      //     orders/cancelled already uses for a whole-order cancellation), but ONLY if it is
+      //     still in a non-terminal status. A line that already shipped keeps its record
+      //     untouched - the stock already left, and cancelling it would misrepresent a real
+      //     shipment as though it never happened.
+      //   - SKU present both before and now, with a different quantity -&gt; update qty on that
+      //     row (only while non-terminal - a shipped line's qty reflects what actually left).
+      //   - SKU present now but not before -&gt; insert it, same shape orders/create uses.
+      // Known limitation: matching is by SKU (falling back to title), same as orders/create -
+      // if one order genuinely has two separate line items sharing the same SKU, this cannot
+      // tell them apart. That is an existing limitation of the matching scheme, not new here.
+      const _TERMINAL_LINE_STATUSES = ['shipped', 'delivered', 'cancelled', 'canceled', 'refunded', 'returned', 'fulfilled']
+      const currentLineItems = order.line_items || []
+      const _normU = (x: string) =&gt; (x || '').trim().toUpperCase()
+      // [FIX] Root cause of duplicated sales rows on split/multi-shipment orders: this reconciliation
+      // originally matched Shopify's line-item SKU against existing sales.pn as plain, un-resolved
+      // strings. This ERP has a known, previously-documented legacy-pn/new_sku duality on its own
+      // TGK-numbered catalog - if a later orders/updated webhook ever reports a line under the OTHER
+      // alias than what sales.pn already holds (a rename since the order was created, or simply which
+      // alias Shopify happens to echo back on a given webhook), the old row looked "removed" (wrong
+      // alias not found -&gt; cancelled) AND the same line looked "new" (that alias not seen before -&gt;
+      // inserted) IN THE SAME PASS - producing a duplicate row for one physical item. The vendor
+      // drop-ship SKUs on the same orders never hit this because they have no assemblies/parts record
+      // at all, so no duality is possible for them - consistent with only the TGK-catalog lines
+      // duplicating in practice. Resolving every SKU string (both Shopify's current line items and the
+      // existing sales.pn values) to the assembly/part's canonical pn before comparing - same pattern
+      // now used in shipstation-ship.ts's hold_sync - closes this for good.
+      const _aliasCandidates = new Set&lt;string&gt;()
+      for (const li of currentLineItems) { const pn = li.sku ? li.sku.trim() : (li.title || '').trim(); if (pn) _aliasCandidates.add(pn) }
+      const { data: existingLineRows } = await db.from('sales').select('id,pn,qty,fulfillment_status').eq('order_number', order.name)
+      for (const row of (existingLineRows || [])) if (row.pn) _aliasCandidates.add(row.pn)
+      const _aliasList = [..._aliasCandidates]
+      const _canonMap: Record&lt;string, string&gt; = {}
+      if (_aliasList.length) {
+        const { data: a1 } = await db.from('assemblies').select('pn').in('pn', _aliasList)
+        ;(a1 || []).forEach((r: any) =&gt; { _canonMap[_normU(r.pn)] = r.pn })
+        const { data: a2 } = await db.from('assemblies').select('pn,new_sku').in('new_sku', _aliasList)
+        ;(a2 || []).forEach((r: any) =&gt; { if (r.new_sku) _canonMap[_normU(r.new_sku)] = r.pn })
+        const { data: p1 } = await db.from('parts').select('pn').in('pn', _aliasList)
+        ;(p1 || []).forEach((r: any) =&gt; { if (!(_normU(r.pn) in _canonMap)) _canonMap[_normU(r.pn)] = r.pn })
+        const { data: p2 } = await db.from('parts').select('pn,new_sku').in('new_sku', _aliasList)
+        ;(p2 || []).forEach((r: any) =&gt; { if (r.new_sku &amp;&amp; !(_normU(r.new_sku) in _canonMap)) _canonMap[_normU(r.new_sku)] = r.pn })
+      }
+      // Falls back to the normalized raw string when nothing matched (e.g. drop-ship SKUs with no
+      // assemblies/parts record at all) - identical to today's behavior for those.
+      const _canon = (raw: string): string =&gt; { const n = _normU(raw); return _canonMap[n] || n }
+      // [FIX] Root cause of "the ERP keeps re-adding a SKU I zeroed out in Shopify, and tells me
+      // to order 1 of it": this read the incoming quantity as \`li.quantity || 1\`, and 0 is falsy
+      // in JS - so a line explicitly zeroed out in Shopify (the normal way to remove an item from
+      // an order that is already in fulfillment) was read as a quantity of ONE. That made the
+      // reconciliation treat a removed line as a live line: it stayed out of the "cancel" branch,
+      // and once the row was deleted by hand it came back as a "new" line on the very next
+      // webhook, at qty 1, forever. Shopify keeps sending zeroed lines in line_items rather than
+      // dropping them from the array, so the quantity is the ONLY signal that it's gone. Now: a
+      // missing/undefined quantity still defaults to 1 (unchanged for normal orders), but an
+      // explicit 0 or negative is treated as removed - excluded from the current-lines map so the
+      // existing row gets cancelled, and excluded from the insert list so it is never re-added.
+      const _liQty = (li: any): number =&gt; (li.quantity === undefined || li.quantity === null) ? 1 : Number(li.quantity)
+      const currentPnQty: Record&lt;string, number&gt; = {}
+      for (const li of currentLineItems) {
+        const pn = li.sku ? li.sku.trim().toUpperCase() : (li.title || '').trim()
+        if (!pn) continue
+        const q = _liQty(li)
+        if (q &lt;= 0) { console.log('[shopify-orders] orders/updated: line zeroed out in Shopify -&gt;', order.name, pn, '- treating as removed'); continue }
+        currentPnQty[_canon(pn)] = q
+      }
+      for (const row of (existingLineRows || [])) {
+        const rowPn = _canon(row.pn || '')
+        const isTerminal = _TERMINAL_LINE_STATUSES.includes(String(row.fulfillment_status || '').toLowerCase())
+        if (isTerminal) continue
+        if (!(rowPn in currentPnQty)) {
+          await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('id', row.id)
+          console.log('[shopify-orders] orders/updated: line removed from order -&gt;', order.name, rowPn, '- cancelled')
+        } else if ((row.qty || 1) !== currentPnQty[rowPn]) {
+          await db.from('sales').update({ qty: currentPnQty[rowPn] }).eq('id', row.id)
+          console.log('[shopify-orders] orders/updated: qty changed -&gt;', order.name, rowPn, row.qty, '-&gt;', currentPnQty[rowPn])
+        }
+      }
+      const existingPnSet = new Set((existingLineRows || []).map((r: any) =&gt; _canon(r.pn || '')))
+      const newLineItems = currentLineItems.filter((li: any) =&gt; {
+        const pn = li.sku ? li.sku.trim().toUpperCase() : (li.title || '').trim()
+        return pn &amp;&amp; _liQty(li) &gt; 0 &amp;&amp; !existingPnSet.has(_canon(pn))
+      })
+      if (newLineItems.length) {
+        const shipAddr = order.shipping_address || {}
+        const custName = (order.shipping_address?.name || order.billing_address?.name || (order.customer ? (order.customer.first_name||'')+' '+(order.customer.last_name||'') : '')).trim()
+        const custEmail = order.email || order.customer?.email || ''
+        for (const li of newLineItems) {
+          const pn = li.sku ? li.sku.trim().toUpperCase() : (li.title || '').trim()
+          const { error: insErr } = await db.from('sales').insert({
+            order_number: order.name,
+            pn,
+            qty: _liQty(li),
+            source: 'Shopify',
+            fulfillment_status: 'Open',
+            financial_status: order.financial_status || 'pending',
+            sale_date: centralDateOnly(order.created_at),
+            customer_name: custName || null,
+            customer_email: custEmail || null,
+            customer_phone: shipAddr.phone || order.customer?.phone || null,
+            shipping_address1: shipAddr.address1 || null,
+            shipping_address2: shipAddr.address2 || null,
+            shipping_city: shipAddr.city || null,
+            shipping_province: shipAddr.province_code || shipAddr.province || null,
+            shipping_zip: shipAddr.zip || null,
+            shipping_country: shipAddr.country_code || shipAddr.country || null,
+            discount_code: (order.discount_codes &amp;&amp; order.discount_codes.length ? order.discount_codes[0].code : null),
+            shopify_order_id: String(order.id),
+            shopify_line_item_id: String(li.id),
+          })
+          if (insErr) console.error('[shopify-orders] orders/updated: insert new line error:', insErr.message)
+          else { console.log('[shopify-orders] orders/updated: new line added to existing order -&gt;', order.name, pn); await dedupeSalesLine(order.name, pn) }
+        }
+      }
+
       // Some fraud apps finish their risk assessment a moment after order creation - checking
       // again here (idempotent, see checkOrderRisk) catches those without needing a dedicated
       // webhook topic.
@@ -8618,30 +8800,25 @@ function json(data: unknown, status = 200) {
 }
 function stripHash(s: string): string { return s.replace(/^#/, '').replace(/^Manual_/i, '') }
 
-// [FIX] centralDateOnly was CALLED in three places (NEW_ORDER, ss_order_audit import,
-// ss_import_batch) but never defined anywhere in this file. NEW_ORDER therefore threw a
-// ReferenceError and returned 500 on every non-Shopify order, so ShipStation-created manual
-// orders never imported. ss_import_batch only broke when order.date was falsy, because || short
-// circuits before evaluating it.
-// Implementation taken verbatim from the shopify-orders edge function, which already had it, and
-// which matches the ERP client's own centralDateOnly() exactly. Intl with an IANA zone handles
-// daylight saving correctly; a fixed -6h offset would not, and would shift orders placed between
-// 00:00 and 01:00 Central onto the previous day for half the year. One implementation, three
-// places, no drift.
-function centralDateOnly(input?: string | null): string {
-  const d = input ? new Date(input) : new Date()
-  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d)
+// [FIX] Same falsy-zero trap fixed in shopify-orders.ts: \`item.quantity || 1\` reads an explicit
+// quantity of 0 as ONE, because 0 is falsy in JS. ShipStation genuinely does report zeroed line
+// items this way - confirmed live on order #10497, whose payload carried
+// {"sku":"JXB-C7001A0-S","quantity":0} - so every import path below would resurrect an item that
+// was deliberately removed from the order, as a quantity of one. A missing/undefined quantity
+// still defaults to 1 (unchanged for normal orders); an explicit 0 or negative means the line is
+// not part of the order and callers skip it entirely.
+function ssItemQty(item: any): number {
+  return (item?.quantity === undefined || item?.quantity === null) ? 1 : Number(item.quantity)
+}
+
+function centralDateOnly(d?: string): string {
+  const dt = d ? new Date(d) : new Date()
+  return new Date(dt.getTime() - 6 * 60 * 60 * 1000).toISOString().slice(0, 10)
 }
 
 async function buildOrderMap() {
   const { data } = await db.from('sales')
-    // [FIX 3a] added \`qty\` — bulk_sync now needs per-line quantity to deduct inventory, not just flip status
     .select('id,order_number,pn,fulfillment_status,qty')
-    // [FIX] Include On Hold and Pre-Order lines so bulk tracking sync catches shipments for orders that
-    // ShipStation shipped while the ERP still had them On Hold or Pre-Order. These were previously
-    // excluded, so every such shipment came back "not found in ERP" and never received tracking. Terminal
-    // states (Shipped/Delivered/Cancelled/fulfilled) stay excluded to avoid re-processing and
-    // double-deduction; deductForShipment also dedups on the tracking number as a second guard.
     .in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
     .limit(100000)
   const map: any = {}
@@ -8650,11 +8827,6 @@ async function buildOrderMap() {
     if (!map[key]) map[key] = []
     map[key].push(line)
   }
-  // [SPLIT] Alias known split children onto their parent's lines so bulk_sync stops counting them
-  // as notFound and hold_sync/cancel_sync can see them at all. NOTE this is coarse: a child maps to
-  // the parent's WHOLE line array, so holding one child marks every open line on the parent On Hold.
-  // That is the same coarseness this function already had for un-split orders. The precise version
-  // filters by ss_order_links.child_skus — worth doing only if partial holds on split orders come up.
   const { data: links } = await db.from('ss_order_links').select('ss_order_number,erp_order_number')
   for (const l of (links || [])) {
     const parentKey = stripHash(l.erp_order_number || '')
@@ -8668,17 +8840,6 @@ function ssAuth(): string {
   return btoa(k + ':' + s)
 }
 
-// ── SPLIT-ORDER RESOLUTION ───────────────────────────────────────────────────────────────────
-// A ShipStation split creates a NEW order with its own orderNumber (typically the parent's number
-// plus a suffix) and its own orderId. The only durable pointer back to the original is
-// advancedOptions.parentId, which is an orderId rather than an order number — so resolving it costs
-// one GET /orders/{id}. That happens once, at split time; the result is cached in ss_order_links and
-// every later webhook for the child is a plain table lookup.
-//
-// Before this existed, a split child arrived with an order number matching nothing in \`sales\`, which
-// left erpLines empty -&gt; allErpPns empty -&gt; matchedPns empty -&gt; the no-SKU-match branch ran an UPDATE
-// against an order number that does not exist. Silent no-op: no status change, no deduction, no error.
-
 async function fetchSSOrder(orderId: number | string): Promise&lt;any | null&gt; {
   try {
     const r = await fetch('https://ssapi.shipstation.com/orders/' + orderId, {
@@ -8689,7 +8850,6 @@ async function fetchSSOrder(orderId: number | string): Promise&lt;any | null&gt;
   } catch (e) { console.warn('[SS][split] GET /orders/' + orderId + ' threw:', e); return null }
 }
 
-// The ERP order_number for this raw number, honouring the '#' prefix variant. Null if unknown.
 async function erpOrderNumberFor(rawNum: string): Promise&lt;string | null&gt; {
   if (!rawNum) return null
   const { data: a } = await db.from('sales').select('id').eq('order_number', rawNum).limit(1)
@@ -8699,9 +8859,6 @@ async function erpOrderNumberFor(rawNum: string): Promise&lt;string | null&gt; {
   return null
 }
 
-// Called when a webhook arrives for an order number the ERP has never seen. If it is a split child,
-// records the child-&gt;parent link, flags the parent as split, and returns the parent's ERP
-// order_number. Returns null for anything that genuinely is not ours.
 async function linkSplitChild(order: any): Promise&lt;string | null&gt; {
   const childNum = stripHash(order?.orderNumber || '')
   if (!childNum) return null
@@ -8709,8 +8866,6 @@ async function linkSplitChild(order: any): Promise&lt;string | null&gt; {
     .select('erp_order_number').eq('ss_order_number', childNum).limit(1)
   if (known?.[0]?.erp_order_number) return known[0].erp_order_number
   const adv = order?.advancedOptions || {}
-  // parentId is the documented field; parentOrderId is covered in case the payload differs.
-  // Confirm against a real split payload in the logs before trusting either name.
   const parentId = adv.parentId ?? adv.parentOrderId ?? null
   if (!parentId) return null
   const parent = await fetchSSOrder(parentId)
@@ -8731,7 +8886,6 @@ async function linkSplitChild(order: any): Promise&lt;string | null&gt; {
   return erpNum
 }
 
-// Resolution used by SHIP_NOTIFY, where we hold a shipment object rather than an order object.
 async function resolveShipmentOrder(salesNum: string, ship: any): Promise&lt;{ num: string | null, viaSplit: boolean }&gt; {
   const direct = await erpOrderNumberFor(salesNum)
   if (direct) return { num: direct, viaSplit: false }
@@ -8745,25 +8899,10 @@ async function resolveShipmentOrder(salesNum: string, ship: any): Promise&lt;{ n
   return { num: null, viaSplit: false }
 }
 
-// [FIX 5a] Ported from the ERP reference copy — only genuine finished goods should ever have their
-// Shopify listing touched by the backorder automation. Subassemblies and hardware packs aren't
-// standalone Shopify products; Pre-Order items use a separate template that must never be overwritten;
-// discontinued/dev items shouldn't be actively managed. The deployed function was missing this gate,
-// so it could clobber the template on those SKUs.
 function isHWPackServer(pn: string): boolean {
-  return /^TGK-P\d/i.test(pn || '')
+  return /^TGK-P\\d/i.test(pn || '')
 }
-// Recompute a PRODUCT's template_suffix from the live state of ALL its variants.
-// Rule (must match the ERP's Theme Audit exactly):
-//   * single-variant product  -&gt; backorder template if that variant is backordered
-//   * multi-variant product   -&gt; backorder template ONLY if EVERY variant is backordered;
-//                                if even one is buyable the product stays on default.
-// A variant counts as backordered when it is tracked and its quantity is &lt;= 0.
-// Returns {changed, from, to, errors} and never throws -- template drift must never break
-// the inventory write that triggered it.
 async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;any&gt; {
-  // Typed explicitly: inferring from/to/skipped as the null type makes every later string
-  // assignment a type error, which fails the Edge Function deploy outright.
   const out: {changed: boolean, from: string | null, to: string | null, skipped: string | null, errors: string[]} =
     {changed: false, from: null, to: null, skipped: null, errors: []}
   if (!prodId) return out
@@ -8779,20 +8918,12 @@ async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;
     const boTpl = Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder'
     const desired = shouldBO ? boTpl : ''
     const current = prod.templateSuffix || ''
-    // This store's main template is literally named "Default product", so treat that (and
-    // a plain "default") as the default template rather than a bespoke one.
     const cnorm = current.trim().toLowerCase()
     const isDefaultTpl = (cnorm === '' || cnorm === 'default' || cnorm === 'default product')
     const currentEff = isDefaultTpl ? '' : current
     out.from = current; out.to = desired
-    // Only ever manage the default &lt;-&gt; backorder transition. Any other suffix (preorder,
-    // or any bespoke template) is intentional merchandising - overwriting it would destroy
-    // a deliberate setup, so leave those products completely alone.
     if (currentEff !== '' &amp;&amp; currentEff !== boTpl) { out.skipped = 'custom template "' + current + '" - not managed'; return out }
     if (currentEff === desired) return out
-    // productUpdate changed argument name across API versions (input: -&gt; product:). We were
-    // already bitten once by a mutation shape disappearing, so try the modern form first and
-    // fall back, rather than assuming either one.
     let applied = false
     const tryUpdate = async (argName: string) =&gt; {
       const m = await gqlFn('mutation { productUpdate(' + argName + ': {id: "' + prodId + '", templateSuffix: "' + desired + '"}) { product { templateSuffix } userErrors { field message } } }')
@@ -8819,10 +8950,6 @@ function isEligibleForBackorderSync(item: any): boolean {
   return true
 }
 
-// [SHARED] Mirrors the client's buildabilityForBackorder EXACTLY so the edge (ship-time) and the client
-// (manual/bulk sync) never disagree on backorder status. Pre-fetches the whole BOM tree in a bounded
-// number of queries, ignores packaging/supply lines, consumes subassembly on-hand before building the
-// remainder from raw parts, and draws a shared part from ONE stock pool across every place it is used.
 async function bomMaxBuild(pn: string): Promise&lt;{ hasBOM: boolean, maxBuild: number }&gt; {
   const bomOf: Record&lt;string, { child_pn: string, qty: number, item_type: string }[]&gt; = {}
   const childPns = new Set&lt;string&gt;()
@@ -8842,19 +8969,38 @@ async function bomMaxBuild(pn: string): Promise&lt;{ hasBOM: boolean, maxBuild: 
   }
   if (!(bomOf[pn] || []).length) return { hasBOM: false, maxBuild: 0 }
   const allChildren = [...childPns]
-  const partRec: Record&lt;string, { stock: number, cat: string }&gt; = {}
+  const partRec: Record&lt;string, { stock: number, cat: string, desc: string }&gt; = {}
   const asmRec: Record&lt;string, { oh: number }&gt; = {}
   if (allChildren.length) {
-    const { data: prows } = await db.from('parts').select('pn,total_unpckgd,category').in('pn', allChildren)
-    ;(prows || []).forEach((p: any) =&gt; { partRec[p.pn] = { stock: Number(p.total_unpckgd) || 0, cat: (p.category || '').toLowerCase() } })
+    const { data: prows } = await db.from('parts').select('pn,total_unpckgd,category,description').in('pn', allChildren)
+    ;(prows || []).forEach((p: any) =&gt; { partRec[p.pn] = { stock: Number(p.total_unpckgd) || 0, cat: (p.category || '').toLowerCase(), desc: (p.description || '').toLowerCase() } })
     const { data: arows } = await db.from('assemblies').select('pn,total_on_hand').in('pn', allChildren)
     ;(arows || []).forEach((a: any) =&gt; { asmRec[a.pn] = { oh: Number(a.total_on_hand) || 0 } })
   }
-  const SUPPLY = ['shipping', 'bulk pieces']
+  // [FIX] Ported from the ERP's shared isNonRawSupplyItem (index.html) - this used to check only
+  // SUPPLY (Shipping/Bulk Pieces) plus a raw substring scan for 'box'/'packaging'/'shipping'
+  // across the WHOLE category string. That missed PACK_CATS entries like "Boxes"/"Cartons"/
+  // "Labels"/"Packing" entirely (no substring overlap with the three words checked), and missed
+  // marketing/sticker/rebate-card categories altogether - meaning a product could be marked
+  // backordered on the live Shopify storefront because a shipping carton or a rebate card ran
+  // out, not because an actual component was missing. Also matches the client's fix for the
+  // opposite failure mode: a raw substring check on the full category path would wrongly treat a
+  // real part like "Products/Drivetrain/DUMPBOXES" as packaging purely because of a name
+  // collision - matching only the exact full category or its top-level "Category/Subcategory"
+  // segment avoids that.
+  const NONRAW_SUPPLY_CATS = ['box', 'boxes', 'packaging', 'packing', 'carton', 'cartons', 'label', 'labels', 'shipping', 'bulk pieces', 'sticker', 'stickers', 'decal', 'decals', 'rebate', 'rebate card', 'rebate cards', 'marketing', 'insert', 'inserts', 'literature', 'card', 'cards', 'flyer', 'flyers', 'brochure', 'brochures']
+  const NONRAW_SUPPLY_KW = ['sticker', 'decal', 'rebate', 'flyer', 'brochure', 'mailer', 'pamphlet']
   const inc = (i: { child_pn: string, item_type: string }): boolean =&gt; {
     if (i.item_type === 'packaging') return false
     const pr = partRec[i.child_pn]
-    if (pr) { const c = pr.cat; if (SUPPLY.includes(c)) return false; if (c.includes('box') || c.includes('packaging') || c.includes('shipping')) return false }
+    if (pr) {
+      const c = pr.cat
+      if (c) {
+        const top = c.split('/')[0].trim()
+        if (NONRAW_SUPPLY_CATS.includes(c) || NONRAW_SUPPLY_CATS.includes(top)) return false
+      }
+      if (NONRAW_SUPPLY_KW.some(k =&gt; pr.desc.includes(k) || i.child_pn.toLowerCase().includes(k))) return false
+    }
     return true
   }
   const isSub = (i: { child_pn: string, item_type: string }): boolean =&gt; (i.child_pn in asmRec) || i.item_type === 'assembly' || i.item_type === 'subassembly'
@@ -8872,7 +9018,7 @@ async function bomMaxBuild(pn: string): Promise&lt;{ hasBOM: boolean, maxBuild: 
     return Math.max(0, Math.min(...per))
   }
   const UB = ub(pn, 0)
-  if (UB === Infinity) return { hasBOM: true, maxBuild: 1 } // only packaging/supply remains -&gt; trivially buildable
+  if (UB === Infinity) return { hasBOM: true, maxBuild: 1 }
   if (UB &lt;= 0) return { hasBOM: true, maxBuild: 0 }
   const feasible = (N: number): boolean =&gt; {
     const partUsed: Record&lt;string, number&gt; = {}, subLeft: Record&lt;string, number&gt; = {}; let ok = true
@@ -8908,23 +9054,17 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
   const { data: toggleRow } = await db.from('settings').select('value').eq('key', 'shopify_backorder_sync_enabled').limit(1)
   const syncEnabled = toggleRow?.[0]?.value
   if (syncEnabled === false || syncEnabled === 'false') {
-    console.log('[SS-&gt;Shopify] sync disabled via ERP toggle — skipped for', pn)
+    console.log('[SS-&gt;Shopify] sync disabled via ERP toggle - skipped for', pn)
     return
   }
-  // [FIX 5b] eligibility gate — never touch subassembly / hardware-pack / pre-order / discontinued / dev listings
-  // [FIX B] new_sku-aware eligibility resolve (pn may be a new_sku)
   let { data: asmCheck } = await db.from('assemblies').select('pn,new_sku,use_new_sku,discontinued,stage,is_subassembly,category,force_backorder').eq('pn', pn).limit(1)
   if (!asmCheck?.length) { const _r = await db.from('assemblies').select('pn,new_sku,use_new_sku,discontinued,stage,is_subassembly,category,force_backorder').eq('new_sku', pn).limit(1); asmCheck = _r.data }
   const { data: partCheck } = asmCheck?.length ? { data: null } : await db.from('parts').select('pn,new_sku,use_new_sku,discontinued,category').eq('pn', pn).limit(1)
   const eligItem = asmCheck?.[0] || partCheck?.[0]
   if (eligItem &amp;&amp; !isEligibleForBackorderSync(eligItem)) {
-    console.log('[SS-&gt;Shopify] skipped — not eligible (subassembly/hardware pack/pre-order/discontinued/dev):', pn)
+    console.log('[SS-&gt;Shopify] skipped - not eligible (subassembly/hardware pack/pre-order/discontinued/dev):', pn)
     return
   }
-  // [SKU] Shopify variant SKUs are the customer-facing SKU (new_sku once use_new_sku is on).
-  // Callers such as cascadeShopifyBackorder hand us the CANONICAL pn, so resolve the display
-  // SKU before touching Shopify -- otherwise the variant lookup below silently misses every
-  // migrated product and the backorder never lands. Same rule as the client's dispPn().
   const shopSkuBO = (eligItem &amp;&amp; eligItem.use_new_sku &amp;&amp; eligItem.new_sku) ? eligItem.new_sku : pn
   if (shopSkuBO !== pn) console.log('[SS-&gt;Shopify] resolved canonical', pn, '-&gt; variant SKU', shopSkuBO)
   const store = (Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
@@ -8932,8 +9072,6 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
   if (!store || !key) return
   let template = ''
   let ssRestock = ''
-  // Manual override from the assembly's edit form: hold on backorder regardless of stock or
-  // buildability, until it is unticked. Checked before any of the automatic logic below.
   const forcedBO = !!(eligItem &amp;&amp; eligItem.force_backorder)
   if (forcedBO) {
     template = Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder'
@@ -8965,12 +9103,9 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
     const vId = mBO.node.id
     const iId = mBO.node.inventoryItem?.id
     const pId = mBO.node.product?.id
-    // Keep any ETA the variant already carries rather than pushing it further out.
     const existingEtaBO = String(mBO.node.metafield?.value || '').trim()
     if (isBO &amp;&amp; existingEtaBO) ssRestock = existingEtaBO
     if (isBO) {
-      // Backordered: track this variant only, zero it, and keep it PURCHASABLE (CONTINUE).
-      // Siblings untouched.
       if (iId) {
         await gqlBO('mutation { inventoryItemUpdate(id: "' + iId + '", input: {tracked: true}) { userErrors { message } } }')
         const locBO = await gqlBO('{ locations(first: 1) { edges { node { id } } } }')
@@ -8981,11 +9116,6 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
       const polBO = pBO?.data?.productVariantsBulkUpdate?.productVariants?.[0]?.inventoryPolicy || null
       const polErrsBO = (pBO?.data?.productVariantsBulkUpdate?.userErrors || []).map((u:any)=&gt;u.message)
       if (polBO !== 'CONTINUE') {
-        // FAIL-SAFE: tracked + anything-but-CONTINUE means customers cannot buy it, which
-        // violates the hard 'always orderable' rule. Could not confirm CONTINUE, so untrack
-        // the variant again - an untracked variant is always purchasable. Losing the
-        // backorder badge beats losing the sale. (Most likely cause: the Admin API token is
-        // missing the write_products scope, since tracking/quantity writes clearly succeed.)
         console.warn('[SS-&gt;Shopify] ' + pn + ': could NOT set inventoryPolicy CONTINUE (got ' + (polBO || 'null') + ')'
           + (polErrsBO.concat(gqlTopErrorsBO).length ? (' - Shopify said: ' + polErrsBO.concat(gqlTopErrorsBO).join(' | ')) : '')
           + ' -- untracking variant so it stays orderable. Check the write_products API scope.')
@@ -8996,13 +9126,11 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
         await gqlBO('mutation { metafieldsSet(metafields: [{ownerId: "' + vId + '", namespace: "custom", key: "estimated_arrival_date", value: "' + ssRestock + '", type: "single_line_text_field"}]) { userErrors { message } } }')
       }
     } else {
-      // Restock -&gt; back to made-to-order default: untrack the variant so it is always available.
       if (iId) await gqlBO('mutation { inventoryItemUpdate(id: "' + iId + '", input: {tracked: false}) { userErrors { message } } }')
       await gqlBO('mutation { productVariantsBulkUpdate(productId: "' + pId + '", variants: [{id: "' + vId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
       await gqlBO('mutation { metafieldsSet(metafields: [{ownerId: "' + vId + '", namespace: "custom", key: "estimated_arrival_date", value: " ", type: "single_line_text_field"}]) { userErrors { message } } }')
     }
     console.log('[SS-&gt;Shopify] variant', pn, isBO ? '-&gt; backorder' : '-&gt; available')
-    // Keep the product template in step with all its variants (same rule as Theme Audit).
     if (pId) await reconcileProductTemplate(gqlBO, pId)
     const ssRestockDate = ssRestock || ''
     try {
@@ -9014,10 +9142,6 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
   }
 }
 
-// [FIX 5c] Ported from the ERP reference copy. When a directly-sold PART ships, that part can be a
-// shared component of several assemblies; depleting it can push ANOTHER assembly's buildability to zero
-// without that assembly's own stock ever changing. Re-check every assembly that uses this part and is
-// already sitting at zero on-hand, so its Shopify backorder status doesn't go stale.
 async function cascadeShopifyBackorder(childPn: string): Promise&lt;void&gt; {
   const { data: boms } = await db.from('bom_items').select('parent_pn').eq('child_pn', childPn)
   const parentPns = [...new Set((boms || []).map((b: any) =&gt; b.parent_pn))]
@@ -9029,19 +9153,8 @@ async function cascadeShopifyBackorder(childPn: string): Promise&lt;void&gt; {
   }
 }
 
-// [FIX 1/2/3b] Single shared deduction routine used by BOTH the real-time webhook and bulk_sync, so the
-// two paths can never diverge. Handles assemblies AND directly-sold parts (the deployed webhook loop had
-// \`if(!asm) continue\`, so part sales were never deducted). Idempotent on the tracking number: a physical
-// shipment is deducted once, ever. This closes three holes at once —
-//   * duplicate webhook redelivery (ShipStation resends the same event, sometimes sub-second),
-//   * the same shipment arriving via both the real-time webhook and a later catch-up bulk_sync,
-//   * a bulk_sync being re-run over an overlapping date range.
-// Returns true if it deducted, false if it skipped (duplicate or SKU not found).
 async function deductForShipment(pn: string, qty: number, tracking: string, orderRef: string): Promise&lt;boolean&gt; {
   const reason = 'Shipped via ShipStation ' + orderRef + ' ' + tracking
-  // PREFERRED PATH: atomic, race-proof. One transaction claims the shipment via a UNIQUE
-  // dedup_key and does the subtraction in SQL, so simultaneous webhooks cannot both deduct
-  // and cannot lose an update. Requires migration-atomic-shipment-deduction.sql.
   if (tracking) {
     const dedupKey = 'shipment|' + pn + '|' + tracking
     try {
@@ -9067,39 +9180,32 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
       console.warn('[SS] apply_shipment_deduction threw - falling back to non-atomic path:', e)
     }
   }
-  // FALLBACK: pre-migration behaviour. Still idempotent on the tracking number, but the
-  // check and the write are separate statements, so a true simultaneous double-delivery can
-  // slip through. Better than refusing to move stock at all.
   if (tracking) {
     const { data: dup } = await db.from('inv_corrections')
       .select('id').eq('source', 'shipment').eq('pn', pn)
       .ilike('reason', '%' + tracking + '%').limit(1)
     if (dup?.length) {
-      console.log('[SS] Already deducted', pn, 'for tracking', tracking, '— skipping (idempotent)')
+      console.log('[SS] Already deducted', pn, 'for tracking', tracking, '- skipping (idempotent)')
       return false
     }
   }
-  // [FIX B] new_sku-aware: sales.pn may hold a new_sku for a migrated product, whose assembly record
-  // still keys on the legacy .pn. Match .pn first, then fall back to .new_sku (injection-safe two-query
-  // form rather than .or(), which would break on any SKU containing a PostgREST filter character).
   let { data: asms } = await db.from('assemblies').select('id,total_on_hand').eq('pn', pn).limit(1)
   if (!asms?.length) { const _r = await db.from('assemblies').select('id,total_on_hand').eq('new_sku', pn).limit(1); asms = _r.data }
   const asm = asms?.[0]
   if (asm) {
     const prev = asm.total_on_hand || 0
-    const newOh = prev - qty // allow negative — backorder convention used everywhere else in the ERP
+    const newOh = prev - qty
     await db.from('assemblies').update({ total_on_hand: newOh, updated_at: new Date().toISOString() }).eq('id', asm.id)
     await db.from('inv_corrections').insert({ pn, previous_qty: prev, new_qty: newOh, adjustment: -qty, reason, source: 'shipment' })
     console.log('[SS] Deducted', qty, 'of', pn, 'on', orderRef, '| on_hand:', prev, '-&gt;', newOh)
     await syncShopifyBackorder(pn, newOh)
     return true
   }
-  // Directly-sold part (not an assembly) — same deduction, different table.
   let { data: prts } = await db.from('parts').select('id,total_unpckgd').eq('pn', pn).limit(1)
-  if (!prts?.length) { const _r = await db.from('parts').select('id,total_unpckgd').eq('new_sku', pn).limit(1); prts = _r.data } // [FIX B] new_sku-aware
+  if (!prts?.length) { const _r = await db.from('parts').select('id,total_unpckgd').eq('new_sku', pn).limit(1); prts = _r.data }
   const prt = prts?.[0]
   if (!prt) {
-    console.warn('[SS] SKU not found in parts or assemblies — no deduction:', pn)
+    console.warn('[SS] SKU not found in parts or assemblies - no deduction:', pn)
     return false
   }
   const prevP = prt.total_unpckgd || 0
@@ -9128,7 +9234,6 @@ Deno.serve(async (req) =&gt; {
     const orderMap = await buildOrderMap()
     const norm = (s: string) =&gt; s.trim().toUpperCase()
     const updateGroups: any = {}
-    // [FIX 3c] collect the matched lines (pn + qty + tracking) so we can deduct after status updates.
     const deductQueue: any[] = []
     let page = 1, totalPages = 1, synced = 0, skipped = 0, notFound = 0
     while (page &lt;= totalPages) {
@@ -9156,7 +9261,7 @@ Deno.serve(async (req) =&gt; {
           const line = lines.find((l: any) =&gt; l.pn === pn)
           if (line) {
             updateGroups[gKey].ids.push(line.id)
-            deductQueue.push({ id: line.id, pn, qty: line.qty || 1, tracking, order: rawNum }) // [FIX 3c]
+            deductQueue.push({ id: line.id, pn, qty: line.qty || 1, tracking, order: rawNum })
           }
         }
         synced++
@@ -9174,13 +9279,6 @@ Deno.serve(async (req) =&gt; {
         applied += Math.min(200, deduped.length - i)
       }
     }
-    // [FIX 3d] Deduct inventory for the shipments we just marked Shipped. bulk_sync previously flipped
-    // status WITHOUT ever deducting, so any shipment the real-time webhook missed (not delivered, edge
-    // function cold, etc.) was marked shipped with its stock never reduced — a silent, permanent
-    // overstatement. Guards against double-deduction: buildOrderMap only returned Open/Packed/Partial
-    // lines (anything already shipped-and-deducted by the webhook is excluded), deductForShipment dedups
-    // on the tracking number, and we dedup line ids within this run so one line matched by two shipments
-    // is only deducted once.
     let deducted = 0
     const seenLineIds = new Set()
     for (const d of deductQueue) {
@@ -9195,47 +9293,98 @@ Deno.serve(async (req) =&gt; {
     const auth = ssAuth()
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
     const orderMap = await buildOrderMap()
-    let page = 1, totalPages = 1, markedHold = 0, markedOpen = 0
-    const stillOnHoldOrderNums = new Set() // order numbers ShipStation currently reports as on_hold —
-    // a split/drop-ship order can have ONE line genuinely on hold while ShipStation reports the OVERALL
-    // order as awaiting_shipment (because the other line is ready to move). Without tracking this, the
-    // release pass below would incorrectly release the still-held line just because its order number also
-    // shows up in the awaiting_shipment list — causing it to flip Open→On Hold→Open→On Hold every cycle.
+    const norm = (s: string) =&gt; (s || '').trim().toUpperCase()
+
+    // Fetch every on_hold and awaiting_shipment order up front (same two calls as before, just
+    // collected before processing instead of interleaved) so every SKU seen anywhere can be
+    // canonicalized in one batch pass before any matching happens.
+    let page = 1, totalPages = 1
+    const onHoldOrders: any[] = []
     while (page &lt;= totalPages) {
       const res = await fetch('https://ssapi.shipstation.com/orders?orderStatus=on_hold&amp;pageSize=500&amp;page=' + page, { headers: { Authorization: 'Basic ' + auth } })
       if (!res.ok) return json({ error: 'ShipStation error ' + res.status }, 502)
       const data = await res.json()
       totalPages = data.pages || 1
-      for (const order of (data.orders || [])) {
-        const rawNum = stripHash(order.orderNumber || '')
-        stillOnHoldOrderNums.add(rawNum)
-        const lines = orderMap[rawNum] || []
-        const ids = lines.filter((l: any) =&gt; ['Open','Packed'].includes(l.fulfillment_status)).map((l: any) =&gt; l.id as string)
-        if (ids.length) {
-          await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', ids)
-          markedHold += ids.length
-        }
-      }
+      onHoldOrders.push(...(data.orders || []))
       page++
     }
-    const { data: heldLines } = await db.from('sales').select('id,order_number').eq('fulfillment_status', 'On Hold').limit(5000)
+    let rPage = 1, rTotalPages = 1
+    const awaitingOrders: any[] = []
+    while (rPage &lt;= rTotalPages) {
+      const relRes = await fetch('https://ssapi.shipstation.com/orders?orderStatus=awaiting_shipment&amp;pageSize=500&amp;page=' + rPage, { headers: { Authorization: 'Basic ' + auth } })
+      if (!relRes.ok) break
+      const relData = await relRes.json()
+      rTotalPages = relData.pages || 1
+      awaitingOrders.push(...(relData.orders || []))
+      rPage++
+    }
+
+    // [FIX] Root cause confirmed on order #10497 via a live comparison: ShipStation's item list
+    // was NOT truncated or reordered between endpoints (ruled that out first) - the actual bug
+    // was comparing ShipStation's reported SKU directly against the raw sales.pn string. This
+    // ERP has a known, previously-documented legacy-pn/new_sku duality on its own TGK-numbered
+    // catalog (9 SKUs already flagged with a mismatch between the two fields). A sales row's pn
+    // was captured verbatim from Shopify at order-creation time under WHICHEVER alias was live
+    // then; if the underlying variant's SKU has since been repointed to the other alias,
+    // ShipStation can report that line under a different string than what sales.pn still holds.
+    // The two vendor drop-ship SKUs that released correctly aren't part of this catalog at all
+    // (no assemblies/parts record, so no duality) - which is exactly why only they matched a
+    // plain string comparison. Resolving both sides to the assembly/part's canonical pn before
+    // comparing - same alias-resolution pattern deductForShipment and shopify-orders.ts's
+    // fulfillment-mirroring already use elsewhere - fixes this regardless of which alias either
+    // side happens to report.
+    const allOrders = [...onHoldOrders, ...awaitingOrders]
+    const rawSkuSet = new Set&lt;string&gt;()
+    for (const o of allOrders) for (const i of (o.items || [])) {
+      const sk = (i.sku || i.name || '').trim()
+      if (sk) rawSkuSet.add(sk)
+    }
+    const involvedOrderNums = new Set(allOrders.map((o: any) =&gt; stripHash(o.orderNumber || '')))
+    for (const num of involvedOrderNums) for (const l of (orderMap[num] || [])) if (l.pn) rawSkuSet.add(l.pn)
+    const skuList = [...rawSkuSet]
+    const canonMap: Record&lt;string, string&gt; = {}
+    const chunk = &lt;T,&gt;(arr: T[], n: number): T[][] =&gt; { const out: T[][] = []; for (let i = 0; i &lt; arr.length; i += n) out.push(arr.slice(i, i + n)); return out }
+    for (const c of chunk(skuList, 200)) {
+      const { data: a1 } = await db.from('assemblies').select('pn').in('pn', c)
+      ;(a1 || []).forEach((r: any) =&gt; { canonMap[norm(r.pn)] = r.pn })
+      const { data: a2 } = await db.from('assemblies').select('pn,new_sku').in('new_sku', c)
+      ;(a2 || []).forEach((r: any) =&gt; { if (r.new_sku) canonMap[norm(r.new_sku)] = r.pn })
+      const { data: p1 } = await db.from('parts').select('pn').in('pn', c)
+      ;(p1 || []).forEach((r: any) =&gt; { if (!(norm(r.pn) in canonMap)) canonMap[norm(r.pn)] = r.pn })
+      const { data: p2 } = await db.from('parts').select('pn,new_sku').in('new_sku', c)
+      ;(p2 || []).forEach((r: any) =&gt; { if (r.new_sku &amp;&amp; !(norm(r.new_sku) in canonMap)) canonMap[norm(r.new_sku)] = r.pn })
+    }
+    // Falls back to the normalized raw string itself when nothing matched (e.g. drop-ship SKUs
+    // with no assemblies/parts record at all) - identical to today's behavior for those.
+    const canon = (raw: string): string =&gt; { const n = norm(raw); return canonMap[n] || n }
+
+    let markedHold = 0, markedOpen = 0
+    const stillOnHoldLineIds = new Set&lt;string&gt;()
+    for (const order of onHoldOrders) {
+      const rawNum = stripHash(order.orderNumber || '')
+      const lines = orderMap[rawNum] || []
+      const heldCanonSkus = new Set((order.items || []).map((i: any) =&gt; canon((i.sku || i.name || '').trim())).filter(Boolean))
+      const ids = lines.filter((l: any) =&gt; ['Open','Packed'].includes(l.fulfillment_status) &amp;&amp; heldCanonSkus.has(canon(l.pn || ''))).map((l: any) =&gt; l.id as string)
+      ids.forEach((id: string) =&gt; stillOnHoldLineIds.add(id))
+      if (ids.length) {
+        await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', ids)
+        markedHold += ids.length
+      }
+    }
+    const { data: heldLines } = await db.from('sales').select('id,order_number,pn').eq('fulfillment_status', 'On Hold').limit(5000)
     if (heldLines?.length) {
-      let rPage = 1, rTotalPages = 1
-      while (rPage &lt;= rTotalPages) {
-        const relRes = await fetch('https://ssapi.shipstation.com/orders?orderStatus=awaiting_shipment&amp;pageSize=500&amp;page=' + rPage, { headers: { Authorization: 'Basic ' + auth } })
-        if (!relRes.ok) break
-        const relData = await relRes.json()
-        rTotalPages = relData.pages || 1
-        for (const order of (relData.orders || [])) {
-          const rawNum = stripHash(order.orderNumber || '')
-          if (stillOnHoldOrderNums.has(rawNum)) continue // this order still has a genuinely-held line — don't release it
-          const toRelease = (heldLines || []).filter((l: any) =&gt; stripHash(l.order_number || '') === rawNum).map((l: any) =&gt; l.id as string)
-          if (toRelease.length) {
-            await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', toRelease)
-            markedOpen += toRelease.length
-          }
+      for (const order of awaitingOrders) {
+        const rawNum = stripHash(order.orderNumber || '')
+        const readyCanonSkus = new Set((order.items || []).map((i: any) =&gt; canon((i.sku || i.name || '').trim())).filter(Boolean))
+        const toRelease = (heldLines || []).filter((l: any) =&gt;
+          stripHash(l.order_number || '') === rawNum
+          &amp;&amp; !stillOnHoldLineIds.has(l.id)
+          &amp;&amp; readyCanonSkus.has(canon(l.pn || ''))
+        ).map((l: any) =&gt; l.id as string)
+        if (toRelease.length) {
+          await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', toRelease)
+          markedOpen += toRelease.length
         }
-        rPage++
       }
     }
     return json({ markedHold, markedOpen, message: markedHold + ' marked On Hold, ' + markedOpen + ' released to Open' })
@@ -9297,11 +9446,262 @@ Deno.serve(async (req) =&gt; {
       matches_found: matches.length,
       matched_orders: matches,
       diagnosis: ssOrders.length === 0
-        ? 'ShipStation returned 0 on-hold orders — nothing to sync'
+        ? 'ShipStation returned 0 on-hold orders - nothing to sync'
         : matches.length === 0
-          ? 'SS has on-hold orders but NONE match ERP order numbers — likely a format mismatch. Compare ss_on_hold_sample vs erp_open_sample.'
-          : matches.length + ' orders matched — hold_sync should work. Run normal hold_sync to apply.'
+          ? 'SS has on-hold orders but NONE match ERP order numbers - likely a format mismatch. Compare ss_on_hold_sample vs erp_open_sample.'
+          : matches.length + ' orders matched - hold_sync should work. Run normal hold_sync to apply.'
     })
+  }
+  if (body.action === 'inspect_order') {
+    // [DEBUG] One-shot inspection tool, same purpose as hold_sync_debug above but for a
+    // different failure: an order ShipStation has split into multiple shipments UNDER THE SAME
+    // order number (Jon found #10497 showing this way - one shipment on_hold, one
+    // awaiting_shipment, both labeled "Order #10497" in ShipStation's own UI). Neither hold_sync
+    // nor the ORDER_NOTIFY webhook has ever looked past orderNumber to see which SKUs belong to
+    // which shipment - both currently flip EVERY non-terminal sales row sharing that order
+    // number to On Hold the moment ANY shipment for that order number reports on_hold. This is
+    // a different case from the existing ss_order_links "split creates a new order number"
+    // mechanism, which does not apply here since the order number is identical.
+    //
+    // This dumps the raw ShipStation response for both the /orders and /shipments endpoints for
+    // one order number, unfiltered, so the actual field that distinguishes shipment membership
+    // (a shipmentId, a per-item status, something else entirely) can be identified before
+    // guessing at a fix. Deploy this, hit it once with the order number, paste the JSON back.
+    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
+    const auth = ssAuth()
+    const orderNumber = String(body.orderNumber || body.order_number || '').trim()
+    if (!orderNumber) return json({ error: 'orderNumber is required' }, 400)
+    const results: any = { orderNumber }
+    try {
+      const ordersRes = await fetch('https://ssapi.shipstation.com/orders?orderNumber=' + encodeURIComponent(orderNumber) + '&amp;pageSize=50', { headers: { Authorization: 'Basic ' + auth } })
+      results.orders_endpoint_status = ordersRes.status
+      results.orders = ordersRes.ok ? await ordersRes.json() : await ordersRes.text()
+    } catch (e) { results.orders_error = String((e as any)?.message || e) }
+    try {
+      const shipRes = await fetch('https://ssapi.shipstation.com/shipments?orderNumber=' + encodeURIComponent(orderNumber) + '&amp;pageSize=50&amp;includeShipmentItems=true', { headers: { Authorization: 'Basic ' + auth } })
+      results.shipments_endpoint_status = shipRes.status
+      results.shipments = shipRes.ok ? await shipRes.json() : await shipRes.text()
+    } catch (e) { results.shipments_error = String((e as any)?.message || e) }
+    // [DEBUG] Second theory to test: hold_sync got 2 of 7 releasable lines right on #10497
+    // (both drop-ship, no ERP stock record) and left 5 real-inventory SKUs stuck On Hold, even
+    // though their SKUs are plainly present in the unfiltered /orders?orderNumber= response
+    // above. hold_sync's release pass does NOT use that unfiltered call though - it walks
+    // /orders?orderStatus=awaiting_shipment&amp;pageSize=500 (the bulk LIST endpoint) and reads
+    // order.items straight off each entry in that list. If ShipStation's list endpoint returns a
+    // truncated or reordered items array compared to the single-order lookup, that would exactly
+    // explain a partial release. This re-fetches using the SAME status+orderNumber combined
+    // filter hold_sync's release loop effectively narrows down to (proven elsewhere in this file,
+    // in the ORDER_NOTIFY on_hold recheck) and reports item counts side by side with the
+    // unfiltered lookup above, per orderId, so the two can be compared directly instead of
+    // guessed at.
+    try {
+      const directOrders = (results.orders &amp;&amp; results.orders.orders) || []
+      const compare: any[] = []
+      for (const o of directOrders) {
+        const statusFilteredRes = await fetch('https://ssapi.shipstation.com/orders?orderNumber=' + encodeURIComponent(orderNumber) + '&amp;orderStatus=' + encodeURIComponent(o.orderStatus || '') + '&amp;pageSize=50', { headers: { Authorization: 'Basic ' + auth } })
+        const statusFilteredData = statusFilteredRes.ok ? await statusFilteredRes.json() : null
+        const matchInFiltered = (statusFilteredData?.orders || []).find((x: any) =&gt; x.orderId === o.orderId)
+        compare.push({
+          orderId: o.orderId,
+          orderStatus: o.orderStatus,
+          direct_lookup_item_count: (o.items || []).length,
+          direct_lookup_skus: (o.items || []).map((i: any) =&gt; i.sku || i.name),
+          status_filtered_endpoint_status: statusFilteredRes.status,
+          status_filtered_item_count: matchInFiltered ? (matchInFiltered.items || []).length : null,
+          status_filtered_skus: matchInFiltered ? (matchInFiltered.items || []).map((i: any) =&gt; i.sku || i.name) : null,
+          found_in_status_filtered_list: !!matchInFiltered
+        })
+      }
+      results.item_count_comparison = compare
+    } catch (e) { results.compare_error = String((e as any)?.message || e) }
+    return json(results)
+  }
+  if (body.action === 'repair_split_order') {
+    // [FIX] Repairs the concrete damage from the duplicate-row / wrong-tracking bug (order
+    // #10497): a duplicate sales row per canonical SKU (created by the now-fixed alias mismatch
+    // in shopify-orders.ts's orders/updated reconciliation), each possibly carrying a bogus
+    // tracking number and a bogus inventory deduction from the now-fixed matchedPns fallback in
+    // the webhook handler above. Ground truth is pulled fresh from ShipStation itself rather than
+    // trusted from the ERP's own (corrupted) rows:
+    //   - what ACTUALLY shipped -&gt; /shipments (real, non-voided shipment records + their items)
+    //   - what is genuinely still open/on-hold right now -&gt; /orders (current order status)
+    //   - what was actually deducted -&gt; inv_corrections, tied to the specific tracking numbers
+    // Everything is matched through the same canonical-pn resolution as the other fixes, so a
+    // duplicate created under one SKU alias is still recognized as the same physical item as the
+    // original row under the other alias.
+    //
+    // Two modes: apply:false (default) computes and RETURNS the full repair plan without writing
+    // anything - review this before rerunning with apply:true. apply:true executes exactly that
+    // plan: reverses any inventory wrongly deducted under a bogus tracking number, applies a
+    // correct deduction if a genuine shipment's deduction never actually landed, updates ONE
+    // surviving row per canonical SKU to the real ground-truth state (normalizing its pn to the
+    // canonical form in the process), and deletes the other duplicate row(s).
+    // Any group this can't confidently resolve (e.g. rows disagree on qty, or ShipStation has no
+    // record at all for that SKU) is left completely untouched and flagged under "issues" for
+    // manual review instead of being guessed at.
+    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
+    const auth = ssAuth()
+    const orderNumber = String(body.orderNumber || body.order_number || '').trim()
+    if (!orderNumber) return json({ error: 'orderNumber is required' }, 400)
+    const apply = body.apply === true
+    const norm = (s: string) =&gt; (s || '').trim().toUpperCase()
+
+    const shipRes = await fetch('https://ssapi.shipstation.com/shipments?orderNumber=' + encodeURIComponent(orderNumber) + '&amp;pageSize=50&amp;includeShipmentItems=true', { headers: { Authorization: 'Basic ' + auth } })
+    if (!shipRes.ok) return json({ error: 'ShipStation shipments lookup failed: ' + shipRes.status }, 502)
+    const shipData = await shipRes.json()
+    const realShipments = (shipData.shipments || []).filter((sh: any) =&gt; !sh.voided)
+
+    const ordRes = await fetch('https://ssapi.shipstation.com/orders?orderNumber=' + encodeURIComponent(orderNumber) + '&amp;pageSize=50', { headers: { Authorization: 'Basic ' + auth } })
+    if (!ordRes.ok) return json({ error: 'ShipStation orders lookup failed: ' + ordRes.status }, 502)
+    const ordData = await ordRes.json()
+    const orderRecords = ordData.orders || []
+
+    // [FIX] sales.order_number is stored exactly as Shopify's order.name, which normally includes
+    // the leading '#' (e.g. '#10497') - every other place in this file that looks up a sales row
+    // by order number already tries both forms (see erpOrderNumberFor, cancel_sync, etc.); this
+    // action needs the same, or a bare-number lookup like the one just used above 404s even
+    // though the rows are right there under the '#' form.
+    const { data: erpRowsBare } = await db.from('sales')
+      .select('id,pn,qty,fulfillment_status,tracking_number,carrier,shipped_at,created_at')
+      .eq('order_number', orderNumber)
+    const { data: erpRowsHash } = await db.from('sales')
+      .select('id,pn,qty,fulfillment_status,tracking_number,carrier,shipped_at,created_at')
+      .eq('order_number', '#' + orderNumber)
+    const erpRows = (erpRowsBare?.length ? erpRowsBare : null) || erpRowsHash || []
+    if (!erpRows.length) return json({ error: 'No sales rows found for order_number ' + orderNumber + ' (tried both "' + orderNumber + '" and "#' + orderNumber + '")' }, 404)
+
+    const aliasCandidates = new Set&lt;string&gt;()
+    erpRows.forEach((r: any) =&gt; { if (r.pn) aliasCandidates.add(r.pn) })
+    realShipments.forEach((sh: any) =&gt; (sh.shipmentItems || []).forEach((i: any) =&gt; { const v = (i.sku || i.name || '').trim(); if (v) aliasCandidates.add(v) }))
+    orderRecords.forEach((o: any) =&gt; (o.items || []).forEach((i: any) =&gt; { const v = (i.sku || i.name || '').trim(); if (v) aliasCandidates.add(v) }))
+    const aliasList = [...aliasCandidates]
+    const canonMap: Record&lt;string, string&gt; = {}
+    if (aliasList.length) {
+      const { data: a1 } = await db.from('assemblies').select('pn').in('pn', aliasList)
+      ;(a1 || []).forEach((r: any) =&gt; { canonMap[norm(r.pn)] = r.pn })
+      const { data: a2 } = await db.from('assemblies').select('pn,new_sku').in('new_sku', aliasList)
+      ;(a2 || []).forEach((r: any) =&gt; { if (r.new_sku) canonMap[norm(r.new_sku)] = r.pn })
+      const { data: p1 } = await db.from('parts').select('pn').in('pn', aliasList)
+      ;(p1 || []).forEach((r: any) =&gt; { if (!(norm(r.pn) in canonMap)) canonMap[norm(r.pn)] = r.pn })
+      const { data: p2 } = await db.from('parts').select('pn,new_sku').in('new_sku', aliasList)
+      ;(p2 || []).forEach((r: any) =&gt; { if (r.new_sku &amp;&amp; !(norm(r.new_sku) in canonMap)) canonMap[norm(r.new_sku)] = r.pn })
+    }
+    const canon = (raw: string): string =&gt; { const n = norm(raw); return canonMap[n] || n }
+
+    const shippedTruth: Record&lt;string, { trackingNumber: string, carrier: string, shippedAt: string }&gt; = {}
+    for (const sh of realShipments) {
+      for (const item of (sh.shipmentItems || [])) {
+        const c = canon((item.sku || item.name || '').trim())
+        if (!c || shippedTruth[c]) continue
+        shippedTruth[c] = { trackingNumber: sh.trackingNumber, carrier: (sh.carrierCode || '').toUpperCase(), shippedAt: sh.shipDate ? new Date(sh.shipDate).toISOString() : new Date().toISOString() }
+      }
+    }
+    const distinctRealTrackings = new Set(Object.values(shippedTruth).map(v =&gt; v.trackingNumber))
+    const currentStatusTruth: Record&lt;string, string&gt; = {}
+    for (const ord of orderRecords) {
+      for (const item of (ord.items || [])) {
+        const c = canon((item.sku || item.name || '').trim())
+        if (!c || (c in currentStatusTruth)) continue
+        currentStatusTruth[c] = ord.orderStatus
+      }
+    }
+    const fsMap: Record&lt;string, string&gt; = { awaiting_shipment: 'Open', on_hold: 'On Hold', pending_fulfillment: 'Open', awaiting_payment: 'Open' }
+
+    const groupsBy: Record&lt;string, any[]&gt; = {}
+    for (const r of erpRows) { const c = canon(r.pn || ''); (groupsBy[c] = groupsBy[c] || []).push(r) }
+
+    const report: any[] = []
+    for (const [c, rows] of Object.entries(groupsBy)) {
+      if (rows.length &lt; 2) continue
+      const qtySet = new Set(rows.map((r: any) =&gt; r.qty || 1))
+      const issues: string[] = []
+      if (qtySet.size &gt; 1) issues.push('rows in this group disagree on qty (' + [...qtySet].join(', ') + ') - skipped, needs manual review')
+      const group: any = {
+        canonicalSku: c,
+        rows: rows.map((r: any) =&gt; ({ id: r.id, pn: r.pn, qty: r.qty, fulfillment_status: r.fulfillment_status, tracking_number: r.tracking_number, carrier: r.carrier })),
+        issues
+      }
+      if (issues.length) { report.push(group); continue }
+
+      const qty = rows[0].qty || 1
+      const realShip = shippedTruth[c] || null
+      const curStatus = currentStatusTruth[c] || null
+      let target: any
+      if (realShip) {
+        target = { pn: c, fulfillment_status: 'Shipped', tracking_number: realShip.trackingNumber, carrier: realShip.carrier, shipped_at: realShip.shippedAt, is_split_shipment: distinctRealTrackings.size &gt; 1 }
+      } else if (curStatus &amp;&amp; fsMap[curStatus]) {
+        target = { pn: c, fulfillment_status: fsMap[curStatus], tracking_number: null, carrier: null, shipped_at: null }
+      } else {
+        group.issues.push('no ShipStation ground truth found for this SKU (not in any real shipment, not in a current order record) - skipped, needs manual review')
+        report.push(group)
+        continue
+      }
+
+      const sorted = rows.slice().sort((a: any, b: any) =&gt; String(a.created_at || a.id).localeCompare(String(b.created_at || b.id)))
+      const keeper = rows.find((r: any) =&gt; target.tracking_number &amp;&amp; r.tracking_number === target.tracking_number) || sorted[0]
+      const toDelete = rows.filter((r: any) =&gt; r.id !== keeper.id)
+
+      const groupAliases = [...new Set(rows.map((r: any) =&gt; r.pn))]
+      const bogusTrackings = [...new Set(rows.map((r: any) =&gt; r.tracking_number).filter(Boolean).filter((t: string) =&gt; t !== (realShip?.trackingNumber || null)))]
+      const inventoryOps: any[] = []
+      for (const bt of bogusTrackings) {
+        for (const alias of groupAliases) {
+          const { data: badDeds } = await db.from('inv_corrections').select('id,adjustment').eq('source', 'shipment').eq('pn', alias).ilike('reason', '%' + bt + '%')
+          for (const d of (badDeds || [])) {
+            inventoryOps.push({ type: 'reverse', pn: c, qty: Math.abs(d.adjustment || 0), badTracking: bt })
+          }
+        }
+      }
+      if (realShip) {
+        let realDeductionFound = false
+        for (const alias of groupAliases) {
+          const { data: goodDeds } = await db.from('inv_corrections').select('id').eq('source', 'shipment').eq('pn', alias).ilike('reason', '%' + realShip.trackingNumber + '%')
+          if (goodDeds &amp;&amp; goodDeds.length) realDeductionFound = true
+        }
+        if (!realDeductionFound) inventoryOps.push({ type: 'deduct', pn: c, qty, tracking: realShip.trackingNumber })
+      }
+
+      group.plan = { keepRowId: keeper.id, target, deleteRowIds: toDelete.map((r: any) =&gt; r.id), inventoryOps }
+      report.push(group)
+
+      if (apply) {
+        for (const op of group.plan.inventoryOps) {
+          if (op.type === 'reverse') {
+            const { data: asm } = await db.from('assemblies').select('id,total_on_hand').eq('pn', c).limit(1)
+            if (asm?.length) {
+              const prev = asm[0].total_on_hand || 0, next = prev + op.qty
+              await db.from('assemblies').update({ total_on_hand: next, updated_at: new Date().toISOString() }).eq('id', asm[0].id)
+              await db.from('inv_corrections').insert({ pn: c, previous_qty: prev, new_qty: next, adjustment: op.qty, reason: 'Reversal of duplicate-row deduction (bogus tracking ' + op.badTracking + ') - order ' + orderNumber, source: 'correction' })
+              op.applied = true
+            } else {
+              const { data: prt } = await db.from('parts').select('id,total_unpckgd').eq('pn', c).limit(1)
+              if (prt?.length) {
+                const prev = prt[0].total_unpckgd || 0, next = prev + op.qty
+                await db.from('parts').update({ total_unpckgd: next, updated_at: new Date().toISOString() }).eq('id', prt[0].id)
+                await db.from('inv_corrections').insert({ pn: c, previous_qty: prev, new_qty: next, adjustment: op.qty, reason: 'Reversal of duplicate-row deduction (bogus tracking ' + op.badTracking + ') - order ' + orderNumber, source: 'correction' })
+                op.applied = true
+              } else {
+                // [FIX] Should not be reachable in practice - a group only gets here because its
+                // canonical SKU already resolved to a real assemblies/parts row earlier - but a
+                // silent no-op on an inventory correction is exactly the kind of thing that must
+                // never happen invisibly. Surfaced in both the log and the returned report instead.
+                console.warn('[repair_split_order] reversal skipped - canonical pn', c, 'matches neither assemblies nor parts')
+                op.applied = false
+                op.note = 'SKIPPED - canonical pn matches neither assemblies nor parts, nothing to correct against'
+              }
+            }
+          } else if (op.type === 'deduct') {
+            op.applied = await deductForShipment(c, op.qty, op.tracking, orderNumber)
+          }
+        }
+        await db.from('sales').update(group.plan.target).eq('id', group.plan.keepRowId)
+        for (const delId of group.plan.deleteRowIds) {
+          await db.from('sales').delete().eq('id', delId)
+        }
+      }
+    }
+
+    return json({ orderNumber, apply, groupsWithDuplicates: report.length, report, note: apply ? 'Plan executed - check each group.plan.inventoryOps[].applied for per-op confirmation.' : 'Dry run only - nothing was written. Review "report", then rerun with apply:true to execute exactly this plan.' })
   }
   if (body.action === 'delivery_sync') {
     const auth = ssAuth()
@@ -9332,22 +9732,6 @@ Deno.serve(async (req) =&gt; {
     }
     return json({ delivered, checked: shipped?.length || 0, message: delivered + ' orders marked Delivered' })
   }
-  // ─────────────────────────────────────────────────────────────────────────────
-  // track_po — PO ETA lookup.  [FIXED]
-  //
-  // Was: GET https://ssapi.shipstation.com/carriers/track?carrierCode=..&amp;trackingNumber=..
-  // That path does not exist in the ShipStation V1 API (V1 exposes /orders, /shipments,
-  // /carriers, /carriers/listservices ... but no tracking lookup), so ShipStation always
-  // answered 404 and this handler forwarded the 404 to the ERP. The button could never work.
-  //
-  // Live carrier tracking lives in the ShipStation V2 API:
-  //   GET https://api.shipstation.com/v2/tracking?carrier_code=..&amp;tracking_number=..
-  // V2 authenticates with an \`API-Key\` header instead of V1's Basic auth, so it needs its
-  // own secret:  supabase secrets set SS_V2_KEY=&lt;your V2 api key&gt;
-  //
-  // Response shape returned to the ERP is unchanged (estimatedDelivery / statusDesc / events)
-  // so no client change is required.
-  // ─────────────────────────────────────────────────────────────────────────────
   if (body.action === 'track_po') {
     const trackingNum = (body.tracking || '').trim()
     const rawCarrier = (body.carrier || '').trim()
@@ -9359,7 +9743,6 @@ Deno.serve(async (req) =&gt; {
       return json({ error: 'Live ETA needs a ShipStation V2 API key. Set the SS_V2_KEY secret, or use the Carrier link on the PO line.' }, 501)
     }
 
-    // V2 carrier codes
     const cu = rawCarrier.toUpperCase()
     const carrierCode =
         cu.includes('FEDEX') || cu.includes('FED') ? 'fedex'
@@ -9379,9 +9762,9 @@ Deno.serve(async (req) =&gt; {
       console.warn('[track_po] V2 tracking', res.status, carrierCode, trackingNum, detail.slice(0, 300))
       return json({
         error: 'ShipStation V2 tracking ' + res.status
-          + (res.status === 404 ? ' — carrier/tracking pair not recognised (is this carrier connected in ShipStation?)' : '')
-          + (res.status === 401 || res.status === 403 ? ' — SS_V2_KEY rejected' : '')
-          + (detail ? ' — ' + detail.slice(0, 180) : '')
+          + (res.status === 404 ? ' - carrier/tracking pair not recognised (is this carrier connected in ShipStation?)' : '')
+          + (res.status === 401 || res.status === 403 ? ' - SS_V2_KEY rejected' : '')
+          + (detail ? ' - ' + detail.slice(0, 180) : '')
       }, res.status)
     }
     const data = await res.json()
@@ -9405,7 +9788,7 @@ Deno.serve(async (req) =&gt; {
     const allSSOrders: any[] = []
     for (const status of ['awaiting_shipment', 'on_hold', 'awaiting_payment', 'pending_fulfillment', 'shipped']) {
       let p = 1, pages = 1
-      while (p &lt;= pages &amp;&amp; p &lt;= 5) { // cap 5 pages per status = 2500 max per status
+      while (p &lt;= pages &amp;&amp; p &lt;= 5) {
         const r = await fetch(
           'https://ssapi.shipstation.com/orders?orderStatus=' + status + '&amp;pageSize=500&amp;page=' + p + '&amp;modifyDateStart=' + since,
           { headers: { Authorization: 'Basic ' + auth } }
@@ -9432,9 +9815,6 @@ Deno.serve(async (req) =&gt; {
       const { data: rows } = await db.from('sales').select('order_number').in('order_number', bothForms).limit(bothForms.length)
       for (const r of (rows || [])) erpFound.add(stripH(r.order_number || ''))
     }
-    // [SPLIT] A split child is NOT a missing order — its lines already exist under the parent.
-    // Importing one would insert duplicate sales rows and double-count demand in planning, so
-    // they are excluded from \`missing\` entirely and reported separately.
     const { data: knownLinks } = await db.from('ss_order_links').select('ss_order_number')
     const linkedChildren = new Set((knownLinks || []).map((l: any) =&gt; stripH(l.ss_order_number || '')))
     const splitChildren = uniqueSSOrders.filter((o: any) =&gt;
@@ -9450,15 +9830,17 @@ Deno.serve(async (req) =&gt; {
         for (const item of (order.items || [])) {
           const pn = item.sku ? item.sku.trim().toUpperCase() : (item.name || '').trim()
           if (!pn) continue
+          const _auditQty = ssItemQty(item)
+          if (_auditQty &lt;= 0) { console.log('[SS] ss_order_audit: skipping zero-quantity line', order.orderNumber, pn); continue }
           const { data: ex } = await db.from('sales').select('id').in('order_number', [order.orderNumber, '#' + order.orderNumber]).eq('pn', pn).limit(1)
           if (ex?.length) continue
           await db.from('sales').insert({
             order_number: order.orderNumber, pn,
-            qty: item.quantity || 1, fulfillment_status: fs,
+            qty: _auditQty, fulfillment_status: fs,
             source: 'ShipStation Import',
             sale_date: centralDateOnly(order.orderDate),
             customer_name: order.shipTo?.name || null,
-            customer_email: order.customerEmail || null, // [CUST]
+            customer_email: order.customerEmail || null,
             created_at: order.orderDate
               ? new Date(order.orderDate.slice(0, 10) + 'T12:00:00.000Z').toISOString()
               : new Date().toISOString(),
@@ -9481,7 +9863,7 @@ Deno.serve(async (req) =&gt; {
         status: o.orderStatus,
         tracking: o.trackingNumber || '',
         carrier: (o.carrierCode || '').toUpperCase(),
-        items: (o.items || []).map((i: any) =&gt; ({ sku: i.sku || i.name, qty: i.quantity || 1 }))
+        items: (o.items || []).map((i: any) =&gt; ({ sku: i.sku || i.name, qty: ssItemQty(i) }))
       }))
     })
   }
@@ -9494,13 +9876,17 @@ Deno.serve(async (req) =&gt; {
       for (const item of (order.items || [])) {
         const pn = (item.sku || '').trim().toUpperCase()
         if (!pn) continue
+        // This path receives items already mapped by the caller (ss_order_audit's report shape),
+        // so the field is \`qty\` rather than ShipStation's raw \`quantity\` - same zero handling.
+        const _batchQty = (item.qty === undefined || item.qty === null) ? 1 : Number(item.qty)
+        if (_batchQty &lt;= 0) { console.log('[SS] ss_import_batch: skipping zero-quantity line', order.orderNumber, pn); continue }
         const { data: ex } = await db.from('sales').select('id')
           .in('order_number', [order.orderNumber, '#' + order.orderNumber])
           .eq('pn', pn).limit(1)
         if (ex?.length) continue
         await db.from('sales').insert({
           order_number: order.orderNumber, pn,
-          qty: item.qty || 1, fulfillment_status: fs,
+          qty: _batchQty, fulfillment_status: fs,
           source: 'ShipStation Import',
           sale_date: order.date || centralDateOnly(),
           customer_name: order.customer || null,
@@ -9536,7 +9922,7 @@ Deno.serve(async (req) =&gt; {
       billTo: billToObj,
       shipTo: shipToObj,
       items,
-      internalNotes: internalNotes || ('TGK ERP order — ' + orderNumber),
+      internalNotes: internalNotes || ('TGK ERP order - ' + orderNumber),
       advancedOptions: { source: 'TGK ERP' }
     }
     const ssRes2 = await fetch('https://ssapi.shipstation.com/orders/createorder', {
@@ -9578,10 +9964,6 @@ Deno.serve(async (req) =&gt; {
     return json({ updated: results.length, results })
   }
   if (body.action === 'get_box_dimensions') {
-    // Returns the actual box dimensions ShipStation has on file for this order's shipment.
-    // Multi-SKU orders always have these HAND-TYPED into ShipStation - there is no preset that
-    // covers a combined shipment, so unlike a single-item order this is real, trustworthy data
-    // rather than a generic package default.
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
     const orderNumber = String(body.orderNumber || '')
     if (!orderNumber) return json({ error: 'orderNumber is required' }, 400)
@@ -9625,7 +10007,7 @@ Deno.serve(async (req) =&gt; {
       const ordRes = await fetch('https://ssapi.shipstation.com/orders?orderNumber=' + encodeURIComponent(orderNumber) + '&amp;pageSize=5', { headers: { Authorization: 'Basic ' + auth } })
       if (ordRes.ok) { const od = await ordRes.json(); const ord = od.orders?.[0]; if (ord?.shipTo) shipFrom = ord.shipTo }
     }
-    if (!shipFrom) return json({ error: 'Original shipment not found in ShipStation — ensure the order was fulfilled through ShipStation' }, 404)
+    if (!shipFrom) return json({ error: 'Original shipment not found in ShipStation - ensure the order was fulfilled through ShipStation' }, 404)
     if (!shipTo) shipTo = { name: 'TGK Motorsport', company: 'TGK Motorsport', street1: '123 Warehouse Dr', city: 'Your City', state: 'CA', postalCode: '90210', country: 'US', residential: false }
     const labelPayload = {
       carrierCode: carrierCode || 'stamps_com',
@@ -9671,11 +10053,6 @@ Deno.serve(async (req) =&gt; {
           tracking_number: tracking, carrier, shipped_at: shippedAt,
           status: 'Resolved', resolved_at: shippedAt
         }).eq('id', errorId)
-        // Pull the replacement out of stock. deductForShipment is idempotent on the tracking
-        // number, so a reship that already deducted when the order was created will not be
-        // deducted twice here. Loops line_items (the full multi-part correction Support
-        // specified) rather than only the single expected_pn, falling back to that single
-        // field for records created before line_items existed.
         const seRes = String(seRow?.resolution || '').toLowerCase()
         const seShipsNothing = (seRes === 'refund' || seRes === 'refunded' || seRes === 'write_off' || seRes === 'no_action')
         if (!seShipsNothing) {
@@ -9698,7 +10075,6 @@ Deno.serve(async (req) =&gt; {
           tracking_number: tracking, carrier, shipped_at: shippedAt,
           status: 'Resolved', resolved_at: shippedAt
         }).eq('id', claimId)
-        // Only resolutions that actually send goods move stock - a refund ships nothing.
         const wRes = String(wRow?.resolution_type || '').toLowerCase()
         const wShips = (wRes === 'replacement' || wRes === 'repair' || wRes === '')
         if (wRow &amp;&amp; wShips) {
@@ -9714,10 +10090,6 @@ Deno.serve(async (req) =&gt; {
         continue
       }
       const salesNum = (orderNum || '').replace(/^Manual_/i, '')
-      // [SPLIT] Resolve through the link table before giving up. A split child arrives with a
-      // suffixed order number that matches nothing in \`sales\`, which previously left erpLines empty
-      // -&gt; allErpPns empty -&gt; matchedPns empty -&gt; the no-SKU-match branch below ran an UPDATE against
-      // an order number that does not exist. Silent no-op: no status change, no deduction, no error.
       const { num: resolvedOrderNumOrNull, viaSplit } = await resolveShipmentOrder(salesNum, ship)
       if (!resolvedOrderNumOrNull) {
         console.warn('[SS] order not in ERP and not a known split child:', salesNum, '- skipping')
@@ -9729,20 +10101,47 @@ Deno.serve(async (req) =&gt; {
       const erpLines = erpLinesRaw ?? []
       const allErpPns = erpLines.map((l: any) =&gt; l.pn as string)
       const norm = (s: string) =&gt; s.trim().toUpperCase()
-      const matchedPns = allErpPns.filter(erpPn =&gt; rawSkus.some((ssSku: string) =&gt; { const e=norm(erpPn),s=norm(ssSku); return e===s||e.includes(s)||s.includes(e) }))
+      // [FIX] Root cause of "shipped 2 of 4, but tracking landed on all 4 including the on-hold
+      // ones, and lines got duplicated": this SKU match used to be a plain string comparison, no
+      // alias resolution. This ERP has a known, previously-documented legacy-pn/new_sku duality
+      // on its own TGK-numbered catalog; when ShipStation reports a shipped SKU under the OTHER
+      // alias than sales.pn holds, matchedPns came up EMPTY, which fell into the "no SKU match"
+      // branch below - a blanket update that used to include On Hold in its status list AND
+      // deduct inventory for every line on the order, genuinely-held lines included. The vendor
+      // drop-ship SKUs on the same orders never hit this (no assemblies/parts record, no
+      // duality possible) - consistent with only the TGK-catalog lines being affected in
+      // practice. Same canonical-alias resolution now used in hold_sync and shopify-orders.ts's
+      // orders/updated reconciliation, kept small here since one shipment event only ever
+      // involves a handful of SKUs.
+      const _aliasList = [...new Set([...allErpPns, ...rawSkus])].filter(Boolean)
+      const _canonMap: Record&lt;string, string&gt; = {}
+      if (_aliasList.length) {
+        const { data: a1 } = await db.from('assemblies').select('pn').in('pn', _aliasList)
+        ;(a1 || []).forEach((r: any) =&gt; { _canonMap[norm(r.pn)] = r.pn })
+        const { data: a2 } = await db.from('assemblies').select('pn,new_sku').in('new_sku', _aliasList)
+        ;(a2 || []).forEach((r: any) =&gt; { if (r.new_sku) _canonMap[norm(r.new_sku)] = r.pn })
+        const { data: p1 } = await db.from('parts').select('pn').in('pn', _aliasList)
+        ;(p1 || []).forEach((r: any) =&gt; { if (!(norm(r.pn) in _canonMap)) _canonMap[norm(r.pn)] = r.pn })
+        const { data: p2 } = await db.from('parts').select('pn,new_sku').in('new_sku', _aliasList)
+        ;(p2 || []).forEach((r: any) =&gt; { if (r.new_sku &amp;&amp; !(norm(r.new_sku) in _canonMap)) _canonMap[norm(r.new_sku)] = r.pn })
+      }
+      const canon = (raw: string): string =&gt; { const n = norm(raw); return _canonMap[n] || n }
+      const matchedPns = allErpPns.filter(erpPn =&gt; {
+        const ce = canon(erpPn)
+        return rawSkus.some((ssSku: string) =&gt; {
+          if (ce === canon(ssSku)) return true
+          const e = norm(erpPn), s = norm(ssSku)
+          return e === s || e.includes(s) || s.includes(e)
+        })
+      })
       console.log('[SS] matchedPns', JSON.stringify(matchedPns), 'of', JSON.stringify(allErpPns), viaSplit ? '(via split link)' : '')
       const isSplit = matchedPns.length &gt; 0 &amp;&amp; matchedPns.length &lt; allErpPns.length
 
-      // [FIX 2] Duplicate-webhook idempotency guard. ShipStation redelivers the same webhook event
-      // (observed sub-second duplicates). The per-line status guard alone has a check-then-act race when
-      // duplicates land before the first delivery has flipped the line to Shipped. A tracking number is
-      // one physical shipment; if a shipment-sourced correction already references it, this delivery is a
-      // duplicate — skip status changes AND inventory entirely.
       let alreadyProcessed = false
       if (tracking) {
         const { data: dupeCheck } = await db.from('inv_corrections').select('id').eq('source', 'shipment').ilike('reason', '%' + tracking + '%').limit(1)
         alreadyProcessed = !!dupeCheck?.length
-        if (alreadyProcessed) console.log('[SS] Duplicate webhook delivery for tracking', tracking, '— skipping entirely')
+        if (alreadyProcessed) console.log('[SS] Duplicate webhook delivery for tracking', tracking, '- skipping entirely')
       }
       if (alreadyProcessed) continue
 
@@ -9760,25 +10159,25 @@ Deno.serve(async (req) =&gt; {
           }
         }
       } else if (viaSplit) {
-        // [SPLIT] Never blanket-ship a parent order from a split child. If the child's SKUs don't
-        // match anything on the parent, the safe failure is to touch nothing and say so — marking
-        // every remaining line Shipped would close out product still sitting on the shelf.
         console.warn('[SS] split child', salesNum, 'matched no SKU on parent', resolvedOrderNum, '- refusing blanket update, no lines touched')
       } else {
-        console.warn('[SS] WARNING: no SKU match for order', resolvedOrderNum, '- updating all non-terminal lines')
-        // Includes On Hold / Pre-Order for the same reason as the deduction gate below.
-        await db.from('sales').update({ fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt }).eq('order_number', resolvedOrderNum).in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
+        // [FIX] Defense in depth on top of the alias fix above: even if a match still somehow
+        // fails for some unforeseen reason, this blanket fallback must never sweep an On Hold
+        // line into Shipped - if ShipStation just reported a real shipment, it is implausible a
+        // genuinely-held line was actually part of it. Dropped from this status list.
+        console.warn('[SS] WARNING: no SKU match for order', resolvedOrderNum, '- updating all non-terminal, non-held lines')
+        await db.from('sales').update({ fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt }).eq('order_number', resolvedOrderNum).in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'Pre-Order', 'Pre-order'])
       }
-      // [SPLIT] A split child that matched nothing deducts nothing — falling back to allErpPns here
-      // would pull stock for the parent's entire order off the back of one partial shipment.
-      const pnsToDeduct = (matchedPns.length &gt; 0 ? matchedPns : (viaSplit ? [] : allErpPns))
+      // [FIX] Same defense in depth for inventory: the blanket allErpPns fallback (used only when
+      // matchedPns is empty and this isn't a split child) must never deduct stock for a line that
+      // is currently On Hold - genuine matches (matchedPns.length&gt;0) are left unrestricted, since
+      // those are confirmed real shipped items regardless of prior status.
+      const pnsToDeduct = (matchedPns.length &gt; 0 ? matchedPns : (viaSplit ? [] : allErpPns.filter((p: string) =&gt; {
+        const line = erpLines.find((l: any) =&gt; l.pn === p)
+        return !line || line.fulfillment_status !== 'On Hold'
+      })))
       for (const pn of pnsToDeduct) {
         const line = erpLines.find((l: any) =&gt; l.pn === pn)
-        // Deduct for any NON-TERMINAL line. Listing allowed statuses here silently skipped
-        // 'On Hold' and 'Pre-Order' shipments: they were flipped to Shipped by the update above
-        // but never pulled stock. Excluding terminal states instead means a status we add later
-        // cannot reintroduce the same silent gap. deductForShipment is idempotent on tracking,
-        // so widening this cannot double-deduct.
         const _TERMINAL = ['shipped', 'delivered', 'cancelled', 'canceled', 'refunded', 'returned', 'fulfilled']
         if (!line) continue
         if (_TERMINAL.includes(String(line.fulfillment_status || '').toLowerCase())) {
@@ -9786,8 +10185,6 @@ Deno.serve(async (req) =&gt; {
           continue
         }
         const lineQty = (line as any).qty || 1
-        // [FIX 1] shared routine — handles BOTH assemblies and directly-sold parts. The deployed loop had
-        // \`if(!asm) continue\`, so a part shipped via the webhook was marked Shipped but never deducted.
         await deductForShipment(pn, lineQty, tracking, resolvedOrderNum)
       }
     }
@@ -9797,9 +10194,6 @@ Deno.serve(async (req) =&gt; {
     const orderNum = order.orderNumber
     const source = (order.orderSource || order.advancedOptions?.source || '').toLowerCase()
     const isShopify = source.includes('shopify') || source.includes('api')
-    // [SPLIT] A split child is not a new order. Without this, splitting a manually-created
-    // ShipStation order inserts duplicate sales rows for lines that already exist under the parent,
-    // double-counting demand in computeDemand and the planning views. Link it and stop.
     if (order?.advancedOptions?.parentId || order?.advancedOptions?.parentOrderId) {
       await linkSplitChild(order)
       console.log('[SS] NEW_ORDER: split child', orderNum, '- linked to parent, not imported')
@@ -9810,13 +10204,15 @@ Deno.serve(async (req) =&gt; {
       const { data: existing } = await db.from('sales').select('id').eq('order_number', salesNum).limit(1)
       if (!existing?.length) {
         for (const item of (order.items || [])) {
+          const _newOrderQty = ssItemQty(item)
+          if (_newOrderQty &lt;= 0) { console.log('[SS] NEW_ORDER: skipping zero-quantity line', salesNum, item.sku || item.name); continue }
           await db.from('sales').insert({
             order_number: salesNum,
             pn: item.sku ? item.sku.trim().toUpperCase() : (item.name || '').trim(),
-            qty: item.quantity || 1,
+            qty: _newOrderQty,
             fulfillment_status: 'Open',
             source: 'ShipStation Manual',
-            customer_name: order.shipTo?.name || null, // [CUST] NEW_ORDER previously set no customer at all
+            customer_name: order.shipTo?.name || null,
             customer_email: order.customerEmail || null,
             sale_date: centralDateOnly(order.orderDate)
           })
@@ -9830,51 +10226,51 @@ Deno.serve(async (req) =&gt; {
     for (const order of orders) {
       if (!order.orderNumber) continue
       const rawNum = stripHash(order.orderNumber)
-      // [SPLIT] This is where splits used to fall on the floor: ORDER_NOTIFY fires for the new child
-      // order, the lookup finds nothing, and \`continue\` discards it silently. The full order object is
-      // right here, so linkSplitChild needs no extra fetch beyond the one parent lookup. This fires at
-      // SPLIT time rather than at label time, which is the whole point — the ERP learns about the split
-      // while you are still deciding what ships, not after a label already exists.
       let resolvedNum = await erpOrderNumberFor(rawNum)
       if (!resolvedNum) resolvedNum = await linkSplitChild(order)
       if (!resolvedNum) continue
+      // [FIX] Same root cause as hold_sync above, confirmed on order #10497: a single order
+      // number can have MULTIPLE ShipStation order records (one per split shipment), each with
+      // its own orderId, orderStatus, and item list. Selecting pn alongside id/fulfillment_status
+      // so both branches below can match against THIS webhook's specific order.items instead of
+      // touching every ERP line sharing the order number.
       const { data: erpLinesRaw } = await db.from('sales')
-        .select('id,fulfillment_status').eq('order_number', resolvedNum)
+        .select('id,pn,fulfillment_status').eq('order_number', resolvedNum)
       const erpLines = erpLinesRaw ?? []
       if (!erpLines.length) continue
+      const norm = (s: string) =&gt; s.trim().toUpperCase()
+      const rawSkus = (order.items || []).map((i: any) =&gt; (i.sku || i.name || '').trim()).filter(Boolean)
+      const matchesThisRecord = (l: any) =&gt; !rawSkus.length || rawSkus.some((sk: string) =&gt; { const e = norm(l.pn || ''), k = norm(sk); return e === k || e.includes(k) || k.includes(e) })
       if (order.orderStatus === 'cancelled') {
         await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('order_number', resolvedNum).in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
-        console.log('[SS] ORDER_NOTIFY → Cancelled:', resolvedNum)
+        console.log('[SS] ORDER_NOTIFY -&gt; Cancelled:', resolvedNum)
       } else if (order.orderStatus === 'on_hold') {
-        const ids = erpLines.filter((l: any) =&gt; ['Open','Packed','Partial'].includes(l.fulfillment_status)).map((l: any) =&gt; l.id)
+        // matchesThisRecord scopes the hold to the SKUs actually on THIS ShipStation record -
+        // rawSkus falls back to "match everything" only if ShipStation's payload carried no
+        // items at all, same fallback philosophy the SHIP_NOTIFY handler already uses elsewhere
+        // in this file rather than silently doing nothing.
+        const ids = erpLines.filter((l: any) =&gt; ['Open','Packed','Partial'].includes(l.fulfillment_status) &amp;&amp; matchesThisRecord(l)).map((l: any) =&gt; l.id)
         if (ids.length) await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', ids)
-        console.log('[SS] ORDER_NOTIFY → On Hold:', resolvedNum)
+        console.log('[SS] ORDER_NOTIFY -&gt; On Hold:', resolvedNum, ids.length, 'of', erpLines.length, 'line(s) matched')
       } else if (order.orderStatus === 'awaiting_shipment') {
-        const ids = erpLines.filter((l: any) =&gt; l.fulfillment_status === 'On Hold').map((l: any) =&gt; l.id)
+        const ids = erpLines.filter((l: any) =&gt; l.fulfillment_status === 'On Hold' &amp;&amp; matchesThisRecord(l)).map((l: any) =&gt; l.id)
         if (ids.length) {
-          // Split/drop-ship orders: ShipStation can report the OVERALL order as awaiting_shipment
-          // because one line is ready to move, even while ANOTHER line on the same order number is
-          // still genuinely on hold. Releasing here unconditionally caused those held lines to flip
-          // Open→On Hold→Open every time a webhook fired — a real, repeating transition that correctly
-          // triggered a real notification each time, which is why it looked like duplicate notifications
-          // but was actually the underlying data genuinely flip-flopping. Before releasing, confirm this
-          // specific order number is NOT still on ShipStation's own on-hold list.
+          // Re-check THIS SPECIFIC ShipStation order record's live status by orderId rather than
+          // searching the on-hold list by order number - a search by number would find a
+          // DIFFERENT still-held sibling record sharing the same order number and wrongly refuse
+          // to release lines that belong to the shipment this webhook is actually about.
           let stillOnHold = false, checkSucceeded = false
-          try {
-            const checkRes = await fetch('https://ssapi.shipstation.com/orders?orderNumber=' + encodeURIComponent(rawNum) + '&amp;orderStatus=on_hold&amp;pageSize=10', { headers: { Authorization: 'Basic ' + ssAuth() } })
-            if (checkRes.ok) {
-              const checkData = await checkRes.json()
-              stillOnHold = (checkData.orders || []).some((o: any) =&gt; stripHash(o.orderNumber || '') === rawNum)
-              checkSucceeded = true
-            }
-          } catch (_e) { /* checkSucceeded stays false — handled below */ }
+          if (order.orderId) {
+            const live = await fetchSSOrder(order.orderId)
+            if (live) { stillOnHold = (live.orderStatus === 'on_hold'); checkSucceeded = true }
+          }
           if (checkSucceeded &amp;&amp; !stillOnHold) {
             await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', ids)
-            console.log('[SS] ORDER_NOTIFY → Released hold:', resolvedNum)
+            console.log('[SS] ORDER_NOTIFY -&gt; Released hold:', resolvedNum, ids.length, 'line(s)')
           } else if (!checkSucceeded) {
-            console.log('[SS] ORDER_NOTIFY → could not verify hold status for', resolvedNum, '— release skipped this time, hold_sync will catch it on the next pass if appropriate')
+            console.log('[SS] ORDER_NOTIFY -&gt; could not verify hold status for', resolvedNum, '(orderId', order.orderId, ') - release skipped this time, hold_sync will catch it on the next pass if appropriate')
           } else {
-            console.log('[SS] ORDER_NOTIFY → awaiting_shipment received for', resolvedNum, 'but order still has a held line on ShipStation — release skipped')
+            console.log('[SS] ORDER_NOTIFY -&gt; awaiting_shipment received for', resolvedNum, 'but this specific ShipStation record still reports on_hold - release skipped')
           }
         }
       }
@@ -11223,6 +11619,9 @@ async function syncOrdersNow(){
       for(const li of (order.line_items||[])){
         const pn=li.sku?li.sku.trim().toUpperCase():(li.title||'').trim();
         if(!pn)continue;
+        // A line zeroed out in Shopify is a REMOVED line - never sync it back in (see
+        // shopifyLineQty). Without this it was re-created at qty 1 on every sync.
+        if(shopifyLineIsRemoved(li))continue;
         const k=existMapKey(orderNum,pn);
         const normON=normOrderNum(orderNum);
         if(lockedOrders.has(normON)) continue; // ERP-edited, skip Shopify overwrite
@@ -11232,12 +11631,12 @@ async function syncOrdersNow(){
           order.fulfillment_status==='fulfilled'?'Delivered':'Open';
 
         if(!Object.prototype.hasOwnProperty.call(existingMap,k)){
-          if(existingOrderNums.has(normON)){syncConflicts.push({orderNum,shopifyPn:pn,qty:li.quantity||1,fs,date:(order.created_at||'').slice(0,10)});continue;}
+          if(existingOrderNums.has(normON)){syncConflicts.push({orderNum,shopifyPn:pn,qty:shopifyLineQty(li),fs,date:(order.created_at||'').slice(0,10)});continue;}
           const custName=((order.shipping_address?.name||order.billing_address?.name||(order.customer?(order.customer.first_name||'')+' '+(order.customer.last_name||''):''))||'').trim()||null;
           const custEmail=(order.email||order.customer?.email||'')||null;
           const _sAddr=order.shipping_address||{};
           const{data}=await db.from('sales').insert({
-            order_number:orderNum,pn,qty:li.quantity||1,
+            order_number:orderNum,pn,qty:shopifyLineQty(li),
             fulfillment_status:fs,financial_status:order.financial_status||'pending',source:'Shopify Sync',
             sale_date:centralDateOnly(order.created_at),
             customer_name:custName,
@@ -11259,7 +11658,7 @@ async function syncOrdersNow(){
             existingOrderNums.add(normON);
             S.sales=[data,...S.sales];
             newCount++;
-            addedOrders.push({orderNum,pn,qty:li.quantity||1,date:(order.created_at||'').slice(0,10),customer:custName||'—',status:fs});
+            addedOrders.push({orderNum,pn,qty:shopifyLineQty(li),date:(order.created_at||'').slice(0,10),customer:custName||'—',status:fs});
             if(S.view!=='sales')showOrderAlert(orderNum,pn);
           }
         } else {
@@ -11457,13 +11856,14 @@ async function importOrdersFromShopify(){
         for(const li of (order.line_items||[])){
           const pn=li.sku?li.sku.trim().toUpperCase():(li.title||'').trim();
           if(!pn)continue;
+          if(shopifyLineIsRemoved(li))continue; // zeroed-out line = removed, same as the sync path
           const exists=S.sales.some(s=>s.order_number===orderNum&&(s.pn||'').toUpperCase()===(pn||'').toUpperCase());
           if(exists){skipped++;continue;}
           const fs=order.financial_status==='refunded'?'Cancelled':
             order.fulfillment_status==='fulfilled'?'Delivered':
             order.fulfillment_status==='partial'?'Shipped':'Open';
           const{data}=await db.from('sales').insert({
-            order_number:orderNum,pn,qty:li.quantity||1,
+            order_number:orderNum,pn,qty:shopifyLineQty(li),
             source:'Shopify Import',fulfillment_status:fs,
             sale_date:centralDateOnly(order.created_at),
             discount_code:(order.discount_codes?.length?order.discount_codes[0].code:null)||null,
@@ -17760,6 +18160,19 @@ function lineRevenue(x){
   var pm=pt?(Number(pt.msrp)||0):0;
   return{rev:q*pm,unit:pm,actual:false,basis:pm>0?'list':'unknown'};
 }
+// [FIX] Shopify keeps a removed line in line_items with quantity 0 rather than dropping it from
+// the array, and `li.quantity||1` reads that 0 as ONE because 0 is falsy in JS. The edge-function
+// webhook paths were fixed for this, but the ERP's OWN client-side Shopify sync/import paths had
+// the identical bug - so a line zeroed out in Shopify kept getting re-inserted at qty 1 every time
+// a sync ran, which is why a deleted drop-ship line reappeared even after the webhook side was
+// corrected. An undefined/missing quantity still defaults to 1 (unchanged for normal orders); an
+// explicit 0 or negative means the line is not part of the order.
+function shopifyLineQty(li){
+  if(!li)return 1;
+  return (li.quantity===undefined||li.quantity===null)?1:Number(li.quantity);
+}
+function shopifyLineIsRemoved(li){ return shopifyLineQty(li)<=0; }
+
 function shopifyLineUnitPrice(li){
   // Net per-unit price actually charged. Order-level discount codes (how dealers buy)
   // arrive as discount_allocations; line-level discounts as total_discount. Preferring
