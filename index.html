@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.30';
+const TGK_ERP_VERSION = 'v23.31';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -8355,6 +8355,109 @@ Deno.serve(async (req) =&gt; {
       preorder_skipped: skippedTemplates.length, skipped_templates: skippedTemplates, results: perVariant
     }), {headers:{...CORS,'Content-Type':'application/json'}})
   }
+  // [AUDIT] Read-only. Reports the CURRENT live Shopify state of every SKU the backorder
+  // automation has ever written to, so the damage from the pre-order bug (backorder automation
+  // overriding products deliberately merchandised as pre-order) can be seen precisely instead of
+  // guessed at. shopify_sync_log is the authoritative record of which SKUs were touched, so that
+  // is the input rather than a hand-built list. Writes NOTHING - safe to run at any time.
+  // Paginated by offset with deliberate pacing, same shape as backfill_sale_dates, because this
+  // is one Shopify call per SKU and the rate limit is real.
+  if (body.action === 'audit_backorder_state') {
+    const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
+    const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
+    if (!store || !key) return new Response(JSON.stringify({error:'Missing Shopify credentials'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
+    const limit = Math.min(Math.max(parseInt(body.limit) || 25, 1), 60)
+    const offset = Math.max(parseInt(body.offset) || 0, 0)
+    const sinceDays = Math.max(parseInt(body.since_days) || 180, 1)
+    const sinceIso = new Date(Date.now() - sinceDays * 86400000).toISOString()
+
+    let skus: string[] = []
+    try {
+      if (Array.isArray(body.skus) &amp;&amp; body.skus.length) {
+        skus = body.skus.map((x: any) =&gt; String(x).trim()).filter(Boolean)
+      } else {
+        const seen = new Set&lt;string&gt;()
+        let from = 0
+        const pageSize = 1000
+        while (true) {
+          const { data, error } = await db.from('shopify_sync_log')
+            .select('pn,created_at,action')
+            .gte('created_at', sinceIso)
+            .order('pn', { ascending: true })
+            .range(from, from + pageSize - 1)
+          if (error) throw error
+          for (const r of (data || [])) {
+            // Only SKUs the automation actually pushed INTO backorder can have overridden a
+            // pre-order presentation; 'reverted' rows are the automation undoing itself.
+            if (r.pn &amp;&amp; (r.action === 'backorder' || r.action === 'partial')) seen.add(r.pn)
+          }
+          if (!data || data.length &lt; pageSize) break
+          from += pageSize
+        }
+        skus = [...seen].sort()
+      }
+    } catch (e) {
+      return new Response(JSON.stringify({error:'Failed to read shopify_sync_log: ' + String((e as any)?.message || e)}), {status:500, headers:{...CORS,'Content-Type':'application/json'}})
+    }
+
+    const page = skus.slice(offset, offset + limit)
+    const H = {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'}
+    const rows: any[] = []
+    for (const sku of page) {
+      try {
+        const safe = sku.replace(/"/g, '')
+        const q = '{ productVariants(first: 10, query: "sku:\\\\"' + safe + '\\\\"") { edges { node { '
+          + 'id sku inventoryPolicy inventoryQuantity inventoryItem { tracked } '
+          + 'metafield(namespace: "custom", key: "estimated_arrival_date") { value } '
+          + 'product { id title handle templateSuffix metafield(namespace: "custom", key: "estimated_arrival_date") { value } } '
+          + '} } } }'
+        const r = await fetch('https://' + store + '/admin/api/2024-01/graphql.json', {method:'POST', headers:H, body: JSON.stringify({query:q})}).then(x =&gt; x.json())
+        const matches = (r?.data?.productVariants?.edges || [])
+          .map((e: any) =&gt; e.node)
+          .filter((n: any) =&gt; (n.sku || '').trim().toUpperCase() === sku.toUpperCase())
+        if (!matches.length) { rows.push({ sku, found: false, note: 'no Shopify variant with this SKU' }); continue }
+        for (const n of matches) {
+          const tpl = n.product?.templateSuffix || ''
+          rows.push({
+            sku,
+            found: true,
+            variant_id: n.id,
+            product_id: n.product?.id,
+            product_title: n.product?.title,
+            handle: n.product?.handle,
+            template_suffix: tpl,
+            looks_preorder: /pre[-_ ]?order/i.test(tpl),
+            tracked: !!n.inventoryItem?.tracked,
+            inventory_policy: n.inventoryPolicy,
+            inventory_quantity: n.inventoryQuantity,
+            variant_eta: (n.metafield?.value || '').trim(),
+            product_eta: (n.product?.metafield?.value || '').trim()
+          })
+        }
+        await new Promise(r2 =&gt; setTimeout(r2, 550))
+      } catch (e) {
+        rows.push({ sku, found: false, error: String((e as any)?.message || e) })
+      }
+    }
+
+    // Grouped so the answer to "what did this break" is readable without scanning every row.
+    const onPreorderTpl = rows.filter((r: any) =&gt; r.found &amp;&amp; r.looks_preorder)
+    const backorderLooking = rows.filter((r: any) =&gt; r.found &amp;&amp; !r.looks_preorder &amp;&amp; r.tracked &amp;&amp; (r.inventory_quantity || 0) &lt;= 0)
+    return new Response(JSON.stringify({
+      ok: true,
+      total_skus_in_log: skus.length,
+      processed_this_batch: page.length,
+      next_offset: offset + page.length,
+      done: (offset + page.length) &gt;= skus.length,
+      summary: {
+        still_on_preorder_template: onPreorderTpl.length,
+        preorder_but_tracked_or_zeroed: onPreorderTpl.filter((r: any) =&gt; r.tracked || r.variant_eta || r.product_eta).length,
+        currently_backorder_looking: backorderLooking.length
+      },
+      rows
+    }), { headers: { ...CORS, 'Content-Type': 'application/json' } })
+  }
+
 if (body.action === 'list_product_templates') {
     const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
     const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
