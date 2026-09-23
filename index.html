@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.39';
+const TGK_ERP_VERSION = 'v23.41';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -2626,7 +2626,13 @@ let _filterDebounce=null;
 function setFilter(ns,k,val){
   if(!S.filters[ns])S.filters[ns]={};
   S.filters[ns][k]=val;
-  if(ns==='sales'&&k==='fstatus')S.filters.sales.readiness=null; // these two are mutually exclusive views of the list
+  if(ns==='sales'&&k==='fstatus'){
+    S.filters.sales.readiness=null; // these two are mutually exclusive views of the list
+    // Also drop any alert-supplied order set: picking a status chip is the user taking over the
+    // filtering, and leaving an invisible order-number restriction in place underneath it would
+    // show a confusingly short list with nothing on screen explaining the omission.
+    S.filters.sales.orderNums=null;
+  }
   if(k==='search'){
     // Debounce text search: full-page render per keystroke is the main typing lag source
     if(_filterDebounce)clearTimeout(_filterDebounce);
@@ -4799,6 +4805,13 @@ function renderSales(){
     }
     return false;
   });
+  // An explicit order-number set, handed over by a dashboard alert that already decided exactly
+  // which orders it means. Applied INSTEAD of re-deriving them from a status filter, which is how
+  // the alert count and the list result were able to contradict each other.
+  if(Array.isArray(sf.orderNums)&&sf.orderNums.length){
+    const _want=new Set(sf.orderNums.map(function(n){return String(n);}));
+    list=list.filter(function(s2){return _want.has(String(s2.order_number||''));});
+  }
   if(sf.fstatus){
     const allowed=new Set(sf.fstatus.split('|'));
     const _inclRef=allowed.has('Refunded');
@@ -4820,7 +4833,7 @@ function renderSales(){
   // salesLoadMore) was already here and viewport-agnostic; desktop just wasn't using it.
   const _salesIsMobile = !!(window.matchMedia && window.matchMedia('(max-width:768px)').matches);
   const _SALES_PAGE = _salesIsMobile ? 100 : 200;
-  const _salesSig = JSON.stringify([q, sf.fstatus||'', sf.readiness||'']);
+  const _salesSig = JSON.stringify([q, sf.fstatus||'', sf.readiness||'', (sf.orderNums||[]).join(',')]);
   if(window._salesMobileSig !== _salesSig){ window._salesMobileSig = _salesSig; window._salesMobileLimit = _SALES_PAGE; }
   window._salesPageSize = _SALES_PAGE;
   const _salesLimit = window._salesMobileLimit || _SALES_PAGE;
@@ -4892,7 +4905,8 @@ function renderSales(){
     <div class="search-wrap" style="flex:1;min-width:180px;max-width:280px"><span class="search-icon"><span class="ic ic-search"></span></span>
       <input placeholder="Order #, SKU or customer…" value="${sf.search||''}" oninput="setFilter('sales','search',this.value)">
     </div>
-    <button class="filter-chip ${!sf.fstatus&&!sf.readiness?'on-teal':''}" onclick="setFilter('sales','fstatus','')">All</button>
+    ${(Array.isArray(sf.orderNums)&&sf.orderNums.length)?`<button class="filter-chip on-teal" style="border-color:var(--yellow);color:var(--yellow)" title="Showing only the orders flagged by the dashboard alert. Click to clear." onclick="setFilter('sales','fstatus','')">Flagged orders (${sf.orderNums.length}) &#10005;</button>`:''}
+    <button class="filter-chip ${!sf.fstatus&&!sf.readiness&&!(sf.orderNums||[]).length?'on-teal':''}" onclick="setFilter('sales','fstatus','')">All</button>
     ${fstats.map(s=>`<button class="filter-chip ${chipActive(s)?'on-teal':''}" onclick="setFilter('sales','fstatus','${s}')">${s}</button>`).join('')}
     ${sf.readiness==='split'?`<span class="filter-chip on-teal" style="cursor:default"><span class="ic ic-alert"></span>Needs Split</span>`:''}
     <span class="filter-count" style="margin-left:auto;white-space:nowrap">${list.length} orders</span>
@@ -28265,15 +28279,34 @@ function renderPriceList(){
     // single band. The data cells below keep their colours untouched - MSRP is still teal, Pref is
     // still orange; only the labels are neutral. A thin coloured underline marks the two tier
     // columns instead, which keeps the teal/orange association without recolouring the text.
-    +'<thead><tr style="position:sticky;top:0;z-index:2;background:var(--bg3)">'
-    +'<th style="text-align:center;width:36px" title="Live on vendor price list">Live</th>'
-    +'<th>SKU</th><th>Category</th><th>Description</th>'
-    +'<th>MSRP</th>'
-    +'<th style="box-shadow:inset 0 -2px 0 var(--teal)">Std 10%</th>'
-    +'<th style="box-shadow:inset 0 -2px 0 var(--orange)">Pref 20%</th>'
-    +'<th>US Ship</th><th>Canada</th><th>Intl</th>'
-    +'<th>Sales Price</th><th>Notes</th><th>Product Page</th>'
-    +'</tr></thead><tbody>'+tbody+'</tbody></table></div>';
+    // [FIX] Second pass on legibility. Making the colours uniform removed the mismatch but the row
+    // was still hard to read for three reasons the colour change did not touch: the app-wide header
+    // style is 10px (--t-xs) UPPERCASE with wide letter-spacing in --text3 (#565f6d), which is thin
+    // and low-contrast at that size; the default header background is only a hair off the page
+    // background, so the band barely separates from the rows; and the fixed page watermark shows
+    // through, mottling whatever sits on top of it. Fixed by giving these headers their own
+    // treatment - one step larger, near-black, heavier, on an explicitly OPAQUE darker band with a
+    // defined bottom border. The band is opaque specifically so the watermark cannot bleed through
+    // it. Applied as one shared style so the row cannot drift back out of alignment column by
+    // column, which is how it ended up with five different colours in the first place.
+    +(function(){
+      var TH='position:sticky;top:0;z-index:2;background:#e4e7ec;color:var(--text);'
+        +'font-size:var(--t-sm);font-weight:700;letter-spacing:.04em;text-transform:uppercase;'
+        +'padding:9px 12px;border-bottom:2px solid var(--border2);white-space:nowrap';
+      function th(label,extra){return '<th style="'+TH+(extra||'')+'">'+label+'</th>';}
+      return '<thead><tr>'
+        +th('Live',';text-align:center;width:36px')
+        +th('SKU')+th('Category')+th('Description')
+        +th('MSRP')
+        // The tier columns keep their teal/orange identity as an underline rather than coloured
+        // text, so the association survives without costing contrast on the label itself.
+        +th('Std 10%',';box-shadow:inset 0 -3px 0 var(--teal)')
+        +th('Pref 20%',';box-shadow:inset 0 -3px 0 var(--orange)')
+        +th('US Ship')+th('Canada')+th('Intl')
+        +th('Sales Price')+th('Notes')+th('Product Page')
+        +'</tr></thead>';
+    })()
+    +'<tbody>'+tbody+'</tbody></table></div>';
 }
 async function publishPriceListNow(){
   const ts=new Date().toISOString();
@@ -28808,6 +28841,37 @@ async function bulkMarkCancelled() {
   render();
 }
 
+// [FEATURE] Workflow alerts can now be dismissed. Dismissal is keyed to a SIGNATURE of what was
+// actually flagged (the specific order numbers), not just the alert name - so dismissing "2 stale
+// orders" hides exactly that situation, and the alert returns on its own the moment a DIFFERENT
+// order goes stale. A plain "hide forever" toggle would silently suppress new problems, which is
+// worse than the noise it removes. Stored per browser; nothing server-side to migrate.
+function _alertDismissKey(id){return 'tgk_alert_dismiss_'+id;}
+function isAlertDismissed(id,sigArr){
+  try{
+    var raw=localStorage.getItem(_alertDismissKey(id));
+    if(!raw)return false;
+    return raw===(Array.isArray(sigArr)?sigArr.join(','):String(sigArr||''));
+  }catch(e){return false;}
+}
+function dismissAlert(id,sig){
+  try{localStorage.setItem(_alertDismissKey(id),sig||'');}catch(e){}
+  toast('Alert dismissed \u2014 it will return if the situation changes');
+  render();
+}
+window.dismissAlert=dismissAlert;
+window.isAlertDismissed=isAlertDismissed;
+
+// Shows exactly the orders the alert counted, by order number, rather than re-deriving them from a
+// status filter that uses a different definition and can disagree.
+function showStaleOrders(){
+  var nums=S._staleOrderNums||[];
+  if(!nums.length){toast('No stale orders to show');return;}
+  S.filters.sales={...(S.filters.sales||{}),fstatus:'',readiness:null,orderNums:nums.slice()};
+  nav('sales');
+}
+window.showStaleOrders=showStaleOrders;
+
 function _buildWorkflowAlerts() {
   if (!S.purchases || !S.sales || !S.assemblies) return '';
   var alerts = [];
@@ -28834,11 +28898,12 @@ function _buildWorkflowAlerts() {
   S.sales.forEach(function(s) {
     if (isInternal(s.order_number)) return;
     var key = s.order_number || ('__noid__' + s.id);
-    if (!byOrder14[key]) byOrder14[key] = { lines: [], date: s.sale_date };
+    if (!byOrder14[key]) byOrder14[key] = { lines: [], date: s.sale_date, orderNum: s.order_number || key };
     byOrder14[key].lines.push(s);
     if (s.sale_date && (!byOrder14[key].date || s.sale_date < byOrder14[key].date)) byOrder14[key].date = s.sale_date;
   });
   var stale14Count = 0;
+  var staleOrderNums = [];
   Object.values(byOrder14).forEach(function(grp) {
     var d = grp.date;
     if (!d || d >= d14 || d < d60) return; // not in 14-60 day window
@@ -28849,9 +28914,22 @@ function _buildWorkflowAlerts() {
     var allOnHold = pending.every(function(l) { return l.fulfillment_status === 'On Hold'; });
     if (allOnHold) return; // on hold is intentional, not a workflow problem
     stale14Count++;
+    staleOrderNums.push(grp.orderNum);
   });
-  if (stale14Count > 0) {
-    alerts.push({ level: 'yellow', icon: '\ud83d\udd52', text: stale14Count + ' unfulfilled order' + (stale14Count > 1 ? 's' : '') + ' 14+ days old (Open or Partial)', nav: "setFilter('sales','fstatus','Open|Partial');nav('sales')", lbl: 'View Orders' });
+  // [FIX] The alert and the list it linked to used two DIFFERENT definitions, so the count and the
+  // result could never be trusted to agree: this alert counts an order if it has any pending line
+  // that is not all-On-Hold, while the list filtered on the GROUPED order's single effective
+  // status being exactly Open or Partial. An order whose effective status resolves to anything
+  // else - Packed, Pre-Order, or On Hold once a sibling line moved - was counted here and then
+  // shown nowhere, which is exactly the "2 orders" / "0 orders" contradiction. Rather than try to
+  // keep two definitions in step, the alert now hands the list the exact order numbers it counted,
+  // so the two cannot disagree by construction.
+  S._staleOrderNums = staleOrderNums;
+  if (stale14Count > 0 && !isAlertDismissed('stale14', staleOrderNums)) {
+    alerts.push({ id:'stale14', sig: staleOrderNums.join(','),
+      level: 'yellow', icon: '\ud83d\udd52',
+      text: stale14Count + ' unfulfilled order' + (stale14Count > 1 ? 's' : '') + ' 14+ days old (Open or Partial)',
+      nav: "showStaleOrders()", lbl: 'View Orders' });
   }
 
   var partBOCount = 0;
@@ -28882,6 +28960,7 @@ function _buildWorkflowAlerts() {
         + '<span style="font-size:var(--t-md);flex-shrink:0">' + a.icon + '</span>'
         + '<span style="font-size:var(--t-md);color:var(--text2);flex:1">' + a.text + '</span>'
         + '<button class="btn btn-sm" style="flex-shrink:0;color:' + col + ';border-color:' + col + ';opacity:.7" onclick="' + a.nav + '">' + a.lbl + ' →</button>'
+        + (a.id ? '<button class="action-btn" title="Dismiss - returns if the situation changes" style="flex-shrink:0" onclick="dismissAlert(\'' + a.id + '\',\'' + String(a.sig||'').replace(/'/g,"\\'") + '\')">&#10005;</button>' : '')
         + '</div>';
     }).join('')
     + '</div>';
