@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.37';
+const TGK_ERP_VERSION = 'v23.38';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -2264,6 +2264,31 @@ function getVendors(){
 }
 
 function handleVendorSelNew(el){if(el.value==='__new'){el.value='';showNewVendor(el.id);}}
+
+// [FEATURE] Finished-goods categories become a real hierarchy: "Finished Goods" stays the gate,
+// with the subcategory after the slash ("Finished Goods/Automotive"). The price-list filters used
+// to test category === 'Finished Goods' EXACTLY, so the moment a subcategory was added the product
+// silently vanished from both the ERP price list and every dealer list. Matching the TOP-LEVEL
+// segment instead keeps plain "Finished Goods" working untouched while admitting subcategories.
+// Deliberately segment-based, not a substring/startsWith test: "Bolts/Washers/Nuts" must never be
+// mistaken for a finished good, and a startsWith check on a future "Finished Goods Archive" would
+// wrongly match too. Same rule already used for the packaging/supply exclusions.
+function catTop(cat){return String(cat||'').split('/')[0].trim();}
+function catSub(cat){var p=String(cat||'').split('/');return p.length>1?p.slice(1).join('/').trim():'';}
+function isFinishedGood(cat){return catTop(cat)==='Finished Goods';}
+// Label for a price-list section header: the subcategory when there is one, else a clear marker so
+// un-subcategorised products are visible as work-to-do rather than blending in.
+function fgSectionLabel(cat){return catSub(cat)||'Uncategorised';}
+// Every finished-goods subcategory currently in use, for the dealer visibility picker.
+function fgSubcategories(){
+  var out={};
+  (S.assemblies||[]).forEach(function(a){
+    if(!isFinishedGood(a.category)||a.discontinued)return;
+    var sub=catSub(a.category);
+    if(sub)out[sub]=(out[sub]||0)+1;
+  });
+  return Object.keys(out).sort().map(function(k){return{name:k,count:out[k]};});
+}
 
 function buildCatCascade(id,table,selected){
   var cats=getCats(table);
@@ -13837,6 +13862,27 @@ function openModal(type,data){
         </div>
       </div>
     </div>
+    <div class="form-group">
+      <label class="form-label">Visible Product Categories</label>
+      <div style="font-size:var(--t-xs);color:var(--text3);margin-bottom:8px">
+        Leave every box unticked to show this dealer <b>all</b> finished goods (the default, and what every existing dealer does today).
+        Tick one or more to restrict their price list to only those categories.
+      </div>
+      <div id="m-dealer-cats" style="display:flex;flex-wrap:wrap;gap:8px">
+        ${(function(){
+          var subs=fgSubcategories();
+          if(!subs.length)return '<div style="font-size:var(--t-sm);color:var(--orange)">No finished-goods subcategories exist yet. Give assemblies a category like <code>Finished Goods/Automotive</code> first, then they will appear here.</div>';
+          var sel=Array.isArray(data.allowed_subcategories)?data.allowed_subcategories:[];
+          return subs.map(function(sc){
+            var on=sel.indexOf(sc.name)!==-1;
+            return '<label style="display:flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid '+(on?'var(--teal)':'var(--border)')+';border-radius:var(--r-md);cursor:pointer;background:'+(on?'var(--teal-dim)':'transparent')+'">'
+              +'<input type="checkbox" class="m-dealer-cat" value="'+escHtml(sc.name)+'"'+(on?' checked':'')+'>'
+              +'<span style="font-size:var(--t-sm);font-weight:600">'+escHtml(sc.name)+'</span>'
+              +'<span class="t3xs">('+sc.count+')</span></label>';
+          }).join('');
+        })()}
+      </div>
+    </div>
     <div class="form-row">${fi('m-notes','Notes',data.notes||'')}</div>
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitDealer('${data.id||''}')">Save Dealer</button></div>`;
   }
@@ -14403,6 +14449,11 @@ async function submitDealer(eid){
   const name=$('m-name').value.trim();if(!name){toast('Name required');return;}
   const _tv=$('m-disc').value;const _rawPct=_tv==='custom'?parseFloat($('m-disc-custom')?.value||0)||0:parseFloat(_tv)||20;
   const payload={name,contact_name:$('m-contact').value.trim(),email:$('m-email').value.trim(),discount_pct:_rawPct/100,status:$('m-status').value,notes:$('m-notes').value,billing_required:!!$('m-billing')?.checked,po_code_prefix:($('m-po-prefix')?.value||'').trim().toLowerCase()||null};
+  // Stored as NULL when nothing is ticked rather than an empty array: the dealer portal treats
+  // null/empty as "no restriction - show everything", and NULL states that intent unambiguously
+  // instead of relying on an empty array being interpreted the same way.
+  var _dcats=Array.prototype.slice.call(document.querySelectorAll('.m-dealer-cat:checked')).map(function(c){return c.value;});
+  payload.allowed_subcategories=_dcats.length?_dcats:null;
   // No client-side token assignment on insert: the dealers table already defaults
   // price_list_token to gen_random_uuid()::text at the database level, confirmed against the
   // live schema. Setting it here too would just duplicate that, for no benefit. genDealerToken()
@@ -28114,16 +28165,22 @@ function renderPriceList(){
   var cat=sf.cat||'';
   var _hwCatsAll=(HW_CATS||[]).concat(SUPPLY_CATS||[]);
   var list=S.assemblies.filter(function(a){
-    if(a.category!=='Finished Goods')return false;
+    if(!isFinishedGood(a.category))return false;
     if(a.discontinued)return false;
     if(isDev(a))return false;
     if(a.status==='Inactive')return false;
     return true;
   });
   if(q)list=list.filter(function(a){return a.pn.toLowerCase().includes(q)||(a.new_sku||'').toLowerCase().includes(q)||(a.description||'').toLowerCase().includes(q);});
-  if(cat)list=list.filter(function(a){return a.category===cat;});
-  list.sort(function(a,b){var ca=a.category||'',cb=b.category||'';return ca!==cb?ca.localeCompare(cb):dispPn(a).localeCompare(dispPn(b));});
-  var allCats=[...new Set(list.map(function(a){return a.category||'';}).filter(Boolean))].sort();
+  if(cat)list=list.filter(function(a){return fgSectionLabel(a.category)===cat;});
+  // Sorted and grouped by SUBCATEGORY now. Previously this sorted on the full category string,
+  // which for finished goods was identical on every row - so the section-header logic below ran
+  // exactly once and produced a single "FINISHED GOODS" band over the whole list.
+  list.sort(function(a,b){
+    var sa=fgSectionLabel(a.category),sb=fgSectionLabel(b.category);
+    return sa!==sb?sa.localeCompare(sb):dispPn(a).localeCompare(dispPn(b));
+  });
+  var allCats=[...new Set(list.map(function(a){return fgSectionLabel(a.category);}).filter(Boolean))].sort();
   var noMsrp=list.filter(function(a){return !(a.msrp>0);}).length;
   function ed(id,field,val,ph,w){
     return '<input class="inline-edit" value="'+escHtml(String(val||''))+'"'
@@ -28136,7 +28193,7 @@ function renderPriceList(){
   var FIT_ICON='<span class="fit-ic" title="Has fitment guide entry" style="display:inline-flex;align-items:center;gap:2px;margin-left:6px;padding:1px 5px;border-radius:var(--r-sm);background:rgba(13,148,136,.15);color:var(--teal);font-size:var(--t-xs);font-weight:700;vertical-align:middle"><svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4"><path d="M20 6L9 17l-5-5"/></svg>FIT</span>';
   var tbody='';var lastCat=null;
   list.forEach(function(a){
-    var c=a.category||'';
+    var c=fgSectionLabel(a.category);
     if(c!==lastCat){tbody+='<tr><td colspan="13" style="padding:8px 12px;background:rgba(13,148,136,.1);font-size:var(--t-sm);font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--text);border-top:2px solid rgba(13,148,136,.3);border-bottom:1px solid rgba(13,148,136,.2)">'+escHtml(c||'UNCATEGORISED')+'</td></tr>';lastCat=c;}
     var msrp=a.msrp||0;
     var sp=a.sales_price!=null?parseFloat(a.sales_price):null;
