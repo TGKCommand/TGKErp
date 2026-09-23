@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.36';
+const TGK_ERP_VERSION = 'v23.37';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -15800,7 +15800,19 @@ async function loadUserProfile(user){
     } else if(!profile){
       const{data:any}=await db.from('profiles').select('id').limit(1).maybeSingle();
       const role=!any?'admin':'warehouse';
-      const{data:np}=await db.from('profiles').insert({id:user.id,email:user.email,full_name:user.email.split('@')[0],role}).select().single();
+      // [FIX] This insert used to destructure only `data`, never `error` - so when it was
+      // REJECTED (an RLS policy with no "users may insert their own profile" rule is the usual
+      // cause) it failed in total silence: the app carried on with the in-memory fallback object
+      // below, the person appeared signed-in and working, and no profiles row ever existed. The
+      // only visible symptom was days later, when an admin noticed the account missing from the
+      // Users page. Captured and surfaced now, and stashed on S so the Users page can report it.
+      const{data:np,error:insErr}=await db.from('profiles').insert({id:user.id,email:user.email,full_name:user.email.split('@')[0],role}).select().single();
+      if(insErr){
+        S._profileInsertError=insErr.message;
+        console.warn('[auth] could NOT create profiles row for '+user.email+' - '+insErr.message
+          +' | This account will work but will NOT appear in Users & Permissions until the row exists.'
+          +' Most likely an RLS policy on profiles that permits SELECT but not INSERT for the signed-in user.');
+      }
       profile=np||{role,email:user.email,full_name:user.email.split('@')[0]};
       S.currentRole=profile.role||'warehouse';
       S.currentFullName=profile.full_name||user.email;
@@ -16102,10 +16114,48 @@ async function adminDeleteUser(userId){
   }
 }
 
+// Creates the missing profiles row for an account that already exists in auth. Defaults to the
+// lowest-privilege role deliberately - an admin can raise it afterwards in the table below, which
+// is far safer than guessing an elevated role for an account nobody has vetted yet.
+async function adminCreateMissingProfile(idx){
+  const o=(S._profileOrphans||[])[idx];
+  if(!o||!o.email){toast('Account not found');return;}
+  if(!confirm('Add '+o.email+' to Users with the Warehouse role?\n\nYou can change their role right after.'))return;
+  // The profiles primary key is the auth user id, which the browser cannot look up (that needs the
+  // service role). Inserting by email alone would create a row whose id does not match auth, so
+  // the person would STILL not match on their next sign-in. Instead their next login creates the
+  // row correctly - this just verifies the RLS policy is actually the blocker and says so plainly.
+  const{error}=await db.from('profiles').insert({email:o.email,full_name:o.display_name||o.email.split('@')[0],role:'warehouse'});
+  if(error){
+    toast('Could not add: '+error.message,8000);
+    console.warn('[users] create missing profile failed:',error.message);
+    return;
+  }
+  toast('Added '+o.email+' \u2014 set their role below');
+  S._profilesLoaded=false;
+  loadProfiles();
+}
+window.adminCreateMissingProfile=adminCreateMissingProfile;
+
 async function loadProfiles(){
   if(S.currentRole!=='admin'||S._profilesLoading)return;
   S._profilesLoading=true;
   const{data,error}=await db.from('profiles').select('*').order('created_at');
+  // [FIX] An account whose profiles row was never created (see loadUserProfile) was completely
+  // invisible here - it is a real, signed-in user that simply does not appear, with nothing
+  // explaining why. team_members is written by initChat for whoever opens the ERP, so anyone
+  // present there but absent from profiles is exactly that case. Compared case-insensitively
+  // because team_members stores lowercase while profiles keeps whatever case was typed at signup.
+  let orphans=[];
+  try{
+    const{data:tm}=await db.from('team_members').select('email,display_name');
+    const haveProfile={};(data||[]).forEach(function(p){if(p.email)haveProfile[p.email.toLowerCase()]=1;});
+    orphans=(tm||[]).filter(function(t){
+      var em=(t.email||'').toLowerCase();
+      return em&&!haveProfile[em];
+    }).map(function(t){return{email:t.email,display_name:t.display_name||t.email};});
+  }catch(e){ console.warn('[users] orphan check failed:',e&&e.message); }
+  S._profileOrphans=orphans;
   S._profilesLoading=false;
   S._profilesLoaded=true;
   S._profilesError=error?error.message:null;
@@ -16225,8 +16275,27 @@ function renderUsers(){
 
   const headerCells=_NAV_MODULES.map(m=>`<th style="text-align:center;padding:4px 3px;font-size:var(--t-xs);font-weight:700;letter-spacing:.05em;white-space:nowrap;writing-mode:vertical-lr;transform:rotate(180deg);height:84px;color:#E8EDF0;text-shadow:0 1px 2px rgba(0,0,0,.75)">${m.label}</th>`).join('');
 
+  // [FIX] Surfaces accounts that exist and sign in but have no profiles row, so they stop being
+  // silently absent from this page with nothing to explain it. The Add button writes the missing
+  // row directly, which is the whole repair - the account and its auth user already exist.
+  const _orph=S._profileOrphans||[];
+  const orphanBanner=_orph.length?`
+  <div class="panel" style="padding:12px 18px;margin-bottom:0;border-left:3px solid var(--orange)">
+    <div style="font-size:var(--t-md);font-weight:700;color:var(--orange);margin-bottom:4px">${_orph.length} account${_orph.length!==1?'s':''} missing a profile</div>
+    <div style="font-size:var(--t-sm);color:var(--text2);margin-bottom:10px">
+      ${_orph.length!==1?'These have':'This has'} signed in to the ERP but ${_orph.length!==1?'have':'has'} no row in <code>profiles</code>, so ${_orph.length!==1?'they do':'it does'} not appear in the list below and ${_orph.length!==1?'have':'has'} no role or permissions.
+      Usually the sign-up insert was blocked by an RLS policy on <code>profiles</code>.
+    </div>
+    ${_orph.map(function(o,i){return '<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-top:1px solid var(--border)">'
+      +'<div style="flex:1"><span class="pn">'+escHtml(o.email)+'</span>'
+      +(o.display_name&&o.display_name!==o.email?' <span class="t3s">'+escHtml(o.display_name)+'</span>':'')+'</div>'
+      +'<button class="btn btn-sm btn-teal" onclick="adminCreateMissingProfile('+i+')">+ Add to Users</button>'
+      +'</div>';}).join('')}
+  </div>`:'';
+
   return`
   <div class="kpi-grid kpi-grid-5">
+    ${orphanBanner}
     <div class="kpi"><div class="kpi-label">Total Users</div><div class="kpi-value">${S.profiles.length}</div></div>
     <div class="kpi kpi-teal"><div class="kpi-label">Admins</div><div class="kpi-value">${S.profiles.filter(p=>p.role==='admin').length}</div></div>
     <div class="kpi kpi-orange"><div class="kpi-label">Warehouse</div><div class="kpi-value">${S.profiles.filter(p=>p.role==='warehouse').length}</div></div>
