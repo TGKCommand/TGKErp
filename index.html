@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.42';
+const TGK_ERP_VERSION = 'v23.43';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -14525,16 +14525,39 @@ async function submitPart(eid){
   if(eid){
     const prev=S.parts.find(p=>p.id===eid);
     const oldPn=prev?.pn;
-    if(oldPn&&newPn!==oldPn){
+    // [FIX] A part-number rename used to cascade the CHILD tables first (bom_items,
+    // inv_corrections, shopify_sync_log) with no error checks, and only THEN update the part row.
+    // If that final update failed - a unique constraint, RLS, a dropped connection - the cascades
+    // had already committed: every BOM using this part now pointed at a PN that did not exist,
+    // silently breaking buildability (which drives backorder decisions and the on-hold release
+    // check), while the user was shown an error and believed nothing had changed. Order is now
+    // reversed: the part is renamed first, and the children only follow if that succeeded, so a
+    // failure leaves everything consistently on the OLD number.
+    const _renaming=!!(oldPn&&newPn!==oldPn);
+    if(_renaming){
       const conflict=[...S.parts.map(p=>p.pn),...S.assemblies.map(a=>a.pn)].find(p=>p===newPn);
       if(conflict){toast(newPn+' already exists — choose a different SKU');return;}
-      await db.from('bom_items').update({child_pn:newPn}).eq('child_pn',oldPn);
-      await db.from('inv_corrections').update({pn:newPn}).eq('pn',oldPn);
-      await db.from('shopify_sync_log').update({pn:newPn}).eq('pn',oldPn);
-      Object.values(S.boms).forEach(lines=>lines.forEach(l=>{if(l.child_pn===oldPn)l.child_pn=newPn;}));
-      S.corrections=S.corrections.map(c=>c.pn===oldPn?{...c,pn:newPn}:c);
     }
     ({error}=await db.from('parts').update(payload).eq('id',eid));
+    if(!error&&_renaming){
+      const _cascadeFails=[];
+      const _c1=await db.from('bom_items').update({child_pn:newPn}).eq('child_pn',oldPn);
+      if(_c1.error)_cascadeFails.push('BOM lines: '+_c1.error.message);
+      const _c2=await db.from('inv_corrections').update({pn:newPn}).eq('pn',oldPn);
+      if(_c2.error)_cascadeFails.push('stock history: '+_c2.error.message);
+      const _c3=await db.from('shopify_sync_log').update({pn:newPn}).eq('pn',oldPn);
+      if(_c3.error)_cascadeFails.push('sync log: '+_c3.error.message);
+      // Local state only mirrors what the database actually accepted.
+      if(!_c1.error)Object.values(S.boms).forEach(lines=>lines.forEach(l=>{if(l.child_pn===oldPn)l.child_pn=newPn;}));
+      if(!_c2.error)S.corrections=S.corrections.map(c=>c.pn===oldPn?{...c,pn:newPn}:c);
+      if(_cascadeFails.length){
+        // The part itself IS renamed. Surfacing exactly which references did not follow means this
+        // can be put right deliberately, instead of BOMs quietly pointing at a PN that is gone.
+        toast('Renamed to '+newPn+', but some references did not update: '+_cascadeFails.join('; ')
+          +'. Anything still using '+oldPn+' will not resolve.',12000);
+        console.warn('[rename] partial cascade for',oldPn,'->',newPn,_cascadeFails);
+      }
+    }
     if(!error&&prev)pushUndo('update','parts',{...prev,...payload},prev,'Edit part: '+payload.pn);
     // [FIX C] On Hand can be changed directly on this form. Both this and the Edit Assembly form now
     // log an inv_corrections entry and trigger Shopify sync when the direct edit changes stock (below).
@@ -14714,20 +14737,34 @@ window.mergeDuplicateAssemblyPair=async function(legacyId,dupId,btnEl){
       total_on_hand:(legacy.total_on_hand||0)+(dup.total_on_hand||0),
       updated_at:new Date().toISOString()
     };
+    // [FIX] This used to add the duplicate's stock into the legacy row FIRST and delete the
+    // duplicate LAST. If that delete failed, both rows still existed while the legacy row already
+    // held both quantities - stock counted twice - and the error handler offered "Retry Merge",
+    // which re-read the (already summed) legacy row and added the duplicate's stock AGAIN, counting
+    // it three times. The six intermediate re-pointing writes also had no error checks, so a silent
+    // failure could delete the duplicate while other BOMs still referenced it.
+    // New order: re-point every reference first (each checked, and each safe to repeat, so a retry
+    // is harmless), then move stock, then delete - and if the delete fails, the stock move is
+    // reversed before throwing, so a retry always starts from correct numbers.
+    const _step=async function(label,q){const r=await q;if(r.error)throw new Error(label+' failed: '+r.error.message);};
+    await _step('Re-pointing sales',db.from('sales').update({pn:legacy.pn}).eq('pn',dup.pn));
+    await _step('Re-pointing warranty claims',db.from('warranty_claims').update({pn:legacy.pn}).eq('pn',dup.pn));
+    await _step('Re-pointing shipment errors (expected)',db.from('shipment_errors').update({expected_pn:legacy.pn}).eq('expected_pn',dup.pn));
+    await _step('Re-pointing shipment errors (actual)',db.from('shipment_errors').update({actual_pn:legacy.pn}).eq('actual_pn',dup.pn));
+    // The duplicate's own BOM is a migration copy of the legacy one, not independent data.
+    await _step('Removing duplicate BOM',db.from('bom_items').delete().eq('parent_pn',dup.pn));
+    // Anything using the duplicate as a component now uses the legacy PN instead.
+    await _step('Re-pointing BOM components',db.from('bom_items').update({child_pn:legacy.pn}).eq('child_pn',dup.pn));
     const{error:updErr}=await db.from('assemblies').update(payload).eq('id',legacyId);
     if(updErr)throw new Error('Update failed: '+updErr.message);
-    // Move any sales/warranty/shipment-error rows recorded under the duplicate's pn to the legacy pn
-    await db.from('sales').update({pn:legacy.pn}).eq('pn',dup.pn);
-    await db.from('warranty_claims').update({pn:legacy.pn}).eq('pn',dup.pn);
-    await db.from('shipment_errors').update({expected_pn:legacy.pn}).eq('expected_pn',dup.pn);
-    await db.from('shipment_errors').update({actual_pn:legacy.pn}).eq('actual_pn',dup.pn);
-    // Discard the duplicate's own BOM (it's a migration copy of the legacy BOM, not independent data —
-    // the caller already confirmed line counts matched or is force-merging)
-    await db.from('bom_items').delete().eq('parent_pn',dup.pn);
-    // If the duplicate is used as a component inside any OTHER assembly's BOM, repoint it to the legacy pn
-    await db.from('bom_items').update({child_pn:legacy.pn}).eq('child_pn',dup.pn);
     const{error:delErr}=await db.from('assemblies').delete().eq('id',dupId);
-    if(delErr)throw new Error('Delete failed: '+delErr.message);
+    if(delErr){
+      // Compensate: put the legacy row's stock back, so the duplicate (which still exists) is not
+      // counted twice and a retry does not sum on top of an already-summed value.
+      const _rb=await db.from('assemblies').update({total_on_hand:legacy.total_on_hand||0,updated_at:new Date().toISOString()}).eq('id',legacyId);
+      if(_rb.error)throw new Error('Delete failed AND stock rollback failed - '+legacy.pn+' may be double-counting '+dup.pn+'\'s stock. Check both on hand values manually. ('+delErr.message+' / '+_rb.error.message+')');
+      throw new Error('Delete failed ('+delErr.message+') - stock change was rolled back, safe to retry');
+    }
     S.assemblies=S.assemblies.map(function(a){return a.id===legacyId?Object.assign({},a,payload):a;}).filter(function(a){return a.id!==dupId;});
     delete S.boms[dup.pn];
     logAction('Merged duplicate SKU '+dup.pn+' into '+legacy.pn,'assemblies',legacy.pn,dup,payload).catch(function(){});
@@ -15707,19 +15744,36 @@ async function submitAsm(eid){
   if(eid){
     const prev=S.assemblies.find(a=>a.id===eid);
     const oldPn=prev?.pn;
-    if(oldPn&&newPn!==oldPn){
+    // [FIX] Same ordering bug as the part rename, and worse here: an assembly rename also moves its
+    // OWN recipe (bom_items.parent_pn). With the cascades running first and unchecked, a failed
+    // update of the assembly row left its entire BOM filed under a PN that did not exist - the
+    // assembly would show an empty BOM, read as unbuildable, and fall into backorder. The assembly
+    // is now renamed first, and its references only follow on success.
+    const _renaming=!!(oldPn&&newPn!==oldPn);
+    if(_renaming){
       const conflict=[...S.parts.map(p=>p.pn),...S.assemblies.map(a=>a.pn)].find(p=>p===newPn);
       if(conflict){toast(newPn+' already exists — choose a different SKU');return;}
-      await db.from('bom_items').update({child_pn:newPn}).eq('child_pn',oldPn);
-      await db.from('bom_items').update({parent_pn:newPn}).eq('parent_pn',oldPn);
-      await db.from('inv_corrections').update({pn:newPn}).eq('pn',oldPn);
-      await db.from('shopify_sync_log').update({pn:newPn}).eq('pn',oldPn);
-      Object.values(S.boms).forEach(lines=>lines.forEach(l=>{if(l.child_pn===oldPn)l.child_pn=newPn;}));
-      if(S.boms[oldPn]){S.boms[newPn]=S.boms[oldPn];delete S.boms[oldPn];}
-      if(S.selBOM===oldPn)S.selBOM=newPn;
-      S.corrections=S.corrections.map(c=>c.pn===oldPn?{...c,pn:newPn}:c);
     }
     ({error}=await db.from('assemblies').update(payload).eq('id',eid));
+    if(!error&&_renaming){
+      const _fails=[];
+      const _r1=await db.from('bom_items').update({child_pn:newPn}).eq('child_pn',oldPn);
+      if(_r1.error)_fails.push('used-in BOMs: '+_r1.error.message);
+      const _r2=await db.from('bom_items').update({parent_pn:newPn}).eq('parent_pn',oldPn);
+      if(_r2.error)_fails.push('own BOM: '+_r2.error.message);
+      const _r3=await db.from('inv_corrections').update({pn:newPn}).eq('pn',oldPn);
+      if(_r3.error)_fails.push('stock history: '+_r3.error.message);
+      const _r4=await db.from('shopify_sync_log').update({pn:newPn}).eq('pn',oldPn);
+      if(_r4.error)_fails.push('sync log: '+_r4.error.message);
+      if(!_r1.error)Object.values(S.boms).forEach(lines=>lines.forEach(l=>{if(l.child_pn===oldPn)l.child_pn=newPn;}));
+      if(!_r2.error){if(S.boms[oldPn]){S.boms[newPn]=S.boms[oldPn];delete S.boms[oldPn];}if(S.selBOM===oldPn)S.selBOM=newPn;}
+      if(!_r3.error)S.corrections=S.corrections.map(c=>c.pn===oldPn?{...c,pn:newPn}:c);
+      if(_fails.length){
+        toast('Renamed to '+newPn+', but some references did not update: '+_fails.join('; ')
+          +'. Anything still using '+oldPn+' will not resolve.',12000);
+        console.warn('[rename asm] partial cascade for',oldPn,'->',newPn,_fails);
+      }
+    }
     if(!error&&prev)pushUndo('update','assemblies',{...prev,...payload},prev,'Edit assembly: '+payload.pn);
     // The On Hand field can be edited directly on this form, bypassing every other stock-changing
     // path in the app (packing, receiving, cycle counts) that normally logs an inv_corrections entry
@@ -28780,14 +28834,14 @@ async function bulkMarkShipped() {
         var aNew = aPrev - lineQty; // allow negative — same backorder convention as every other ship path
         await db.from('assemblies').update({ total_on_hand: aNew, updated_at: now }).eq('id', asm.id);
         _asmQtyPatch[asm.id] = aNew;
-        await db.from('inv_corrections').insert({ pn: line.pn, previous_qty: aPrev, new_qty: aNew, adjustment: -lineQty, reason: 'Bulk mark Shipped — order ' + oKey, user_email: S.currentUser || null, source: 'shipment' });
+        await db.from('inv_corrections').insert({ pn: line.pn, previous_qty: aPrev, new_qty: aNew, adjustment: -lineQty, reason: 'Bulk mark Shipped — order ' + oKey + (tracking ? ' ' + tracking : ''), user_email: S.currentUser || null, source: 'shipment' });
         syncShopifyTemplate(line.pn, aNew);
       } else if (prt) {
         var pPrev = (_partQtyPatch[prt.id] !== undefined) ? _partQtyPatch[prt.id] : (prt.total_unpckgd || 0);
         var pNew = pPrev - lineQty;
         await db.from('parts').update({ total_unpckgd: pNew, updated_at: now }).eq('id', prt.id);
         _partQtyPatch[prt.id] = pNew;
-        await db.from('inv_corrections').insert({ pn: line.pn, previous_qty: pPrev, new_qty: pNew, adjustment: -lineQty, reason: 'Bulk mark Shipped — order ' + oKey, user_email: S.currentUser || null, source: 'shipment' });
+        await db.from('inv_corrections').insert({ pn: line.pn, previous_qty: pPrev, new_qty: pNew, adjustment: -lineQty, reason: 'Bulk mark Shipped — order ' + oKey + (tracking ? ' ' + tracking : ''), user_email: S.currentUser || null, source: 'shipment' });
         cascadeShopifySync(line.pn);
       }
       var payload = { fulfillment_status: 'Shipped', shipped_at: now, updated_at: now };
