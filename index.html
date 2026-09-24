@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.47';
+const TGK_ERP_VERSION = 'v23.48';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -25183,20 +25183,28 @@ async function deleteResolutionRecord(table, linkCol, id, label){
     +'. The ticket will be kept, and just unlinked from this '+label+'.';
   if(!confirm(msg))return false;
 
+  // Best-effort unlink. Its outcome is recorded rather than acted on: once the foreign key is
+  // ON DELETE SET NULL (see migration-resolution-deletes.sql) the database clears the link itself
+  // during the delete, so a blocked unlink must NOT stop the delete from being attempted. The
+  // result is only used to explain a failure accurately.
+  var unlinkOk=true;
   if(linked){
     var patch={};patch[linkCol]=null;
-    var ul=await db.from('tickets').update(patch).eq(linkCol,id);
-    if(ul.error){
-      toast('\u26a0 Could not unlink the Support ticket, so the '+label+' was not deleted: '+ul.error.message,9000);
-      console.warn('['+table+' delete] unlink failed:',ul.error);
-      return false;
-    }
+    // Rows are requested back because an RLS-blocked UPDATE reports success having changed nothing.
+    var ul=await db.from('tickets').update(patch).eq(linkCol,id).select('id');
+    unlinkOk=!ul.error&&!!ul.data&&ul.data.length>=linked.length;
+    if(!unlinkOk)console.warn('['+table+' delete] ticket unlink did not take ('+(ul.error?ul.error.message:((ul.data||[]).length+' of '+linked.length+' updated - RLS on tickets likely blocking UPDATE'))+') - attempting delete anyway');
   }
 
   var r=await db.from(table).delete().eq('id',id).select('id');
   if(r.error){
     var m=r.error.message||'';
-    var why=/foreign key|violates|constraint/i.test(m)?'something else still references it ('+m+')':m;
+    var isFk=/foreign key|violates|constraint/i.test(m);
+    var why=isFk
+      ? (linked&&!unlinkOk
+          ? 'it is still linked to a Support ticket, and that link could not be cleared. Run migration-resolution-deletes.sql so the link clears itself on delete'
+          : 'something else still references it ('+m+')')
+      : m;
     toast('\u26a0 '+label.charAt(0).toUpperCase()+label.slice(1)+' NOT deleted: '+why,10000);
     console.warn('['+table+' delete] failed:',r.error);
     return false;
