@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.45';
+const TGK_ERP_VERSION = 'v23.46';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -25141,12 +25141,63 @@ async function advanceWarranty(id, newStatus) {
   toast('Status → '+newStatus);render();
 }
 
+// Shared delete for both Customer Resolution record types (warranty claims and shipment errors).
+// [FIX] Both used to discard the delete's result, then remove the record from the screen and toast
+// success regardless - so whenever the database refused, the record reappeared on the next load.
+// Two ways it refuses, which need different detection:
+//   1. A linked Support Center ticket. tickets.<linkCol> points at the record; unless that foreign
+//      key is ON DELETE SET NULL, deleting a linked record fails with a constraint error. These
+//      records very often originate from a ticket, so it is the common case.
+//   2. Row-level security. With no matching DELETE policy, Supabase returns SUCCESS having deleted
+//      zero rows - no error at all. Checking `error` cannot see it, so the deleted rows are
+//      requested back and counted.
+// The linked ticket is kept (it is the customer conversation history) and only unlinked first.
+async function deleteResolutionRecord(table, linkCol, id, label){
+  var linked=null;
+  try{
+    var lq=await db.from('tickets').select('id,ticket_number').eq(linkCol,id).limit(5);
+    if(lq&&!lq.error&&lq.data&&lq.data.length)linked=lq.data;
+  }catch(_e){}
+  var msg='Delete this '+label+'?';
+  if(linked)msg+='\n\nIt is linked to Support ticket'+(linked.length>1?'s ':' ')
+    +linked.map(function(t){return '#'+(t.ticket_number||t.id);}).join(', ')
+    +'. The ticket will be kept, and just unlinked from this '+label+'.';
+  if(!confirm(msg))return false;
+
+  if(linked){
+    var patch={};patch[linkCol]=null;
+    var ul=await db.from('tickets').update(patch).eq(linkCol,id);
+    if(ul.error){
+      toast('\u26a0 Could not unlink the Support ticket, so the '+label+' was not deleted: '+ul.error.message,9000);
+      console.warn('['+table+' delete] unlink failed:',ul.error);
+      return false;
+    }
+  }
+
+  var r=await db.from(table).delete().eq('id',id).select('id');
+  if(r.error){
+    var m=r.error.message||'';
+    var why=/foreign key|violates|constraint/i.test(m)?'something else still references it ('+m+')':m;
+    toast('\u26a0 '+label.charAt(0).toUpperCase()+label.slice(1)+' NOT deleted: '+why,10000);
+    console.warn('['+table+' delete] failed:',r.error);
+    return false;
+  }
+  if(!r.data||!r.data.length){
+    toast('\u26a0 '+label.charAt(0).toUpperCase()+label.slice(1)+' NOT deleted \u2014 the database accepted the request but removed nothing. '
+      +'This is almost always a missing DELETE policy on '+table+'.',10000);
+    console.warn('['+table+' delete] 0 rows affected for id',id,'- check the RLS DELETE policy on '+table);
+    return false;
+  }
+  return linked?'unlinked':true;
+}
+window.deleteResolutionRecord=deleteResolutionRecord;
+
 async function deleteWarranty(id) {
-  if(!confirm('Delete this claim?'))return;
-  await db.from('warranty_claims').delete().eq('id',id);
+  var ok=await deleteResolutionRecord('warranty_claims','warranty_claim_id',id,'claim');
+  if(!ok)return;
   S.warrantyClaims=S.warrantyClaims.filter(w=>w.id!==id);
   logAction('Deleted warranty claim','warranty_claims',null,null,null).catch(()=>{});
-  toast('Claim deleted');render();
+  toast('Claim deleted'+(ok==='unlinked'?' \u00b7 Support ticket kept and unlinked':''));updateBadge();render();
 }
 
 async function updateWarranty(id){
@@ -25492,8 +25543,8 @@ async function advanceShipmentError(id,newStatus){
 }
 
 async function deleteShipmentError(id){
-  if(!confirm('Delete this shipment error record?'))return;
-  await db.from('shipment_errors').delete().eq('id',id);
+  var ok=await deleteResolutionRecord('shipment_errors','shipment_error_id',id,'shipment error');
+  if(!ok)return;
   S.shipmentErrors=(S.shipmentErrors||[]).filter(e=>e.id!==id);
   logAction('Deleted shipment error','shipment_errors',null,null,null).catch(()=>{});
   toast('Deleted');updateBadge();render();
