@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.41';
+const TGK_ERP_VERSION = 'v23.42';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -14117,6 +14117,35 @@ function openModal(type,data){
     </div>
     ${fi('dso-ref','Vendor Order # (optional, applies to all lines)','','placeholder="Confirmation # from the vendor, for your own reference"')}
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" style="background:var(--orange);border-color:var(--orange)" onclick="submitMarkDropshipOrderedGroup('${escHtml(data.orderNum)}','${_dsJsEsc(data.vendorKey)}')">Mark All Ordered</button></div>`;
+  }
+  else if(type==='onHoldReady'){
+    var _ords=data.orders||[],_blds=data.buildSkus||[];
+    title=_ords.length+' on-hold order'+(_ords.length!==1?'s':'')+' ready to fulfil';
+    body=`<div style="font-size:var(--t-md);color:var(--text2);margin-bottom:14px">
+      Worked out oldest-first against current on-hand stock, with each order's parts set aside as it goes \u2014 so this is what you can actually release, in this order, not a per-order guess that double-counts shared components. Stock already committed to orders that are not on hold is excluded.
+    </div>
+    ${_blds.length?`<div class="panel" style="padding:10px 14px;margin-bottom:12px;border-left:3px solid var(--orange)">
+      <div style="font-size:var(--t-sm);font-weight:700;color:var(--orange);margin-bottom:6px">Needs assembling first (${_blds.length} SKU${_blds.length!==1?'s':''})</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        ${_blds.map(function(b){return '<span class="pill" style="font-family:var(--mono);font-size:var(--t-sm)">'+escHtml(dispSku(b.pn))+' <b>\u00d7'+b.qty+'</b></span>';}).join('')}
+      </div>
+      <div style="font-size:var(--t-xs);color:var(--text3);margin-top:6px">Totals across every order below. Components are in stock; these just have not been built yet.</div>
+    </div>`:'<div style="font-size:var(--t-sm);color:var(--teal);margin-bottom:12px">Everything is already assembled \u2014 nothing to build, just pack and ship.</div>'}
+    <div class="tbl-wrap" style="max-height:320px;overflow-y:auto">
+      <table><thead><tr><th>Order</th><th>Customer</th><th>Date</th><th>Lines</th><th>Needs Assembly</th></tr></thead><tbody>
+      ${_ords.map(function(o){return '<tr>'
+        +'<td class="pn">'+escHtml(o.orderNum)+'</td>'
+        +'<td style="font-size:var(--t-sm)">'+escHtml(o.customer||'')+'</td>'
+        +'<td style="font-size:var(--t-sm);color:var(--text3)">'+escHtml(o.date||'')+'</td>'
+        +'<td style="text-align:center">'+o.lines+'</td>'
+        +'<td style="font-size:var(--t-sm)">'+(o.needsBuild.length?o.needsBuild.map(function(b){return escHtml(dispSku(b.pn))+' \u00d7'+b.qty;}).join(', '):'<span style="color:var(--teal)">from stock</span>')+'</td>'
+        +'</tr>';}).join('')}
+      </tbody></table>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal()">Close</button>
+      <button class="btn btn-primary" onclick="releaseFulfillableHolds()">View These Orders \u2192</button>
+    </div>`;
   }
   else if(type==='dropShipGroup'){
     title='\u2193 Drop Ship \u2014 Order '+data.orderNum;
@@ -28841,6 +28870,125 @@ async function bulkMarkCancelled() {
   render();
 }
 
+// [FEATURE] "Which on-hold orders could I release right now?" - the question after a PO gets
+// checked in. Deliberately NOT built on fastReadiness (used by the Sales list), for two reasons
+// that both cause over-counting on exactly this question:
+//   1. fastReadiness only looks at on-hand stock. An assembly sitting at 0 but fully buildable from
+//      components reads as blocked, which is the opposite of what this needs to surface - the whole
+//      point is "you have the parts now, go build it".
+//   2. Nothing allocates stock BETWEEN orders. Two on-hold orders each needing 1 of a part with 1
+//      in stock would both report ready, so the pill would promise two releases and deliver one.
+// This walks the on-hold orders oldest-first against a single shared pool, consuming as it goes, so
+// the count is what you can ACTUALLY release, in that order. Each order is evaluated against a
+// cloned pool and only committed if the WHOLE order can be satisfied - a partially-fillable order
+// must not silently eat components that a fully-fillable one behind it needs.
+function computeOnHoldFulfillable(){
+  if(!S.assemblies||!S.sales)return{orders:[],buildSkus:[]};
+  if(!S._partIdx||!S._asmIdx)buildLookupMaps();
+  var pm=S._partIdx,am=S._asmIdx;
+
+  // Working pool. Only what is genuinely on the shelf - no inbound POs, no speculative supply.
+  var pool={asm:{},part:{}};
+  (S.assemblies||[]).forEach(function(a){pool.asm[a.pn]=Number(a.total_on_hand)||0;});
+  (S.parts||[]).forEach(function(p){pool.part[p.pn]=Number(p.total_unpckgd)||0;});
+
+  // Stock already spoken for by orders that are NOT on hold and still owe product. Without this the
+  // pill would count components that an open order in front of it is already going to consume.
+  (S.sales||[]).forEach(function(l){
+    var st=l.fulfillment_status||'Open';
+    if(['Shipped','Delivered','Cancelled','Refunded','On Hold'].indexOf(st)!==-1)return;
+    if(isInternal(l.order_number))return;
+    var q=Number(l.qty)||1;
+    if(pool.asm[l.pn]!==undefined)pool.asm[l.pn]=Math.max(0,pool.asm[l.pn]-q);
+    else if(pool.part[l.pn]!==undefined)pool.part[l.pn]=Math.max(0,pool.part[l.pn]-q);
+  });
+
+  function clone(p){return{asm:Object.assign({},p.asm),part:Object.assign({},p.part)};}
+
+  // Consumes qty of pn from the pool, building from components where stock is short. Returns the
+  // number of units that had to be BUILT (so the caller can report what needs assembling), or null
+  // if it cannot be satisfied at all.
+  function consume(pn,qty,p,depth,builtOut){
+    if(depth>8)return null;
+    var need=qty;
+    var isAsm=(pool.asm[pn]!==undefined)||!!am[pn];
+    if(isAsm){
+      var have=Math.max(0,p.asm[pn]||0);
+      var fromStock=Math.min(have,need);
+      p.asm[pn]=have-fromStock;
+      need-=fromStock;
+      if(need<=0)return 0;
+      var bom=(S.boms&&S.boms[pn])||[];
+      if(!bom.length)return null; // nothing on hand and no recipe - cannot be produced
+      for(var i=0;i<bom.length;i++){
+        var it=bom[i];
+        var cp=pm[it.child_pn];
+        // Packaging/shipping supplies must never block a build decision - same rule the backorder
+        // buildability uses, so the two cannot disagree about what counts as a real component.
+        if(isNonRawSupplyItem(it.item_type,(cp&&cp.category),(cp&&cp.description),it.child_pn))continue;
+        var per=Number(it.qty)||1;
+        var r=consume(it.child_pn,per*need,p,depth+1,builtOut);
+        if(r===null)return null;
+      }
+      builtOut[pn]=(builtOut[pn]||0)+need;
+      return need;
+    }
+    var havep=Math.max(0,p.part[pn]||0);
+    if(havep>=need){p.part[pn]=havep-need;return 0;}
+    return null;
+  }
+
+  var byOrder={};
+  (S.sales||[]).forEach(function(l){
+    if((l.fulfillment_status||'')!=='On Hold')return;
+    if(isInternal(l.order_number))return;
+    var k=l.order_number||('__id__'+l.id);
+    if(!byOrder[k])byOrder[k]={orderNum:l.order_number||k,lines:[],date:l.sale_date,customer:l.customer_name||''};
+    byOrder[k].lines.push(l);
+    if(l.sale_date&&(!byOrder[k].date||l.sale_date<byOrder[k].date))byOrder[k].date=l.sale_date;
+  });
+
+  // Oldest first: if stock only covers some of them, the ones that have waited longest win.
+  var groups=Object.values(byOrder).sort(function(a,b){return String(a.date||'').localeCompare(String(b.date||''));});
+
+  var out=[],buildTotals={};
+  groups.forEach(function(g){
+    var trial=clone(pool),built={},ok=true;
+    for(var i=0;i<g.lines.length;i++){
+      var l=g.lines[i];
+      // A SKU with no assemblies/parts record is drop-ship or vendor-supplied - not something we
+      // hold or build, so it never blocks a release decision.
+      if(pool.asm[l.pn]===undefined&&pool.part[l.pn]===undefined&&!am[l.pn]&&!pm[l.pn])continue;
+      if(consume(l.pn,Number(l.qty)||1,trial,0,built)===null){ok=false;break;}
+    }
+    if(!ok)return;
+    pool=trial; // commit only a fully satisfiable order
+    var needsBuild=Object.keys(built).map(function(k){return{pn:k,qty:built[k]};});
+    needsBuild.forEach(function(b){buildTotals[b.pn]=(buildTotals[b.pn]||0)+b.qty;});
+    out.push({orderNum:g.orderNum,customer:g.customer,date:g.date,lines:g.lines.length,needsBuild:needsBuild});
+  });
+
+  return{orders:out,buildSkus:Object.keys(buildTotals).sort().map(function(k){return{pn:k,qty:buildTotals[k]};})};
+}
+window.computeOnHoldFulfillable=computeOnHoldFulfillable;
+
+function showOnHoldFulfillable(){
+  var r=computeOnHoldFulfillable();
+  if(!r.orders.length){toast('No on-hold orders can be fulfilled from current stock');return;}
+  openModal('onHoldReady',r);
+}
+window.showOnHoldFulfillable=showOnHoldFulfillable;
+
+function releaseFulfillableHolds(){
+  var r=computeOnHoldFulfillable();
+  if(!r.orders.length){toast('Nothing to release');return;}
+  var nums=r.orders.map(function(o){return o.orderNum;});
+  closeModal();
+  S.filters.sales={...(S.filters.sales||{}),fstatus:'',readiness:null,orderNums:nums};
+  nav('sales');
+}
+window.releaseFulfillableHolds=releaseFulfillableHolds;
+
 // [FEATURE] Workflow alerts can now be dismissed. Dismissal is keyed to a SIGNATURE of what was
 // actually flagged (the specific order numbers), not just the alert name - so dismissing "2 stale
 // orders" hides exactly that situation, and the alert returns on its own the moment a DIFFERENT
@@ -28950,12 +29098,28 @@ function _buildWorkflowAlerts() {
   if(latePOLines.length>overduePOs.length){
   }
 
+  // The "you can release these now" signal. Placed with the alerts because that is where the
+  // morning check happens, but coloured teal - it is an opportunity, not a problem. Not dismissible
+  // on purpose: it disappears by itself the moment the orders are released or stock moves.
+  try{
+    var _ohr = computeOnHoldFulfillable();
+    if (_ohr.orders.length) {
+      var _bTxt = _ohr.buildSkus.length
+        ? (' \u00b7 ' + _ohr.buildSkus.length + ' SKU' + (_ohr.buildSkus.length!==1?'s':'') + ' need assembly')
+        : ' \u00b7 all from stock';
+      alerts.unshift({ level:'teal', icon:'<span class="ic ic-check"></span>',
+        text: '<b style="color:var(--teal)">' + _ohr.orders.length + ' on-hold order' + (_ohr.orders.length!==1?'s':'')
+          + ' can be fulfilled now</b>' + _bTxt,
+        nav: "showOnHoldFulfillable()", lbl: 'Show Me' });
+    }
+  }catch(e){ console.warn('[dash] on-hold fulfillable check failed:', e && e.message); }
+
   if (!alerts.length) return '';
 
   return '<div class="panel" style="padding:10px 16px;border-left:3px solid var(--red);margin-bottom:14px">'
     + '<div style="font-size:var(--t-xs);font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text3);margin-bottom:8px"><span class="ic ic-flame"></span>Workflow Alerts</div>'
     + alerts.map(function(a) {
-      var col = a.level === 'red' ? 'var(--red)' : a.level==='yellow'?'var(--yellow)':'var(--orange)';
+      var col = a.level === 'red' ? 'var(--red)' : a.level==='yellow'?'var(--yellow)':a.level==='teal'?'var(--teal)':'var(--orange)';
       return '<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)">'
         + '<span style="font-size:var(--t-md);flex-shrink:0">' + a.icon + '</span>'
         + '<span style="font-size:var(--t-md);color:var(--text2);flex:1">' + a.text + '</span>'
