@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.43';
+const TGK_ERP_VERSION = 'v23.45';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -5811,12 +5811,12 @@ async function unpackSaleOrder(saleId, pn, qty){
 }
 
 async function markPreorder(saleId){
-  await db.from('sales').update({fulfillment_status:'Pre-order'}).eq('id',saleId);
+  if(!await salesWrite(db.from('sales').update({fulfillment_status:'Pre-order'}).eq('id',saleId),'pre-order status'))return;
   S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Pre-order'}:s);
   toast('Marked as Pre-order');render();
 }
 async function markOpenFromPreorder(saleId){
-  await db.from('sales').update({fulfillment_status:'Open'}).eq('id',saleId);
+  if(!await salesWrite(db.from('sales').update({fulfillment_status:'Open'}).eq('id',saleId),'open status'))return;
   S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Open'}:s);
   toast('Moved to Open — ready to fulfill');render();
 }
@@ -6041,19 +6041,30 @@ async function submitReturnV2(orderNum){
 
   for(const l of lines){
     const pn=l.pn;const qty2=l.qty||1;
+    // Block-scoped and reset per line, so a failed status write can only ever reverse THIS line's
+    // restock - never a value left over from an earlier line.
+    let _restocked=null;
     if(condition==='Resellable'&&condition!=='PreERP'){
       const asm=asmByPn(pn);
       const prt=partByPn(pn);
       if(asm){
         const newOh=await adjustStock('assembly',asm,qty2,{reason:'Return \u2014 '+reason+' (order '+orderNum+')',source:'return'});
-        if(newOh!==null)results.push('+'+qty2+' '+pn);
+        if(newOh!==null){results.push('+'+qty2+' '+pn);_restocked={kind:'assembly',rec:asm};}
       } else if(prt){
         const newOh=await adjustStock('part',prt,qty2,{reason:'Return \u2014 '+reason+' (order '+orderNum+')',source:'return'});
-        if(newOh!==null)results.push('+'+qty2+' '+pn);
+        if(newOh!==null){results.push('+'+qty2+' '+pn);_restocked={kind:'part',rec:prt};}
       }
     }
     const _newStatus=condition==='PreERP'?l.fulfillment_status||'Delivered':'Returned';
-    await db.from('sales').update({fulfillment_status:_newStatus,return_reason:reason+(fullNotes?' — '+fullNotes:''),return_status:'returned',updated_at:new Date().toISOString()}).eq('id',l.id);
+    if(!await salesWrite(db.from('sales').update({fulfillment_status:_newStatus,return_reason:reason+(fullNotes?' \u2014 '+fullNotes:''),return_status:'returned',updated_at:new Date().toISOString()}).eq('id',l.id),'return for '+pn)){
+      // Still not marked returned, so it will come back through the returns flow and be restocked
+      // again. Reverse this restock rather than let the same unit be added twice.
+      if(_restocked){
+        await adjustStock(_restocked.kind,_restocked.rec,-qty2,{reason:'Reversed - return status failed to save (order '+orderNum+')',source:'correction'});
+        results.pop();
+      }
+      continue;
+    }
     S.sales=S.sales.map(s=>s.id===l.id?{...s,fulfillment_status:_newStatus,return_status:'returned'}:s);
   }
 
@@ -6236,13 +6247,29 @@ async function dedupeOrders(){
     losers.forEach(l=>idsToDelete.push(l.id));
   }
 
+  // [FIX] This copies tracking from a duplicate onto the row being kept, then deletes the
+  // duplicates. The copy was unchecked and counted as rescued regardless, and the deletion below
+  // ran unconditionally - so when a copy failed, the duplicate still got deleted, and it was the
+  // ONLY row holding that tracking number. Permanent data loss, reported as "rescued". Any failed
+  // rescue now stops the run before a single row is deleted: dedupe is a maintenance action that is
+  // trivially re-run once the cause is fixed, and not deleting is always recoverable.
   let rescued=0;
+  const rescueFails=[];
   for(const patch of trackingPatches){
     const{id,...fields}=patch;
-    await db.from('sales').update(fields).eq('id',id);
+    const r=await db.from('sales').update(fields).eq('id',id);
+    if(r.error){rescueFails.push(id+': '+r.error.message);continue;}
     rescued++;
   }
   if(rescued)prog(`Rescued tracking on ${rescued} rows`);
+  if(rescueFails.length){
+    console.warn('[dedupe] tracking rescue failed, deletion aborted:',rescueFails);
+    await refreshSales();render();
+    toast('\u26a0 Dedupe stopped before deleting anything: '+rescueFails.length+' tracking number'
+      +(rescueFails.length!==1?'s':'')+' could not be copied to the kept row, and deleting now would lose '
+      +(rescueFails.length!==1?'them':'it')+'. No rows were removed. ('+rescueFails[0]+')',12000);
+    return;
+  }
 
   prog(`Deleting ${idsToDelete.length} duplicate rows…`);
   const CHUNK=200;
@@ -6373,15 +6400,25 @@ async function submitShipment(saleId,pn,qty){
   // line first; without this guard a manual Ship here would deduct the same shipment a second time.
   const _shipChk=S.sales.find(s=>s.id===saleId);
   if(_shipChk&&['Shipped','Delivered','Cancelled','Refunded'].includes(_shipChk.fulfillment_status||'Open')){toast(pn+' is already '+_shipChk.fulfillment_status+' — not shipping/deducting again');return;}
+  var _shipDeducted=null; // what was actually taken, so it can be reversed if the status write fails
   if(asm){
-    await adjustStock('assembly',asm,-qty,{reason:'Shipped order'+(tracking?' \u2014 '+tracking:''),source:'shipment'}); // may go negative = backorder
+    if(await adjustStock('assembly',asm,-qty,{reason:'Shipped order'+(tracking?' \u2014 '+tracking:''),source:'shipment'})!==null)_shipDeducted={kind:'assembly',rec:asm}; // may go negative = backorder
     if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
   } else if(prt){
-    await adjustStock('part',prt,-qty,{reason:'Shipped order'+(tracking?' \u2014 '+tracking:''),source:'shipment'}); // directly-sold part \u2014 same deduction, different table
+    if(await adjustStock('part',prt,-qty,{reason:'Shipped order'+(tracking?' \u2014 '+tracking:''),source:'shipment'})!==null)_shipDeducted={kind:'part',rec:prt}; // directly-sold part \u2014 same deduction, different table
     if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
   }
   const preSale=S.sales.find(s=>s.id===saleId);
-  await db.from('sales').update({fulfillment_status:'Shipped',tracking_number:tracking,carrier,shipped_at:new Date().toISOString()}).eq('id',saleId);
+  if(!await salesWrite(db.from('sales').update({fulfillment_status:'Shipped',tracking_number:tracking,carrier,shipped_at:new Date().toISOString()}).eq('id',saleId),'shipment')){
+    // The line is still Open in the database, so it WILL be shipped again. Put the stock back now,
+    // with its own audit row, or that second ship deducts the same unit twice.
+    if(_shipDeducted){
+      await adjustStock(_shipDeducted.kind,_shipDeducted.rec,qty,{reason:'Reversed - shipment status failed to save'+(tracking?' \u2014 '+tracking:''),source:'correction'});
+      if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
+    }
+    render();
+    return;
+  }
   S.sales=S.sales.map(s=>s.id===saleId?{...s,fulfillment_status:'Shipped',tracking_number:tracking,carrier,shipped_at:new Date().toISOString()}:s);
   pushActivity({icon:'<span class="ic ic-box"></span>',type:'order_status',text:'#'+(preSale?.order_number||'')+' → Shipped',sub:dispSku(pn)+(preSale?.customer_name?' — '+preSale.customer_name:''),tracking:tracking||'',carrier:carrier||'',ts:new Date().toISOString(),cls:'var(--teal)'});
   const saleRow=S.sales.find(s=>s.id===saleId);
@@ -9241,6 +9278,27 @@ async function buildOrderMap() {
   }
   return map
 }
+// Resolves a set of SKU strings to canonical pn, honouring the pn/new_sku duality. Used where a
+// ShipStation SKU has to be compared against an ERP sales line: the two sides frequently carry
+// DIFFERENT aliases of the same item, and a plain or substring string match then misses the real
+// match or grabs the wrong one. Anything with no assemblies/parts record resolves to itself.
+async function buildCanonMap(skus: string[]): Promise&lt;(raw: string) =&gt; string&gt; {
+  const norm = (x: string) =&gt; String(x || '').trim().toUpperCase()
+  const list = [...new Set(skus.map((x) =&gt; String(x || '').trim()).filter(Boolean))]
+  const m: Record&lt;string, string&gt; = {}
+  if (list.length) {
+    const { data: a1 } = await db.from('assemblies').select('pn').in('pn', list)
+    ;(a1 || []).forEach((r: any) =&gt; { m[norm(r.pn)] = r.pn })
+    const { data: a2 } = await db.from('assemblies').select('pn,new_sku').in('new_sku', list)
+    ;(a2 || []).forEach((r: any) =&gt; { if (r.new_sku) m[norm(r.new_sku)] = r.pn })
+    const { data: p1 } = await db.from('parts').select('pn').in('pn', list)
+    ;(p1 || []).forEach((r: any) =&gt; { if (!(norm(r.pn) in m)) m[norm(r.pn)] = r.pn })
+    const { data: p2 } = await db.from('parts').select('pn,new_sku').in('new_sku', list)
+    ;(p2 || []).forEach((r: any) =&gt; { if (r.new_sku &amp;&amp; !(norm(r.new_sku) in m)) m[norm(r.new_sku)] = r.pn })
+  }
+  return (raw: string) =&gt; { const n = norm(raw); return m[n] || n }
+}
+
 function ssAuth(): string {
   const k = Deno.env.get('SS_KEY') || '', s = Deno.env.get('SS_SECRET') || ''
   return btoa(k + ':' + s)
@@ -9821,8 +9879,14 @@ Deno.serve(async (req) =&gt; {
       const rawNum = stripHash(order.orderNumber || '')
       const lines = orderMap[rawNum] || []
       const heldCanonSkus = new Set((order.items || []).map((i: any) =&gt; canon((i.sku || i.name || '').trim())).filter(Boolean))
+      // [FIX] The protection set used to be built from the same Open/Packed-filtered list as the
+      // write below, so a line ALREADY On Hold was never protected. On the run after a line was
+      // held, it fell outside the set, the release pass saw it matching a ready sibling record,
+      // and released it - then the following run held it again. It alternated every 5 minutes.
+      // Every line an on-hold record contains is protected, whatever its current status; only the
+      // WRITE is limited to lines that are not already held.
+      lines.filter((l: any) =&gt; heldCanonSkus.has(canon(l.pn || ''))).forEach((l: any) =&gt; stillOnHoldLineIds.add(l.id as string))
       const ids = lines.filter((l: any) =&gt; ['Open','Packed'].includes(l.fulfillment_status) &amp;&amp; heldCanonSkus.has(canon(l.pn || ''))).map((l: any) =&gt; l.id as string)
-      ids.forEach((id: string) =&gt; stillOnHoldLineIds.add(id))
       if (ids.length) {
         await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', ids)
         markedHold += ids.length
@@ -10707,9 +10771,14 @@ Deno.serve(async (req) =&gt; {
         .select('id,pn,fulfillment_status').eq('order_number', resolvedNum)
       const erpLines = erpLinesRaw ?? []
       if (!erpLines.length) continue
-      const norm = (s: string) =&gt; s.trim().toUpperCase()
       const rawSkus = (order.items || []).map((i: any) =&gt; (i.sku || i.name || '').trim()).filter(Boolean)
-      const matchesThisRecord = (l: any) =&gt; !rawSkus.length || rawSkus.some((sk: string) =&gt; { const e = norm(l.pn || ''), k = norm(sk); return e === k || e.includes(k) || k.includes(e) })
+      // [FIX] Was a raw substring match (e === k || e.includes(k) || k.includes(e)). That both
+      // missed real matches when the ERP line and ShipStation carried different aliases of the
+      // same item, and made false ones - a short SKU is a substring of plenty of longer ones.
+      // Canonical resolution, same as hold_sync, so the two paths agree on which line is which.
+      const canon = await buildCanonMap([...rawSkus, ...erpLines.map((l: any) =&gt; l.pn || '')])
+      const recCanon = new Set(rawSkus.map((x: string) =&gt; canon(x)))
+      const matchesThisRecord = (l: any) =&gt; recCanon.has(canon(l.pn || ''))
       if (order.orderStatus === 'cancelled') {
         await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('order_number', resolvedNum).in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
         console.log('[SS] ORDER_NOTIFY -&gt; Cancelled:', resolvedNum)
@@ -10718,11 +10787,47 @@ Deno.serve(async (req) =&gt; {
         // rawSkus falls back to "match everything" only if ShipStation's payload carried no
         // items at all, same fallback philosophy the SHIP_NOTIFY handler already uses elsewhere
         // in this file rather than silently doing nothing.
-        const ids = erpLines.filter((l: any) =&gt; ['Open','Packed','Partial'].includes(l.fulfillment_status) &amp;&amp; matchesThisRecord(l)).map((l: any) =&gt; l.id)
+        // An item-less payload still holds the whole order: over-holding is safe and recoverable,
+        // whereas guessing which lines to leave open is not.
+        const ids = erpLines.filter((l: any) =&gt; ['Open','Packed','Partial'].includes(l.fulfillment_status) &amp;&amp; (!rawSkus.length || matchesThisRecord(l))).map((l: any) =&gt; l.id)
         if (ids.length) await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', ids)
         console.log('[SS] ORDER_NOTIFY -&gt; On Hold:', resolvedNum, ids.length, 'of', erpLines.length, 'line(s) matched')
       } else if (order.orderStatus === 'awaiting_shipment') {
-        const ids = erpLines.filter((l: any) =&gt; l.fulfillment_status === 'On Hold' &amp;&amp; matchesThisRecord(l)).map((l: any) =&gt; l.id)
+        // [FIX] Root cause of lines flip-flopping Open &lt;-&gt; On Hold (and the dashboard alert that
+        // depends on Open lines blinking with them). A split order has several ShipStation records
+        // under ONE order number, and the same SKU can sit in more than one of them - qty 2 with
+        // one unit ready and one held. This released any line matching the READY record, without
+        // looking at the siblings; the next hold_sync then saw the sibling still on_hold and
+        // re-held it; the next ORDER_NOTIFY (ShipStation sends one on nearly any edit) released it
+        // again, indefinitely. A line is now released only if NO on-hold sibling still contains it.
+        // An item-less payload releases nothing: releasing on a guess is the unsafe direction.
+        let ids: string[] = []
+        if (rawSkus.length) {
+          const heldBySibling = new Set&lt;string&gt;()
+          let siblingsOk = false
+          try {
+            const sr = await fetch('https://ssapi.shipstation.com/orders?orderNumber=' + encodeURIComponent(rawNum) + '&amp;pageSize=50', { headers: { Authorization: 'Basic ' + ssAuth() } })
+            if (sr.ok) {
+              const sd = await sr.json()
+              const sibs = (sd.orders || []).filter((o: any) =&gt; stripHash(o.orderNumber || '') === rawNum &amp;&amp; o.orderId !== order.orderId)
+              const sibSkus: string[] = []
+              sibs.forEach((o: any) =&gt; (o.items || []).forEach((i: any) =&gt; { const v = (i.sku || i.name || '').trim(); if (v) sibSkus.push(v) }))
+              const sibCanon = await buildCanonMap(sibSkus)
+              sibs.filter((o: any) =&gt; o.orderStatus === 'on_hold').forEach((o: any) =&gt;
+                (o.items || []).forEach((i: any) =&gt; { const v = (i.sku || i.name || '').trim(); if (v) heldBySibling.add(sibCanon(v)) }))
+              siblingsOk = true
+            }
+          } catch (_e) { /* siblingsOk stays false - handled below */ }
+          if (!siblingsOk) {
+            // Could not see the siblings, so cannot rule out a flip-flop. Leave it for hold_sync,
+            // which evaluates every record at once and so cannot disagree with itself.
+            console.log('[SS] ORDER_NOTIFY -&gt; could not read sibling records for', resolvedNum, '- release deferred to hold_sync')
+          } else {
+            ids = erpLines.filter((l: any) =&gt; l.fulfillment_status === 'On Hold' &amp;&amp; matchesThisRecord(l) &amp;&amp; !heldBySibling.has(canon(l.pn || ''))).map((l: any) =&gt; l.id)
+            const blocked = erpLines.filter((l: any) =&gt; l.fulfillment_status === 'On Hold' &amp;&amp; matchesThisRecord(l) &amp;&amp; heldBySibling.has(canon(l.pn || ''))).length
+            if (blocked) console.log('[SS] ORDER_NOTIFY -&gt;', blocked, 'line(s) on', resolvedNum, 'kept On Hold - an on-hold sibling record still holds that SKU')
+          }
+        }
         if (ids.length) {
           // Re-check THIS SPECIFIC ShipStation order record's live status by orderId rather than
           // searching the on-hold list by order number - a search by number would find a
@@ -12421,9 +12526,14 @@ async function ssManualSync(orderNum,tracking,carrier){
   }
   if(!rows?.length){toast('Order '+orderNum+' not found in ERP');return;}
   const undoOps=[];
+  let _msShipped=0;
   for(const sale of rows){
+    // Status first, and nothing else for this line unless it saved: the deduction below used to run
+    // regardless, so a failed write left the line Open with its stock already gone - and the next
+    // sync or ship of that still-Open line deducted it again.
+    if(!await salesWrite(db.from('sales').update({fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier||'',shipped_at:new Date().toISOString()}).eq('id',sale.id),'shipment for '+sale.pn))continue;
+    _msShipped++;
     undoOps.push({action:'update',table:'sales',data:{...sale,fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier},prev:{...sale}});
-    await db.from('sales').update({fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier||'',shipped_at:new Date().toISOString()}).eq('id',sale.id);
     S.sales=S.sales.map(s=>s.id===sale.id?{...s,fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier||''}:s);
     // [FIX A] Only deduct if this line was NOT already Shipped/Delivered/Cancelled/Refunded before this
     // manual sync ran. Without this, re-running manual sync on an order the ShipStation edge function (or
@@ -12441,7 +12551,9 @@ async function ssManualSync(orderNum,tracking,carrier){
     }
     }
   }
-  if(!rows.length){toast('No lines updated — check order number');return;}
+  // Judged on what actually saved, not on how many lines were found - otherwise a run where every
+  // write failed still finished by announcing the order as shipped.
+  if(!_msShipped){await refreshSales();toast('No lines were updated for '+orderNum+' \u2014 see the errors above',7000);return;}
   pushActivity({icon:'<span class="ic ic-box"></span>',type:'order_status',text:'#'+orderNum+' → Shipped (manual sync)',sub:'',tracking:tracking||'',carrier:carrier||'',ts:new Date().toISOString(),cls:'var(--teal)'});
   await refreshSales();
   pushUndoMulti('Manual ship order '+orderNum,undoOps);
@@ -25808,6 +25920,24 @@ function resolveShipTarget(pn){
      not installed yet it falls back to the legacy read-modify-write, so the
      app works identically before and after the migration.
    ============================================================ */
+// [FIX] A sales write whose result is thrown away, followed by an unconditional local-state update
+// and a success toast, is the most dangerous pattern in this file: if the write fails, the screen
+// shows the new status, the database keeps the old one, and the next reload silently reverts it.
+// Where the write is paired with a stock move it is worse than cosmetic - the line reappears as
+// Open or Delivered, gets processed a second time, and moves stock a second time. This returns a
+// plain success flag so callers can skip the local update (and reverse any stock move) on failure.
+async function salesWrite(query, ctx){
+  var r;
+  try{ r = await query; }catch(e){ r = {error:{message:(e&&e.message)||String(e)}}; }
+  if(r && r.error){
+    console.error('[sales:'+(ctx||'?')+']', r.error);
+    try{ toast('\u26a0 Could not save '+(ctx||'change')+': '+(r.error.message||'unknown')+' \u2014 not applied',8000); }catch(_){}
+    return false;
+  }
+  return true;
+}
+window.salesWrite=salesWrite;
+
 async function dbq(promise, ctx){
   var res = await promise;
   if(res && res.error){
@@ -26204,8 +26334,9 @@ async function applyTrackingCSV(){
       if(row.tracking_number){skipped++;continue;} // already has tracking — never overwrite
       const patch={tracking_number:ship.tracking,carrier:ship.carrier||null};
       if(ship.shipDate)patch.shipped_at=new Date(ship.shipDate).toISOString();
-      await db.from('sales').update(patch).eq('id',row.id);
-      updated++;
+      const _br=await db.from('sales').update(patch).eq('id',row.id);
+      if(_br.error){console.warn('[tracking backfill] '+row.id+':',_br.error.message);continue;}
+      updated++; // counted only when it actually saved, so the summary cannot overstate
     }
   }
 
@@ -28940,6 +29071,20 @@ function computeOnHoldFulfillable(){
   if(!S.assemblies||!S.sales)return{orders:[],buildSkus:[]};
   if(!S._partIdx||!S._asmIdx)buildLookupMaps();
   var pm=S._partIdx,am=S._asmIdx;
+  // [FIX] Root cause of buildable on-hold orders never appearing here. The lookup indexes are keyed
+  // by BOTH pn and new_sku, but the stock pool and S.boms are keyed by canonical pn only. A line
+  // recorded under an alias (the "Superseded: TGK-ACC-04" style SKUs) was recognised as an
+  // assembly by the index, then read 0 on hand from the pool and found no BOM - so the whole order
+  // reported unfulfillable however much stock existed. The mirror image hit the reservation pass:
+  // an OPEN order under an alias reserved nothing, so this over-promised. Every SKU is resolved to
+  // its canonical pn before it touches the pool or a BOM.
+  function canonOf(pn){
+    var a=am[pn]||am[String(pn||'').toUpperCase()];
+    if(a&&a.pn)return a.pn;
+    var p=pm[pn]||pm[String(pn||'').toUpperCase()];
+    if(p&&p.pn)return p.pn;
+    return pn;
+  }
 
   // Working pool. Only what is genuinely on the shelf - no inbound POs, no speculative supply.
   var pool={asm:{},part:{}};
@@ -28952,9 +29097,9 @@ function computeOnHoldFulfillable(){
     var st=l.fulfillment_status||'Open';
     if(['Shipped','Delivered','Cancelled','Refunded','On Hold'].indexOf(st)!==-1)return;
     if(isInternal(l.order_number))return;
-    var q=Number(l.qty)||1;
-    if(pool.asm[l.pn]!==undefined)pool.asm[l.pn]=Math.max(0,pool.asm[l.pn]-q);
-    else if(pool.part[l.pn]!==undefined)pool.part[l.pn]=Math.max(0,pool.part[l.pn]-q);
+    var q=Number(l.qty)||1, cpn=canonOf(l.pn);
+    if(pool.asm[cpn]!==undefined)pool.asm[cpn]=Math.max(0,pool.asm[cpn]-q);
+    else if(pool.part[cpn]!==undefined)pool.part[cpn]=Math.max(0,pool.part[cpn]-q);
   });
 
   function clone(p){return{asm:Object.assign({},p.asm),part:Object.assign({},p.part)};}
@@ -28964,8 +29109,9 @@ function computeOnHoldFulfillable(){
   // if it cannot be satisfied at all.
   function consume(pn,qty,p,depth,builtOut){
     if(depth>8)return null;
+    pn=canonOf(pn); // BOM children can carry an alias too
     var need=qty;
-    var isAsm=(pool.asm[pn]!==undefined)||!!am[pn];
+    var isAsm=(pool.asm[pn]!==undefined);
     if(isAsm){
       var have=Math.max(0,p.asm[pn]||0);
       var fromStock=Math.min(have,need);
@@ -29012,8 +29158,9 @@ function computeOnHoldFulfillable(){
       var l=g.lines[i];
       // A SKU with no assemblies/parts record is drop-ship or vendor-supplied - not something we
       // hold or build, so it never blocks a release decision.
-      if(pool.asm[l.pn]===undefined&&pool.part[l.pn]===undefined&&!am[l.pn]&&!pm[l.pn])continue;
-      if(consume(l.pn,Number(l.qty)||1,trial,0,built)===null){ok=false;break;}
+      var lcpn=canonOf(l.pn);
+      if(pool.asm[lcpn]===undefined&&pool.part[lcpn]===undefined)continue;
+      if(consume(lcpn,Number(l.qty)||1,trial,0,built)===null){ok=false;break;}
     }
     if(!ok)return;
     pool=trial; // commit only a fully satisfiable order
@@ -30191,7 +30338,15 @@ async function processReturn(saleId,action){
         if(noh2!==null){invOk=true;results.push('+'+qty+' '+pn);undoOps.push({action:'update',table:'parts',data:{id:prt.id,total_unpckgd:noh2},prev:prt});}else errors.push(pn+': stock update failed');
       }
       if(invOk||!asm&&!prt){
-        await db.from('sales').update({return_status:'returned',updated_at:new Date().toISOString()}).eq('id',line.id);
+        if(!await salesWrite(db.from('sales').update({return_status:'returned',updated_at:new Date().toISOString()}).eq('id',line.id),'return for '+pn)){
+          // Left un-returned, this line stays in the queue and would be restocked again next time.
+          if(invOk){
+            await adjustStock(asm?'assembly':'part',asm||prt,-qty,{reason:'Reversed - return status failed to save (order '+orderNum+')',source:'correction'});
+            undoOps.pop();results.pop();
+          }
+          errors.push(pn+': return status did not save, stock change reversed');
+          continue;
+        }
         undoOps.push({action:'update',table:'sales',data:{id:line.id,return_status:'returned'},prev:line});
         S.sales=S.sales.map(function(s){return s.id===line.id?Object.assign({},s,{return_status:'returned'}):s;});
       }
@@ -30207,9 +30362,10 @@ async function processReturn(saleId,action){
       if(wres.data){
         undoOps.push({action:'insert',table:'warranty_claims',data:wres.data});
         S.warrantyClaims=[wres.data,...(S.warrantyClaims||[])];
-        await db.from('sales').update({return_status:'damaged',updated_at:new Date().toISOString()}).eq('id',line.id);
-        undoOps.push({action:'update',table:'sales',data:{id:line.id,return_status:'damaged'},prev:line});
-        S.sales=S.sales.map(function(s){return s.id===line.id?Object.assign({},s,{return_status:'damaged'}):s;});
+        if(await salesWrite(db.from('sales').update({return_status:'damaged',updated_at:new Date().toISOString()}).eq('id',line.id),'damaged status for '+pn)){
+          undoOps.push({action:'update',table:'sales',data:{id:line.id,return_status:'damaged'},prev:line});
+          S.sales=S.sales.map(function(s){return s.id===line.id?Object.assign({},s,{return_status:'damaged'}):s;});
+        }else errors.push(pn+': damaged status did not save');
         results.push('Warranty: '+pn);
       }else if(wres.error)errors.push(pn+': '+wres.error.message);
     }
@@ -30639,24 +30795,35 @@ async function reverseReturn(saleId){
     if(!line.return_status)continue;
     var pn=line.pn;var qty=line.qty||1;
 
+    var _revTaken=null; // per-line; what was deducted, so it can be put back if the status fails
     if(line.return_status==='returned'){
       var asm=findAsm(pn); // [FIX B] new_sku-aware (line.pn may be a new_sku)
       var prt=asm?null:S.parts.find(function(p){return p.pn===pn||(p.new_sku&&p.new_sku===pn);});
       if(asm){
         var newOh=await adjustStock('assembly',asm,-qty,{reason:'Reversed return \u2014 order '+orderNum,source:'reverse_return'}); // allow negative \u2014 backorder convention
-        if(newOh!==null)results.push('-'+qty+' '+pn+' (reversed)');else errors.push(pn+': stock update failed');
+        if(newOh!==null){results.push('-'+qty+' '+pn+' (reversed)');_revTaken={kind:'assembly',rec:asm};}else errors.push(pn+': stock update failed');
       } else if(prt){
         var newOh2=await adjustStock('part',prt,-qty,{reason:'Reversed return \u2014 order '+orderNum,source:'reverse_return'});
-        if(newOh2!==null)results.push('-'+qty+' '+pn+' (reversed)');else errors.push(pn+': stock update failed');
+        if(newOh2!==null){results.push('-'+qty+' '+pn+' (reversed)');_revTaken={kind:'part',rec:prt};}else errors.push(pn+': stock update failed');
       }
     }
 
-    await db.from('sales').update({
+    // [FIX] Same pattern as the ship and return paths: this status write's result was discarded and
+    // the screen updated regardless. On failure the line stayed marked 'returned' in the database,
+    // so the reversal could be run a second time and deduct the same units again.
+    if(!await salesWrite(db.from('sales').update({
       fulfillment_status:'Refunded',
       return_status:null,
       return_reason:null,
       updated_at:new Date().toISOString()
-    }).eq('id',line.id);
+    }).eq('id',line.id),'return reversal for '+pn)){
+      if(_revTaken){
+        await adjustStock(_revTaken.kind,_revTaken.rec,qty,{reason:'Undone - return reversal status failed to save (order '+orderNum+')',source:'correction'});
+        results.pop();
+      }
+      errors.push(pn+': reversal did not save, stock change undone');
+      continue;
+    }
     S.sales=S.sales.map(function(s){
       return s.id===line.id?Object.assign({},s,{fulfillment_status:'Refunded',return_status:null,return_reason:null}):s;
     });
@@ -30675,10 +30842,13 @@ async function dismissPreERPRefund(orderNum,evt){
   var lines=S.sales.filter(function(s){return (s.order_number||s.id)===orderNum;});
   if(!lines.length){toast('Order not found');return;}
   var ids=lines.map(function(s){return s.id;});
+  var _okIds=[];
   for(var i=0;i<ids.length;i++){
-    await db.from('sales').update({return_status:'dismissed',return_reason:'Pre-ERP / no inventory action',updated_at:new Date().toISOString()}).eq('id',ids[i]);
+    if(await salesWrite(db.from('sales').update({return_status:'dismissed',return_reason:'Pre-ERP / no inventory action',updated_at:new Date().toISOString()}).eq('id',ids[i]),'dismissal'))_okIds.push(ids[i]);
   }
-  S.sales=S.sales.map(function(s){return ids.includes(s.id)?Object.assign({},s,{return_status:'dismissed',return_reason:'Pre-ERP / no inventory action'}):s;});
+  // Only the lines that actually saved are shown as dismissed; the rest stay put and visible.
+  S.sales=S.sales.map(function(s){return _okIds.includes(s.id)?Object.assign({},s,{return_status:'dismissed',return_reason:'Pre-ERP / no inventory action'}):s;});
+  if(_okIds.length!==ids.length){render();return;}
   toast('Order '+orderNum+' dismissed — no inventory change');
   render();
 }
