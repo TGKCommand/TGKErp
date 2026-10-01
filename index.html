@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.50';
+const TGK_ERP_VERSION = 'v23.51';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -4729,6 +4729,7 @@ function renderPurchases(){
       </div>
     </td>
     <td onclick="event.stopPropagation()" style="display:flex;gap:4px;flex-wrap:nowrap">
+      ${p.status==='Lost'?`<button class="action-btn" onclick="undoLost('${p.id}')" title="Marked Lost by mistake? Restore the PO and remove the Lost flag">Undo Lost</button>`:''}
       ${isDraft?`<button class="btn btn-primary btn-sm" onclick="approvePO('${p.id}')"><span class="ic ic-upload"></span>Approve</button>`:''}
       ${!isDraft&&isPending?`<button class="btn btn-teal btn-sm" onclick="quickReceive('${p.id}')" title="Receive items"><span class="ic ic-box"></span>Receive</button>`:''}
       ${!isDraft&&isPending?`<button class="action-btn" onclick="quickAddTracking('${p.id}','${p.vendor.replace(/'/g,"\\'")}')" title="Add tracking">${tracking.length?'<span class="ic ic-link"></span>+':'<span class="ic ic-link"></span>Track'}</button>`:''}
@@ -12913,10 +12914,67 @@ async function submitApprovePO(poId){
   render();
 }
 
+function _undoLostGuess(po){
+  const ls=S.poLines[po.id]||[];
+  const anyRecv=ls.some(l=>(l.qty_received||0)>0);
+  const allRecv=ls.length>0&&ls.every(l=>(l.qty_received||0)>=(l.qty_ordered||0));
+  if(allRecv)return 'Received';
+  if(anyRecv)return 'Partial';
+  return (S.poTracking[po.id]||[]).length?'In Transit':'On Order';
+}
+async function undoLost(poId){
+  const po=S.purchases.find(p=>String(p.id)===String(poId));
+  if(!po)return;
+  if(!po.lost_at&&po.status!=='Lost'){toast('This PO is not marked Lost');return;}
+  try{await loadPOLines(poId);await loadPOTracking(poId);}catch(e){}
+  if(po.status!=='Lost'){
+    // Recovered -> Received, or any other status: just erase the Lost flag.
+    const target=po.status==='Recovered'?'Received':po.status;
+    if(!confirm('Remove the Lost flag from this PO'+(target!==po.status?' and set it back to '+target:'')+'?\n\nThis erases the record that it was ever marked Lost.'))return;
+    await _applyUndoLost(po,target);
+    return;
+  }
+  const guess=_undoLostGuess(po);
+  const opts=['On Order','In Transit','Partial','Draft','Received'];
+  const existing=document.getElementById('undo-lost-modal');if(existing)existing.remove();
+  const m=document.createElement('div');m.id='undo-lost-modal';
+  m.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
+  m.innerHTML='<div style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(440px,95vw);padding:20px;box-shadow:0 16px 48px rgba(0,0,0,.18)">'
+    +'<div style="font-size:var(--t-lg);font-weight:700;color:var(--text);margin-bottom:6px">Undo Lost - '+escHtml(po.vendor||'')+'</div>'
+    +'<div class="t3s" style="margin-bottom:12px">This puts the PO back into play and erases the Lost flag as if it was never marked Lost. Its open quantities count as incoming again.</div>'
+    +'<label class="form-label" style="display:block;margin-bottom:4px">Restore status to</label>'
+    +'<select id="undo-lost-status" class="form-input">'+opts.map(o=>'<option value="'+o+'"'+(o===guess?' selected':'')+'>'+o+'</option>').join('')+'</select>'
+    +'<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">'
+    +'<button class="btn btn-sm" onclick="document.getElementById(\'undo-lost-modal\').remove()">Cancel</button>'
+    +'<button class="btn btn-primary btn-sm" onclick="submitUndoLost(\''+poId+'\')">Undo Lost</button></div></div>';
+  document.body.appendChild(m);
+}
+async function submitUndoLost(poId){
+  const po=S.purchases.find(p=>String(p.id)===String(poId));
+  const sel=document.getElementById('undo-lost-status');
+  const target=sel?sel.value:'On Order';
+  document.getElementById('undo-lost-modal')?.remove();
+  if(po)await _applyUndoLost(po,target);
+}
+async function _applyUndoLost(po,target){
+  const prevSt=po.status;
+  const{error}=await db.from('purchases').update({status:target,lost_at:null,updated_at:new Date().toISOString()}).eq('id',po.id);
+  if(error){toast('Error: '+error.message,9000);return;}
+  S._onOrderMap=null;
+  S.purchases=S.purchases.map(p=>String(p.id)===String(po.id)?{...p,status:target,lost_at:null}:p);
+  pushActivity({icon:'<span class="ic ic-refresh"></span>',type:'po_status',text:'PO '+(po.vendor||'')+' Lost flag removed ('+prevSt+' -> '+target+')',sub:po.description||po.pn||'',ts:new Date().toISOString(),cls:'var(--text2)'});
+  toast('Lost flag removed - PO is now '+target,5000);
+  updateBadge();render();
+}
+window.undoLost=undoLost;window.submitUndoLost=submitUndoLost;
 async function updatePOStatus(id,ns){
   const prev=S.purchases.find(p=>p.id===id);
   const _upd={status:ns,updated_at:new Date().toISOString()};
   if(ns==='Recovered'&&prev&&!prev.lost_at)_upd.lost_at=new Date().toISOString();
+  if(prev&&prev.status==='Lost'&&(ns==='Draft'||ns==='On Order'||ns==='In Transit'||ns==='Partial')){
+    // Leaving Lost for an open status almost always means it was marked by accident.
+    if(confirm('Remove the Lost flag from this PO too?\n\nOK = it was marked Lost by mistake, erase the Lost history.\nCancel = keep a "Was Lost" record on the PO.'))_upd.lost_at=null;
+  }
   if(ns==='Lost'){
     if(prev&&prev.status==='Lost')return;
     if(!confirm('Mark this PO as LOST?\n\nIts incoming quantity will be removed from every part on the PO. If it turns up later you can still receive it and it will be flagged as a recovered lost order.\n\nCreate a new PO for the replacement shipment.')){render();return;}
@@ -12925,7 +12983,7 @@ async function updatePOStatus(id,ns){
   const{error}=await db.from('purchases').update(_upd).eq('id',id);
   if(error){toast('Error: '+error.message+(/lost_at/i.test(error.message||'')?' - run purchases_lost_status.sql in Supabase first':''),9000);render();return;}
   S._onOrderMap=null;
-  S.purchases=S.purchases.map(p=>p.id===id?{...p,status:ns,...(_upd.lost_at?{lost_at:_upd.lost_at}:{})}:p);
+  S.purchases=S.purchases.map(p=>p.id===id?{...p,status:ns,...(('lost_at' in _upd)?{lost_at:_upd.lost_at}:{})}:p);
   const po=S.purchases.find(p=>p.id===id);
   const statusEmoji={Recovered:'<span class="ic ic-check"></span>',Received:'<span class="ic ic-check"></span>','In Transit':'<span class="ic ic-truck"></span>',Ordered:'<span class="ic ic-clipboard"></span>',Cancelled:'<span class="ic ic-x"></span>',Draft:'<span class="ic ic-doc"></span>','On Order':'<span class="ic ic-box"></span>',Partial:'<span class="ic ic-refresh"></span>',Lost:'<span class="ic ic-alert"></span>'}[ns]||'<span class="ic ic-refresh"></span>';
   const cls={Recovered:'var(--teal)',Received:'var(--teal)','In Transit':'var(--yellow)',Cancelled:'var(--red)',Lost:'var(--red)','On Order':'var(--orange)'}[ns]||'var(--text2)';
@@ -20688,7 +20746,8 @@ function renderPODetail(po) {
   ${po.status==='Lost'?`<div style="background:var(--red-dim);border:1.5px solid rgba(220,38,38,.3);border-radius:var(--r-md);padding:12px 16px;margin-bottom:14px">
     <div style="font-size:var(--t-md);font-weight:700;color:var(--red)">This PO is marked LOST${po.lost_at?' ('+String(po.lost_at).slice(0,10)+')':''}</div>
     <div style="font-size:var(--t-sm);color:var(--text2);margin-top:3px">Nothing on this PO counts as incoming. If the shipment shows up you can still receive it here - stock is added and it is logged as a recovered lost order. Make sure the replacement PO is adjusted so it is not double counted.</div>
-  </div>`:(po.lost_at?`<div style="background:var(--red-dim);border:1px solid rgba(220,38,38,.25);border-radius:var(--r-md);padding:8px 14px;margin-bottom:14px;font-size:var(--t-sm);color:var(--red);font-weight:600">This PO was marked Lost on ${String(po.lost_at).slice(0,10)}${po.status==='Recovered'?' and was later received (Recovered).':'.'}</div>`:'')}
+    <div style="margin-top:8px"><button class="btn btn-sm" onclick="undoLost('${po.id}')" title="Marked Lost by mistake? Restore the PO and remove the Lost flag entirely">Undo Lost (marked by mistake)</button></div>
+  </div>`:(po.lost_at?`<div style="background:var(--red-dim);border:1px solid rgba(220,38,38,.25);border-radius:var(--r-md);padding:8px 14px;margin-bottom:14px;font-size:var(--t-sm);color:var(--red);font-weight:600;display:flex;align-items:center;gap:12px;flex-wrap:wrap"><span style="flex:1">This PO was marked Lost on ${String(po.lost_at).slice(0,10)}${po.status==='Recovered'?' and was later received (Recovered).':'.'}</span><button class="btn btn-sm" onclick="undoLost('${po.id}')" title="Remove the Lost flag${po.status==='Recovered'?' and set the PO back to Received':''}">${po.status==='Recovered'?'Remove Lost flag (set to Received)':'Remove Lost flag'}</button></div>`:'')}
   <div class="panel" style="padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
     <span style="font-size:var(--t-xs);font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--text3)">Status:</span>
     ${['Draft','On Order','In Transit','Partial','Received','Lost','Recovered','Cancelled'].map(s=>`
