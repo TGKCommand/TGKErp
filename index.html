@@ -461,7 +461,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.55';
+const TGK_ERP_VERSION = 'v23.56';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -19791,22 +19791,23 @@ function buildOpenPoCountMap(){
 window.advDupSummary=advDupSummary;window.advDupBadge=advDupBadge;
 
 /* ===================================================================================
-   PRICE-BREAK SAVINGS ADVISOR  (v23.55)
-   "If you order 160 you get top-tier pricing and save $X" - recognised when:
-     * a higher vendor price tier exists above what you are about to order,
-     * the extra units are still used up within a sensible number of weeks (demand, with an
-       upward trend allowed a longer window), and
-     * the per-unit price drop and the total dollars saved clear your thresholds.
-   Also looks BACKWARDS: several small POs in the lookback window that, combined, would have
-   reached a cheaper tier (e.g. 40 then 80 in 40 days -> 120 would have priced at the 100+ tier).
+   PRICE-BREAK SAVINGS  (v23.56 - plain-English rewrite)
+   For each part with vendor price tiers:
+     "You usually order 40 at $56.25 each and use about 4.5 a week.
+      Order 100 instead: $48.00 each. Saves $825 on that order (about $1,930 a year).
+      100 lasts about 22 weeks."
+   Rules (kept simple on purpose):
+     - "usually order" = the typical (median) PO quantity and price paid in the last 12 months.
+     - A bigger tier is only suggested if that order gets used up within N weeks (default 26).
+     - Yearly saving = what you use in a year x the per-unit price drop. Hidden below $X/yr (default 100).
    =================================================================================== */
 function tierCfg(){
   var st=S.settings||{};
   function n(k,d,min){var v=parseFloat(st[k]);return (isFinite(v)&&v>=min)?v:d;}
-  return{maxWeeks:n('tier_max_weeks',26,1),minPct:n('tier_min_pct',5,0),minSave:n('tier_min_save',25,0),days:n('tier_lookback_days',60,7)};
+  return{weeks:n('tier_use_within_weeks',26,1),minYear:n('tier_min_year_save',100,0)};
 }
 function tierBuildRecent(){
-  var cfg=tierCfg(),cutoff=Date.now()-cfg.days*86400000,m={};
+  var cutoff=Date.now()-365*86400000,m={};
   (S.purchases||[]).forEach(function(po){
     if(po.status==='Cancelled'||po.status==='Lost'||po.status==='Draft')return;
     var t=Date.parse(po.order_date||po.created_at||'')||0;if(t<cutoff)return;
@@ -19815,7 +19816,7 @@ function tierBuildRecent(){
     ls.forEach(function(l){
       if(!l.pn||l.pn==='SHIPPING'||isShippingLine(l))return;
       var part=partByPn(l.pn);if(!part||!(l.qty_ordered>0))return;
-      (m[part.pn]=m[part.pn]||[]).push({po:po,qty:l.qty_ordered,price:Number(l.unit_cost)||0,t:t});
+      (m[part.pn]=m[part.pn]||[]).push({qty:Number(l.qty_ordered),price:Number(l.unit_cost)||0,t:t});
     });
   });
   S._tierRecent=m;S._tierRecentAt=Date.now();return m;
@@ -19828,93 +19829,85 @@ function tierTrend(p){
   var c=S.calc&&S.calc.part&&S.calc.part[p.pn],w4=(c&&c.wk4)||0,w12=(c&&c.wk12)||0;
   return (w4>0&&w12>0)?(w4/w12):1;
 }
-/* Returns null or {qty, price, curQty, curPrice, saveTotal, savePct, cover, up, trend, extraCash, hist}. */
+function _median(a){if(!a.length)return 0;var b=a.slice().sort(function(x,y){return x-y;});var k=Math.floor(b.length/2);return b.length%2?b[k]:(b[k-1]+b[k])/2;}
+/* baseQty given (order screen / planning): compare against that order.
+   baseQty omitted (report): compare against how you usually order. */
 function advTierOpp(p,baseQty){
   if(!p||p.discontinued)return null;
   var cfg=tierCfg();
   var breaks=(typeof _getBreaks==='function'?_getBreaks(p):[]).filter(function(b){return Number(b.qty)>0&&Number(b.price)>0;})
     .map(function(b){return{qty:Number(b.qty),price:Number(b.price)};}).sort(function(a,b){return a.qty-b.qty;});
   if(!breaks.length)return null;
-  var recent=tierRecentFor(p.pn);
+  var hist=tierRecentFor(p.pn);
   var wk=effectiveWkDemand(p);
+  if(!(wk>0)&&hist.length)wk=hist.reduce(function(s,r){return s+r.qty;},0)/52;
+  if(!(wk>0))return null; // no usage = no way to say a bigger order gets used
   var trend=tierTrend(p),up=trend>=1.15;
-  if(!(wk>0)&&recent.length){var tq=recent.reduce(function(s,r){return s+r.qty;},0);wk=tq/(cfg.days/7);}
-  var curQty=Math.max(baseQty!=null?baseQty:Math.max(calcSuggestedQty(p),p.moq||0),1);
-  var curPrice=costForQty(p,curQty);
-  var avail=Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn))+openOrderedQty(p.pn);
+  var curQty,curPrice,usual=false;
+  if(baseQty!=null){curQty=Math.max(1,Math.round(baseQty));curPrice=costForQty(p,curQty);}
+  else if(hist.length){
+    usual=true;curQty=Math.round(_median(hist.map(function(r){return r.qty;})));
+    var paid=hist.filter(function(r){return r.price>0;}).map(function(r){return r.price;});
+    curPrice=paid.length?_median(paid):costForQty(p,curQty);
+  }else{curQty=Math.max(1,Math.max(calcSuggestedQty(p),p.moq||0));curPrice=costForQty(p,curQty);}
+  if(!(curPrice>0))return null;
+  var limit=cfg.weeks*(up?1.25:1);
   var best=null;
   breaks.forEach(function(b){
     if(b.qty<=curQty||b.price>=curPrice)return;
-    var pct=(1-b.price/curPrice)*100;
-    var save=b.qty*(curPrice-b.price); // same units bought at the tier price instead of today's price
-    var cover=wk>0?(avail+b.qty)/wk:null;
-    var cap=cfg.maxWeeks*(up?1.25:1); // a rising SKU is allowed a longer run of cover
-    if(cover===null||cover>cap)return;
-    if(pct<cfg.minPct||save<cfg.minSave)return;
-    if(!best||save>best.saveTotal)best={qty:b.qty,price:b.price,curQty:curQty,curPrice:curPrice,saveTotal:save,savePct:pct,cover:cover,
-      up:up,trend:trend,extraCash:b.qty*b.price-curQty*curPrice,wk:wk};
+    var lasts=b.qty/wk;if(lasts>limit)return;
+    var perUnit=curPrice-b.price,perYear=wk*52*perUnit;
+    if(perYear<cfg.minYear)return;
+    if(!best||perYear>best.perYear)best={qty:b.qty,price:b.price,lasts:lasts,perOrder:b.qty*perUnit,perYear:perYear,pct:perUnit/curPrice*100};
   });
-  // Look-back: small POs in the window that together would have priced at a higher tier.
-  var hist=null;
-  if(recent.length>=2){
-    var tot=recent.reduce(function(s,r){return s+r.qty;},0);
-    var paid=recent.reduce(function(s,r){return s+r.qty*(r.price||costForQty(p,r.qty));},0);
-    var comb=tot*costForQty(p,tot);
-    if(paid-comb>=cfg.minSave&&costForQty(p,tot)<Math.min.apply(null,recent.map(function(r){return r.price||costForQty(p,r.qty);}))+1e-9)
-      hist={n:recent.length,tot:tot,paid:paid,comb:comb,saved:paid-comb,parts:recent.map(function(r){return r.qty;})};
-    else if(paid-comb>=cfg.minSave)hist={n:recent.length,tot:tot,paid:paid,comb:comb,saved:paid-comb,parts:recent.map(function(r){return r.qty;})};
-  }
-  if(!best&&!hist)return null;
-  var o=best||{qty:0,price:0,curQty:curQty,curPrice:curPrice,saveTotal:0,savePct:0,cover:null,up:up,trend:trend,extraCash:0,wk:wk};
-  o.hist=hist;return o;
+  if(!best)return null;
+  best.curQty=curQty;best.curPrice=curPrice;best.wk=wk;best.up=up;best.trend=trend;best.usual=usual;best.orders=hist.length;
+  best.extraCash=best.qty*best.price-curQty*curPrice;
+  return best;
 }
-function tierShort(o){
-  if(!o||!o.qty)return '';
-  return 'Order '+o.qty+' &rarr; '+fc(o.price)+'/ea, save '+fc(o.saveTotal)+' ('+Math.round(o.savePct)+'%)'+(o.up?' &#8599; trending up':'');
+function tierFmtWk(w){return w>=10?Math.round(w):(Math.round(w*10)/10);}
+function tierSentence(o,html){
+  var B=html?function(x){return '<b>'+x+'</b>';}:function(x){return x;};
+  var now=(o.usual?'You usually order ':'You are ordering ')+B(o.curQty)+' at '+B(fc(o.curPrice))+' each'
+    +' and use about '+B(tierFmtWk(o.wk))+' a week'+(o.up?' (and rising)':'')+'.';
+  var then='Order '+B(o.qty)+' instead: '+B(fc(o.price))+' each. Saves '+B(fc(o.perOrder))+' on that order (about '+B(fc(o.perYear))+' a year). '
+    +o.qty+' lasts about '+tierFmtWk(o.lasts)+' weeks.';
+  return{now:now,then:then};
 }
-function tierTitle(o){
-  if(!o)return '';
-  var t='';
-  if(o.qty)t+='Ordering '+o.qty+' instead of '+o.curQty+' drops the price from '+fc(o.curPrice)+' to '+fc(o.price)+' each. The same '+o.qty+' units would cost '+fc(o.qty*o.curPrice)+' at today\'s price, so you save '+fc(o.saveTotal)+'. It covers about '+(o.cover!==null?o.cover.toFixed(1):'?')+' weeks of demand'+(o.up?' (demand is trending up '+Math.round((o.trend-1)*100)+'%)':'')+'. Extra cash up front: '+fc(Math.max(0,o.extraCash))+'.';
-  if(o.hist)t+=(t?'  ':'')+'Last '+tierCfg().days+' days: '+o.hist.parts.join(' + ')+' = '+o.hist.tot+' units across '+o.hist.n+' POs for '+fc(o.hist.paid)+'; as one order that is '+fc(o.hist.comb)+' (saves '+fc(o.hist.saved)+').';
-  return t;
-}
-/* ---- order modal callout ---- */
+function tierShort(o){return o?('Order '+o.qty+' instead, save '+fc(o.perOrder)):'';}
+function tierTitle(o){if(!o)return '';var s=tierSentence(o,false);return s.now+' '+s.then;}
 function tierModalHTML(p,qty){
-  var o=advTierOpp(p,qty);
-  if(!o)return '';
-  var h='<div style="background:var(--green-dim);border:1px solid rgba(22,163,74,.3);border-radius:var(--r-md);padding:10px 12px;margin-bottom:12px">';
-  if(o.qty){
-    h+='<div style="font-size:var(--t-md);font-weight:700;color:var(--green)">Order '+o.qty+' instead of '+o.curQty+' and save '+fc(o.saveTotal)+' ('+Math.round(o.savePct)+'%)</div>'
-      +'<div class="t3s" style="margin-top:2px">'+fc(o.curPrice)+' &rarr; '+fc(o.price)+' per unit. About '+(o.cover!==null?o.cover.toFixed(1):'?')+' weeks of cover'+(o.up?', demand trending up '+Math.round((o.trend-1)*100)+'%':'')+'. Extra cash up front '+fc(Math.max(0,o.extraCash))+'.</div>'
-      +'<button class="btn btn-teal btn-sm" style="margin-top:6px" onclick="var q=document.getElementById(\'pom-qty\');if(q){q.value='+o.qty+';}var s=document.getElementById(\'pom-slider\');if(s)s.value='+o.qty+';_pomUpdate()">Use '+o.qty+'</button>';
-  }
-  if(o.hist)h+='<div class="t3s" style="margin-top:'+(o.qty?'6':'0')+'px;color:var(--orange)"><b>Missed savings:</b> '+o.hist.parts.join(' + ')+' = '+o.hist.tot+' units in the last '+tierCfg().days+' days across '+o.hist.n+' POs. Ordered together that is '+fc(o.hist.comb)+' instead of '+fc(o.hist.paid)+' (saves '+fc(o.hist.saved)+').</div>';
-  return h+'</div>';
+  var o=advTierOpp(p,qty);if(!o)return '';
+  var s=tierSentence(o,true);
+  return '<div style="background:var(--green-dim);border:1px solid rgba(22,163,74,.3);border-radius:var(--r-md);padding:10px 12px;margin-bottom:12px">'
+    +'<div style="font-size:var(--t-md);font-weight:700;color:var(--green)">Buy '+o.qty+' and save '+fc(o.perOrder)+'</div>'
+    +'<div class="t3s" style="margin-top:3px">'+s.then+'</div>'
+    +'<button class="btn btn-teal btn-sm" style="margin-top:6px" onclick="var q=document.getElementById(\'pom-qty\');if(q){q.value='+o.qty+';}var s=document.getElementById(\'pom-slider\');if(s)s.value='+o.qty+';_pomUpdate()">Use '+o.qty+'</button></div>';
 }
-/* ---- savings report ---- */
+function tierOrderQty(pn,qty){
+  openPartOrderModal(pn);
+  setTimeout(function(){var q=document.getElementById('pom-qty');if(q)q.value=qty;var s=document.getElementById('pom-slider');if(s)s.value=qty;if(window._pomUpdate)_pomUpdate();},120);
+}
 function openTierSavings(){
   document.getElementById('tier-modal')?.remove();
   var c=tierCfg();
   var m=document.createElement('div');m.id='tier-modal';
   m.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
-  m.innerHTML='<div style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(1150px,96vw);max-height:90vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.18)">'
-    +'<div style="padding:16px 22px 10px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:12px"><div style="flex:1">'
-    +'<div style="font-size:var(--t-lg);font-weight:700;color:var(--text)">Price-Break Savings</div>'
-    +'<div class="t3s" style="margin-top:3px">Parts where ordering more reaches a cheaper vendor tier and the extra units still get used in a sensible time. Rising-demand parts are given a longer window. Also shows small POs that would have priced lower as one order.</div></div>'
+  m.innerHTML='<div style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(900px,96vw);max-height:90vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.18)">'
+    +'<div style="padding:16px 22px 12px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:12px"><div style="flex:1">'
+    +'<div style="font-size:var(--t-lg);font-weight:700;color:var(--text)">Buy in bigger batches, pay less</div>'
+    +'<div class="t3s" style="margin-top:3px">Your vendors charge less per part when you order more at once. These parts are worth ordering in a bigger batch next time.</div>'
+    +'<div id="tier-total" style="font-size:var(--t-xl);font-weight:800;color:var(--green);margin-top:8px"></div></div>'
     +'<button class="btn btn-sm" onclick="document.getElementById(\'tier-modal\').remove()">Close</button></div>'
-    +'<div style="padding:10px 22px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--border)">'
-    +'<span class="t3s">Cover no more than</span><input id="tier-w" type="number" min="1" max="104" value="'+c.maxWeeks+'" class="form-input" style="width:64px;padding:4px 8px"><span class="t3s">weeks. Price drop at least</span>'
-    +'<input id="tier-p" type="number" min="0" max="90" value="'+c.minPct+'" class="form-input" style="width:60px;padding:4px 8px"><span class="t3s">% and save at least $</span>'
-    +'<input id="tier-s" type="number" min="0" value="'+c.minSave+'" class="form-input" style="width:70px;padding:4px 8px"><span class="t3s">. Look back</span>'
-    +'<input id="tier-d" type="number" min="7" max="365" value="'+c.days+'" class="form-input" style="width:64px;padding:4px 8px"><span class="t3s">days.</span>'
-    +'<button class="btn btn-sm" onclick="tierSaveCfg()">Save + refresh</button><span id="tier-count" class="t3s" style="margin-left:auto"></span></div>'
-    +'<div id="tier-body" style="overflow:auto;padding:6px 14px 14px;flex:1"></div></div>';
+    +'<div style="padding:8px 22px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;border-bottom:1px solid var(--border);font-size:var(--t-sm);color:var(--text3)">'
+    +'Only suggest batches you would use up within <input id="tier-w" type="number" min="1" max="104" value="'+c.weeks+'" class="form-input" style="width:60px;padding:3px 6px"> weeks, '
+    +'and that save at least $<input id="tier-y" type="number" min="0" value="'+c.minYear+'" class="form-input" style="width:76px;padding:3px 6px"> a year.'
+    +'<button class="btn btn-sm" onclick="tierSaveCfg()">Update</button></div>'
+    +'<div id="tier-body" style="overflow:auto;padding:10px 18px 16px;flex:1"></div></div>';
   document.body.appendChild(m);tierRender();
 }
 async function tierSaveCfg(){
-  var v={tier_max_weeks:parseFloat(document.getElementById('tier-w')?.value),tier_min_pct:parseFloat(document.getElementById('tier-p')?.value),
-    tier_min_save:parseFloat(document.getElementById('tier-s')?.value),tier_lookback_days:parseFloat(document.getElementById('tier-d')?.value)};
+  var v={tier_use_within_weeks:parseFloat(document.getElementById('tier-w')?.value),tier_min_year_save:parseFloat(document.getElementById('tier-y')?.value)};
   Object.keys(v).forEach(function(k){if(!isFinite(v[k]))delete v[k];});
   Object.assign(S.settings,v);
   try{await db.from('settings').upsert(Object.keys(v).map(function(k){return{key:k,value:v[k]};}),{onConflict:'key'});}catch(e){console.warn('[tier cfg] save failed',e);}
@@ -19924,34 +19917,26 @@ function tierRender(){
   var body=document.getElementById('tier-body');if(!body)return;
   S._tierRecent=null;tierBuildRecent();
   var rows=[];
-  S.parts.forEach(function(p){
-    if(p.discontinued||p.build_to_order)return;
-    var o=advTierOpp(p);if(!o)return;
-    rows.push({p:p,o:o,sort:(o.qty?o.saveTotal:0)+(o.hist?o.hist.saved:0)});
-  });
-  rows.sort(function(a,b){return b.sort-a.sort;});
-  var total=rows.reduce(function(s,r){return s+(r.o.qty?r.o.saveTotal:0);},0),missed=rows.reduce(function(s,r){return s+(r.o.hist?r.o.hist.saved:0);},0);
-  var cnt=document.getElementById('tier-count');if(cnt)cnt.innerHTML=rows.length+' parts &middot; up to '+fc(total)+' available &middot; '+fc(missed)+' missed recently';
-  if(!rows.length){body.innerHTML='<div class="section-empty">No price-break opportunities right now with these settings. Parts need price tiers entered on the part record to show up here.</div>';return;}
-  var th='padding:6px 8px;text-align:left;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.05em;color:var(--text3);white-space:nowrap;position:sticky;top:0;background:var(--bg3)';
-  var h='<table style="width:100%;border-collapse:collapse;font-size:var(--t-sm)"><thead><tr>'
-    +['Part','Order now','Better order','Saves','Cover','Demand','Recent POs (missed savings)',''].map(function(t){return '<th style="'+th+'">'+t+'</th>';}).join('')+'</tr></thead><tbody>';
-  rows.forEach(function(r){
-    var o=r.o,p=r.p;
-    var better=o.qty?('<b>'+o.qty+'</b> @ '+fc(o.price)+'<div class="t3xs">extra cash '+fc(Math.max(0,o.extraCash))+'</div>'):'<span class="t3s">-</span>';
-    var saves=o.qty?('<b style="color:var(--green)">'+fc(o.saveTotal)+'</b><div class="t3xs">'+Math.round(o.savePct)+'% per unit</div>'):'<span class="t3s">-</span>';
-    var dem=o.wk>0?(o.wk.toFixed(1)+'/wk'+(o.up?' <span style="color:var(--green);font-weight:700">&#8599; +'+Math.round((o.trend-1)*100)+'%</span>':'')):'-';
-    var hist=o.hist?(o.hist.parts.join(' + ')+' = '+o.hist.tot+'<div class="t3xs" style="color:var(--orange)">paid '+fc(o.hist.paid)+' vs '+fc(o.hist.comb)+' as one: saves '+fc(o.hist.saved)+'</div>'):'<span class="t3s">-</span>';
-    h+='<tr style="border-bottom:1px solid var(--border)"><td style="padding:7px 8px;font-family:var(--mono);font-weight:600;color:var(--teal);white-space:nowrap">'+escHtml(dispPn(p))+'<div class="t3xs" style="font-family:var(--font);font-weight:400;max-width:210px;overflow:hidden;text-overflow:ellipsis">'+escHtml(p.description||'')+'</div></td>'
-      +'<td style="padding:7px 8px;white-space:nowrap">'+o.curQty+' @ '+fc(o.curPrice)+'</td>'
-      +'<td style="padding:7px 8px;white-space:nowrap">'+better+'</td><td style="padding:7px 8px;white-space:nowrap">'+saves+'</td>'
-      +'<td style="padding:7px 8px;white-space:nowrap">'+(o.cover!==null?o.cover.toFixed(1)+' wk':'-')+'</td>'
-      +'<td style="padding:7px 8px;white-space:nowrap">'+dem+'</td><td style="padding:7px 8px">'+hist+'</td>'
-      +'<td style="padding:7px 8px;white-space:nowrap"><button class="btn btn-teal btn-sm" onclick="document.getElementById(\'tier-modal\').remove();openPartOrderModal(\''+escHtml(p.pn)+'\')">Order</button></td></tr>';
-  });
-  body.innerHTML=h+'</tbody></table><div class="t3xs" style="margin-top:8px">Saves = the extra tier\'s units priced at today\'s per-unit cost minus the tier cost. It assumes you would buy those units anyway within the cover window shown.</div>';
+  S.parts.forEach(function(p){if(p.discontinued||p.build_to_order)return;var o=advTierOpp(p);if(o)rows.push({p:p,o:o});});
+  rows.sort(function(a,b){return b.o.perYear-a.o.perYear;});
+  var tot=rows.reduce(function(s,r){return s+r.o.perYear;},0);
+  var te=document.getElementById('tier-total');
+  if(te)te.textContent=rows.length?('About '+fc(tot)+' a year saved across '+rows.length+' part'+(rows.length!==1?'s':'')):'';
+  if(!rows.length){body.innerHTML='<div class="section-empty">Nothing worth changing right now. Try allowing more weeks or a lower yearly saving above. Parts only show up here if they have price tiers entered and some usage.</div>';return;}
+  body.innerHTML=rows.map(function(r){
+    var o=r.o,p=r.p,s=tierSentence(o,true);
+    return '<div style="display:flex;gap:14px;align-items:center;padding:12px 4px;border-bottom:1px solid var(--border)">'
+      +'<div style="flex:1;min-width:0">'
+      +'<div><span style="font-family:var(--mono);font-weight:700;color:var(--teal)">'+escHtml(dispPn(p))+'</span> <span class="t3s">'+escHtml(p.description||'')+'</span></div>'
+      +'<div style="font-size:var(--t-md);color:var(--text2);margin-top:4px">'+s.now+'</div>'
+      +'<div style="font-size:var(--t-md);color:var(--text);margin-top:2px">'+s.then+'</div></div>'
+      +'<div style="text-align:right;flex-shrink:0;min-width:130px">'
+      +'<div style="font-size:var(--t-xl);font-weight:800;color:var(--green)">'+fc(o.perYear)+'</div><div class="t3xs">saved per year</div>'
+      +'<button class="btn btn-teal btn-sm" style="margin-top:6px" onclick="document.getElementById(\'tier-modal\').remove();tierOrderQty(\''+escHtml(p.pn)+'\','+o.qty+')">Order '+o.qty+'</button></div></div>';
+  }).join('');
 }
-window.openTierSavings=openTierSavings;window.tierSaveCfg=tierSaveCfg;window.advTierOpp=advTierOpp;
+window.openTierSavings=openTierSavings;window.tierSaveCfg=tierSaveCfg;window.advTierOpp=advTierOpp;window.tierOrderQty=tierOrderQty;
+
 
 
 function _buildLastMoveMap(){
@@ -20183,7 +20168,7 @@ function renderPlanning() {
       <button class="btn btn-sm" onclick="nav('pobuilder')"><span class="ic ic-cart"></span>PO Builder</button>
       <button class="btn btn-sm" onclick="openStaleReport()" title="Find parts with no sales or stock adjustments in the last 90 days"><span class="ic ic-trash"></span>Stale (90d)</button>
       <button class="btn btn-sm" onclick="openRepeatPOAdvisor()" title="Parts that keep getting ordered in small or overlapping POs, with a recommended MOQ" style="color:var(--orange);border-color:rgba(234,88,12,.35)"><span class="ic ic-refresh"></span>Repeat POs</button>
-      <button class="btn btn-sm" onclick="openTierSavings()" title="Parts where ordering more reaches a cheaper vendor price tier, and recent small POs that would have priced lower as one order" style="color:var(--green);border-color:rgba(22,163,74,.35)"><span class="ic ic-money"></span>Tier Savings</button>
+      <button class="btn btn-sm" onclick="openTierSavings()" title="Parts where ordering a bigger batch gets a lower price per unit" style="color:var(--green);border-color:rgba(22,163,74,.35)"><span class="ic ic-money"></span>Bulk Savings</button>
       <button class="btn btn-primary btn-sm" onclick="createSuggestedPOs()">+ Create Suggested POs (${needsReorder.length})</button>
     </div>
     <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--border)">
@@ -20331,9 +20316,9 @@ function renderPlanning() {
             ? '<span style="color:var(--text3);font-size:var(--t-md)">&mdash;</span>'+(moq>0?'<div class="t3xxs">optional min '+moq+'</div>':'')
             : '<span style="font-size:var(--t-md);font-weight:700;color:'+(moq>sq?'var(--orange)':'var(--text)')+'">'+orderQty+'</span>'
               +(effectiveMOQ>sq?'<div style="font-size:var(--t-xs);color:var(--text3);margin-top:1px">need '+sq+' / min '+(moq>0?moq:'Tier 1: '+effectiveMOQ)+'</div>':'')
-              +((tierOpp&&tierOpp.qty)?'<div style="font-size:var(--t-xs);color:var(--green);font-weight:700;margin-top:1px;cursor:pointer" onclick="event.stopPropagation();openPartOrderModal(\''+p.pn+'\')" title="'+escHtml(tierTitle(tierOpp))+'">&#128176; '+tierShort(tierOpp)+'</div>'
+              +((tierOpp&&tierOpp.qty)?'<div style="font-size:var(--t-xs);color:var(--green);font-weight:700;margin-top:1px;cursor:pointer" onclick="event.stopPropagation();tierOrderQty(\''+p.pn+'\','+tierOpp.qty+')" title="'+escHtml(tierTitle(tierOpp))+'">&#128176; '+tierShort(tierOpp)+'</div>'
                 :(pbHint?'<div style="font-size:var(--t-xs);color:var(--yellow);margin-top:1px">&#128161; '+pbHint+'</div>':''))
-              +((tierOpp&&tierOpp.hist&&!tierOpp.qty)?'<div style="font-size:var(--t-xs);color:var(--orange);margin-top:1px;cursor:pointer" onclick="event.stopPropagation();openPartOrderModal(\''+p.pn+'\')" title="'+escHtml(tierTitle(tierOpp))+'">Recent small POs missed '+fc(tierOpp.hist.saved)+'</div>':'')
+
         }
       </td>
       <td><span class="pill ${statusCls}" title="Reorder point: ${rp}${onOrder>0?' · '+onOrder+' on open PO':''}">${status}</span></td>
