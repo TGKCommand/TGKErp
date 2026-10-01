@@ -338,6 +338,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
     <button class="nav-item" id="nav-inventory" onclick="navInventory()"><span class="nav-dot"></span>Inventory</button>
     <div class="sub-nav" id="sub-nav-inventory">
       <button class="nav-sub-item" id="subnav-invparts" onclick="navInventory('parts')">Parts</button>
+      <button class="nav-sub-item" id="subnav-invbodates" onclick="navInventory('backorderdates')">Backorder Dates</button>
       <button class="nav-sub-item" id="subnav-invbackorder" onclick="navInventory('backorderlog')">Backorder Log</button>
     </div>
     <button class="nav-item" id="nav-packqueue" onclick="nav('packqueue')"><span class="nav-dot"></span>Production</button>
@@ -460,7 +461,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.51';
+const TGK_ERP_VERSION = 'v23.52';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1337,7 +1338,8 @@ function setupRealtime(){
       var key=_it?_it.pn:r.pn;
       if(!S.currentBackorders)S.currentBackorders={};
       if(r.action==='backorder')S.currentBackorders[key]={restock_date:r.restock_date||null,since:r.created_at};
-      else delete S.currentBackorders[key]; // reverted/partial -> no longer showing as backordered
+      else{delete S.currentBackorders[key]; // reverted/partial -> no longer showing as backordered
+        if(r.action==='reverted'&&typeof boReleaseLock==='function')boReleaseLock(key);}
       rtRender(['lookup','dashboard','inventory','planning']);
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'purchases'},p=>{
@@ -1561,6 +1563,7 @@ function nav(v){
   }
   $('subnav-invparts')?.classList.toggle('active',v==='inventory'&&(S.invTab||'parts')==='parts');
   $('subnav-invbackorder')?.classList.toggle('active',v==='inventory'&&S.invTab==='backorderlog');
+  $('subnav-invbodates')?.classList.toggle('active',v==='inventory'&&S.invTab==='backorderdates');
   if(v==='pricelist'||v==='fitments'){
     $('nav-dealers')?.classList.add('active');
   }
@@ -1695,6 +1698,7 @@ function navBack(){
   if(_si){_si.style.display=S.view==='inventory'?'block':'none';_si.classList.toggle('open',S.view==='inventory');}
   $('subnav-invparts')?.classList.toggle('active',S.view==='inventory'&&(S.invTab||'parts')==='parts');
   $('subnav-invbackorder')?.classList.toggle('active',S.view==='inventory'&&S.invTab==='backorderlog');
+  $('subnav-invbodates')?.classList.toggle('active',S.view==='inventory'&&S.invTab==='backorderdates');
   $('page-title').textContent=PAGE_TITLES[S.view]||S.view;
   const bb=$('back-btn');if(bb)bb.style.display=(S.navHistory.length||(typeof _navDrillActive==='function'&&_navDrillActive()))?'':'none';
   // Do NOT call pushHist() here — we are going backwards, not forwards
@@ -1717,7 +1721,7 @@ function navInventory(sub){
   document.querySelectorAll('.nav-item').forEach(function(el){el.classList.remove('active');});
   var _nb=document.getElementById('nav-inventory');
   if(_nb)_nb.classList.add('active');
-  var _subMap={'parts':'subnav-invparts','backorderlog':'subnav-invbackorder'};
+  var _subMap={'parts':'subnav-invparts','backorderdates':'subnav-invbodates','backorderlog':'subnav-invbackorder'};
   Object.keys(_subMap).forEach(function(k){
     var _el=document.getElementById(_subMap[k]);
     if(_el)_el.classList.toggle('active',k===(sub||'parts'));
@@ -1725,6 +1729,7 @@ function navInventory(sub){
   S.invTab=sub||'parts';
   nav('inventory');
   if(sub==='backorderlog')setTimeout(loadInvBackorderLog,60);
+  if(sub==='backorderdates')setTimeout(loadBackorderDates,60);
 }
 
 function navDealers(sub){
@@ -1827,6 +1832,7 @@ window.addEventListener('popstate',function(e){
   if(_si){_si.style.display=S.view==='inventory'?'block':'none';_si.classList.toggle('open',S.view==='inventory');}
   $('subnav-invparts')?.classList.toggle('active',S.view==='inventory'&&(S.invTab||'parts')==='parts');
   $('subnav-invbackorder')?.classList.toggle('active',S.view==='inventory'&&S.invTab==='backorderlog');
+  $('subnav-invbodates')?.classList.toggle('active',S.view==='inventory'&&S.invTab==='backorderdates');
   const _sd=$('sub-nav-dealers');
   if(_sd){const _do=['dealers','pricelist','fitments'].includes(S.view);_sd.style.display=_do?'block':'none';_sd.classList.toggle('open',_do);}
   $('subnav-dealerlist')?.classList.toggle('active',S.view==='dealers');
@@ -2044,6 +2050,7 @@ function syncShopifyTemplate(pn,newOh){
     }
   }
   const template=isBackorder?(S.settings.shopify_backorder_template||'backorder'):'';
+  if(!isBackorder&&_item&&typeof boReleaseLock==='function')boReleaseLock(_item.pn); // came off backorder: any manual date lock ends here
   console.log('[Shopify template] '+pn+': newOh='+newOh+' -> template='+(template||'(revert to normal)'));
   var restockDate='';
   if(isBackorder){
@@ -2053,7 +2060,11 @@ function syncShopifyTemplate(pn,newOh){
     // Only compute a fresh date when this is a genuinely new backorder event (it wasn't backordered
     // a moment ago).
     var _existing=currentBackorderOf(pn);
-    if(_existing&&_existing.restock_date){
+    var _lk=(S.backorderLocks&&_item)?S.backorderLocks[_item.pn]:null;
+    if(_lk&&_lk.restock_date){
+      restockDate=_lk.restock_date;
+      console.log('[Shopify backorder] '+pn+': date is LOCKED - keeping '+restockDate);
+    }else if(_existing&&_existing.restock_date){
       restockDate=_existing.restock_date;
       console.log('[Shopify backorder] '+pn+': already backordered — keeping original restock_date='+restockDate);
     }else{
@@ -4518,6 +4529,7 @@ function bomParPick(pn){
 
 function renderInventory(){
   if((S.invTab||'parts')==='backorderlog')return renderInventoryBackorderLog();
+  if((S.invTab||'parts')==='backorderdates')return renderInventoryBackorderDates();
   let list=S.parts.filter(p=>!p.discontinued);
   const sf=S.filters.inv||{};
   const q=(sf.search||S.searchQ||'').toLowerCase();
@@ -8377,8 +8389,8 @@ Deno.serve(async (req) =&gt; {
       let actual_policy = null, actual_tracked = null
 
       const existingEta = String(match.node.metafield?.value || '').trim()
-      const effRestockDate = (backorder &amp;&amp; existingEta) ? existingEta : restockDate
-      const eta_preserved = !!(backorder &amp;&amp; existingEta &amp;&amp; existingEta !== restockDate)
+      const effRestockDate = (backorder &amp;&amp; existingEta &amp;&amp; !body.force_restock_date) ? existingEta : restockDate
+      const eta_preserved = !!(backorder &amp;&amp; existingEta &amp;&amp; !body.force_restock_date &amp;&amp; existingEta !== restockDate)
 
       if (backorder) {
         if (invItemId) {
@@ -8475,7 +8487,7 @@ Deno.serve(async (req) =&gt; {
     const allSucceeded = ok
     const anySucceeded = perVariant.some((r:any) =&gt; r.ok)
     const effective_action = backorder ? (allSucceeded ? 'backorder' : (anySucceeded ? 'partial' : 'reverted')) : 'reverted'
-    try { await db.from('shopify_sync_log').insert({ pn: sku, action: effective_action, trigger_source: body.trigger_source || 'erp_manual', restock_date: ((effective_action === 'backorder' || effective_action === 'partial') ? (restockDate || null) : null) }) } catch (e) { console.warn('[set_variant_backorder] log failed:', e) }
+    try { await db.from('shopify_sync_log').insert({ pn: sku, action: effective_action, trigger_source: body.trigger_source || 'erp_manual', restock_date: ((effective_action === 'backorder' || effective_action === 'partial') ? (perVariant[0]?.restock_date || restockDate || null) : null) }) } catch (e) { console.warn('[set_variant_backorder] log failed:', e) }
     // Existing callers read this action's OLD single-variant response shape directly at the
     // TOP level (d.template, d.reason, d.actual_policy, d.actual_tracked, d.failsafe_applied,
     // d.errors) - one caller's own error-reporting depends on d.reason specifically, and its
@@ -11184,6 +11196,295 @@ async function loadInvBackorderLog(){
     wrap.innerHTML='<div style="font-size:var(--t-sm);color:var(--red);padding:12px 0">Error: '+e.message+'</div>';
   }
 }
+/* ===================================================================================
+   BACKORDER DATES  (v23.52)
+   - "Backorder Dates" page: every SKU currently on backorder + its restock date.
+   - Manual date edit locks the SKU (table backorder_eta_locks). A lock is released when the SKU
+     comes off backorder, when you press Unlock, or when you set a new date by hand (which re-locks
+     at the new date).
+   - Auto-extend: when an UNLOCKED backorder date is within `lead` days (default 2), add `add` days
+     (default 15) so the date on the storefront never lapses while the item is still backordered.
+   =================================================================================== */
+function boYmd(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
+function boParse(s){var m=/^(\d{4})-(\d{2})-(\d{2})/.exec(String(s||''));return m?new Date(+m[1],+m[2]-1,+m[3]):null;}
+function boAddDays(s,n){var d=boParse(s);if(!d)return '';d.setDate(d.getDate()+n);return boYmd(d);}
+function boDaysLeft(s){var d=boParse(s);if(!d)return null;var t=new Date();t=new Date(t.getFullYear(),t.getMonth(),t.getDate());return Math.round((d-t)/86400000);}
+function boCfg(){
+  var st=S.settings||{};
+  var add=parseInt(st.backorder_extend_days);var lead=parseInt(st.backorder_extend_lead_days);
+  return{extendDays:(add>0?add:15),leadDays:(isFinite(lead)&&lead>=0?lead:2),enabled:st.backorder_auto_extend!==false};
+}
+function boAliases(item){
+  var a=[];[item&&item.pn,item&&item.new_sku,item?dispPn(item):''].forEach(function(x){if(x&&a.indexOf(x)<0)a.push(x);});return a;
+}
+async function boLoadLocks(){
+  try{
+    var r=await db.from('backorder_eta_locks').select('*');
+    if(r.error){S._boLocksErr=r.error.message||'error';if(!S.backorderLocks)S.backorderLocks={};return false;}
+    S._boLocksErr=null;var m={};(r.data||[]).forEach(function(x){m[x.pn]=x;});S.backorderLocks=m;return true;
+  }catch(e){S._boLocksErr=String((e&&e.message)||e);if(!S.backorderLocks)S.backorderLocks={};return false;}
+}
+async function boWriteLock(pn,date){
+  var row={pn:pn,restock_date:date,locked_by:S.currentUser||null,locked_at:new Date().toISOString()};
+  var r=await db.from('backorder_eta_locks').upsert(row,{onConflict:'pn'});
+  if(r&&r.error)return r.error.message||'error';
+  if(!S.backorderLocks)S.backorderLocks={};
+  S.backorderLocks[pn]=row;return null;
+}
+async function boReleaseLock(pn){
+  try{
+    if(!S.backorderLocks||!S.backorderLocks[pn])return;
+    delete S.backorderLocks[pn];
+    await db.from('backorder_eta_locks').delete().eq('pn',pn);
+  }catch(e){console.warn('[backorder lock] release failed',e);}
+}
+async function boLatestLog(item){
+  try{
+    var r=await db.from('shopify_sync_log').select('pn,action,restock_date,created_at').in('pn',boAliases(item)).order('created_at',{ascending:false}).limit(1);
+    return (r&&r.data&&r.data[0])||null;
+  }catch(e){return null;}
+}
+/* Push a restock date to Shopify. force_restock_date makes the edge function overwrite the date that
+   is already on the variant (without it the function keeps whatever Shopify already holds). */
+async function boPushDate(item,newDate,source){
+  var shopSku=dispPn(item),resp=null,txt='',d=null;
+  try{
+    resp=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'set_variant_backorder',sku:shopSku,backorder:true,restock_date:newDate,force_restock_date:true,trigger_source:source})});
+    txt=await resp.text();try{d=JSON.parse(txt);}catch(e){}
+  }catch(e){return{ok:false,error:String((e&&e.message)||e)};}
+  if(!d||!d.ok){
+    return{ok:false,error:(d&&(d.reason||d.error||d.note))||('HTTP '+(resp&&resp.status)+' '+String(txt).slice(0,80))};
+  }
+  if(d.restock_date&&d.restock_date!==newDate){
+    // Old edge function: Shopify kept the date it already had. Make the log tell the truth.
+    try{await db.from('shopify_sync_log').insert({pn:shopSku,action:'backorder',trigger_source:'eta_edit_not_applied',restock_date:d.restock_date,user_email:S.currentUser||null});}catch(e){}
+    return{ok:false,stale:true,error:'Shopify kept its existing date ('+d.restock_date+'). Redeploy the updated shopify-orders edge function (see the patch notes) so date changes can overwrite it.'};
+  }
+  return{ok:true};
+}
+function boSetLocal(pn,date){
+  if(!S.currentBackorders)S.currentBackorders={};
+  S.currentBackorders[pn]=Object.assign({},S.currentBackorders[pn]||{},{restock_date:date});
+}
+
+/* ---------- auto-extend sweep ---------- */
+async function boAutoExtendSweep(manual){
+  if(S._boSweeping)return{done:0,due:0};
+  var cfg=boCfg();
+  if(!manual&&!cfg.enabled)return{done:0,due:0};
+  if(!manual&&S._boEdgeStale)return{done:0,due:0};
+  if(!S.shopify||!S.shopify.store){if(manual)toast('Configure the Shopify store in Integrations first');return{done:0,due:0};}
+  if(S.settings&&S.settings.shopify_backorder_sync_enabled===false){if(manual)toast('Backorder sync is switched off in Integrations');return{done:0,due:0};}
+  S._boSweeping=true;S._boSweepAt=Date.now();
+  var done=0,due=0,failed=[];
+  try{
+    var okLocks=await boLoadLocks();
+    if(!okLocks){
+      // Never extend without knowing which dates are locked.
+      if(manual||!S._boWarnedLocks){S._boWarnedLocks=true;toast('Backorder auto-extend is paused: the lock table is missing. Run backorder_eta_locks.sql in Supabase.',10000);}
+      return{done:0,due:0};
+    }
+    var cur=await getCurrentBackorderedItems();
+    if(cur.error)return{done:0,due:0};
+    var curKeys={};cur.items.forEach(function(i){curKeys[i.pn]=true;});
+    // Release locks for SKUs that have come off backorder (confirmed by the log, not just by absence).
+    var lockKeys=Object.keys(S.backorderLocks||{});
+    for(var li=0;li<lockKeys.length;li++){
+      var lp=lockKeys[li];if(curKeys[lp])continue;
+      var lit=findAsm(lp)||_findPart(lp);
+      if(!lit){await boReleaseLock(lp);continue;}
+      var llog=await boLatestLog(lit);
+      if(llog&&llog.action==='reverted')await boReleaseLock(lp);
+    }
+    var lead=cfg.leadDays,add=cfg.extendDays,today=boYmd(new Date());
+    var todo=cur.items.filter(function(i){
+      var rd=i.logRow&&i.logRow.restock_date;if(!rd)return false;
+      if(S.backorderLocks[i.pn])return false;
+      var dl=boDaysLeft(rd);return dl!==null&&dl<=lead;
+    });
+    due=todo.length;
+    for(var k=0;k<todo.length&&k<40;k++){
+      var item=findAsm(todo[k].pn)||_findPart(todo[k].pn);if(!item)continue;
+      // Another open ERP session may have just extended this one - re-read the newest log row first.
+      var fresh=await boLatestLog(item);
+      if(!fresh||fresh.action!=='backorder')continue;
+      var rd2=fresh.restock_date||todo[k].logRow.restock_date;
+      var dl2=boDaysLeft(rd2);
+      if(dl2===null)continue;
+      if(dl2>lead){boSetLocal(item.pn,rd2);continue;}
+      var nd=boAddDays(dl2<0?today:rd2,add);
+      var res=await boPushDate(item,nd,'eta_auto_extend');
+      if(res.ok){boSetLocal(item.pn,nd);done++;}
+      else{
+        failed.push(dispPn(item)+': '+res.error);
+        if(res.stale){S._boEdgeStale=true;break;}
+      }
+      await new Promise(function(r){setTimeout(r,700);});
+    }
+    if(done)toast('Auto-extended '+done+' backorder date'+(done!==1?'s':'')+' by '+add+' days',6000);
+    if(failed.length){
+      console.warn('[backorder auto-extend] failed:',failed);
+      if(manual||S._boEdgeStale)toast('Auto-extend problem: '+failed[0],10000);
+    }
+    if(S.view==='inventory'&&S.invTab==='backorderdates')loadBackorderDates();
+  }catch(e){
+    console.warn('[backorder auto-extend] error',e);
+  }finally{S._boSweeping=false;}
+  return{done:done,due:due};
+}
+setInterval(function(){
+  try{
+    if(document.hidden)return;
+    if(typeof S==='undefined'||!S.assemblies||!S.assemblies.length||!S.settings||!S.currentBackorders)return;
+    if(!S._boSweepAt||(Date.now()-S._boSweepAt)>30*60*1000)boAutoExtendSweep(false);
+  }catch(e){}
+},60000);
+async function boRunSweepNow(){
+  var b=document.getElementById('bod-run-btn');if(b){b.disabled=true;b.textContent='Running...';}
+  var r=await boAutoExtendSweep(true);
+  if(b){b.disabled=false;b.textContent='Run auto-extend now';}
+  if(r&&!r.done&&!r.due)toast('Nothing due - no unlocked date is within '+boCfg().leadDays+' days');
+  loadBackorderDates();
+}
+async function boSaveCfg(){
+  var on=document.getElementById('bod-cfg-on')?.checked!==false;
+  var lead=parseInt(document.getElementById('bod-cfg-lead')?.value);var add=parseInt(document.getElementById('bod-cfg-add')?.value);
+  if(!(add>0)){toast('Days to add must be at least 1');return;}
+  if(!(isFinite(lead)&&lead>=0)){toast('Lead days must be 0 or more');return;}
+  S.settings.backorder_auto_extend=on;S.settings.backorder_extend_days=add;S.settings.backorder_extend_lead_days=lead;
+  await db.from('settings').upsert([{key:'backorder_auto_extend',value:on},{key:'backorder_extend_days',value:add},{key:'backorder_extend_lead_days',value:lead}],{onConflict:'key'});
+  toast('Auto-extend settings saved');boRenderDates();
+}
+
+/* ---------- manual edit / lock ---------- */
+async function boManualSet(btn){
+  var pn=btn.dataset.pn,tr=btn.closest('tr'),inp=tr&&tr.querySelector('input[type=date]'),nd=inp&&inp.value;
+  if(!nd){toast('Pick a date first');return;}
+  var item=findAsm(pn)||_findPart(pn);if(!item){toast('SKU not found');return;}
+  var dl=boDaysLeft(nd);
+  if(dl!==null&&dl<0&&!confirm('That date is in the past. Set it anyway?'))return;
+  btn.disabled=true;var old=btn.textContent;btn.textContent='Saving...';
+  var r=await boPushDate(item,nd,'eta_manual');
+  if(!r.ok){toast('Could not update the date: '+r.error,10000);btn.disabled=false;btn.textContent=old;return;}
+  boSetLocal(item.pn,nd);
+  var lerr=await boWriteLock(item.pn,nd);
+  if(lerr)toast('Date updated on Shopify, but it could not be locked ('+lerr+'). Run backorder_eta_locks.sql in Supabase.',10000);
+  else toast('Restock date set to '+nd+' and locked',5000);
+  var row=(S._bodItems||[]).find(function(i){return i.pn===item.pn;});if(row&&row.logRow)row.logRow=Object.assign({},row.logRow,{restock_date:nd});
+  boRenderDates();
+}
+async function boLockNow(btn){
+  var pn=btn.dataset.pn,row=(S._bodItems||[]).find(function(i){return i.pn===pn;});
+  var rd=row&&row.logRow&&row.logRow.restock_date;
+  if(!rd){toast('Set a date first - there is nothing to lock');return;}
+  var err=await boWriteLock(pn,rd);
+  if(err){toast('Could not lock: '+err+' - run backorder_eta_locks.sql in Supabase',10000);return;}
+  toast('Locked at '+rd,4000);boRenderDates();
+}
+async function boUnlock(btn){
+  var pn=btn.dataset.pn;
+  if(!confirm('Unlock this date? Auto-extend will manage it again.'))return;
+  await boReleaseLock(pn);toast('Unlocked - auto-extend will manage this date again',4000);boRenderDates();
+}
+
+/* ---------- the page ---------- */
+function renderInventoryBackorderDates(){
+  var c=boCfg();
+  return '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:10px;flex-wrap:wrap">'
+    +'<div><div style="font-size:var(--t-lg);font-weight:700;color:var(--text)">Backorder Dates</div>'
+    +'<div style="font-size:var(--t-sm);color:var(--text3);margin-top:2px">Everything currently on backorder and the restock date customers see. Setting a date locks it - auto-extend leaves locked dates alone.</div></div>'
+    +'<div style="display:flex;gap:6px"><button class="btn btn-sm" onclick="loadBackorderDates()"><span class="ic ic-refresh"></span>Refresh</button>'
+    +'<button class="btn btn-sm" id="bod-run-btn" onclick="boRunSweepNow()" title="Check every unlocked date now instead of waiting for the next automatic check">Run auto-extend now</button></div></div>'
+    +'<div id="bod-banner"></div>'
+    +'<div class="panel" style="padding:10px 14px;margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+    +'<label style="display:flex;align-items:center;gap:6px;font-size:var(--t-sm);font-weight:700;color:var(--text)"><input type="checkbox" id="bod-cfg-on" '+(c.enabled?'checked':'')+'>Auto-extend</label>'
+    +'<span class="t3s">When an unlocked date is within</span>'
+    +'<input id="bod-cfg-lead" type="number" min="0" max="30" value="'+c.leadDays+'" class="form-input" style="width:60px;padding:4px 8px">'
+    +'<span class="t3s">days, add</span>'
+    +'<input id="bod-cfg-add" type="number" min="1" max="120" value="'+c.extendDays+'" class="form-input" style="width:60px;padding:4px 8px">'
+    +'<span class="t3s">days.</span><button class="btn btn-sm" onclick="boSaveCfg()">Save</button>'
+    +'<span id="bod-kpis" style="margin-left:auto;font-size:var(--t-sm);color:var(--text3)"></span></div>'
+    +'<div class="filter-bar" style="margin-bottom:12px">'
+    +'<div class="search-wrap"><span class="search-icon"><span class="ic ic-search"></span></span><input id="bod-search" placeholder="Search SKU..." oninput="boRenderDates()" style="width:160px"></div>'
+    +['all|All','soon|Due to extend','overdue|Overdue','locked|Locked','nodate|No date'].map(function(x){var p=x.split('|');return '<button class="filter-chip" id="bod-f-'+p[0]+'" onclick="window._bodFilter=\''+p[0]+'\';boRenderDates()">'+p[1]+'</button>';}).join('')
+    +'</div><div id="bod-wrap"><div style="font-size:var(--t-sm);color:var(--text3);padding:12px 0">Loading...</div></div>';
+}
+async function loadBackorderDates(){
+  var wrap=document.getElementById('bod-wrap');if(!wrap)return;
+  await boLoadLocks();
+  var cur=await getCurrentBackorderedItems();
+  if(cur.error){wrap.innerHTML='<div style="font-size:var(--t-sm);color:var(--red);padding:12px 0">Error: '+escHtml(cur.error.message||'could not read the sync log')+'</div>';return;}
+  S._bodItems=cur.items;
+  boRenderDates();
+}
+function boRenderDates(){
+  var wrap=document.getElementById('bod-wrap');if(!wrap)return;
+  var cfg=boCfg(),lead=cfg.leadDays,filter=window._bodFilter||'all';
+  var q=((document.getElementById('bod-search')||{}).value||'').toLowerCase();
+  var banner=[];
+  if(S._boLocksErr)banner.push('<div class="panel" style="padding:10px 14px;margin-bottom:10px;border-left:3px solid var(--red);font-size:var(--t-sm);color:var(--red)"><b>Lock table not found.</b> Date locking and auto-extend are paused. Run <span class="pn">backorder_eta_locks.sql</span> in the Supabase SQL editor. ('+escHtml(S._boLocksErr)+')</div>');
+  if(S._boEdgeStale)banner.push('<div class="panel" style="padding:10px 14px;margin-bottom:10px;border-left:3px solid var(--orange);font-size:var(--t-sm);color:var(--orange)"><b>Edge function needs the update.</b> Shopify kept its existing date instead of the new one. Redeploy the updated <span class="pn">shopify-orders</span> function so date changes can overwrite it.</div>');
+  var bn=document.getElementById('bod-banner');if(bn)bn.innerHTML=banner.join('');
+  var locks=S.backorderLocks||{};
+  var rows=(S._bodItems||[]).map(function(i){
+    var item=findAsm(i.pn)||_findPart(i.pn),rd=(i.logRow&&i.logRow.restock_date)||'';
+    return{pn:i.pn,item:item,sku:item?dispPn(item):i.display,desc:(item&&item.description)||'',rd:rd,dl:rd?boDaysLeft(rd):null,lock:locks[i.pn]||null};
+  });
+  var kSoon=0,kOver=0,kLock=0,kNo=0;
+  rows.forEach(function(r){
+    if(r.lock)kLock++;
+    if(r.dl===null)kNo++;else if(r.dl<0)kOver++;
+    if(!r.lock&&r.dl!==null&&r.dl<=lead)kSoon++;
+  });
+  var kp=document.getElementById('bod-kpis');
+  if(kp)kp.textContent=rows.length+' on backorder \u00b7 '+kLock+' locked \u00b7 '+kSoon+' due to extend \u00b7 '+kOver+' overdue \u00b7 '+kNo+' no date';
+  ['all','soon','overdue','locked','nodate'].forEach(function(f){var b=document.getElementById('bod-f-'+f);if(b)b.classList.toggle('on-teal',f===filter);});
+  rows=rows.filter(function(r){
+    if(q&&(r.sku+' '+r.pn+' '+r.desc).toLowerCase().indexOf(q)<0)return false;
+    if(filter==='soon')return !r.lock&&r.dl!==null&&r.dl<=lead;
+    if(filter==='overdue')return r.dl!==null&&r.dl<0;
+    if(filter==='locked')return !!r.lock;
+    if(filter==='nodate')return r.dl===null;
+    return true;
+  });
+  rows.sort(function(a,b){
+    if(a.dl===null&&b.dl!==null)return -1;if(b.dl===null&&a.dl!==null)return 1;
+    if(a.dl!==b.dl)return (a.dl||0)-(b.dl||0);
+    return String(a.sku).localeCompare(String(b.sku));
+  });
+  if(!rows.length){wrap.innerHTML='<div style="font-size:var(--t-sm);color:var(--text3);padding:12px 0">'+((S._bodItems||[]).length?'Nothing matches this filter.':'Nothing is currently on backorder.')+'</div>';return;}
+  var th='padding:6px 10px;text-align:left;color:var(--text3);font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.05em;white-space:nowrap';
+  var html='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:var(--t-md)"><thead><tr style="border-bottom:2px solid var(--border)">'
+    +'<th style="'+th+'">SKU</th><th style="'+th+'">Description</th><th style="'+th+'">Restock date</th><th style="'+th+'">Time left</th><th style="'+th+'">Status</th><th style="'+th+'">Actions</th></tr></thead><tbody>';
+  rows.forEach(function(r){
+    var daysTxt=r.dl===null?'<span class="t3s">no date</span>':(r.dl<0?'<span style="color:var(--red);font-weight:700">'+(-r.dl)+'d overdue</span>':(r.dl<=lead?'<span style="color:var(--orange);font-weight:700">'+r.dl+'d left</span>':'<span>'+r.dl+'d</span>'));
+    var status;
+    if(r.lock){
+      var who=(r.lock.locked_by||'').split('@')[0]||'someone';
+      var when=r.lock.locked_at?new Date(r.lock.locked_at).toLocaleDateString():'';
+      status='<span class="pill pill-orange" title="Locked by '+escHtml(who)+(when?' on '+escHtml(when):'')+'. Auto-extend skips this SKU until you unlock it or it comes off backorder.">LOCKED</span>';
+    }else{
+      status='<span class="pill pill-muted" title="Auto-extend manages this date">Auto</span>'+((r.dl!==null&&r.dl<=lead)?' <span class="t3xs" style="color:var(--orange)">extends on next check</span>':'');
+    }
+    var pnA=escHtml(r.pn);
+    var btns='<button class="btn btn-teal btn-sm" data-pn="'+pnA+'" onclick="boManualSet(this)" title="Save this date to Shopify and lock it">Set + lock</button> '
+      +(r.lock?'<button class="btn btn-sm" data-pn="'+pnA+'" onclick="boUnlock(this)">Unlock</button>'
+              :'<button class="btn btn-sm" data-pn="'+pnA+'" onclick="boLockNow(this)" title="Lock the current date as it is">Lock</button>');
+    html+='<tr style="border-bottom:1px solid var(--border)">'
+      +'<td style="padding:7px 10px;font-family:var(--mono);font-size:var(--t-sm);font-weight:600;color:var(--teal);white-space:nowrap">'+escHtml(r.sku||'')+'</td>'
+      +'<td style="padding:7px 10px;font-size:var(--t-sm);color:var(--text2);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(r.desc||'\u2014')+'</td>'
+      +'<td style="padding:7px 10px"><input type="date" class="form-input" value="'+escHtml(r.rd)+'" style="width:150px;padding:4px 8px"></td>'
+      +'<td style="padding:7px 10px;font-size:var(--t-sm);white-space:nowrap">'+daysTxt+'</td>'
+      +'<td style="padding:7px 10px;white-space:nowrap">'+status+'</td>'
+      +'<td style="padding:7px 10px;white-space:nowrap">'+btns+'</td></tr>';
+  });
+  html+='</tbody></table></div>';
+  wrap.innerHTML=html;
+}
+window.boManualSet=boManualSet;window.boLockNow=boLockNow;window.boUnlock=boUnlock;window.boRunSweepNow=boRunSweepNow;window.boSaveCfg=boSaveCfg;
+window.loadBackorderDates=loadBackorderDates;window.boRenderDates=boRenderDates;window.boReleaseLock=boReleaseLock;window.boAutoExtendSweep=boAutoExtendSweep;
+
 async function bulkSyncShopifyBackorder(){
   if(!S.shopify||!S.shopify.store){toast('Configure Shopify store URL in Integrations first');return;}
   if(S.settings.shopify_backorder_sync_enabled===false){toast('Backorder sync is disabled — enable it in the toggle above first');return;}
