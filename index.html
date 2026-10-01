@@ -461,7 +461,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.53';
+const TGK_ERP_VERSION = 'v23.54';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -19038,7 +19038,7 @@ async function submitPOCart(){
   });
   const vendors=Object.keys(groups);
   const summary=vendors.map(v=>v+' ('+groups[v].length+' line'+(groups[v].length>1?'s':'')+')').join(', ');
-  if(!confirm('Create '+vendors.length+' Draft PO'+(vendors.length>1?'s':'')+' for: '+summary+'?\n\nYou\'ll review and approve each one before placing the order.'))return;
+  if(!confirm('Create '+vendors.length+' Draft PO'+(vendors.length>1?'s':'')+' for: '+summary+'?\n\nYou\'ll review and approve each one before placing the order.'+advDupSummary(S.poCart.map(function(c){return c.pn;}))))return;
   const newPOIds=[];
   for(const v of vendors){
     const items=groups[v];
@@ -19617,6 +19617,179 @@ function calcSuggestedQty(p) {
   return sq;
 }
 
+/* ===================================================================================
+   REPEAT PO ADVISOR  (v23.54)
+   Finds parts that keep getting ordered in small, overlapping POs and recommends a MOQ that makes
+   one PO cover the target number of weeks. Flags:
+     - OVERLAP : 2+ open POs for the same part right now
+     - FREQUENT: ordered 2+ times in the window and the average PO covers fewer weeks than the target
+   =================================================================================== */
+function advOpenStatus(st){return st!=='Received'&&st!=='Recovered'&&st!=='Cancelled'&&st!=='Lost';}
+function advCfg(){
+  var c=S._advCfg||{};
+  return{weeks:(c.weeks>0?c.weeks:12),days:(c.days>0?c.days:180)};
+}
+function advNiceQty(n){
+  n=Math.max(1,Math.ceil(n));
+  var step=n<=20?1:n<=50?5:n<=200?10:n<=1000?50:100;
+  return Math.ceil(n/step)*step;
+}
+function advCompute(){
+  var cfg=advCfg(),cutoff=Date.now()-cfg.days*86400000;
+  var byPn={};
+  (S.purchases||[]).forEach(function(po){
+    if(po.status==='Cancelled'||po.status==='Lost')return; // a Lost PO and its replacement are intentional, not a duplicate
+    var t=Date.parse(po.order_date||po.created_at||'')||0;
+    var ls=S.poLines[po.id]||[];
+    if(!ls.length&&po.pn&&po.qty)ls=[{pn:po.pn,qty_ordered:po.qty,qty_received:po.qty_received||0,unit_cost:po.unit_cost}];
+    var seen={};
+    ls.forEach(function(l){
+      if(!l.pn||l.pn==='SHIPPING'||isShippingLine(l))return;
+      var part=partByPn(l.pn);if(!part)return; // parts only; finished goods are built, not reordered
+      var k=part.pn;
+      var e=byPn[k]||(byPn[k]={part:part,open:[],recent:[]});
+      var rec={po:po,qty:l.qty_ordered||0,remaining:Math.max(0,(l.qty_ordered||0)-(l.qty_received||0)),t:t};
+      if(advOpenStatus(po.status)&&rec.remaining>0&&!seen['o'+k]){seen['o'+k]=1;e.open.push(rec);}
+      if(t>=cutoff&&!seen['r'+k]){seen['r'+k]=1;e.recent.push(rec);}
+    });
+  });
+  var rows=[];
+  Object.keys(byPn).forEach(function(k){
+    var e=byPn[k],p=e.part;
+    if(p.discontinued||p.build_to_order)return;
+    var wk=effectiveWkDemand(p);
+    var n=e.recent.length;
+    var avgQty=n?e.recent.reduce(function(s,r){return s+r.qty;},0)/n:0;
+    var cover=(wk>0&&n)?avgQty/wk:null;
+    var times=e.recent.map(function(r){return r.t;}).filter(Boolean).sort(function(a,b){return a-b;});
+    var gap=null;if(times.length>1)gap=Math.round((times[times.length-1]-times[0])/(times.length-1)/86400000);
+    var overlap=e.open.length>=2;
+    var frequent=n>=2&&wk>0&&cover!==null&&cover<cfg.weeks;
+    if(!overlap&&!frequent)return;
+    var target=wk>0?Math.ceil(wk*cfg.weeks):0;
+    var sugg=target>0?advNiceQty(target):0;
+    var breaks=(typeof _getBreaks==='function'?_getBreaks(p):[]).filter(function(b){return b.qty>0&&b.price>0;}).sort(function(a,b){return a.qty-b.qty;});
+    var tier=null;
+    for(var i=0;i<breaks.length;i++){if(breaks[i].qty>=target&&breaks[i].qty<=target*2){tier=breaks[i];break;}}
+    if(tier&&tier.qty>sugg)sugg=tier.qty;
+    var cur=p.moq||0;
+    rows.push({pn:p.pn,part:p,open:e.open,n:n,gap:gap,avgQty:Math.round(avgQty),wk:wk,cover:cover,
+      overlap:overlap,frequent:frequent,cur:cur,sugg:sugg,tier:tier,
+      needsBump:sugg>0&&sugg>cur,cash:sugg*(p.unit_cost||0)});
+  });
+  rows.sort(function(a,b){return (b.overlap-a.overlap)||(b.n-a.n)||(b.open.length-a.open.length);});
+  return rows;
+}
+function openRepeatPOAdvisor(filter){
+  window._advFilter=filter||'all';
+  document.getElementById('adv-modal')?.remove();
+  var cfg=advCfg();
+  var m=document.createElement('div');m.id='adv-modal';
+  m.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
+  m.innerHTML='<div style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(1100px,96vw);max-height:90vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.18)">'
+    +'<div style="padding:16px 22px 10px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:12px">'
+    +'<div style="flex:1"><div style="font-size:var(--t-lg);font-weight:700;color:var(--text)">Repeat PO Advisor</div>'
+    +'<div class="t3s" style="margin-top:3px">Parts that keep getting ordered in small or overlapping POs. A MOQ makes every order at least that big and rounds suggested orders up to a multiple of it, so one PO covers the weeks you choose instead of several small ones.</div></div>'
+    +'<button class="btn btn-sm" onclick="document.getElementById(\'adv-modal\').remove()">Close</button></div>'
+    +'<div style="padding:10px 22px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--border)">'
+    +'<span class="t3s">One PO should cover</span><input id="adv-weeks" type="number" min="1" max="52" value="'+cfg.weeks+'" class="form-input" style="width:64px;padding:4px 8px">'
+    +'<span class="t3s">weeks of demand. Look back</span><input id="adv-days" type="number" min="30" max="730" value="'+cfg.days+'" class="form-input" style="width:72px;padding:4px 8px">'
+    +'<span class="t3s">days.</span><button class="btn btn-sm" onclick="advApplyCfg()">Update</button>'
+    +['all|All flagged','overlap|Open overlaps','frequent|Ordered too often','bump|MOQ needs raising'].map(function(x){var q=x.split('|');return '<button class="filter-chip" id="adv-f-'+q[0]+'" onclick="window._advFilter=\''+q[0]+'\';advRender()">'+q[1]+'</button>';}).join('')
+    +'<span id="adv-count" class="t3s" style="margin-left:auto"></span></div>'
+    +'<div id="adv-body" style="overflow:auto;padding:6px 14px 14px;flex:1"></div></div>';
+  document.body.appendChild(m);
+  advRender();
+}
+function advApplyCfg(){
+  var w=parseInt(document.getElementById('adv-weeks')?.value),d=parseInt(document.getElementById('adv-days')?.value);
+  S._advCfg={weeks:(w>0?w:12),days:(d>0?d:180)};advRender();
+}
+function advRender(){
+  var body=document.getElementById('adv-body');if(!body)return;
+  var f=window._advFilter||'all',cfg=advCfg(),all=advCompute();
+  ['all','overlap','frequent','bump'].forEach(function(x){var b=document.getElementById('adv-f-'+x);if(b)b.classList.toggle('on-teal',x===f);});
+  var rows=all.filter(function(r){
+    if(f==='overlap')return r.overlap;if(f==='frequent')return r.frequent;if(f==='bump')return r.needsBump;return true;});
+  var cnt=document.getElementById('adv-count');if(cnt)cnt.textContent=rows.length+' of '+all.length+' flagged';
+  if(!rows.length){body.innerHTML='<div class="section-empty">'+(all.length?'Nothing matches this filter.':'No repeat or overlapping POs found for the last '+cfg.days+' days at '+cfg.weeks+' weeks of cover per PO.')+'</div>';return;}
+  var th='padding:6px 8px;text-align:left;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.05em;color:var(--text3);white-space:nowrap;position:sticky;top:0;background:var(--bg3)';
+  var h='<table style="width:100%;border-collapse:collapse;font-size:var(--t-sm)"><thead><tr>'
+    +['Part','Why flagged','Open POs','POs / avg gap','Avg PO','Demand/wk','Cover per PO','MOQ now','Suggested MOQ',''].map(function(t){return '<th style="'+th+'">'+t+'</th>';}).join('')+'</tr></thead><tbody>';
+  rows.forEach(function(r){
+    var why=[];
+    if(r.overlap)why.push('<span class="pill pill-red">'+r.open.length+' open POs</span>');
+    if(r.frequent)why.push('<span class="pill pill-orange">small POs, often</span>');
+    var openTxt=r.open.length?r.open.map(function(o){return '<a href="#" onclick="document.getElementById(\'adv-modal\').remove();goToPO(\''+escHtml(o.po.id)+'\');return false" style="color:var(--teal);text-decoration:none" title="'+escHtml((o.po.vendor||'')+' - '+o.po.status)+'">'+(o.po.order_date||'').slice(5)+' x'+o.remaining+'</a>';}).join('<br>'):'<span class="t3s">none</span>';
+    var coverTxt=r.cover===null?'<span class="t3s">no demand</span>':('<b style="color:'+(r.cover<cfg.weeks?'var(--orange)':'var(--teal)')+'">'+r.cover.toFixed(1)+' wk</b>');
+    var sugTxt=r.sugg>0?('<b>'+r.sugg+'</b>'+(r.tier?'<div class="t3xs">= price-break tier</div>':'')+'<div class="t3xs">~'+fc(r.cash)+' per PO</div>'):'<span class="t3s">needs demand data</span>';
+    var act=(r.sugg>0&&r.needsBump)?'<button class="btn btn-teal btn-sm" data-pn="'+escHtml(r.pn)+'" data-moq="'+r.sugg+'" onclick="advSetMOQ(this)">Set MOQ '+r.sugg+'</button>':(r.sugg>0?'<span class="pill pill-teal">MOQ ok</span>':'');
+    h+='<tr style="border-bottom:1px solid var(--border)"><td style="padding:7px 8px;font-family:var(--mono);font-weight:600;color:var(--teal);white-space:nowrap">'+escHtml(dispPn(r.part))+'<div class="t3xs" style="font-family:var(--font);font-weight:400;max-width:200px;overflow:hidden;text-overflow:ellipsis">'+escHtml(r.part.description||'')+'</div></td>'
+      +'<td style="padding:7px 8px">'+why.join(' ')+'</td>'
+      +'<td style="padding:7px 8px;font-size:var(--t-xs)">'+openTxt+'</td>'
+      +'<td style="padding:7px 8px;white-space:nowrap">'+r.n+(r.gap!==null?' / '+r.gap+'d':'')+'</td>'
+      +'<td style="padding:7px 8px">'+r.avgQty+'</td>'
+      +'<td style="padding:7px 8px">'+(r.wk>0?r.wk.toFixed(1):'-')+'</td>'
+      +'<td style="padding:7px 8px">'+coverTxt+'</td>'
+      +'<td style="padding:7px 8px">'+(r.cur||'<span class="t3s">none</span>')+'</td>'
+      +'<td style="padding:7px 8px">'+sugTxt+'</td>'
+      +'<td style="padding:7px 8px;white-space:nowrap">'+act+'</td></tr>';
+  });
+  h+='</tbody></table><div class="t3xs" style="margin-top:8px">Suggested MOQ = weekly demand x '+cfg.weeks+' weeks, rounded up to a clean number (or the next vendor price-break if one is close). Overlaps are flagged even when MOQ is fine - those need a human to merge or cancel a PO.</div>';
+  body.innerHTML=h;
+}
+async function advSetMOQ(btn){
+  var pn=btn.dataset.pn,moq=parseInt(btn.dataset.moq),part=partByPn(pn);
+  if(!part||!(moq>0))return;
+  btn.disabled=true;
+  var r=await db.from('parts').update({moq:moq,updated_at:new Date().toISOString()}).eq('id',part.id);
+  if(r&&r.error){toast('Could not set MOQ: '+r.error.message,8000);btn.disabled=false;return;}
+  part.moq=moq;
+  toast('MOQ for '+dispPn(part)+' set to '+moq,4000);
+  advRender();
+}
+/* Open (not yet received) PO lines for one part - used by the planning badge and the duplicate-order guard. */
+function advOpenPOsFor(pn){
+  var out=[],aliases=[pn];
+  var it=partByPn(pn);if(it){if(it.pn&&aliases.indexOf(it.pn)<0)aliases.push(it.pn);if(it.new_sku&&aliases.indexOf(it.new_sku)<0)aliases.push(it.new_sku);}
+  (S.purchases||[]).forEach(function(po){
+    if(!advOpenStatus(po.status))return;
+    var ls=S.poLines[po.id]||[],rem=0;
+    if(ls.length)ls.forEach(function(l){if(aliases.indexOf(l.pn)>-1)rem+=Math.max(0,(l.qty_ordered||0)-(l.qty_received||0));});
+    else if(aliases.indexOf(po.pn)>-1)rem+=po.qty||0;
+    if(rem>0)out.push({po:po,remaining:rem});
+  });
+  return out;
+}
+window.openRepeatPOAdvisor=openRepeatPOAdvisor;window.advApplyCfg=advApplyCfg;window.advRender=advRender;window.advSetMOQ=advSetMOQ;window.advOpenPOsFor=advOpenPOsFor;
+
+
+/* One-line summary of parts that already sit on an open PO - used to warn before a second PO is created. */
+function advDupSummary(pns){
+  var out=[];
+  (pns||[]).forEach(function(pn){
+    var d=advOpenPOsFor(pn);if(!d.length)return;
+    var it=partByPn(pn);
+    out.push((it?dispPn(it):pn)+' (already '+d.reduce(function(s,x){return s+x.remaining;},0)+' on '+d.length+' open PO'+(d.length>1?'s':'')+')');
+  });
+  return out.length?('\n\nHEADS UP - already on an open PO: '+out.slice(0,8).join(', ')+(out.length>8?' and '+(out.length-8)+' more':'')+'.\nOrdering these again is how duplicate POs happen.'):'';
+}
+function advDupBadge(pn){
+  var d=advOpenPOsFor(pn);if(!d.length)return '';
+  return '<span class="pill pill-orange" style="margin-left:6px" title="'+escHtml(d.map(function(x){return (x.po.vendor||'')+' '+(x.po.order_date||'')+' x'+x.remaining+' ('+x.po.status+')';}).join(' | '))+'">'+d.length+' open PO'+(d.length>1?'s':'')+'</span>';
+}
+function buildOpenPoCountMap(){
+  var m={};
+  (S.purchases||[]).forEach(function(po){
+    if(!advOpenStatus(po.status))return;
+    var ls=S.poLines[po.id]||[],seen={};
+    if(ls.length)ls.forEach(function(l){if(l.pn&&!seen[l.pn]&&Math.max(0,(l.qty_ordered||0)-(l.qty_received||0))>0){seen[l.pn]=1;m[l.pn]=(m[l.pn]||0)+1;}});
+    else if(po.pn&&(po.qty||0)>0)m[po.pn]=(m[po.pn]||0)+1;
+  });
+  return m;
+}
+window.advDupSummary=advDupSummary;window.advDupBadge=advDupBadge;
+
 function _buildLastMoveMap(){
   const m={};
   const upd=(pn,d)=>{ if(!pn||!d)return; const t=Date.parse(d); if(t&&(!m[pn]||t>m[pn]))m[pn]=t; };
@@ -19741,6 +19914,7 @@ function renderPlanning() {
   const allTracked=S.parts.filter(p=>!p.discontinued&&!isDevOnlyPart(p));
   // ── Per-render memoization: prime on-order map, compute status + suggested qty ONCE per part ──
   S._onOrderMap=buildOnOrderMap();
+  S._openPoCnt=buildOpenPoCountMap();
   const _stByPn={},_sqByPn={};
   allTracked.forEach(p=>{_stByPn[p.pn]=getPlanningStatus(p);_sqByPn[p.pn]=calcSuggestedQty(p);});
   const _uiaMap={};S.assemblies.forEach(function(a){var oh=a.total_on_hand||0;if(oh<=0)return;(S.boms[a.pn]||[]).forEach(function(i){var tp=i.item_type||'part';if(tp!=='assembly'&&tp!=='subassembly')_uiaMap[i.child_pn]=(_uiaMap[i.child_pn]||0)+oh*(i.qty||1);});});
@@ -19843,6 +20017,7 @@ function renderPlanning() {
       ${sf.vendor?`<button class="btn btn-teal btn-sm" onclick="createVendorPO('${sf.vendor}')"><span class="ic ic-doc"></span>One PO — ${sf.vendor}</button>`:''}
       <button class="btn btn-sm" onclick="nav('pobuilder')"><span class="ic ic-cart"></span>PO Builder</button>
       <button class="btn btn-sm" onclick="openStaleReport()" title="Find parts with no sales or stock adjustments in the last 90 days"><span class="ic ic-trash"></span>Stale (90d)</button>
+      <button class="btn btn-sm" onclick="openRepeatPOAdvisor()" title="Parts that keep getting ordered in small or overlapping POs, with a recommended MOQ" style="color:var(--orange);border-color:rgba(234,88,12,.35)"><span class="ic ic-refresh"></span>Repeat POs</button>
       <button class="btn btn-primary btn-sm" onclick="createSuggestedPOs()">+ Create Suggested POs (${needsReorder.length})</button>
     </div>
     <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--border)">
@@ -19967,6 +20142,7 @@ function renderPlanning() {
         <div style="font-weight:700;color:${ohColor}">${oh}${reserved>0?` <span style="font-size:var(--t-xs);color:var(--orange);font-weight:400">(${effectiveOh} avail)</span>`:''}</div>
         <div style="width:52px;height:4px;background:var(--bg3);border-radius:var(--r-sm);margin-top:3px;overflow:hidden"><div style="width:${barPct}%;height:100%;background:${barColor};border-radius:var(--r-sm)"></div></div>
         ${onOrder>0?`<div style="font-size:var(--t-xs);color:var(--teal);margin-top:2px;white-space:nowrap">+${onOrder} on order</div>`:''}
+        ${((S._openPoCnt&&Math.max(S._openPoCnt[p.pn]||0,p.new_sku?(S._openPoCnt[p.new_sku]||0):0))>1)?`<div style="margin-top:2px"><span class="pill pill-red" style="cursor:pointer" onclick="event.stopPropagation();openRepeatPOAdvisor('overlap')" title="More than one open PO for this part. Click to see them and the MOQ the Repeat PO Advisor recommends.">${Math.max(S._openPoCnt[p.pn]||0,p.new_sku?(S._openPoCnt[p.new_sku]||0):0)} open POs</span></div>`:''}
       </td>
 
 
@@ -20539,6 +20715,7 @@ async function quickAdjustStock(partId,pn,delta){
 async function createPOFromSuggestion(pn, vendor, qty, cost, desc) {
   const part=partByPn(pn);
   const moq=part?.moq||0;
+  { const _dup=advDupSummary([pn]); if(_dup && !confirm('Create another PO for '+pn+'?'+_dup+'\n\nOK = create it anyway, Cancel = stop.'))return; }
   if(moq>0&&qty<moq){
     const proceed=confirm('! MOQ Warning\n\nPart '+pn+' has a minimum order quantity of '+moq+'.\nYou\'re about to order '+qty+' unit'+(qty!==1?'s':'')+'.\n\nOrder '+moq+' instead (recommended), or continue with '+qty+'?');
     if(proceed===false)return; // user cancelled
@@ -20601,7 +20778,7 @@ async function createVendorPO(vendor){
     });
   }
   if(!need.length){toast('Nothing needs ordering from '+vendor);return;}
-  if(!confirm('Create ONE PO for '+vendor+' with '+need.length+' line items?'))return;
+  if(!confirm('Create ONE PO for '+vendor+' with '+need.length+' line items?'+advDupSummary(need.map(function(x){return x.p.pn;}))))return;
   const total=need.reduce((t,x)=>t+x.qty*costForQty(x.p,x.qty),0);
   const {data:po,error}=await db.from('purchases').insert({
     vendor,pn:need[0].p.pn+(need.length>1?' +'+(need.length-1)+' more':''),
@@ -20653,7 +20830,7 @@ async function createSuggestedPOs(){
     const items=groups[v];const vTotal=items.reduce((s,x)=>s+x.total,0);
     const rows=items.map(x=>`<tr>
       <td style="padding:4px 6px"><input type="checkbox" id="cpr-${x.p.id}" checked></td>
-      <td style="padding:4px 6px;font-family:var(--mono);font-size:var(--t-sm);color:var(--teal)">${dispPn(x.p)}</td>
+      <td style="padding:4px 6px;font-family:var(--mono);font-size:var(--t-sm);color:var(--teal);white-space:nowrap">${dispPn(x.p)}${advDupBadge(x.p.pn)}</td>
       <td style="padding:4px 6px;font-size:var(--t-sm);color:var(--text2);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${x.p.description||''}</td>
       <td style="padding:4px 6px;text-align:right;font-family:var(--mono);font-size:var(--t-sm)">${x.oq}</td>
       <td style="padding:4px 6px;text-align:right;font-size:var(--t-sm);color:var(--text3)">${fc(x.cost)}</td>
