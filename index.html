@@ -460,7 +460,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.48';
+const TGK_ERP_VERSION = 'v23.50';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -778,9 +778,30 @@ function statusPill(s){
   return `<span class="pill ${m[s]||'pill-muted'}">${l[s]||s}</span>`;
 }
 function poPill(s){
-  const m={'On Order':'pill-orange','In Transit':'pill-yellow','Received':'pill-teal','Cancelled':'pill-red'};
+  const m={'On Order':'pill-orange','In Transit':'pill-yellow','Received':'pill-teal','Cancelled':'pill-red','Lost':'pill-red','Recovered':'pill-green'};
   return `<span class="pill ${m[s]||'pill-muted'}">${s}</span>`;
 }
+/* PO status pill plus a "was lost" tag. A PO that was marked Lost keeps lost_at forever, so once it
+   turns up and is received it reads Received + "Recovered after loss" instead of looking like a
+   normal receipt. */
+function poStatusBadge(p){
+  if(!p)return '';
+  let h=poPill(p.status);
+  if(p.lost_at&&p.status!=='Lost'){
+    const d=String(p.lost_at).slice(0,10);
+    if(p.status==='Recovered')h=h.replace('<span class="pill','<span title="Marked Lost on '+d+', later received" class="pill');
+    else h+=`<span class="pill pill-red" style="margin-left:4px" title="This PO was marked Lost on ${d}">Was Lost</span>`;
+  }
+  return h;
+}
+window.poStatusBadge=poStatusBadge;
+/* Status a PO moves to when its last line is received: a PO that was ever lost closes as Recovered. */
+function poDoneStatus(po){return (po&&(po.status==='Lost'||po.status==='Recovered'||po.lost_at))?'Recovered':'Received';}
+window.poDoneStatus=poDoneStatus;
+/* A Lost PO is never incoming: the replacement shipment lives on a new PO. */
+function poIsLostId(poId){const _p=(S.purchases||[]).find(x=>String(x.id)===String(poId));return !!(_p&&_p.status==='Lost');}
+function lostRecvTag(poId){const _p=(S.purchases||[]).find(x=>String(x.id)===String(poId));return (_p&&(_p.status==='Lost'||_p.lost_at))?' [LOST ORDER - recovered]':'';}
+window.poIsLostId=poIsLostId;window.lostRecvTag=lostRecvTag;
 const _stubRe=/^\d+[\s-]+(items?|line[\s-]*PO)$/i;
 function isShippingLine(l){
   if(!l)return false;
@@ -799,7 +820,7 @@ function isShippingLine(l){
 function poOutstanding(p){
   if(!p)return 0;
   const st=p.status||'';
-  if(st==='Received'||st==='Cancelled'||st==='Draft')return 0;
+  if(st==='Received'||st==='Recovered'||st==='Cancelled'||st==='Draft'||st==='Lost')return 0;
   const _allLs=S.poLines[p.id]||[];
   const _itemLs=_allLs.filter(l=>!isShippingLine(l));
   const ls=_itemLs.length?_itemLs:_allLs;
@@ -1332,8 +1353,8 @@ function setupRealtime(){
         const prev=S.purchases.find(x=>x.id===p.new.id);
         S.purchases=S.purchases.map(x=>x.id===p.new.id?p.new:x);
         if(prev&&prev.status!==p.new.status){
-          const statusEmoji={Received:'<span class="ic ic-check"></span>','In Transit':'<span class="ic ic-truck"></span>',Ordered:'<span class="ic ic-clipboard"></span>',Cancelled:'<span class="ic ic-x"></span>',Draft:'<span class="ic ic-doc"></span>','On Order':'<span class="ic ic-box"></span>',Partial:'<span class="ic ic-refresh"></span>'}[p.new.status]||'<span class="ic ic-refresh"></span>';
-          const cls={Received:'var(--teal)','In Transit':'var(--yellow)',Cancelled:'var(--red)','On Order':'var(--orange)'}[p.new.status]||'var(--text2)';
+          const statusEmoji={Recovered:'<span class="ic ic-check"></span>',Received:'<span class="ic ic-check"></span>','In Transit':'<span class="ic ic-truck"></span>',Ordered:'<span class="ic ic-clipboard"></span>',Cancelled:'<span class="ic ic-x"></span>',Draft:'<span class="ic ic-doc"></span>','On Order':'<span class="ic ic-box"></span>',Partial:'<span class="ic ic-refresh"></span>'}[p.new.status]||'<span class="ic ic-refresh"></span>';
+          const cls={Recovered:'var(--teal)',Received:'var(--teal)','In Transit':'var(--yellow)',Cancelled:'var(--red)','On Order':'var(--orange)'}[p.new.status]||'var(--text2)';
           pushActivity({icon:statusEmoji,type:'po_status',text:'PO '+p.new.vendor+' → '+p.new.status,sub:p.new.description||p.new.pn,ts:new Date().toISOString(),cls});
         }
       }
@@ -2695,7 +2716,7 @@ function renderDashboard(){
   const packedLines   =S.sales.filter(s=>!isInternal(s.order_number)&&s.fulfillment_status==='Packed');
   const openWarranty=S.warrantyClaims.filter(w=>w.status==='Open').length;
   const openCounts=S.cycleCounts.filter(c=>c.status==='Open').length;
-  const openPOs=S.purchases.filter(p=>p.status!=='Received');
+  const openPOs=S.purchases.filter(p=>p.status!=='Received'&&p.status!=='Recovered'&&p.status!=='Lost');
   const openPOAmt=openPOs.reduce((s,p)=>s+poExtended(p),0);
   const feed=buildActivityFeed(12);
   function calcRev(arr){return arr.reduce(function(s,x){return s+lineRevenue(x).rev;},0);}
@@ -4675,7 +4696,7 @@ function renderPurchases(){
     <div class="search-wrap"><span class="search-icon"><span class="ic ic-search"></span></span>
       <input placeholder="Vendor or part…" value="${sf.search||''}" oninput="setFilter('po','search',this.value)">
     </div>
-    ${['','Draft','On Order','In Transit','Partial','Received','Cancelled'].map(s=>`<button class="filter-chip ${sf.status===s&&s?'on-teal':sf.status===''&&s===''?'on-teal':''}" onclick="setFilter('po','status','${s}')">${s||'All'}</button>`).join('')}
+    ${['','Draft','On Order','In Transit','Partial','Received','Lost','Recovered','Cancelled'].map(s=>`<button class="filter-chip ${sf.status===s&&s?'on-teal':sf.status===''&&s===''?'on-teal':''}" onclick="setFilter('po','status','${s}')">${s||'All'}</button>`).join('')}
     <button class="btn btn-sm" style="margin-left:auto" title="Remove duplicate POs (same vendor + date)" onclick="deduplicatePOs()"><span class="ic ic-trash"></span>Dedupe</button>
     <button class="btn btn-primary btn-sm" onclick="nav('pobuilder')">+ New PO</button>
   </div>
@@ -4690,7 +4711,7 @@ function renderPurchases(){
     const d=poDisplayData(p);
     const isMulti=d.pn==='Multiple';
     const tracking=S.poTracking[p.id]||[];
-    const isPending=p.status!=='Received'&&p.status!=='Cancelled';
+    const isPending=p.status!=='Received'&&p.status!=='Recovered'&&p.status!=='Cancelled';
     const isDraft=p.status==='Draft';
     const trackChips=tracking.slice(0,2).map(t=>`<a href="${trackingUrl(t.carrier||'',t.tracking_number)}" target="_blank" onclick="event.stopPropagation()" style="font-size:var(--t-xs);background:var(--bg4);border:1px solid var(--border);border-radius:var(--r-sm);padding:1px 5px;color:var(--teal);text-decoration:none;cursor:pointer;white-space:nowrap" title="Track ${t.tracking_number}${t.estimated_delivery?' — ETA: '+t.estimated_delivery:t.carrier_status?' — '+t.carrier_status:''}">${t.carrier} ···${t.tracking_number.slice(-6)}${t.estimated_delivery?' (ETA '+t.estimated_delivery.slice(5)+')':''} ↗</a>`).join(' ');
     const moreTrack=tracking.length>2?`<span class="t3xxs">+${tracking.length-2}</span>`:'';
@@ -4703,7 +4724,7 @@ function renderPurchases(){
     <td class="money-cost" style="font-weight:700">${fc(d.extended)}</td>
     <td>
       <div style="display:flex;flex-direction:column;gap:3px">
-        <div>${poPill(p.status)}</div>
+        <div>${poStatusBadge(p)}</div>
         ${tracking.length?`<div style="display:flex;gap:4px;flex-wrap:wrap">${trackChips}${moreTrack}</div>`:''}
       </div>
     </td>
@@ -4712,7 +4733,7 @@ function renderPurchases(){
       ${!isDraft&&isPending?`<button class="btn btn-teal btn-sm" onclick="quickReceive('${p.id}')" title="Receive items"><span class="ic ic-box"></span>Receive</button>`:''}
       ${!isDraft&&isPending?`<button class="action-btn" onclick="quickAddTracking('${p.id}','${p.vendor.replace(/'/g,"\\'")}')" title="Add tracking">${tracking.length?'<span class="ic ic-link"></span>+':'<span class="ic ic-link"></span>Track'}</button>`:''}
       <select class="form-input" style="padding:3px 6px;font-size:var(--t-xs);width:auto;border-radius:var(--r-sm)" onchange="updatePOStatus('${p.id}',this.value);this.blur()" onclick="event.stopPropagation()" title="Change PO status">
-        ${['Draft','On Order','In Transit','Partial','Received','Cancelled'].map(s=>`<option value="${s}" ${p.status===s?'selected':''}>${s}</option>`).join('')}
+        ${['Draft','On Order','In Transit','Partial','Received','Lost','Recovered','Cancelled'].map(s=>`<option value="${s}" ${p.status===s?'selected':''}>${s}</option>`).join('')}
       </select>
       <button class="action-btn del" onclick="deletePO('${p.id}')">×</button>
     </td>
@@ -6869,7 +6890,7 @@ function renderVendors(){
     if(!p.vendor)return;
     if(!vendorStats[p.vendor])vendorStats[p.vendor]={openPOs:0,totalPOs:0,spend:0,onOrder:0,parts:new Set()};
     vendorStats[p.vendor].totalPOs++;
-    if(p.status!=='Received'&&p.status!=='Cancelled')vendorStats[p.vendor].openPOs++;
+    if(p.status!=='Received'&&p.status!=='Recovered'&&p.status!=='Cancelled'&&p.status!=='Lost')vendorStats[p.vendor].openPOs++;
     vendorStats[p.vendor].spend+=poExtended(p);
     vendorStats[p.vendor].onOrder+=poOutstanding(p);
   });
@@ -6893,7 +6914,7 @@ function renderVendors(){
   const totalVendors=registeredList.length+legacyList.length;
   const totalSpend=(S.purchases||[]).reduce((s,p)=>s+poExtended(p),0);
   const totalOnOrder=(S.purchases||[]).reduce((s,p)=>s+poOutstanding(p),0);
-  const openPOCount=(S.purchases||[]).filter(p=>p.status!=='Received'&&p.status!=='Cancelled').length;
+  const openPOCount=(S.purchases||[]).filter(p=>p.status!=='Received'&&p.status!=='Recovered'&&p.status!=='Cancelled'&&p.status!=='Lost').length;
 
   return `
   <div class="kpi-grid kpi-grid-4" style="margin-bottom:16px">
@@ -12776,7 +12797,7 @@ async function sendAI(){
   const c=$('ai-chat');if(c)c.scrollTop=c.scrollHeight;
   const lowParts=S.parts.filter(p=>avgWk(p)>0&&wks(p)!==null&&wks(p)<4).map(p=>`${dispPn(p)}(${wks(p)}wk)`).join(', ');
   const critAsm=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&liveStatus(a)==='critical').map(a=>`${dispPn(a)}(${a.total_on_hand||0}oh)`).join(', ');
-  const openPOs=S.purchases.filter(p=>p.status!=='Received').map(p=>{const _li=partByPn(p.pn)||asmByPn(p.pn);return `${_li?dispPn(_li):p.pn}@${p.vendor}(${p.status})`;}).join(', ');
+  const openPOs=S.purchases.filter(p=>p.status!=='Received'&&p.status!=='Recovered'&&p.status!=='Lost').map(p=>{const _li=partByPn(p.pn)||asmByPn(p.pn);return `${_li?dispPn(_li):p.pn}@${p.vendor}(${p.status})`;}).join(', ');
   const ctx=`You are the AI assistant for TGK Motorsport ERP. TGK builds performance Audi/Tesla parts. Live Supabase data: ${S.parts.length} parts, ${S.assemblies.length} assemblies. Low stock (under 4wks): ${lowParts||'none'}. Critical (zero/negative stock): ${critAsm||'none'}. Open POs: ${openPOs||'none'}. 7-day orders: ${S.sales.filter(s=>s.sale_date>=daysAgo(7)).length}. Be specific, actionable, concise.`;
   try{
     let data=null;
@@ -12894,14 +12915,22 @@ async function submitApprovePO(poId){
 
 async function updatePOStatus(id,ns){
   const prev=S.purchases.find(p=>p.id===id);
-  const{error}=await db.from('purchases').update({status:ns,updated_at:new Date().toISOString()}).eq('id',id);
-  if(error){toast('Error: '+error.message);return;}
-  S.purchases=S.purchases.map(p=>p.id===id?{...p,status:ns}:p);
+  const _upd={status:ns,updated_at:new Date().toISOString()};
+  if(ns==='Recovered'&&prev&&!prev.lost_at)_upd.lost_at=new Date().toISOString();
+  if(ns==='Lost'){
+    if(prev&&prev.status==='Lost')return;
+    if(!confirm('Mark this PO as LOST?\n\nIts incoming quantity will be removed from every part on the PO. If it turns up later you can still receive it and it will be flagged as a recovered lost order.\n\nCreate a new PO for the replacement shipment.')){render();return;}
+    _upd.lost_at=new Date().toISOString();
+  }
+  const{error}=await db.from('purchases').update(_upd).eq('id',id);
+  if(error){toast('Error: '+error.message+(/lost_at/i.test(error.message||'')?' - run purchases_lost_status.sql in Supabase first':''),9000);render();return;}
+  S._onOrderMap=null;
+  S.purchases=S.purchases.map(p=>p.id===id?{...p,status:ns,...(_upd.lost_at?{lost_at:_upd.lost_at}:{})}:p);
   const po=S.purchases.find(p=>p.id===id);
-  const statusEmoji={Received:'<span class="ic ic-check"></span>','In Transit':'<span class="ic ic-truck"></span>',Ordered:'<span class="ic ic-clipboard"></span>',Cancelled:'<span class="ic ic-x"></span>',Draft:'<span class="ic ic-doc"></span>','On Order':'<span class="ic ic-box"></span>',Partial:'<span class="ic ic-refresh"></span>'}[ns]||'<span class="ic ic-refresh"></span>';
-  const cls={Received:'var(--teal)','In Transit':'var(--yellow)',Cancelled:'var(--red)','On Order':'var(--orange)'}[ns]||'var(--text2)';
+  const statusEmoji={Recovered:'<span class="ic ic-check"></span>',Received:'<span class="ic ic-check"></span>','In Transit':'<span class="ic ic-truck"></span>',Ordered:'<span class="ic ic-clipboard"></span>',Cancelled:'<span class="ic ic-x"></span>',Draft:'<span class="ic ic-doc"></span>','On Order':'<span class="ic ic-box"></span>',Partial:'<span class="ic ic-refresh"></span>',Lost:'<span class="ic ic-alert"></span>'}[ns]||'<span class="ic ic-refresh"></span>';
+  const cls={Recovered:'var(--teal)',Received:'var(--teal)','In Transit':'var(--yellow)',Cancelled:'var(--red)',Lost:'var(--red)','On Order':'var(--orange)'}[ns]||'var(--text2)';
   pushActivity({icon:statusEmoji,type:'po_status',text:'PO '+((po||prev)?.vendor||'')+' → '+ns,sub:((po||prev)?.description||(po||prev)?.pn)||'',ts:new Date().toISOString(),cls});
-  toast(`PO → ${ns}`);render();
+  toast(ns==='Lost'?'PO marked LOST - incoming qty removed. Create a new PO for the replacement.':`PO -> ${ns}`,ns==='Lost'?6000:undefined);render();
 }
 async function deletePO(id){
   if(!confirm('Delete this PO?'))return;
@@ -17498,7 +17527,7 @@ function buildReportRows(id, preset, customFrom, customTo){
     }
 
     case 'po_open':{
-      const rows=fd(S.purchases.filter(p=>p.status!=='Received'&&p.status!=='Cancelled'),'order_date');
+      const rows=fd(S.purchases.filter(p=>p.status!=='Received'&&p.status!=='Recovered'&&p.status!=='Cancelled'&&p.status!=='Lost'),'order_date');
       const cols=['Date','Vendor','Description','Extended ($)','Status'];
       const data=rows.map(p=>({'Date':p.order_date||'','Vendor':p.vendor,'Description':p.description||p.pn||'','Extended ($)':+poExtended(p).toFixed(2),'Status':p.status||''}));
       return{cols,data};
@@ -17512,7 +17541,7 @@ function buildReportRows(id, preset, customFrom, customTo){
     }
 
     case 'po_received':{
-      const rows=fd(S.purchases.filter(p=>p.status==='Received'),'order_date');
+      const rows=fd(S.purchases.filter(p=>p.status==='Received'||p.status==='Recovered'),'order_date');
       const cols=['Date','Vendor','Description','Lines','Received Value ($)'];
       const data=rows.map(p=>{
         const lines=S.poLines[p.id]||[];
@@ -17528,9 +17557,9 @@ function buildReportRows(id, preset, customFrom, customTo){
       rows.forEach(p=>{
         if(!map[p.vendor])map[p.vendor]={Vendor:p.vendor,'Total POs':0,'Open POs':0,'Total Spend ($)':0,'Received ($)':0};
         map[p.vendor]['Total POs']++;
-        if(p.status!=='Received'&&p.status!=='Cancelled')map[p.vendor]['Open POs']++;
+        if(p.status!=='Received'&&p.status!=='Recovered'&&p.status!=='Cancelled'&&p.status!=='Lost')map[p.vendor]['Open POs']++;
         map[p.vendor]['Total Spend ($)']+=poExtended(p);
-        if(p.status==='Received'){const lines=S.poLines[p.id]||[];map[p.vendor]['Received ($)']+=lines.reduce((s,l)=>s+(l.qty_received||0)*(l.unit_cost||0),0);}
+        if(p.status==='Received'||p.status==='Recovered'){const lines=S.poLines[p.id]||[];map[p.vendor]['Received ($)']+=lines.reduce((s,l)=>s+(l.qty_received||0)*(l.unit_cost||0),0);}
       });
       const cols=['Vendor','Total POs','Open POs','Total Spend ($)','Received ($)'];
       const data=Object.values(map).sort((a,b)=>b['Total Spend ($)']-a['Total Spend ($)']).map(r=>({...r,'Total Spend ($)':+r['Total Spend ($)'].toFixed(2),'Received ($)':+r['Received ($)'].toFixed(2)}));
@@ -17836,8 +17865,8 @@ function buildActivityFeed(limit){
   });
 
   S.purchases.slice(0,15).forEach(p=>{
-    const icon={Received:'<span class="ic ic-check"></span>','In Transit':'<span class="ic ic-truck"></span>',Ordered:'<span class="ic ic-clipboard"></span>',Draft:'<span class="ic ic-doc"></span>','On Order':'<span class="ic ic-box"></span>'}[p.status]||'<span class="ic ic-doc"></span>';
-    const cls={Received:'var(--teal)','In Transit':'var(--yellow)',Ordered:'var(--orange)'}[p.status]||'var(--text3)';
+    const icon={Recovered:'<span class="ic ic-check"></span>',Received:'<span class="ic ic-check"></span>','In Transit':'<span class="ic ic-truck"></span>',Ordered:'<span class="ic ic-clipboard"></span>',Draft:'<span class="ic ic-doc"></span>','On Order':'<span class="ic ic-box"></span>'}[p.status]||'<span class="ic ic-doc"></span>';
+    const cls={Recovered:'var(--teal)',Received:'var(--teal)','In Transit':'var(--yellow)',Ordered:'var(--orange)'}[p.status]||'var(--text3)';
     events.push({ts:p.order_date||p.updated_at,icon,type:'po',
       text:'PO — '+p.vendor+(p.status?' · '+p.status:''),
       sub:p.description||p.pn,cls});
@@ -18049,8 +18078,8 @@ function assemblyDossier(pn){
     </div>
     ${(()=>{
       const asmOpenLines=[];
-      Object.values(S.poLines).forEach(function(ls){ls.forEach(function(l){if(l.pn===pn&&(l.qty_received||0)<(l.qty_ordered||0))asmOpenLines.push(l);});});
-      const asmOpenPOs=S.purchases.filter(function(po){return po.pn===pn&&po.status!=='Received'&&po.status!=='Cancelled';});
+      Object.values(S.poLines).forEach(function(ls){ls.forEach(function(l){if(l.pn===pn&&(l.qty_received||0)<(l.qty_ordered||0)&&!poIsLostId(l.po_id))asmOpenLines.push(l);});});
+      const asmOpenPOs=S.purchases.filter(function(po){return po.pn===pn&&po.status!=='Received'&&po.status!=='Recovered'&&po.status!=='Cancelled'&&po.status!=='Lost';});
       const total=asmOpenPOs.length+asmOpenLines.length;
       if(total===0)return'';
       return '<div class="panel" style="padding:0"><div class="section-header">Incoming \u2014 Open POs ('+total+')</div>'
@@ -18108,8 +18137,8 @@ function partDossier(pn){
   const _itemCorr=itemCorrections(pn,40);
   const corr=_itemCorr.slice(0,8);
   const receipts=_itemCorr.filter(c=>c.source==='po_receipt').slice(0,10);
-  const openLines=[];Object.values(S.poLines).forEach(ls=>ls.forEach(l=>{if(l.pn===pn&&l.qty_received<l.qty_ordered)openLines.push(l);}));
-  const openPOs=S.purchases.filter(po=>po.pn===pn&&po.status!=='Received');
+  const openLines=[];Object.values(S.poLines).forEach(ls=>ls.forEach(l=>{if(l.pn===pn&&l.qty_received<l.qty_ordered&&!poIsLostId(l.po_id))openLines.push(l);}));
+  const openPOs=S.purchases.filter(po=>po.pn===pn&&po.status!=='Received'&&po.status!=='Recovered'&&po.status!=='Lost');
   const partClaims=S.warrantyClaims.filter(w=>w.pn===pn);
   const w=wks(p);
   return `
@@ -19113,7 +19142,7 @@ function buildOnOrderMap(){
   // One pass over all POs → map of pn → open (unreceived) qty. Invalidate by setting S._onOrderMap=null on any PO mutation.
   const m={};
   S.purchases.forEach(po=>{
-    if(po.status==='Received'||po.status==='Cancelled')return;
+    if(po.status==='Received'||po.status==='Recovered'||po.status==='Cancelled'||po.status==='Lost')return;
     const lines=S.poLines[po.id]||[];
     if(lines.length){
       lines.forEach(l=>{m[l.pn]=(m[l.pn]||0)+Math.max(0,(l.qty_ordered||0)-(l.qty_received||0));});
@@ -19127,7 +19156,7 @@ function openOrderedQty(pn) {
   if(S._onOrderMap)return S._onOrderMap[pn]||0; // fast path when a render has primed the cache
   let qty = 0;
   S.purchases.forEach(po => {
-    if(po.status === 'Received' || po.status === 'Cancelled') return;
+    if(po.status === 'Received' || po.status === 'Recovered' || po.status === 'Cancelled' || po.status === 'Lost') return;
     const lines = S.poLines[po.id] || [];
     if(lines.length) {
       lines.forEach(l => { if(l.pn === pn) qty += Math.max(0, (l.qty_ordered||0) - (l.qty_received||0)); });
@@ -20369,7 +20398,7 @@ function olderOpenPOsFor(pn,curPo){
   (S.purchases||[]).forEach(function(p){
     if(!p||String(p.id)===String(curPo.id))return;
     var st=p.status||'';
-    if(st==='Received'||st==='Cancelled'||st==='Draft')return;
+    if(st==='Received'||st==='Recovered'||st==='Cancelled'||st==='Draft'||st==='Lost')return;
     var t=_poTime(p);
     if(t===null||t>=curT)return;
     var ls=S.poLines[p.id]||[],qty=0;
@@ -20410,7 +20439,7 @@ async function goToPO(id){
   await loadPOLines(id);
   var po=S.purchases.find(function(p){return p.id===id;});
   if(po&&(S.poLines[id]||[]).length===0&&po.pn&&(po.qty||0)>0&&!po.pn.includes('+')){
-    var ins=await db.from('po_lines').insert({po_id:id,pn:po.pn,description:po.description||'',qty_ordered:po.qty||0,unit_cost:po.unit_cost||0,qty_received:po.status==='Received'?(po.qty||0):0,status:po.status==='Received'?'Complete':'Pending'}).select().single();
+    var ins=await db.from('po_lines').insert({po_id:id,pn:po.pn,description:po.description||'',qty_ordered:po.qty||0,unit_cost:po.unit_cost||0,qty_received:(po.status==='Received'||po.status==='Recovered')?(po.qty||0):0,status:(po.status==='Received'||po.status==='Recovered')?'Complete':'Pending'}).select().single();
     if(ins.data)S.poLines[id]=[ins.data];
   }
   await loadPOTracking(id);
@@ -20427,7 +20456,7 @@ async function openPODetail(id) {
   await loadPOLines(id);
   const po=S.purchases.find(p=>p.id===id);
   if(po&&(S.poLines[id]||[]).length===0&&po.pn&&(po.qty||0)>0&&!po.pn.includes('+')){
-    const{data}=await db.from('po_lines').insert({po_id:id,pn:po.pn,description:po.description||'',qty_ordered:po.qty||0,unit_cost:po.unit_cost||0,qty_received:po.status==='Received'?(po.qty||0):0,status:po.status==='Received'?'Complete':'Pending'}).select().single();
+    const{data}=await db.from('po_lines').insert({po_id:id,pn:po.pn,description:po.description||'',qty_ordered:po.qty||0,unit_cost:po.unit_cost||0,qty_received:(po.status==='Received'||po.status==='Recovered')?(po.qty||0):0,status:(po.status==='Received'||po.status==='Recovered')?'Complete':'Pending'}).select().single();
     if(data)S.poLines[id]=[data];
   }
   await loadPOTracking(id);
@@ -20483,6 +20512,7 @@ async function quickReceive(poId){
         <div style="flex:1">
           <div style="font-size:var(--t-lg);font-weight:700;color:var(--text)"><span class="ic ic-box"></span>Receive — ${po.vendor}</div>
           <div class="t3s">${po.order_date||''} · ${pending.length} line${pending.length!==1?'s':''} pending</div>
+          ${po.status==='Lost'?'<div style="margin-top:4px;font-size:var(--t-sm);font-weight:700;color:var(--red)">LOST ORDER - receiving it will be logged as a recovered lost order</div>':''}
         </div>
         <button onclick="document.getElementById('quick-recv-modal').remove()" style="background:transparent;border:none;color:var(--text3);font-size:var(--t-2xl);cursor:pointer;line-height:1.25"><span class="ic ic-x"></span></button>
       </div>
@@ -20554,7 +20584,7 @@ async function submitQuickReceive(poId){
   const allDone=updated.length>0&&updated.every(l=>(l.qty_received||0)>=(l.qty_ordered||0));
   const po=S.purchases.find(p=>p.id===poId);
   let newStatus=po?.status;
-  if(allDone) newStatus='Received';
+  if(allDone) newStatus=poDoneStatus(po);
   else if(markTransit&&(po?.status==='Ordered'||po?.status==='Draft')) newStatus='In Transit';
   if(newStatus&&newStatus!==po?.status){
     await db.from('purchases').update({status:newStatus,updated_at:new Date().toISOString()}).eq('id',poId);
@@ -20636,7 +20666,7 @@ function renderPODetail(po) {
     ${recNavControl(po.id)}
     <div style="flex:1">
       <div style="font-size:var(--t-lg);font-weight:700;color:var(--text)">${po.vendor} — PO</div>
-      <div class="t3s">${po.order_date||''} · ${poPill(po.status)}</div>
+      <div class="t3s">${po.order_date||''} &middot; ${poStatusBadge(po)}</div>
     </div>
     <div style="text-align:right">
       <div class="money-cost" style="font-size:var(--t-lg);font-weight:700">${fc(totalOrdered)}</div>
@@ -20655,10 +20685,14 @@ function renderPODetail(po) {
       <div style="font-size:var(--t-sm);color:var(--text2);margin-top:3px">Review the line items below, add any missing parts, then click <b>Approve &amp; Place Order</b> to confirm you've ordered it. That locks in the order date and moves it to Ordered status so you can track receipt.</div>
     </div>
   </div>`:''}
+  ${po.status==='Lost'?`<div style="background:var(--red-dim);border:1.5px solid rgba(220,38,38,.3);border-radius:var(--r-md);padding:12px 16px;margin-bottom:14px">
+    <div style="font-size:var(--t-md);font-weight:700;color:var(--red)">This PO is marked LOST${po.lost_at?' ('+String(po.lost_at).slice(0,10)+')':''}</div>
+    <div style="font-size:var(--t-sm);color:var(--text2);margin-top:3px">Nothing on this PO counts as incoming. If the shipment shows up you can still receive it here - stock is added and it is logged as a recovered lost order. Make sure the replacement PO is adjusted so it is not double counted.</div>
+  </div>`:(po.lost_at?`<div style="background:var(--red-dim);border:1px solid rgba(220,38,38,.25);border-radius:var(--r-md);padding:8px 14px;margin-bottom:14px;font-size:var(--t-sm);color:var(--red);font-weight:600">This PO was marked Lost on ${String(po.lost_at).slice(0,10)}${po.status==='Recovered'?' and was later received (Recovered).':'.'}</div>`:'')}
   <div class="panel" style="padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
     <span style="font-size:var(--t-xs);font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--text3)">Status:</span>
-    ${['Draft','On Order','In Transit','Partial','Received','Cancelled'].map(s=>`
-      <button class="btn btn-sm ${po.status===s?'btn-primary':''}" style="${po.status===s?'':'opacity:.7'}" onclick="updatePOStatus('${po.id}','${s}')">${s}</button>`).join('')}
+    ${['Draft','On Order','In Transit','Partial','Received','Lost','Recovered','Cancelled'].map(s=>`
+      <button class="btn btn-sm ${po.status===s?'btn-primary':''}" style="${po.status===s?'':'opacity:.7'}${s==='Lost'&&po.status!=='Lost'?';color:var(--red)':''}" onclick="updatePOStatus('${po.id}','${s}')">${s}</button>`).join('')}
     <span style="margin-left:auto;font-size:var(--t-xs);color:var(--text3)">PO ID: <span style="font-family:var(--mono)">${po.id}</span></span>
   </div>
   <div class="kpi-grid kpi-grid-3" style="margin-bottom:16px">
@@ -20756,7 +20790,7 @@ async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
   if(part){
     const po=S.purchases.find(p=>p.id===poId);
     const poRef=po?(' ['+po.vendor+(po.order_date?' '+po.order_date:'')+']'):'';
-    const reason='PO Receipt'+poRef+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial \u2014 '+remaining+' outstanding)':'')+(note?' \u2014 '+note:'');
+    const reason='PO Receipt'+poRef+lostRecvTag(poId)+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial \u2014 '+remaining+' outstanding)':'')+(note?' \u2014 '+note:'');
     undoOps.push({action:'update',table:'parts',data:{...part,total_unpckgd:(part.total_unpckgd||0)+qty},prev:{...part}});
     const newQty=await adjustStock('part',part,qty,{reason:reason,source:'po_receipt',skipSync:true});
     if(adjustStock.lastCorrection){undoOps.push({action:'insert',table:'inv_corrections',data:adjustStock.lastCorrection});S.corrections=[adjustStock.lastCorrection,...S.corrections];}
@@ -20768,7 +20802,7 @@ async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
     if(_rasm){
       const _po=S.purchases.find(p=>p.id===poId);
       const _poRef=_po?(' ['+_po.vendor+(_po.order_date?' '+_po.order_date:'')+']'):'';
-      const _reason='PO Receipt'+_poRef+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial \u2014 '+remaining+' outstanding)':'')+(note?' \u2014 '+note:'');
+      const _reason='PO Receipt'+_poRef+lostRecvTag(poId)+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial \u2014 '+remaining+' outstanding)':'')+(note?' \u2014 '+note:'');
       undoOps.push({action:'update',table:'assemblies',data:{..._rasm,total_on_hand:(_rasm.total_on_hand||0)+qty},prev:{..._rasm}});
       await adjustStock('assembly',_rasm,qty,{reason:_reason,source:'po_receipt'});
       if(adjustStock.lastCorrection){undoOps.push({action:'insert',table:'inv_corrections',data:adjustStock.lastCorrection});S.corrections=[adjustStock.lastCorrection,...S.corrections];}
@@ -20790,8 +20824,10 @@ async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
   const lines = S.poLines[poId]||[];
   if(lines.every(l=>l.qty_received>=l.qty_ordered)){
     if(poBefore)undoOps.push({action:'update',table:'purchases',data:{id:poId},prev:{...stripMeta(poBefore)}});
-    await db.from('purchases').update({status:'Received',updated_at:new Date().toISOString()}).eq('id',poId);
-    S.purchases = S.purchases.map(p=>p.id===poId?{...p,status:'Received'}:p);
+    const _doneSt=poDoneStatus(poBefore);
+    await db.from('purchases').update({status:_doneSt,updated_at:new Date().toISOString()}).eq('id',poId);
+    S.purchases = S.purchases.map(p=>p.id===poId?{...p,status:_doneSt}:p);
+    S._onOrderMap=null;
   }
   pushUndoMulti('Receive '+qty+'× '+pn+' on PO',undoOps);
   logAction('PO received: '+qty+' x '+pn,'purchases',pn,null,{qty,poId}).catch(()=>{});
@@ -20826,16 +20862,17 @@ async function receiveAllLines(poId) {
   const allIn=fresh.length>0&&fresh.every(function(l){return (l.qty_received||0)>=(l.qty_ordered||0)||l.status==='Backordered';});
   if(allIn){
     if(poBefore)undoOps.push({action:'update',table:'purchases',data:{id:poId},prev:Object.assign({},stripMeta(poBefore))});
-    const up=await db.from('purchases').update({status:'Received',updated_at:new Date().toISOString()}).eq('id',poId);
-    if(up&&up.error){toast('\u26a0 Lines received, but marking the PO Received failed: '+up.error.message,9000);}
-    else{S.purchases=S.purchases.map(function(p){return p.id===poId?Object.assign({},p,{status:'Received'}):p;});}
+    const _doneSt=poDoneStatus(poBefore);
+    const up=await db.from('purchases').update({status:_doneSt,updated_at:new Date().toISOString()}).eq('id',poId);
+    if(up&&up.error){toast('\u26a0 Lines received, but marking the PO '+_doneSt+' failed: '+up.error.message,9000);}
+    else{S.purchases=S.purchases.map(function(p){return p.id===poId?Object.assign({},p,{status:_doneSt}):p;});S._onOrderMap=null;}
   }
   if(undoOps.length)pushUndoMulti('Receive all on PO'+(poBefore&&poBefore.vendor?(' \u2014 '+poBefore.vendor):''),undoOps);
   logAction('PO all lines received on PO '+poId,'purchases',null,null,{poId,lines:done}).catch(()=>{});
   updateBadge();
   render();
   if(failed.length)toast('\u26a0 '+done+' line'+(done!==1?'s':'')+' received, '+failed.length+' failed \u2014 '+failed[0],9000);
-  else toast('\u2713 '+done+' line'+(done!==1?'s':'')+' received'+(allIn?' \u2014 PO marked Received':' \u2014 PO still partially open'),6000);
+  else toast('\u2713 '+done+' line'+(done!==1?'s':'')+' received'+(allIn?' \u2014 PO marked '+poDoneStatus(poBefore):' \u2014 PO still partially open'),6000);
 }
 
 async function unreceiveLine(lineId, poId){
@@ -20861,10 +20898,11 @@ async function unreceiveLine(lineId, poId){
   undoOps.push({action:'update',table:'po_lines',data:{id:lineId},prev:{...stripMeta(line)}});
   await db.from('po_lines').update({qty_received:0,status:'Pending',notes:null,updated_at:new Date().toISOString()}).eq('id',lineId);
   const po=S.purchases.find(p=>p.id===poId);
-  if(po&&po.status==='Received'){
+  if(po&&(po.status==='Received'||po.status==='Recovered')){
     undoOps.push({action:'update',table:'purchases',data:{id:poId},prev:{...stripMeta(po)}});
-    await db.from('purchases').update({status:'On Order',updated_at:new Date().toISOString()}).eq('id',poId);
-    S.purchases=S.purchases.map(p=>p.id===poId?{...p,status:'On Order'}:p);
+    const _backSt=po.lost_at?'Lost':'On Order';
+    await db.from('purchases').update({status:_backSt,updated_at:new Date().toISOString()}).eq('id',poId);
+    S.purchases=S.purchases.map(p=>p.id===poId?{...p,status:_backSt}:p);
   }
   await loadPOLines(poId);
   pushUndoMulti('Un-receive '+line.qty_received+'× '+line.pn,undoOps);
@@ -20883,7 +20921,7 @@ async function checkInLineQuick(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived
   if(part){
     const po=S.purchases.find(p=>p.id===poId);
     const poRef=po?(' ['+po.vendor+(po.order_date?' '+po.order_date:'')+']'):'';
-    const newQty=await adjustStock('part',part,qty,{reason:'PO Receipt \u2014 Bulk'+poRef,source:'po_receipt',skipSync:true});
+    const newQty=await adjustStock('part',part,qty,{reason:'PO Receipt \u2014 Bulk'+poRef+lostRecvTag(poId),source:'po_receipt',skipSync:true});
     if(newQty!==null){syncShopifyTemplate(pn,newQty);cascadeShopifySync(pn);}
   } else {
     // [FIX E] assembly received via bulk receive-all
@@ -20891,7 +20929,7 @@ async function checkInLineQuick(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived
     if(_rasm){
       const _po=S.purchases.find(p=>p.id===poId);
       const _poRef=_po?(' ['+_po.vendor+(_po.order_date?' '+_po.order_date:'')+']'):'';
-      await adjustStock('assembly',_rasm,qty,{reason:'PO Receipt \u2014 Bulk'+_poRef,source:'po_receipt'});
+      await adjustStock('assembly',_rasm,qty,{reason:'PO Receipt \u2014 Bulk'+_poRef+lostRecvTag(poId),source:'po_receipt'});
     }
   }
   if(S.poLines[poId]) S.poLines[poId]=S.poLines[poId].map(l=>l.id===lineId?{...l,qty_received:newReceived,status:'Complete'}:l);
@@ -29305,7 +29343,7 @@ function _buildWorkflowAlerts() {
 
   var today = new Date().toISOString().slice(0, 10);
   var overduePOs = S.purchases.filter(function(p) {
-    return p.status !== 'Received' && p.expected_date && p.expected_date < today;
+    return p.status !== 'Received' && p.status !== 'Recovered' && p.status !== 'Lost' && p.expected_date && p.expected_date < today;
   });
   if (overduePOs.length) {
     alerts.push({ level: 'red', icon: '\u23f0', text: overduePOs.length + ' overdue PO' + (overduePOs.length > 1 ? 's' : '') + ' \u2014 past expected delivery date', nav: "nav('purchases')", lbl: 'View POs' });
