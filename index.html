@@ -461,7 +461,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.59';
+const TGK_ERP_VERSION = 'v23.60';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -22054,11 +22054,28 @@ function _upSim(pn,N,ctx){
 // Can `want` units of `pn` be built if finished assemblies in stock are unpacked? Returns
 // {ok, want, rawMax, maxTotal, steps:[{pn,id,desc,units,forPn}], viaRaw}. rawMax is what buildability()
 // already reports; maxTotal is the most that can be built once unpacking is allowed (capped at want).
+function _upSolve(pn,want,rawMax,respect){
+  var prev=UNPACK_RESPECT_OPEN_ORDERS; UNPACK_RESPECT_OPEN_ORDERS=respect;
+  try{
+    var ctx={am:S._asmIdx,pm:S._partIdx,idx:_upIndex(),excl:_upExcluded(pn)};
+    var best=null,ok=false,maxTotal=rawMax;
+    var full=_upSim(pn,want,ctx);
+    if(full.ok){ok=true;maxTotal=want;best=full;}
+    else{
+      var lo=rawMax,hi=want-1;
+      while(lo<hi){var mid=lo+Math.ceil((hi-lo)/2);var r=_upSim(pn,mid,ctx);if(r.ok){lo=mid;best=r;}else hi=mid-1;}
+      maxTotal=lo;
+      if(lo>rawMax&&!best)best=_upSim(pn,lo,ctx);
+      if(lo<=rawMax)best=null;
+    }
+    return{ok:ok,maxTotal:maxTotal,steps:best?best.steps:[]};
+  }finally{UNPACK_RESPECT_OPEN_ORDERS=prev;}
+}
 function buildabilityUnpack(pn,want){
   want=Math.max(0,Math.floor(Number(want)||0));
   var C=S._buildabilityCache,ck=C?('__up|'+pn+'|'+want):null;
   if(ck&&C[ck])return C[ck];
-  var res={ok:false,want:want,rawMax:0,maxTotal:0,steps:[],viaRaw:false};
+  var res={ok:false,want:want,rawMax:0,maxTotal:0,steps:[],viaRaw:false,borrows:false};
   try{
     var b=buildability(pn);
     if(!b.hasBOM||want<=0){if(ck)C[ck]=res;return res;}
@@ -22066,27 +22083,22 @@ function buildabilityUnpack(pn,want){
     res.maxTotal=res.rawMax;
     if(res.rawMax>=want){res.ok=true;res.viaRaw=true;res.maxTotal=want;if(ck)C[ck]=res;return res;}
     if(!S._partIdx||!S._asmIdx)buildLookupMaps();
-    var ctx={am:S._asmIdx,pm:S._partIdx,idx:_upIndex(),excl:_upExcluded(pn)};
-    var best=null;
-    var full=_upSim(pn,want,ctx);
-    if(full.ok){res.ok=true;res.maxTotal=want;best=full;}
-    else{
-      var lo=res.rawMax,hi=want-1;
-      while(lo<hi){var mid=lo+Math.ceil((hi-lo)/2);var r=_upSim(pn,mid,ctx);if(r.ok){lo=mid;best=r;}else hi=mid-1;}
-      res.maxTotal=lo;
-      if(lo>res.rawMax&&!best)best=_upSim(pn,lo,ctx);
-      if(lo<=res.rawMax)best=null;
+    // Pass 1: only stock no other open order needs. Pass 2 (if that falls short): allow stock that other
+    // open orders are counting on, and flag it - the user decides, the planner just shows the option.
+    var pick=_upSolve(pn,want,res.rawMax,true);
+    if(!pick.ok){
+      var loose=_upSolve(pn,want,res.rawMax,false);
+      if(loose.maxTotal>pick.maxTotal){pick=loose;res.borrows=true;}
     }
-    if(best){
-      var out=[];
-      best.steps.forEach(function(st){
-        var last=out[out.length-1];
-        if(last&&last.pn===st.pn&&last.forPn===st.forPn){last.units+=st.units;return;}
-        var a=S._asmIdx[st.pn];
-        out.push({pn:st.pn,id:a?a.id:null,desc:a?(a.description||''):'',units:st.units,forPn:st.forPn});
-      });
-      res.steps=out;
-    }
+    res.ok=pick.ok;res.maxTotal=pick.maxTotal;
+    var out=[];
+    pick.steps.forEach(function(st){
+      var last=out[out.length-1];
+      if(last&&last.pn===st.pn&&last.forPn===st.forPn){last.units+=st.units;return;}
+      var a=S._asmIdx[st.pn];
+      out.push({pn:st.pn,id:a?a.id:null,desc:a?(a.description||''):'',units:st.units,forPn:st.forPn});
+    });
+    res.steps=out;
   }catch(e){console.warn('[unpack-build] planning failed for',pn,e);}
   if(ck)C[ck]=res;
   return res;
@@ -22095,12 +22107,13 @@ window.buildabilityUnpack=buildabilityUnpack;
 function _upTitle(up){
   if(!up||!up.steps||!up.steps.length)return '';
   return (up.ok?'Can be built after unpacking: ':'Partly buildable after unpacking: ')
-    +up.steps.map(function(st){return st.units+'x '+dispSku(st.pn)+' (to free '+dispSku(st.forPn)+')';}).join(', ');
+    +up.steps.map(function(st){return st.units+'x '+dispSku(st.pn)+' (to free '+dispSku(st.forPn)+')';}).join(', ')
+    +(up.borrows?' -- NOTE: uses finished stock that other open orders are also counting on':'');
 }
 // Small badge for order rows (same look as the existing orange "Buildable" badge).
 function _upBadge(up){
   if(!up||up.viaRaw||!up.steps||!up.steps.length)return '';
-  var txt=up.ok?'Unpack to build':('Unpack: up to '+up.maxTotal);
+  var txt=up.ok?'Unpack to build':('Unpack: up to '+up.maxTotal);if(up.borrows)txt+=' (shared stock)';
   return '<div style="font-size:var(--t-xs);font-weight:700;color:var(--orange)" title="'+escHtml(_upTitle(up))+'">&#128295; '+txt+'</div>';
 }
 // Status pill override for the Production Queue.
@@ -22121,6 +22134,7 @@ function unpackPlanPanel(asm,want,b){
     var head=up.ok
       ?'<span style="color:var(--green);font-weight:700"><span class="ic ic-check"></span>All '+want+' can be built by unpacking stock</span>'
       :'<span style="color:var(--yellow);font-weight:700"><span class="ic ic-alert"></span>Unpacking stock raises max buildable from '+up.rawMax+' to '+up.maxTotal+' (of '+want+' wanted)</span>';
+    if(up.borrows)head+='<div style="margin-top:4px;font-size:var(--t-xs);color:var(--orange)">Heads up: this unpacks finished stock that other open orders are also counting on.</div>';
     var rows=up.steps.map(function(st){
       return '<div class="check-row">'
         +'<span class="pn" style="color:var(--teal)">'+escHtml(dispSku(st.pn))+'</span>'
@@ -22134,7 +22148,7 @@ function unpackPlanPanel(asm,want,b){
       +'<div style="padding:8px 14px;font-size:var(--t-sm)">'+head+'</div>'+rows
       +'<div style="padding:8px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
       +'<button class="btn btn-teal btn-sm" onclick="runUnpackPlan(\''+asm.pn+'\','+runQty+')"><span class="ic ic-arrow-back"></span>Run these unpacks ('+up.steps.length+')</button>'
-      +'<span class="t3xs">Unpacking returns every component of the donor to stock. '+(UNPACK_RESPECT_OPEN_ORDERS?'Stock that other open orders need is left alone. ':'')+'Then pack '+runQty+' as usual.</span>'
+      +'<span class="t3xs">Unpacking returns every component of the donor to stock. '+'Then pack '+runQty+' as usual.</span>'
       +'</div></div>';
   }catch(e){console.warn('[unpack-build] panel failed',e);return '';}
 }
