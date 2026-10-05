@@ -461,7 +461,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.61';
+const TGK_ERP_VERSION = 'v23.63';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -6116,7 +6116,8 @@ async function submitReturnV2(orderNum){
   if(doShopify){
     try{
       const edgeUrl=SUPA_URL+'/functions/v1/shopify-orders';
-      const resp=await fetch(edgeUrl,{method:'POST',headers:{'Content-Type':'application/json'},
+      let _rfTok=SUPA_KEY;try{const{data:{session:_rs}}=await db.auth.getSession();if(_rs&&_rs.access_token)_rfTok=_rs.access_token;}catch(_){}
+      const resp=await fetch(edgeUrl,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+_rfTok},
         body:JSON.stringify({
           action:'create_refund',
           store:S.shopify?.store||'',key:S.shopify?.key||'', // TODO: remove after redeploying shopify-orders edge fn with env fallback
@@ -6130,8 +6131,12 @@ async function submitReturnV2(orderNum){
       const rd=await resp.json();
       if(resp.ok&&rd.refund_id){
         results.push('Shopify refund $'+(rd.amount||refundAmtInput||0)+' (ID: '+rd.refund_id+')');
-        await db.from('sales').update({financial_status:'refunded',updated_at:new Date().toISOString()}).eq('order_number',orderNum);
-        S.sales=S.sales.map(s=>s.order_number===orderNum?{...s,financial_status:'refunded'}:s);
+        // [AUDIT] Was always 'refunded' for the whole order, so returning one item made reports count
+        // every line on the order as refunded. Full only when every line on the order is being returned.
+        const _ordLines=S.sales.filter(s=>s.order_number===orderNum&&!['Cancelled'].includes(s.fulfillment_status||''));
+        const _finSt=_ordLines.every(s=>lines.some(l=>l.id===s.id))?'refunded':'partially_refunded';
+        await db.from('sales').update({financial_status:_finSt,updated_at:new Date().toISOString()}).eq('order_number',orderNum);
+        S.sales=S.sales.map(s=>s.order_number===orderNum?{...s,financial_status:_finSt}:s);
       }else{
         errors.push('Shopify: '+(rd.error||'unknown error'));
       }
@@ -6433,6 +6438,22 @@ async function checkPOTracking(poTrackingId, poId, carrier, tracking){
 
 function openShipModal(saleId,pn,qty){openModal('shipOrder',{saleId,pn,qty});}
 
+// [AUDIT] Manual ERP orders created before v23.62 had their stock taken at CREATION ('Manual ERP order X',
+// source 'manual'). Shipping them must not take it again. True only for those legacy orders, and only
+// while they have not been un-shipped (an un-ship put the units back, so a re-ship must deduct).
+async function _manualCreateDeducted(orderNum,pn){
+  if(!orderNum||!pn)return false;
+  try{
+    var r=await db.from('inv_corrections').select('pn').eq('source','manual').eq('reason','Manual ERP order '+orderNum);
+    if(r.error||!r.data||!r.data.length)return false;
+    var it=_canonItem(pn),keys={};keys[pn]=1;if(it){keys[it.pn]=1;if(it.new_sku)keys[it.new_sku]=1;}
+    if(!r.data.some(function(x){return keys[x.pn];}))return false;
+    var u=await db.from('inv_corrections').select('id').eq('source','unship').in('pn',Object.keys(keys)).ilike('reason','%order '+orderNum+' reverted%').limit(1);
+    return !(u.data&&u.data.length);
+  }catch(e){console.warn('[ship] manual-order check failed',e);return false;}
+}
+window._manualCreateDeducted=_manualCreateDeducted;
+
 async function submitShipment(saleId,pn,qty){
   const tracking=document.getElementById('ship-tracking').value.trim();
   const carrier=document.getElementById('ship-carrier').value;
@@ -6445,8 +6466,17 @@ async function submitShipment(saleId,pn,qty){
   // line first; without this guard a manual Ship here would deduct the same shipment a second time.
   const _shipChk=S.sales.find(s=>s.id===saleId);
   if(_shipChk&&['Shipped','Delivered','Cancelled','Refunded'].includes(_shipChk.fulfillment_status||'Open')){toast(pn+' is already '+_shipChk.fulfillment_status+' — not shipping/deducting again');return;}
+  try{
+    const _fr=await db.from('sales').select('fulfillment_status').eq('id',saleId).maybeSingle();
+    if(!_fr.error&&_fr.data&&['Shipped','Delivered','Cancelled','Refunded'].includes(_fr.data.fulfillment_status||'Open')){
+      toast(pn+' is already '+_fr.data.fulfillment_status+' (updated by ShipStation or another user) - not deducting again',7000);
+      await refreshSales();render();return;
+    }
+  }catch(_e){console.warn('[ship] status re-check failed',_e);}
+  const _legacyManual=await _manualCreateDeducted(_shipChk&&_shipChk.order_number,(asm||prt||{}).pn||pn);
   var _shipDeducted=null; // what was actually taken, so it can be reversed if the status write fails
-  if(asm){
+  if(_legacyManual){console.log('[ship] '+pn+' was deducted when the manual order was created - not deducting again');}
+  else if(asm){
     if(await adjustStock('assembly',asm,-qty,{reason:'Shipped order'+(tracking?' \u2014 '+tracking:''),source:'shipment'})!==null)_shipDeducted={kind:'assembly',rec:asm}; // may go negative = backorder
     if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
   } else if(prt){
@@ -6468,8 +6498,8 @@ async function submitShipment(saleId,pn,qty){
   pushActivity({icon:'<span class="ic ic-box"></span>',type:'order_status',text:'#'+(preSale?.order_number||'')+' → Shipped',sub:dispSku(pn)+(preSale?.customer_name?' — '+preSale.customer_name:''),tracking:tracking||'',carrier:carrier||'',ts:new Date().toISOString(),cls:'var(--teal)'});
   const saleRow=S.sales.find(s=>s.id===saleId);
   const undoOps=[{action:'update',table:'sales',data:{id:saleId},prev:{...stripMeta(preSale||{}),id:saleId,fulfillment_status:preSale?.fulfillment_status||'Packed',tracking_number:preSale?.tracking_number||null,carrier:preSale?.carrier||null,shipped_at:null}}];
-  if(asmPrev)undoOps.push({action:'update',table:'assemblies',data:{id:asmPrev.id,total_on_hand:(asmPrev.total_on_hand||0)-qty},prev:{...asmPrev}});
-  if(prtPrev)undoOps.push({action:'update',table:'parts',data:{id:prtPrev.id,total_unpckgd:(prtPrev.total_unpckgd||0)-qty},prev:{...prtPrev}});
+  if(asmPrev&&_shipDeducted)undoOps.push({action:'update',table:'assemblies',data:{id:asmPrev.id,total_on_hand:(asmPrev.total_on_hand||0)-qty},prev:{...asmPrev}});
+  if(prtPrev&&_shipDeducted)undoOps.push({action:'update',table:'parts',data:{id:prtPrev.id,total_unpckgd:(prtPrev.total_unpckgd||0)-qty},prev:{...prtPrev}});
   pushUndoMulti('Ship '+qty+'×'+pn,undoOps);
   updateBadge();closeModal();
   toast('Shipped '+qty+'\u00d7 '+pn+(tracking?' \u00b7 '+tracking:''));
@@ -8038,7 +8068,8 @@ Deno.serve(async (req) =&gt; {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
   if (req.method === 'GET') return new Response('pong', { headers: CORS })
   let body: any = {}
-  try { body = await req.json() } catch (_) {}
+  let _rawBody = ''
+  try { _rawBody = await req.text(); body = _rawBody ? JSON.parse(_rawBody) : {} } catch (_) {}
   if (body.ping) return new Response('pong', { headers: CORS })
   if (body.action === 'oauth_exchange') {
     const clientId = Deno.env.get('SHOPIFY_CLIENT_ID') || ''
@@ -8968,7 +8999,27 @@ if (body.action === 'list_product_templates') {
       topic = 'orders/cancelled'
     }
   }
-  if (!topic) return new Response('ok', { headers: CORS })
+  // [AUDIT] create_refund carries no Shopify topic, so it used to stop here with a plain 'ok' and never
+  // reach its handler below - the ERP then failed to parse that as JSON and reported a Shopify error.
+  if (!topic &amp;&amp; body.action !== 'create_refund') return new Response('ok', { headers: CORS })
+  // [AUDIT] Shopify webhook signature check (opt-in). Set SHOPIFY_WEBHOOK_SECRET in this function's secrets
+  // to the webhook signing secret (Shopify admin &gt; Settings &gt; Notifications &gt; Webhooks). Until it is set,
+  // behaviour is unchanged. Once set, an order webhook without a valid signature is refused.
+  const _whSecret = Deno.env.get('SHOPIFY_WEBHOOK_SECRET') || ''
+  if (_whSecret &amp;&amp; topic) {
+    const _sig = req.headers.get('x-shopify-hmac-sha256') || ''
+    const _key = await crypto.subtle.importKey('raw', new TextEncoder().encode(_whSecret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+    const _mac = new Uint8Array(await crypto.subtle.sign('HMAC', _key, new TextEncoder().encode(_rawBody)))
+    let _bin = ''
+    for (let i = 0; i &lt; _mac.length; i++) _bin += String.fromCharCode(_mac[i])
+    const _exp = btoa(_bin)
+    let _diff = _sig.length === _exp.length ? 0 : 1
+    for (let i = 0; i &lt; _exp.length &amp;&amp; i &lt; _sig.length; i++) _diff |= _sig.charCodeAt(i) ^ _exp.charCodeAt(i)
+    if (_diff !== 0) {
+      console.warn('[shopify-orders] rejected webhook with missing/invalid signature, topic', topic)
+      return new Response('invalid signature', { status: 401, headers: CORS })
+    }
+  }
   try {
     const order = body
     const fin = (order.financial_status || '').toLowerCase()
@@ -9040,8 +9091,13 @@ if (body.action === 'list_product_templates') {
         .in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
     } else if (topic === 'orders/updated') {
       const updFields: Record&lt;string, any&gt; = {}
+      // [AUDIT] A PARTIAL refund (one returned item, a shipping refund, a goodwill credit - including the
+      // refund the ERP's own Returns screen creates) used to flip EVERY line on the order to Refunded. Lines
+      // still waiting to ship dropped out of open demand, and when they did ship the ShipStation webhook saw
+      // a terminal status and never deducted their stock. Partial refunds now only record financial_status:
+      // Shopify lowers the refunded line's current_quantity and the reconciliation below handles exactly that
+      // line. A FULL refund or void still marks lines Refunded, but never overwrites a Returned/Cancelled line.
       if (fin === 'refunded' || fin === 'voided' || fin === 'partially_refunded') {
-        updFields.fulfillment_status = 'Refunded'
         updFields.financial_status = fin
       }
       const ua = order.shipping_address || {}
@@ -9056,6 +9112,10 @@ if (body.action === 'list_product_templates') {
       }
       if (Object.keys(updFields).length) {
         await db.from('sales').update(updFields).eq('order_number', order.name)
+      }
+      if (fin === 'refunded' || fin === 'voided') {
+        await db.from('sales').update({ fulfillment_status: 'Refunded' }).eq('order_number', order.name)
+          .or('fulfillment_status.is.null,fulfillment_status.not.in.(Returned,Cancelled,Refunded)')
       }
 
       // [FIX] Root cause of a removed/edited line item never updating in the ERP: this handler
@@ -9240,6 +9300,12 @@ if (body.action === 'list_product_templates') {
       }
     }
     if (body.action === 'create_refund') {
+    // [AUDIT] This URL is public (Shopify must reach it), so a refund requires a signed-in ERP user's token.
+    const _tok = (req.headers.get('Authorization') || '').replace('Bearer ', '')
+    const _who = _tok ? await db.auth.getUser(_tok) : null
+    if (!_who || _who.error || !_who.data || !_who.data.user) {
+      return new Response(JSON.stringify({ error: 'Refund refused - not signed in to the ERP' }), { status: 401, headers: { ...CORS, 'Content-Type': 'application/json' } })
+    }
     const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
     const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
     if (!store || !key) return new Response(JSON.stringify({error:'Missing Shopify credentials — set SHOPIFY_STORE and SHOPIFY_KEY in edge function secrets'}), {status:400, headers:{...CORS,'Content-Type':'application/json'}})
@@ -9735,6 +9801,14 @@ async function cascadeShopifyBackorder(childPn: string): Promise&lt;void&gt; {
 
 async function deductForShipment(pn: string, qty: number, tracking: string, orderRef: string): Promise&lt;boolean&gt; {
   const reason = 'Shipped via ShipStation ' + orderRef + ' ' + tracking
+  // [AUDIT] Manual ERP orders created before ERP v23.62 had stock taken at creation. Don't take it twice.
+  try {
+    const { data: mc } = await db.from('inv_corrections').select('id').eq('source', 'manual').eq('pn', pn).eq('reason', 'Manual ERP order ' + orderRef).limit(1)
+    if (mc?.length) {
+      const { data: un } = await db.from('inv_corrections').select('id').eq('source', 'unship').eq('pn', pn).ilike('reason', '%order ' + orderRef + ' reverted%').limit(1)
+      if (!un?.length) { console.log('[SS] skip deduct', pn, orderRef, '- manual ERP order, stock already taken at creation'); return false }
+    }
+  } catch (e) { console.warn('[SS] manual-order check failed', e) }
   if (tracking) {
     const dedupKey = 'shipment|' + pn + '|' + tracking
     try {
@@ -9775,7 +9849,8 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
   if (asm) {
     const prev = asm.total_on_hand || 0
     const newOh = prev - qty
-    await db.from('assemblies').update({ total_on_hand: newOh, updated_at: new Date().toISOString() }).eq('id', asm.id)
+    const { error: uErr } = await db.from('assemblies').update({ total_on_hand: newOh, updated_at: new Date().toISOString() }).eq('id', asm.id)
+    if (uErr) { console.error('[SS] stock update FAILED for', pn, uErr.message); await db.from('error_log').insert({ page: 'shipstation-ship', app_version: 'edge shipstation-ship', message: 'Stock deduction failed for ' + pn + ' on ' + orderRef + ': ' + uErr.message }).then(() =&gt; {}, () =&gt; {}); return false }
     await db.from('inv_corrections').insert({ pn, previous_qty: prev, new_qty: newOh, adjustment: -qty, reason, source: 'shipment' })
     console.log('[SS] Deducted', qty, 'of', pn, 'on', orderRef, '| on_hand:', prev, '-&gt;', newOh)
     await syncShopifyBackorder(pn, newOh)
@@ -9790,7 +9865,8 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
   }
   const prevP = prt.total_unpckgd || 0
   const newQtyP = prevP - qty
-  await db.from('parts').update({ total_unpckgd: newQtyP, updated_at: new Date().toISOString() }).eq('id', prt.id)
+  const { error: uErrP } = await db.from('parts').update({ total_unpckgd: newQtyP, updated_at: new Date().toISOString() }).eq('id', prt.id)
+  if (uErrP) { console.error('[SS] stock update FAILED for', pn, uErrP.message); await db.from('error_log').insert({ page: 'shipstation-ship', app_version: 'edge shipstation-ship', message: 'Stock deduction failed for ' + pn + ' on ' + orderRef + ': ' + uErrP.message }).then(() =&gt; {}, () =&gt; {}); return false }
   await db.from('inv_corrections').insert({ pn, previous_qty: prevP, new_qty: newQtyP, adjustment: -qty, reason, source: 'shipment' })
   console.log('[SS] Deducted', qty, 'of', pn, '(part) on', orderRef, '| on_hand:', prevP, '-&gt;', newQtyP)
   await syncShopifyBackorder(pn, newQtyP)
@@ -9829,8 +9905,12 @@ Deno.serve(async (req) =&gt; {
         if (!lines.length) { notFound++; continue }
         const rawSkus = (ship.shipmentItems || []).flatMap((i: any) =&gt; [i.sku, i.name].filter(Boolean))
         const allPns = lines.map((l: any) =&gt; l.pn as string)
+        // [AUDIT] Exact SKU match first. The substring test alone let a short SKU (TGK-0404-01) match a
+        // longer one on the same order (TGK-0404-01-HW), marking an unshipped line Shipped and deducting it.
+        // Substring stays only as a last resort when nothing matched exactly.
+        const _exact = allPns.filter(p =&gt; rawSkus.some((s: string) =&gt; norm(p) === norm(s)))
         const matched = rawSkus.length &gt; 0
-          ? allPns.filter(p =&gt; rawSkus.some((s: string) =&gt; { const e=norm(p),k=norm(s); return e===k||e.includes(k)||k.includes(e) }))
+          ? (_exact.length ? _exact : allPns.filter(p =&gt; rawSkus.some((s: string) =&gt; { const e=norm(p),k=norm(s); return e===k||e.includes(k)||k.includes(e) })))
           : allPns
         const tracking = ship.trackingNumber
         const carrier = (ship.carrierCode || '').toUpperCase()
@@ -10724,7 +10804,10 @@ Deno.serve(async (req) =&gt; {
         ;(p2 || []).forEach((r: any) =&gt; { if (r.new_sku &amp;&amp; !(norm(r.new_sku) in _canonMap)) _canonMap[norm(r.new_sku)] = r.pn })
       }
       const canon = (raw: string): string =&gt; { const n = norm(raw); return _canonMap[n] || n }
-      const matchedPns = allErpPns.filter(erpPn =&gt; {
+      // [AUDIT] Exact (canonical) match first; substring only if nothing on the order matched exactly.
+      // See bulk_sync - the substring test alone marks and deducts the wrong line on split shipments.
+      const _exactPns = allErpPns.filter(erpPn =&gt; { const ce = canon(erpPn); return rawSkus.some((ssSku: string) =&gt; ce === canon(ssSku) || norm(erpPn) === norm(ssSku)) })
+      const matchedPns = _exactPns.length ? _exactPns : allErpPns.filter(erpPn =&gt; {
         const ce = canon(erpPn)
         return rawSkus.some((ssSku: string) =&gt; {
           if (ce === canon(ssSku)) return true
@@ -12898,7 +12981,8 @@ async function ssManualSync(orderNum,tracking,carrier){
     // which a raw .eq('pn',sale.pn) query would never match -- silently skipping the deduction.
     const _msAsm=findAsm(sale.pn);
     const _msPrt=_msAsm?null:((S._partIdx&&S._partIdx[sale.pn])||S.parts.find(p=>p.pn===sale.pn||(p.new_sku&&p.new_sku===sale.pn)));
-    if(_msAsm){
+    if(await _manualCreateDeducted(orderNum,(_msAsm||_msPrt||{}).pn)){console.log('[ship] '+sale.pn+' on '+orderNum+' was deducted when the manual order was created - not deducting again');}
+    else if(_msAsm){
       await adjustStock('assembly',_msAsm,-(sale.qty||1),{reason:'Manual ship \u2014 order '+orderNum+' tracking '+tracking,source:'shipment'}); // allow negative = backorder
     } else if(_msPrt){
       await adjustStock('part',_msPrt,-(sale.qty||1),{reason:'Manual ship \u2014 order '+orderNum+' tracking '+tracking,source:'shipment'});
@@ -14984,7 +15068,8 @@ async function submitSale(){
     var ins=await db.from('sales').insert(Object.assign({},base,{pn:it.pn,qty:it.qty})).select().single();
     if(ins.error){ toast('Error: '+ins.error.message); return; }
     S.sales=[ins.data,...S.sales];
-    try{ if(it.type==='assembly'){ var asm2=asmByPn(it.pn); if(asm2){ await adjustStock('assembly',asm2,-it.qty,{reason:'Manual ERP order '+orderNum,source:'manual',skipSync:true}); } } else { var prt=partByPn(it.pn); if(prt){ await adjustStock('part',prt,-it.qty,{reason:'Manual ERP order '+orderNum,source:'manual',skipSync:true}); } } }catch(_e){ console.warn('deduct failed',_e); }
+    // [AUDIT] No stock change here. Stock leaves when the line SHIPS (every ship path deducts); deducting
+    // at creation as well took every manual order out of inventory twice.
   }
   try{ if(typeof lockOrderFromSync==='function') await lockOrderFromSync(orderNum); }catch(_e){}
   closeModal(); render();
@@ -15878,7 +15963,7 @@ async function submitManualSale(){
   }).select().single();
   if(error){toast('Error: '+error.message);return;}
   S.sales=[data,...S.sales];
-  try{ var _asm=asmByPn(pn); if(_asm){ await adjustStock('assembly',_asm,-qty,{reason:'Manual ERP order '+orderNum,source:'manual',skipSync:true}); } }catch(_e){ console.warn('manual order deduct failed',_e); }
+  // [AUDIT] No stock change at creation - it is deducted when the line ships (see _manualCreateDeducted).
   try{ if(typeof lockOrderFromSync==='function') await lockOrderFromSync(orderNum); }catch(_e){}
   closeModal();
   toast('Order '+orderNum+' created'+(createSS?' — creating in ShipStation…':''));
@@ -17221,17 +17306,40 @@ function stripMeta(row){
   return rest;
 }
 
-async function applyUndoOp(op){
+// [AUDIT] Undo/redo used to write the whole old row back, stock included. Any stock movement since
+// the action (a webhook shipment, another user's pack, a receipt) was silently overwritten - and even
+// an undo of a non-stock edit (website toggle, lead time, tier price) reset stock to its old value.
+// Stock is now reversed as a delta through adjustStock (atomic, floored, audited, backorder-aware);
+// every other column still restores exactly as before. Audit rows (inv_corrections) are append-only:
+// undo writes its own reversing row instead of deleting history.
+function _undoStockField(table){return table==='parts'?'total_unpckgd':(table==='assemblies'?'total_on_hand':null);}
+async function _applyRowState(op,dir,desc){
+  var f=_undoStockField(op.table);
+  var target=dir<0?op.prev:op.data, from=dir<0?op.data:op.prev;
+  var row=stripMeta(target||{});
+  var id=op.data&&op.data.id;
+  if(!f){var r=await db.from(op.table).update(row).eq('id',id);if(r.error)throw r.error;return;}
+  var delta=(target&&from&&target[f]!=null&&from[f]!=null)?(Number(target[f]||0)-Number(from[f]||0)):0;
+  delete row[f];delete row.backorder_qty;delete row.id;
+  if(Object.keys(row).length){var r2=await db.from(op.table).update(row).eq('id',id);if(r2.error)throw r2.error;}
+  if(delta){
+    var list=op.table==='parts'?S.parts:S.assemblies;
+    var rec=list.find(function(x){return x.id===id;})||{id:id,pn:(op.prev&&op.prev.pn)||(op.data&&op.data.pn)||''};
+    var nq=await adjustStock(op.table==='parts'?'part':'assembly',rec,delta,{reason:(dir<0?'Undo':'Redo')+(desc?': '+desc:''),source:dir<0?'undo':'redo'});
+    if(nq===null)throw new Error('stock update failed for '+(rec.pn||id));
+  }
+}
+async function applyUndoOp(op,desc){
+  var r;
+  if(op.table==='inv_corrections')return; // audit history is append-only
   if(op.action === 'delete') {
-    await db.from(op.table).insert(op.data);
+    r=await db.from(op.table).insert(op.data); if(r&&r.error)throw r.error;
   } else if(op.action === 'insert') {
-    await db.from(op.table).delete().eq('id', op.data.id);
+    r=await db.from(op.table).delete().eq('id', op.data.id); if(r&&r.error)throw r.error;
   } else if(op.action === 'update') {
-    const prev = stripMeta(op.prev);
-    const {error} = await db.from(op.table).update(prev).eq('id', op.data.id);
-    if(error) throw error;
+    await _applyRowState(op,-1,desc);
   } else if(op.action === 'bom_delete') {
-    await db.from('bom_items').insert(op.data);
+    r=await db.from('bom_items').insert(op.data); if(r&&r.error)throw r.error;
   }
 }
 
@@ -17239,18 +17347,17 @@ async function applyUndoOp(op){
 // re-deleted, an undone 'insert' gets re-inserted (with its original id, so it's the same row,
 // not a new one), an undone 'update' gets its post-edit state (op.data) re-applied, and an
 // undone 'bom_delete' gets re-removed.
-async function applyRedoOp(op){
+async function applyRedoOp(op,desc){
+  var r;
+  if(op.table==='inv_corrections')return; // the stock delta below writes its own audit row
   if(op.action === 'delete') {
-    await db.from(op.table).delete().eq('id', op.data.id);
+    r=await db.from(op.table).delete().eq('id', op.data.id); if(r&&r.error)throw r.error;
   } else if(op.action === 'insert') {
-    const {error} = await db.from(op.table).insert(stripMeta(op.data));
-    if(error) throw error;
+    r=await db.from(op.table).insert(stripMeta(op.data)); if(r&&r.error)throw r.error;
   } else if(op.action === 'update') {
-    const cur = stripMeta(op.data);
-    const {error} = await db.from(op.table).update(cur).eq('id', op.data.id);
-    if(error) throw error;
+    await _applyRowState(op,1,desc);
   } else if(op.action === 'bom_delete') {
-    await db.from('bom_items').delete().eq('id', op.data.id);
+    r=await db.from('bom_items').delete().eq('id', op.data.id); if(r&&r.error)throw r.error;
   }
 }
 
@@ -17260,9 +17367,9 @@ async function undo() {
   updateUndoBtn();
   try {
     if(last.action === 'multi') {
-      for(const op of [...last.ops].reverse()) await applyUndoOp(op);
+      for(const op of [...last.ops].reverse()) await applyUndoOp(op,last.desc);
     } else {
-      await applyUndoOp(last);
+      await applyUndoOp(last,last.desc);
     }
     // [FEATURE] Park the just-undone action on the redo stack instead of discarding it, so
     // undoing too far can be walked back with Redo rather than having to redo the work by hand.
@@ -17286,9 +17393,9 @@ async function redo() {
   updateRedoBtn();
   try {
     if(next.action === 'multi') {
-      for(const op of next.ops) await applyRedoOp(op);
+      for(const op of next.ops) await applyRedoOp(op,next.desc);
     } else {
-      await applyRedoOp(next);
+      await applyRedoOp(next,next.desc);
     }
     // Goes back onto the undo stack (not treated as a "new" action, so this does NOT clear the
     // redo stack -- only pushUndo/pushUndoMulti do that, for genuinely new work).
@@ -17360,15 +17467,27 @@ async function restoreBackup(id) {
   const {data,error} = await db.from('backups').select('data').eq('id',id).single();
   if(error){toast('Failed to load backup');return;}
   const d = data.data;
+  // [AUDIT] The restore deletes every row and then inserts the backup. Those results were never checked,
+  // so a failed insert silently left the table empty. Snapshot the current data first, check each step,
+  // and stop with the name of the safety backup if anything fails.
+  const _safeLbl='Pre-restore safety '+new Date().toLocaleString();
+  const _sb=await db.from('backups').insert({label:_safeLbl,data:{parts:S.parts,assemblies:S.assemblies,dealers:S.dealers,purchases:S.purchases,sales:S.sales.slice(0,200),boms:S.boms,ts:new Date().toISOString()}});
+  if(_sb.error){toast('Restore cancelled - could not save a safety backup first: '+_sb.error.message,9000);return;}
+  const _rs=async function(t,rows){
+    const dr=await db.from(t).delete().neq('id','00000000-0000-0000-0000-000000000000');
+    if(dr.error)throw new Error(t+' delete failed: '+dr.error.message+' (nothing replaced)');
+    const ir=await db.from(t).insert(rows);
+    if(ir.error)throw new Error(t+' insert FAILED after delete: '+ir.error.message+' - restore the backup named "'+_safeLbl+'" now');
+  };
   setSyncState('busy');
   try {
-    if(d.parts?.length){await db.from('parts').delete().neq('id','00000000-0000-0000-0000-000000000000');await db.from('parts').insert(d.parts);}
-    if(d.assemblies?.length){await db.from('assemblies').delete().neq('id','00000000-0000-0000-0000-000000000000');await db.from('assemblies').insert(d.assemblies);}
-    if(d.dealers?.length){await db.from('dealers').delete().neq('id','00000000-0000-0000-0000-000000000000');await db.from('dealers').insert(d.dealers);}
+    if(d.parts?.length)await _rs('parts',d.parts);
+    if(d.assemblies?.length)await _rs('assemblies',d.assemblies);
+    if(d.dealers?.length)await _rs('dealers',d.dealers);
     await loadAll();
     toast('Backup restored successfully');
   } catch(e) {
-    toast('Restore error: ' + e.message);
+    toast('Restore error: ' + e.message, 15000);
     setSyncState('err');
   }
 }
@@ -19610,27 +19729,22 @@ function buildOnOrderMap(){
   S.purchases.forEach(po=>{
     if(po.status==='Received'||po.status==='Recovered'||po.status==='Cancelled'||po.status==='Lost')return;
     const lines=S.poLines[po.id]||[];
+    // [AUDIT] Keyed by the item's canonical pn (a PO line entered under the new SKU used to count as on
+    // order for nothing), and a line-less legacy PO now counts only what is still outstanding.
+    const _k=pn=>(_canonItem(pn)||{}).pn||pn;
     if(lines.length){
-      lines.forEach(l=>{m[l.pn]=(m[l.pn]||0)+Math.max(0,(l.qty_ordered||0)-(l.qty_received||0));});
+      lines.forEach(l=>{if(!l.pn)return;const k=_k(l.pn);m[k]=(m[k]||0)+Math.max(0,(l.qty_ordered||0)-(l.qty_received||0));});
     }else if(po.pn){
-      m[po.pn]=(m[po.pn]||0)+(po.qty||0);
+      const k=_k(po.pn);m[k]=(m[k]||0)+Math.max(0,(po.qty||0)-(po.qty_received||0));
     }
   });
   return m;
 }
 function openOrderedQty(pn) {
-  if(S._onOrderMap)return S._onOrderMap[pn]||0; // fast path when a render has primed the cache
-  let qty = 0;
-  S.purchases.forEach(po => {
-    if(po.status === 'Received' || po.status === 'Recovered' || po.status === 'Cancelled' || po.status === 'Lost') return;
-    const lines = S.poLines[po.id] || [];
-    if(lines.length) {
-      lines.forEach(l => { if(l.pn === pn) qty += Math.max(0, (l.qty_ordered||0) - (l.qty_received||0)); });
-    } else if(po.pn === pn) {
-      qty += po.qty || 0;
-    }
-  });
-  return qty;
+  // [AUDIT] Same canonical keying as buildOnOrderMap, so the cached and uncached answers always agree.
+  const k=(_canonItem(pn)||{}).pn||pn;
+  const m=S._onOrderMap||buildOnOrderMap(); // never prime a cache outside render - it would go stale
+  return m[k]||0;
 }
 
 function calcReorderPoint(p) {
@@ -21572,6 +21686,17 @@ function renderPODetail(po) {
 }
 
 async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
+  // [AUDIT] One receipt at a time (a double-click used to receive twice), and the received count is read
+  // fresh from the database instead of trusting the number baked into the button when the page drew.
+  if(S._rcvInFlight){toast('A receipt is already being saved - please wait');return;}
+  S._rcvInFlight=true;
+  try{
+    try{const _fr=await db.from('po_lines').select('qty_received,qty_ordered').eq('id',lineId).maybeSingle();
+      if(!_fr.error&&_fr.data){qtyAlreadyReceived=Number(_fr.data.qty_received)||0;qtyOrdered=Number(_fr.data.qty_ordered)||qtyOrdered;}}catch(_e){}
+    return await _checkInLineImpl(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived);
+  }finally{S._rcvInFlight=false;}
+}
+async function _checkInLineImpl(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
   const inp = document.getElementById('checkin-'+lineId);
   const noteInp = document.getElementById('checkin-note-'+lineId);
   const qty = parseFloat(inp.value)||0;
@@ -21583,6 +21708,17 @@ async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
   const undoOps=[];
   const lineBefore=(S.poLines[poId]||[]).find(l=>l.id===lineId);
   const poBefore=S.purchases.find(p=>p.id===poId);
+  // [AUDIT] Save the PO line FIRST. Stock used to be added before this write, and the write was never
+  // checked - a failed save left stock up with the line still outstanding, so it got received again.
+  if(!partByPn(pn)&&!findAsm(pn)){
+    if(!confirm(pn+' is not in Parts or Assemblies, so receiving it will NOT add any stock.\n\nOK = mark it received anyway (non-stock item)\nCancel = stop'))return;
+  }
+  if(lineBefore)undoOps.push({action:'update',table:'po_lines',data:{id:lineId},prev:{...stripMeta(lineBefore)}});
+  const _lineUpd=remaining>0
+    ?{qty_received:newReceived,status:'Partial',notes:remaining+' still outstanding',updated_at:new Date().toISOString()}
+    :{qty_received:newReceived,status:'Complete',updated_at:new Date().toISOString()};
+  const _lu=await db.from('po_lines').update(_lineUpd).eq('id',lineId);
+  if(_lu&&_lu.error){toast('Receipt NOT saved ('+_lu.error.message+') - no stock was added',9000);return;}
 
   const part = partByPn(pn);
   if(part){
@@ -21608,13 +21744,9 @@ async function checkInLine(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived) {
   }
 
   if(remaining>0){
-    if(lineBefore)undoOps.push({action:'update',table:'po_lines',data:{id:lineId},prev:{...stripMeta(lineBefore)}});
-    await db.from('po_lines').update({qty_received:newReceived,status:'Partial',notes:remaining+' still outstanding',updated_at:new Date().toISOString()}).eq('id',lineId);
     if(S.poLines[poId])S.poLines[poId]=S.poLines[poId].map(l=>l.id===lineId?{...l,qty_received:newReceived,status:'Partial',notes:remaining+' still outstanding'}:l);
     toast('Received '+qty+'× '+pn+' — '+remaining+' still outstanding on this PO');
   } else {
-    if(lineBefore)undoOps.push({action:'update',table:'po_lines',data:{id:lineId},prev:{...stripMeta(lineBefore)}});
-    await db.from('po_lines').update({qty_received:newReceived,status:'Complete',updated_at:new Date().toISOString()}).eq('id',lineId);
     toast('Received '+qty+'× '+pn+(surplus>0?' (+'+surplus+' surplus into stock)':'')+' <span class="ic ic-check"></span>');
   }
 
@@ -21678,6 +21810,9 @@ async function unreceiveLine(lineId, poId){
   if(!line||!(line.qty_received>0)){toast('Nothing received on this line');return;}
   if(!confirm('Reverse this receipt? '+line.qty_received+'× '+line.pn+' will be REMOVED from stock and the line reset to Pending.'))return;
   const undoOps=[];
+  // [AUDIT] Reset the line first and check it saved; stock comes off only after that.
+  const _ul=await db.from('po_lines').update({qty_received:0,status:'Pending',notes:null,updated_at:new Date().toISOString()}).eq('id',lineId);
+  if(_ul&&_ul.error){toast('Reversal NOT saved ('+_ul.error.message+') - stock unchanged',9000);return;}
   const part=partByPn(line.pn);
   if(part){
     undoOps.push({action:'update',table:'parts',data:{...part,total_unpckgd:(part.total_unpckgd||0)-line.qty_received},prev:{...part}});
@@ -21694,7 +21829,6 @@ async function unreceiveLine(lineId, poId){
     }
   }
   undoOps.push({action:'update',table:'po_lines',data:{id:lineId},prev:{...stripMeta(line)}});
-  await db.from('po_lines').update({qty_received:0,status:'Pending',notes:null,updated_at:new Date().toISOString()}).eq('id',lineId);
   const po=S.purchases.find(p=>p.id===poId);
   if(po&&(po.status==='Received'||po.status==='Recovered')){
     undoOps.push({action:'update',table:'purchases',data:{id:poId},prev:{...stripMeta(po)}});
@@ -21710,6 +21844,7 @@ async function unreceiveLine(lineId, poId){
 }
 
 async function checkInLineQuick(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived, qty) {
+  if(!partByPn(pn)&&!findAsm(pn))throw new Error('not in Parts or Assemblies - receive it on its own line'); // [AUDIT] was marked received with no stock and no message
   const newReceived = qtyAlreadyReceived + qty;
   const _lineUp=await db.from('po_lines').update({qty_received:newReceived,status:'Complete',updated_at:new Date().toISOString()}).eq('id',lineId);
   // Stock must never move on a line whose receipt did not persist - that would leave
@@ -22493,6 +22628,7 @@ async function submitCustomPackList(){
     if(bom.length>0){
       for(const item of bom){
         const delta=-(item.qty*qty);
+        if(!delta||!isFinite(delta))continue; // [AUDIT] zero-qty line: nothing to move
         const _cpDedAs=(typeof _findAsm2==='function'?_findAsm2(item.child_pn):null)||liveAsmMap[item.child_pn];
         const _cpIsAsmDeduct=!!_cpDedAs; // table membership, not item_type
         if(_cpIsAsmDeduct){
@@ -30145,34 +30281,29 @@ async function bulkMarkShipped() {
     for (var j = 0; j < lines.length; j++) {
       var line = lines[j];
       var lineQty = line.qty || 1;
-      // Deduct inventory BEFORE flipping status — same logic submitShipment uses for a single order,
-      // just applied per-line here since this bulk action was skipping it entirely.
+      // [AUDIT] Status first, stock second - same order as manual sync. The old version wrote stock with a
+      // plain read-modify-write of the local (possibly stale) number, ignored write errors, allowed it to
+      // go negative outside the backorder rules, and deducted even when the status write then failed, so
+      // the still-Open line got deducted again on its next ship. Now: re-check the line in the database,
+      // save the status, and only then deduct through adjustStock (atomic, floored, audited).
       var asm = findAsm(line.pn);
       var prt = asm ? null : _partByPn.get(line.pn);
-      if (asm) {
-        // Keyed by id, not pn: findAsm() also resolves by new_sku, and the old `a.pn === line.pn`
-        // patch silently matched nothing in that case, leaving local stock stale after the ship.
-        var aPrev = (_asmQtyPatch[asm.id] !== undefined) ? _asmQtyPatch[asm.id] : (asm.total_on_hand || 0);
-        var aNew = aPrev - lineQty; // allow negative — same backorder convention as every other ship path
-        await db.from('assemblies').update({ total_on_hand: aNew, updated_at: now }).eq('id', asm.id);
-        _asmQtyPatch[asm.id] = aNew;
-        await db.from('inv_corrections').insert({ pn: line.pn, previous_qty: aPrev, new_qty: aNew, adjustment: -lineQty, reason: 'Bulk mark Shipped — order ' + oKey + (tracking ? ' ' + tracking : ''), user_email: S.currentUser || null, source: 'shipment' });
-        syncShopifyTemplate(line.pn, aNew);
-      } else if (prt) {
-        var pPrev = (_partQtyPatch[prt.id] !== undefined) ? _partQtyPatch[prt.id] : (prt.total_unpckgd || 0);
-        var pNew = pPrev - lineQty;
-        await db.from('parts').update({ total_unpckgd: pNew, updated_at: now }).eq('id', prt.id);
-        _partQtyPatch[prt.id] = pNew;
-        await db.from('inv_corrections').insert({ pn: line.pn, previous_qty: pPrev, new_qty: pNew, adjustment: -lineQty, reason: 'Bulk mark Shipped — order ' + oKey + (tracking ? ' ' + tracking : ''), user_email: S.currentUser || null, source: 'shipment' });
-        cascadeShopifySync(line.pn);
-      }
+      var _cur = await db.from('sales').select('fulfillment_status').eq('id', line.id).maybeSingle();
+      if (!_cur.error && _cur.data && ['Shipped','Delivered','Cancelled','Refunded'].includes(_cur.data.fulfillment_status || 'Open')) continue;
       var payload = { fulfillment_status: 'Shipped', shipped_at: now, updated_at: now };
       if (tracking) { payload.tracking_number = tracking; payload.carrier = carrier || null; }
       var res = await db.from('sales').update(payload).eq('id', line.id);
-      if (res.error) { errors++; console.warn('[bulk ship]', res.error.message); }
-      else {
-        _salePatch[line.id] = payload;
-        done++;
+      if (res.error) { errors++; console.warn('[bulk ship]', res.error.message); continue; }
+      _salePatch[line.id] = payload;
+      done++;
+      if (await _manualCreateDeducted(line.order_number, (asm || prt || {}).pn)) continue;
+      var _why = 'Bulk mark Shipped \u2014 order ' + oKey + (tracking ? ' ' + tracking : '');
+      if (asm) {
+        var _na = await adjustStock('assembly', asm, -lineQty, { reason: _why, source: 'shipment', skipSync: true });
+        if (_na !== null) syncShopifyTemplate(asm.pn, _na); else { errors++; console.warn('[bulk ship] stock not deducted for', line.pn); }
+      } else if (prt) {
+        var _np = await adjustStock('part', prt, -lineQty, { reason: _why, source: 'shipment', skipSync: true });
+        if (_np !== null) cascadeShopifySync(prt.pn); else { errors++; console.warn('[bulk ship] stock not deducted for', line.pn); }
       }
     }
   }
