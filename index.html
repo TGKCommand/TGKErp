@@ -461,7 +461,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.64';
+const TGK_ERP_VERSION = 'v23.66';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -621,7 +621,7 @@ function computeDemand(){
   if(!S._asmIdx||!S._partIdx)buildLookupMaps(); // [CANON] O(1) resolver maps for SKU consolidation below
   S.sales.forEach(s=>{
     if(!s.pn||!s.sale_date)return;
-    if(s.fulfillment_status==='Cancelled')return;
+    if(s.fulfillment_status==='Cancelled')return; // Refunded/Returned lines DO count - the customer wanted it (decided v23.65)
     const w=Math.floor((now-new Date(s.sale_date))/(7*24*3600*1000));
     if(w<0||w>=12)return;
     const q=s.qty||1;
@@ -4728,7 +4728,7 @@ function renderPurchases(){
   <th style="cursor:pointer;user-select:none" onclick="(()=>{var d=S.filters.po&&S.filters.po.sort==='vendor'&&S.filters.po.dir==='asc'?'desc':'asc';setFilter('po','sort','vendor');setFilter('po','dir',d)})()">Vendor ${_poSF==='vendor'?(_poSD==='asc'?'&uarr;':'&darr;'):''}</th>
   <th>Part #</th><th>Description</th><th>Qty</th>
   <th style="cursor:pointer;user-select:none" onclick="(()=>{var d=S.filters.po&&S.filters.po.sort==='value'&&S.filters.po.dir==='asc'?'desc':'asc';setFilter('po','sort','value');setFilter('po','dir',d)})()">Value ${_poSF==='value'?(_poSD==='asc'?'&uarr;':'&darr;'):''}</th>
-  ${(function(){setRecordNav('purchase order',list.map(function(p){return p.id;}),function(id){openPO(id);});return '';})()}<th>Status &amp; Tracking</th><th></th></tr></thead><tbody>
+  ${(function(){setRecordNav('purchase order',list.map(function(p){return p.id;}),function(id){return openPODetail(id);});return '';})()}<th>Status &amp; Tracking</th><th></th></tr></thead><tbody>
   ${list.map(p=>{
     const d=poDisplayData(p);
     const isMulti=d.pn==='Multiple';
@@ -7713,7 +7713,13 @@ function renderIntegrations(){
 
     <div class="section-header" style="background:transparent;border:none;padding-left:0">0 — Run SQL migration in Supabase (Dashboard → SQL Editor)</div>
     <div style="font-size:var(--t-sm);color:var(--text3);margin:4px 0 6px">Adds columns for address, customer info, discount codes, financial status, split shipments, holds, refunds, and cancellations:</div>
-    <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:12px;font-size:var(--t-xs);font-family:var(--mono);color:var(--text2);overflow-x:auto;max-height:160px">ALTER TABLE sales
+    <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:12px;font-size:var(--t-xs);font-family:var(--mono);color:var(--text2);overflow-x:auto;max-height:160px">-- v23.65: per-line shipment deduction tracking. Lets the ShipStation webhook retry and correct a failed
+-- stock deduction instead of skipping it forever.
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS deduct_pending boolean DEFAULT false;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS stock_deducted_at timestamptz;
+CREATE INDEX IF NOT EXISTS sales_deduct_pending_idx ON sales (deduct_pending) WHERE deduct_pending;
+
+ALTER TABLE sales
   ADD COLUMN IF NOT EXISTS customer_name text,
   ADD COLUMN IF NOT EXISTS customer_email text,
   ADD COLUMN IF NOT EXISTS customer_phone text,
@@ -9366,6 +9372,72 @@ if (body.action === 'list_product_templates') {
     <div style="font-size:var(--t-sm);color:var(--text3);margin:4px 0 6px;display:flex;align-items:center;gap:8px">Replace <span class="pn">supabase/functions/shipstation-ship/index.ts</span> with:<button class="btn btn-sm" style="margin-left:auto;font-size:var(--t-xs)" onclick="var pre=this.closest('div').nextElementSibling;copyText(pre?pre.textContent:'',this)">Copy</button></div>
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:12px;font-size:var(--t-xs);font-family:var(--mono);color:var(--text2);overflow-x:auto;max-height:280px">import { createClient } from 'npm:@supabase/supabase-js@2'
 const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
+// [AUDIT v23.65] How the last deductForShipment call ended: deducted | duplicate | manual | notfound | failed
+let _lastDeduct = ''
+let _pendingColumnOk = true
+// Per-line ledger: sales.deduct_pending is set BEFORE a line is marked Shipped and cleared once its stock is
+// deducted (or found already deducted). Anything left pending is retried automatically.
+async function markDeductPending(ids: string[], on: boolean): Promise&lt;void&gt; {
+  if (!_pendingColumnOk || !ids.length) return
+  const upd: any = { deduct_pending: on }
+  if (!on) upd.stock_deducted_at = new Date().toISOString()
+  const { error } = await db.from('sales').update(upd).in('id', ids)
+  if (error) {
+    if (/deduct_pending|stock_deducted_at|column/i.test(error.message || '')) { _pendingColumnOk = false; console.warn('[SS] sales.deduct_pending not migrated - per-line retry disabled until the migration runs') }
+    else console.warn('[SS] could not update deduct_pending:', error.message)
+  }
+}
+async function logEdgeError(message: string): Promise&lt;void&gt; {
+  await db.from('error_log').insert({ page: 'shipstation-ship', app_version: 'edge shipstation-ship', message }).then(() =&gt; {}, () =&gt; {})
+}
+// Deduct one sales line and settle its pending flag. Returns false only when it must be retried.
+async function deductLine(line: any, tracking: string, orderRef: string): Promise&lt;boolean&gt; {
+  _lastDeduct = 'failed'
+  try { await deductForShipment(line.pn, Number(line.qty) || 1, tracking, orderRef) } catch (e) { _lastDeduct = 'failed'; console.error('[SS] deduction threw for', line.pn, e) }
+  if (_lastDeduct === 'failed') {
+    await logEdgeError('Stock deduction failed for ' + line.pn + ' on ' + orderRef + ' (tracking ' + tracking + ') - left pending, retried automatically')
+    return false
+  }
+  if (_lastDeduct === 'notfound') await logEdgeError(line.pn + ' on ' + orderRef + ' shipped but is not in Parts or Assemblies - no stock deducted')
+  await markDeductPending([line.id], false)
+  return true
+}
+async function retryPendingDeductions(limit: number): Promise&lt;{ tried: number, done: number, failed: number, remaining: number | null }&gt; {
+  const out = { tried: 0, done: 0, failed: 0, remaining: null as number | null }
+  if (!_pendingColumnOk) return out
+  const { data: rows, error } = await db.from('sales').select('id,pn,qty,order_number,tracking_number').eq('deduct_pending', true).limit(limit)
+  if (error) { if (/deduct_pending|column/i.test(error.message || '')) _pendingColumnOk = false; return out }
+  for (const l of (rows || [])) {
+    // Never retry without a tracking number: it is the duplicate guard that makes a retry safe.
+    if (!l.tracking_number) { await logEdgeError('Pending deduction for ' + l.pn + ' on ' + l.order_number + ' has no tracking number - fix the line, then retry'); continue }
+    out.tried++
+    if (await deductLine(l, l.tracking_number, l.order_number || '')) out.done++; else out.failed++
+  }
+  const { count } = await db.from('sales').select('id', { count: 'exact', head: true }).eq('deduct_pending', true)
+  out.remaining = count ?? null
+  return out
+}
+// One stock rule, same as the ERP's apply_stock_delta: on hand never goes below 0, the shortfall is backorder,
+// and stock coming back clears backorder first. Uses the database function when it exists.
+async function stockDelta(kind: 'assembly' | 'part', id: string, delta: number): Promise&lt;{ prev: number, next: number } | null&gt; {
+  try {
+    const { data, error } = await db.rpc('apply_stock_delta', { p_kind: kind, p_id: String(id), p_delta: delta })
+    if (!error &amp;&amp; data) { const row = Array.isArray(data) ? data[0] : data; if (row &amp;&amp; row.new_qty != null) return { prev: Number(row.prev_qty || 0), next: Number(row.new_qty) } }
+  } catch (_) { /* fall through */ }
+  const table = kind === 'assembly' ? 'assemblies' : 'parts', field = kind === 'assembly' ? 'total_on_hand' : 'total_unpckgd'
+  const { data: r, error: rErr } = await db.from(table).select(field + ',backorder_qty').eq('id', id).maybeSingle()
+  if (rErr || !r) return null
+  const prev = Number((r as any)[field]) || 0
+  let bo = Number((r as any).backorder_qty) || 0
+  let next: number
+  if (delta &gt;= 0) { const settle = Math.min(bo, delta); bo -= settle; next = prev + (delta - settle) }
+  else { next = prev + delta; if (next &lt; 0) { bo += -next; next = 0 } }
+  const upd: any = { backorder_qty: bo, updated_at: new Date().toISOString() }
+  upd[field] = next
+  const { error: uErr } = await db.from(table).update(upd).eq('id', id)
+  if (uErr) return null
+  return { prev, next }
+}
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -9808,7 +9880,7 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
     const { data: mc } = await db.from('inv_corrections').select('id').eq('source', 'manual').eq('pn', pn).eq('reason', 'Manual ERP order ' + orderRef).limit(1)
     if (mc?.length) {
       const { data: un } = await db.from('inv_corrections').select('id').eq('source', 'unship').eq('pn', pn).ilike('reason', '%order ' + orderRef + ' reverted%').limit(1)
-      if (!un?.length) { console.log('[SS] skip deduct', pn, orderRef, '- manual ERP order, stock already taken at creation'); return false }
+      if (!un?.length) { console.log('[SS] skip deduct', pn, orderRef, '- manual ERP order, stock already taken at creation'); _lastDeduct = 'manual'; return false }
     }
   } catch (e) { console.warn('[SS] manual-order check failed', e) }
   if (tracking) {
@@ -9821,12 +9893,13 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
         const row = Array.isArray(rpcRes) ? rpcRes[0] : rpcRes
         if (row &amp;&amp; row.applied === false) {
           console.log('[SS]', pn, 'tracking', tracking, '-&gt; not applied (' + (row.kind || 'duplicate') + ') - skipping')
+          _lastDeduct = 'duplicate'
           return false
         }
         if (row &amp;&amp; row.applied === true) {
           console.log('[SS] Deducted', qty, 'of', pn, 'on', orderRef, '| atomic |', row.kind, 'on_hand:', row.prev_qty, '-&gt;', row.new_qty)
-          await syncShopifyBackorder(pn, Number(row.new_qty))
-          if (row.kind === 'part') await cascadeShopifyBackorder(pn)
+          _lastDeduct = 'deducted' // stock is down - a Shopify sync error below must not mark this as a failed deduction
+          try { await syncShopifyBackorder(pn, Number(row.new_qty)); if (row.kind === 'part') await cascadeShopifyBackorder(pn) } catch (e) { console.warn('[SS] Shopify sync after deduction failed', e) }
           return true
         }
       } else {
@@ -9842,37 +9915,35 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
       .ilike('reason', '%' + tracking + '%').limit(1)
     if (dup?.length) {
       console.log('[SS] Already deducted', pn, 'for tracking', tracking, '- skipping (idempotent)')
+      _lastDeduct = 'duplicate'
       return false
     }
   }
-  let { data: asms } = await db.from('assemblies').select('id,total_on_hand').eq('pn', pn).limit(1)
-  if (!asms?.length) { const _r = await db.from('assemblies').select('id,total_on_hand').eq('new_sku', pn).limit(1); asms = _r.data }
+  let { data: asms } = await db.from('assemblies').select('id').eq('pn', pn).limit(1)
+  if (!asms?.length) { const _r = await db.from('assemblies').select('id').eq('new_sku', pn).limit(1); asms = _r.data }
   const asm = asms?.[0]
-  if (asm) {
-    const prev = asm.total_on_hand || 0
-    const newOh = prev - qty
-    const { error: uErr } = await db.from('assemblies').update({ total_on_hand: newOh, updated_at: new Date().toISOString() }).eq('id', asm.id)
-    if (uErr) { console.error('[SS] stock update FAILED for', pn, uErr.message); await db.from('error_log').insert({ page: 'shipstation-ship', app_version: 'edge shipstation-ship', message: 'Stock deduction failed for ' + pn + ' on ' + orderRef + ': ' + uErr.message }).then(() =&gt; {}, () =&gt; {}); return false }
-    await db.from('inv_corrections').insert({ pn, previous_qty: prev, new_qty: newOh, adjustment: -qty, reason, source: 'shipment' })
-    console.log('[SS] Deducted', qty, 'of', pn, 'on', orderRef, '| on_hand:', prev, '-&gt;', newOh)
-    await syncShopifyBackorder(pn, newOh)
-    return true
+  let prt: any = null
+  if (!asm) {
+    let { data: prts } = await db.from('parts').select('id').eq('pn', pn).limit(1)
+    if (!prts?.length) { const _r = await db.from('parts').select('id').eq('new_sku', pn).limit(1); prts = _r.data }
+    prt = prts?.[0] || null
   }
-  let { data: prts } = await db.from('parts').select('id,total_unpckgd').eq('pn', pn).limit(1)
-  if (!prts?.length) { const _r = await db.from('parts').select('id,total_unpckgd').eq('new_sku', pn).limit(1); prts = _r.data }
-  const prt = prts?.[0]
-  if (!prt) {
+  if (!asm &amp;&amp; !prt) {
     console.warn('[SS] SKU not found in parts or assemblies - no deduction:', pn)
+    _lastDeduct = 'notfound'
     return false
   }
-  const prevP = prt.total_unpckgd || 0
-  const newQtyP = prevP - qty
-  const { error: uErrP } = await db.from('parts').update({ total_unpckgd: newQtyP, updated_at: new Date().toISOString() }).eq('id', prt.id)
-  if (uErrP) { console.error('[SS] stock update FAILED for', pn, uErrP.message); await db.from('error_log').insert({ page: 'shipstation-ship', app_version: 'edge shipstation-ship', message: 'Stock deduction failed for ' + pn + ' on ' + orderRef + ': ' + uErrP.message }).then(() =&gt; {}, () =&gt; {}); return false }
-  await db.from('inv_corrections').insert({ pn, previous_qty: prevP, new_qty: newQtyP, adjustment: -qty, reason, source: 'shipment' })
-  console.log('[SS] Deducted', qty, 'of', pn, '(part) on', orderRef, '| on_hand:', prevP, '-&gt;', newQtyP)
-  await syncShopifyBackorder(pn, newQtyP)
-  await cascadeShopifyBackorder(pn)
+  const kind: 'assembly' | 'part' = asm ? 'assembly' : 'part'
+  const res = await stockDelta(kind, String((asm || prt).id), -qty)
+  if (!res) {
+    console.error('[SS] stock update FAILED for', pn)
+    _lastDeduct = 'failed'
+    return false
+  }
+  await db.from('inv_corrections').insert({ pn, previous_qty: res.prev, new_qty: res.next, adjustment: -qty, reason, source: 'shipment' })
+  console.log('[SS] Deducted', qty, 'of', pn, '(' + kind + ') on', orderRef, '| on_hand:', res.prev, '-&gt;', res.next)
+  _lastDeduct = 'deducted' // stock is down - a Shopify sync error below must not mark this as a failed deduction
+  try { await syncShopifyBackorder(pn, res.next); if (kind === 'part') await cascadeShopifyBackorder(pn) } catch (e) { console.warn('[SS] Shopify sync after deduction failed', e) }
   return true
 }
 
@@ -9883,6 +9954,9 @@ Deno.serve(async (req) =&gt; {
   if (body.check_secrets) {
     const k = Deno.env.get('SS_KEY') || '', s = Deno.env.get('SS_SECRET') || ''
     return json({ ss_key_set: k.length &gt; 0, ss_key_length: k.length, ss_key_preview: k.length &gt; 4 ? k.slice(0,2)+'...'+k.slice(-2) : '(empty)', ss_secret_set: s.length &gt; 0, ss_secret_length: s.length, ss_secret_preview: s.length &gt; 4 ? s.slice(0,2)+'...'+s.slice(-2) : '(empty)', ss_v2_key_set: (Deno.env.get('SS_V2_KEY') || '').length &gt; 0 })
+  }
+  if (body.action === 'retry_pending_deductions') {
+    return json(await retryPendingDeductions(200))
   }
   if (body.action === 'bulk_sync') {
     const auth = ssAuth()
@@ -9930,6 +10004,7 @@ Deno.serve(async (req) =&gt; {
       }
       page++
     }
+    await markDeductPending([...new Set(deductQueue.map((d: any) =&gt; d.id))] as string[], true)
     let applied = 0
     for (const g of Object.values(updateGroups)) {
       const deduped = [...new Set((g as any).ids)]
@@ -9946,8 +10021,8 @@ Deno.serve(async (req) =&gt; {
     for (const d of deductQueue) {
       if (seenLineIds.has(d.id)) continue
       seenLineIds.add(d.id)
-      const did = await deductForShipment(d.pn, d.qty, d.tracking, d.order)
-      if (did) deducted++
+      const did = await deductLine({ id: d.id, pn: d.pn, qty: d.qty }, d.tracking, d.order)
+      if (did &amp;&amp; _lastDeduct === 'deducted') deducted++
     }
     return json({ synced, skipped, notFound, applied, deducted, pages: totalPages, message: 'Synced ' + synced + ' shipments, applied ' + applied + ' line updates, deducted ' + deducted + ' line(s)' })
   }
@@ -10715,6 +10790,10 @@ Deno.serve(async (req) =&gt; {
   const ssRes = await fetch(fetchUrl, { headers: { Authorization: 'Basic ' + auth } })
   if (!ssRes.ok) return new Response('SS fetch failed: ' + ssRes.status, { status: 502, headers: CORS })
   const data = await ssRes.json()
+  // [AUDIT] Every ShipStation delivery first finishes any deduction an earlier delivery left pending.
+  if (resource_type === 'SHIP_NOTIFY' || resource_type === 'ORDER_SHIPPED') {
+    try { const r = await retryPendingDeductions(25); if (r.tried) console.log('[SS] pending deductions retried:', JSON.stringify(r)) } catch (e) { console.warn('[SS] pending retry failed', e) }
+  }
   if (resource_type === 'SHIP_NOTIFY' || resource_type === 'ORDER_SHIPPED'
       || resource_type === 'ITEM_SHIPPED' || resource_type === 'FULFILLMENT_SHIPPED') {
     const shipments = data.shipments ?? [data]
@@ -10776,8 +10855,9 @@ Deno.serve(async (req) =&gt; {
         continue
       }
       const resolvedOrderNum = resolvedOrderNumOrNull
-      const { data: erpLinesRaw } = await db.from('sales')
-        .select('id,pn,fulfillment_status,qty').eq('order_number', resolvedOrderNum)
+      let { data: erpLinesRaw, error: _elErr } = await db.from('sales')
+        .select('id,pn,fulfillment_status,qty,deduct_pending').eq('order_number', resolvedOrderNum)
+      if (_elErr) ({ data: erpLinesRaw } = await db.from('sales').select('id,pn,fulfillment_status,qty').eq('order_number', resolvedOrderNum))
       const erpLines = erpLinesRaw ?? []
       const allErpPns = erpLines.map((l: any) =&gt; l.pn as string)
       const norm = (s: string) =&gt; s.trim().toUpperCase()
@@ -10820,13 +10900,33 @@ Deno.serve(async (req) =&gt; {
       console.log('[SS] matchedPns', JSON.stringify(matchedPns), 'of', JSON.stringify(allErpPns), viaSplit ? '(via split link)' : '')
       const isSplit = matchedPns.length &gt; 0 &amp;&amp; matchedPns.length &lt; allErpPns.length
 
-      let alreadyProcessed = false
-      if (tracking) {
-        const { data: dupeCheck } = await db.from('inv_corrections').select('id').eq('source', 'shipment').ilike('reason', '%' + tracking + '%').limit(1)
-        alreadyProcessed = !!dupeCheck?.length
-        if (alreadyProcessed) console.log('[SS] Duplicate webhook delivery for tracking', tracking, '- skipping entirely')
+      // [AUDIT v23.65] Replaces the old whole-shipment skip ("this tracking number already has a deduction, so
+      // ignore the delivery"). If an earlier delivery died half-way, that skip meant the remaining lines were
+      // marked Shipped but never deducted - permanently. Now each line is flagged deduct_pending BEFORE it is
+      // marked Shipped and cleared only once its stock is deducted (or found already deducted), so a retry or
+      // the automatic pending sweep finishes exactly the lines that are still owed. Lines already terminal and
+      // not pending were shipped some other way (ERP Ship button, bulk ship) and are left alone.
+      // [FIX] Same defense in depth for inventory: the blanket allErpPns fallback (used only when
+      // matchedPns is empty and this isn't a split child) must never deduct stock for a line that
+      // is currently On Hold - genuine matches (matchedPns.length&gt;0) are left unrestricted, since
+      // those are confirmed real shipped items regardless of prior status.
+      const _TERMINAL = ['shipped', 'delivered', 'cancelled', 'canceled', 'refunded', 'returned', 'fulfilled']
+      const pnsToDeduct = (matchedPns.length &gt; 0 ? matchedPns : (viaSplit ? [] : allErpPns.filter((p: string) =&gt; {
+        const line = erpLines.find((l: any) =&gt; l.pn === p)
+        return !line || line.fulfillment_status !== 'On Hold'
+      })))
+      const deductLines: any[] = []
+      for (const pn of pnsToDeduct) {
+        const line: any = erpLines.find((l: any) =&gt; l.pn === pn)
+        if (!line) continue
+        if (_TERMINAL.includes(String(line.fulfillment_status || '').toLowerCase())) {
+          if (line.deduct_pending === true) deductLines.push(line) // an earlier delivery shipped it but never finished the deduction
+          else console.log('[SS] skip deduct for', pn, '- terminal status', line.fulfillment_status)
+          continue
+        }
+        deductLines.push(line)
       }
-      if (alreadyProcessed) continue
+      await markDeductPending(deductLines.filter((l: any) =&gt; l.deduct_pending !== true).map((l: any) =&gt; l.id), true)
 
       if (matchedPns.length &gt; 0) {
         for (const pn of matchedPns) {
@@ -10851,25 +10951,7 @@ Deno.serve(async (req) =&gt; {
         console.warn('[SS] WARNING: no SKU match for order', resolvedOrderNum, '- updating all non-terminal, non-held lines')
         await db.from('sales').update({ fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt }).eq('order_number', resolvedOrderNum).in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'Pre-Order', 'Pre-order'])
       }
-      // [FIX] Same defense in depth for inventory: the blanket allErpPns fallback (used only when
-      // matchedPns is empty and this isn't a split child) must never deduct stock for a line that
-      // is currently On Hold - genuine matches (matchedPns.length&gt;0) are left unrestricted, since
-      // those are confirmed real shipped items regardless of prior status.
-      const pnsToDeduct = (matchedPns.length &gt; 0 ? matchedPns : (viaSplit ? [] : allErpPns.filter((p: string) =&gt; {
-        const line = erpLines.find((l: any) =&gt; l.pn === p)
-        return !line || line.fulfillment_status !== 'On Hold'
-      })))
-      for (const pn of pnsToDeduct) {
-        const line = erpLines.find((l: any) =&gt; l.pn === pn)
-        const _TERMINAL = ['shipped', 'delivered', 'cancelled', 'canceled', 'refunded', 'returned', 'fulfilled']
-        if (!line) continue
-        if (_TERMINAL.includes(String(line.fulfillment_status || '').toLowerCase())) {
-          console.log('[SS] skip deduct for', pn, '- terminal status', line.fulfillment_status)
-          continue
-        }
-        const lineQty = (line as any).qty || 1
-        await deductForShipment(pn, lineQty, tracking, resolvedOrderNum)
-      }
+      for (const line of deductLines) await deductLine(line, tracking, resolvedOrderNum)
     }
   }
   if (resource_type === 'NEW_ORDER') {
@@ -15148,6 +15230,11 @@ async function _submitPartImpl(eid){
   const newPn=$('m-pn').value.trim();if(!newPn){toast('Part # required');return;}
   const breaks=(S.pendingPriceBreaks||[]).filter(Boolean).sort(function(a,b){return a.qty-b.qty;}).map(function(b){return{qty:b.qty,price:b.price};});
   const payload={pn:newPn,vendor:$('m-vendor').value.trim(),description:$('m-desc').value.trim(),category:$('m-cat').value.trim(),unit_cost:parseFloat($('m-cost').value)||0,lead_time_weeks:parseInt($('m-lead').value)||1,avg_sales_wk:parseFloat($('m-avg').value)||0,total_unpckgd:parseInt($('m-unpckgd').value)||0,min_qty:parseFloat($('m-min').value)||0,max_qty:parseFloat($('m-max')?.value)||0,moq:parseFloat($('m-moq').value)||0,safety_stock:parseFloat($('m-safety')?.value)||0,price_breaks:breaks,location:$('m-loc').value.trim(),drawing_url:$('m-drawing').value.trim(),image_url:($('m-image')?.value||'').trim()||null,build_to_order:!!($('m-build-to-order')?.checked),notes:($('m-notes')?.value||'').trim()||null,discontinued:$('m-disc').checked,updated_at:new Date().toISOString()};
+  // [AUDIT] On Hand used to ride along with EVERY save of this form - fix a typo in the description while a
+  // shipment went out and the shipped units came back. It now moves only if On Hand was actually edited,
+  // and then as a delta through adjustStock (one stock rule, audited, Shopify synced).
+  const _ohEl=$('m-unpckgd');const _ohChanged=!!(eid&&_ohEl&&String(_ohEl.value).trim()!==String(_ohEl.defaultValue).trim());const _ohTarget=payload.total_unpckgd;
+  if(eid)delete payload.total_unpckgd;
   if(_isBoxCat(payload.category)){
     var _bl=document.getElementById('m-box-l'),_bw=document.getElementById('m-box-w'),_bh=document.getElementById('m-box-h');
     if(_bl)payload.box_length_in=_bl.value?parseFloat(_bl.value):null;
@@ -15195,11 +15282,15 @@ async function _submitPartImpl(eid){
     if(!error&&prev)pushUndo('update','parts',{...prev,...payload},prev,'Edit part: '+payload.pn);
     // [FIX C] On Hand can be changed directly on this form. Both this and the Edit Assembly form now
     // log an inv_corrections entry and trigger Shopify sync when the direct edit changes stock (below).
-    if(!error&&prev&&(prev.total_unpckgd||0)!==(payload.total_unpckgd||0)){
-      const _adj=(payload.total_unpckgd||0)-(prev.total_unpckgd||0);
-      await db.from('inv_corrections').insert({pn:payload.pn,previous_qty:prev.total_unpckgd||0,new_qty:payload.total_unpckgd||0,adjustment:_adj,reason:'Direct edit via Edit Part form',user_email:S.currentUser||null,source:'manual_edit'});
-      syncShopifyTemplate(payload.pn,payload.total_unpckgd||0);
-      cascadeShopifySync(payload.pn);
+    if(!error&&prev&&_ohChanged){
+      const _fr=await db.from('parts').select('total_unpckgd').eq('id',prev.id).maybeSingle();
+      const _cur=(!_fr.error&&_fr.data)?(Number(_fr.data.total_unpckgd)||0):(prev.total_unpckgd||0);
+      const _d=_ohTarget-_cur;
+      if(_d){
+        const _nq=await adjustStock('part',{...prev,pn:payload.pn},_d,{reason:'Direct edit via Edit Part form',source:'manual_edit'});
+        if(_nq===null)toast('Saved, but the On Hand change failed - stock unchanged',8000);
+        else pushUndo('update','parts',{id:prev.id,pn:payload.pn,total_unpckgd:_nq},{id:prev.id,pn:payload.pn,total_unpckgd:_cur},'On Hand edit: '+payload.pn);
+      }
     }
   }
   else{({data,error}=await db.from('parts').insert(payload).select().single());}
@@ -16377,6 +16468,9 @@ window.submitAsm=submitAsm;
 async function _submitAsmImpl(eid){
   const newPn=$('m-pn').value.trim();if(!newPn){toast('SKU required');return;}
   const payload={pn:newPn,description:$('m-desc').value.trim(),category:$('m-cat').value.trim(),msrp:parseFloat($('m-msrp').value)||0,shipping_cost:parseFloat($('m-ship').value)||10,total_on_hand:parseInt($('m-oh').value)||0,status:$('m-status').value,location:($('m-location')?.value||'').trim()||null,avg_sales_wk:parseFloat($('m-avg').value)||0,drawing_url:$('m-drawing').value.trim(),image_url:($('m-image')?.value||'').trim()||null,discontinued:$('m-stage')?.value==='discontinued',stage:$('m-stage')?.value==='discontinued'?null:($('m-stage')?.value||null),new_sku:($('m-new-sku')?.value||'').trim()||null,use_new_sku:!!($('m-use-new-sku')?.checked),cc_project:($('m-cc-project')?.value||'').trim()||null,pl_notes:($('m-pl-notes')?.value||'').trim()||null,product_url:($('m-product-url')?.value||'').trim()||null,website:!!($('m-website')?.checked),force_backorder:!!($('m-force-bo')?.checked),build_to_order:!!($('m-build-to-order')?.checked),updated_at:new Date().toISOString()};
+  // [AUDIT] Same as the Edit Part form: stock only moves when On Hand was actually edited, as a delta.
+  const _ohEl=$('m-oh');const _ohChanged=!!(eid&&_ohEl&&String(_ohEl.value).trim()!==String(_ohEl.defaultValue).trim());const _ohTarget=payload.total_on_hand;
+  if(eid)delete payload.total_on_hand;
   let error,data;
   if(eid){
     const prev=S.assemblies.find(a=>a.id===eid);
@@ -16417,11 +16511,15 @@ async function _submitAsmImpl(eid){
     // and triggers the Shopify sync. Without this, a direct edit here silently drifts from both the
     // audit trail and Shopify's backorder status — exactly the kind of gap that's easy to miss because
     // editing a form field feels like "just changing data," not "shipping or receiving inventory."
-    if(!error&&prev&&(prev.total_on_hand||0)!==(payload.total_on_hand||0)){
-      const _adj=(payload.total_on_hand||0)-(prev.total_on_hand||0);
-      await db.from('inv_corrections').insert({pn:payload.pn,previous_qty:prev.total_on_hand||0,new_qty:payload.total_on_hand||0,adjustment:_adj,reason:'Direct edit via Edit Assembly form',user_email:S.currentUser||null,source:'manual_edit'});
-      syncShopifyTemplate(payload.pn,payload.total_on_hand||0);
-      cascadeShopifySync(payload.pn);
+    if(!error&&prev&&_ohChanged){
+      const _fr=await db.from('assemblies').select('total_on_hand').eq('id',prev.id).maybeSingle();
+      const _cur=(!_fr.error&&_fr.data)?(Number(_fr.data.total_on_hand)||0):(prev.total_on_hand||0);
+      const _d=_ohTarget-_cur;
+      if(_d){
+        const _nq=await adjustStock('assembly',{...prev,pn:payload.pn},_d,{reason:'Direct edit via Edit Assembly form',source:'manual_edit'});
+        if(_nq===null)toast('Saved, but the On Hand change failed - stock unchanged',8000);
+        else pushUndo('update','assemblies',{id:prev.id,pn:payload.pn,total_on_hand:_nq},{id:prev.id,pn:payload.pn,total_on_hand:_cur},'On Hand edit: '+payload.pn);
+      }
     }
   }
   else{({data,error}=await db.from('assemblies').insert(payload).select().single());}
@@ -17525,6 +17623,10 @@ function startAutoRefresh(){
   // Auto hold sync — Integrations has always claimed this runs "every 5 min", but no timer ever
   // existed to actually do it; syncHoldsOnly()/runHoldSync() were click-only. Holds are time-
   // sensitive (fraud flags, backorders, CS issues) so this runs independent of idle state.
+  if(S.autoDeductRetryTimer)clearInterval(S.autoDeductRetryTimer);
+  // [AUDIT] Shipments whose stock deduction failed stay flagged on the sales line and are retried here,
+  // as well as at the start of every ShipStation webhook. Silent unless something was fixed or still fails.
+  S.autoDeductRetryTimer=setInterval(function(){if(S.currentUserId)retryPendingDeductions(true);},5*60*1000);
   S.autoHoldSyncTimer=setInterval(async()=>{
     if(!S.currentUserId)return;
     if(!(S.shopify?.store&&S.shopify?.key))return; // Shopify not configured — nothing to sync against
@@ -19727,21 +19829,34 @@ function activeTierNum(p, qty){
 
 function buildOnOrderMap(){
   // One pass over all POs → map of pn → open (unreceived) qty. Invalidate by setting S._onOrderMap=null on any PO mutation.
-  const m={};
+  const m={},dm={};
   S.purchases.forEach(po=>{
     if(po.status==='Received'||po.status==='Recovered'||po.status==='Cancelled'||po.status==='Lost')return;
     const lines=S.poLines[po.id]||[];
     // [AUDIT] Keyed by the item's canonical pn (a PO line entered under the new SKU used to count as on
     // order for nothing), and a line-less legacy PO now counts only what is still outstanding.
     const _k=pn=>(_canonItem(pn)||{}).pn||pn;
+    const _isDraft=po.status==='Draft';
+    const _add=function(k,q){m[k]=(m[k]||0)+q;if(_isDraft&&q>0)dm[k]=(dm[k]||0)+q;};
     if(lines.length){
-      lines.forEach(l=>{if(!l.pn)return;const k=_k(l.pn);m[k]=(m[k]||0)+Math.max(0,(l.qty_ordered||0)-(l.qty_received||0));});
+      lines.forEach(l=>{if(!l.pn)return;_add(_k(l.pn),Math.max(0,(l.qty_ordered||0)-(l.qty_received||0)));});
     }else if(po.pn){
-      const k=_k(po.pn);m[k]=(m[k]||0)+Math.max(0,(po.qty||0)-(po.qty_received||0));
+      _add(_k(po.pn),Math.max(0,(po.qty||0)-(po.qty_received||0)));
     }
   });
+  // Draft POs DO count as on order (so the same shortage is not suggested twice), but the draft share is
+  // kept separately so every screen can say so. Non-enumerable: callers iterating the map never see it.
+  Object.defineProperty(m,'_draft',{value:dm,enumerable:false});
   return m;
 }
+// How much of openOrderedQty(pn) is sitting on DRAFT POs (created, not yet sent to the vendor).
+function openDraftQty(pn){
+  const k=(_canonItem(pn)||{}).pn||pn;
+  const m=S._onOrderMap||buildOnOrderMap();
+  return (m._draft&&m._draft[k])||0;
+}
+function draftNote(pn){const d=openDraftQty(pn);return d>0?(' ('+d+' draft)'):'';}
+window.openDraftQty=openDraftQty;window.draftNote=draftNote;
 function openOrderedQty(pn) {
   // [AUDIT] Same canonical keying as buildOnOrderMap, so the cached and uncached answers always agree.
   const k=(_canonItem(pn)||{}).pn||pn;
@@ -20493,10 +20608,10 @@ function renderPlanning() {
       <td class="pn" style="color:${_isDevRow?'var(--purple)':'var(--text)'}">${dispPn(p)}${_isDevRow?' <span class="bomtag bomtag-hwp" title="DEV-only part - kept out of planning KPIs and suggested POs">DEV</span>':''}${p.use_new_sku&&p.new_sku?`<div style="font-size:var(--t-xs);color:var(--text3);font-weight:400">${escHtml(p.pn)}</div>`:''}</td>
       <td style="max-width:115px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--t-sm)">${p.description||''}</td>
       <td style="font-size:var(--t-xs);color:var(--text3);max-width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.vendor||''}</td>
-      <td title="Reorder point: ${rp}${onOrder>0?' · '+onOrder+' on open PO':''}${reserved>0?' · '+reserved+' reserved for backorders':''}">
+      <td title="Reorder point: ${rp}${onOrder>0?' · '+onOrder+' on open PO'+draftNote(p.pn):''}${reserved>0?' · '+reserved+' reserved for backorders':''}">
         <div style="font-weight:700;color:${ohColor}">${oh}${reserved>0?` <span style="font-size:var(--t-xs);color:var(--orange);font-weight:400">(${effectiveOh} avail)</span>`:''}</div>
         <div style="width:52px;height:4px;background:var(--bg3);border-radius:var(--r-sm);margin-top:3px;overflow:hidden"><div style="width:${barPct}%;height:100%;background:${barColor};border-radius:var(--r-sm)"></div></div>
-        ${onOrder>0?`<div style="font-size:var(--t-xs);color:var(--teal);margin-top:2px;white-space:nowrap">+${onOrder} on order</div>`:''}
+        ${onOrder>0?`<div style="font-size:var(--t-xs);color:var(--teal);margin-top:2px;white-space:nowrap">+${onOrder} on order${draftNote(p.pn)}</div>`:''}
         ${((S._openPoCnt&&Math.max(S._openPoCnt[p.pn]||0,p.new_sku?(S._openPoCnt[p.new_sku]||0):0))>1)?`<div style="margin-top:2px"><span class="pill pill-red" style="cursor:pointer" onclick="event.stopPropagation();openRepeatPOAdvisor('overlap')" title="More than one open PO for this part. Click to see them and the MOQ the Repeat PO Advisor recommends.">${Math.max(S._openPoCnt[p.pn]||0,p.new_sku?(S._openPoCnt[p.new_sku]||0):0)} open POs</span></div>`:''}
       </td>
 
@@ -20514,7 +20629,7 @@ function renderPlanning() {
       <td style="font-weight:700;font-size:var(--t-md);font-family:var(--mono);vertical-align:middle" title="Weeks of stock at current demand rate${wksNeg?' — IN DEFICIT: reserved backorders exceed on-hand stock':''}"><span style="color:${wksColor};background:${wksBg};padding:${wksPad};border-radius:${wksRadius};display:inline-block">${wksStock!==null?wksStock+'w':'—'}</span></td>
       <td style="vertical-align:middle;padding:6px 8px" title="Reorder point: ${rp} · Need: ${S.forecastWeeks||8}w + ${ltWeeks(p)}w lead = ${(S.forecastWeeks||8)+ltWeeks(p)}w coverage · MOQ: ${effectiveMOQ>0?(effectiveMOQ+(moq>0?' (explicit)':' (Tier 1 break)')):'none'} · On order: ${onOrder} · Max (order-up-to, info only): ${p.max_qty>0?p.max_qty:'none'}">
         ${alreadyCovered
-          ? '<span style="color:var(--teal);font-size:var(--t-sm);font-weight:700">&#10003; Covered</span><div style="font-size:var(--t-xs);color:var(--text3);margin-top:1px">'+onOrder+' inbound</div>'
+          ? '<span style="color:var(--teal);font-size:var(--t-sm);font-weight:700">&#10003; Covered</span><div style="font-size:var(--t-xs);color:var(--text3);margin-top:1px">'+onOrder+' inbound'+draftNote(p.pn)+'</div>'
           : sq===0
             ? '<span style="color:var(--text3);font-size:var(--t-md)">&mdash;</span>'+(moq>0?'<div class="t3xxs">optional min '+moq+'</div>':'')
             : '<span style="font-size:var(--t-md);font-weight:700;color:'+(moq>sq?'var(--orange)':'var(--text)')+'">'+orderQty+'</span>'
@@ -20524,7 +20639,7 @@ function renderPlanning() {
 
         }
       </td>
-      <td><span class="pill ${statusCls}" title="Reorder point: ${rp}${onOrder>0?' · '+onOrder+' on open PO':''}">${status}</span></td>
+      <td><span class="pill ${statusCls}" title="Reorder point: ${rp}${onOrder>0?' · '+onOrder+' on open PO'+draftNote(p.pn):''}">${status}</span></td>
       <td onclick="event.stopPropagation()" style="padding:4px 8px;vertical-align:middle;white-space:nowrap">
         ${(()=>{
           const inCart=S.poCart&&S.poCart.find(c=>c.pn===p.pn);
@@ -24757,6 +24872,7 @@ async function applyCountCorrections(countId) {
         (r.data||[]).forEach(function(row){
           const it=_aliases[row.pn]; if(!it||!it.line.counted_at)return;
           if(row.source==='cycle_count'&&row.reference_id===countId)return;
+          if(row.source==='normalize')return; // relabels a negative figure as backorder - nothing physical moved
           if(String(row.created_at)<=String(it.line.counted_at))return;
           const d=(row.previous_qty!=null&&row.new_qty!=null)?(Number(row.new_qty)-Number(row.previous_qty)):(Number(row.adjustment)||0);
           _moved.set(it,(_moved.get(it)||0)+d);
@@ -24771,7 +24887,7 @@ async function applyCountCorrections(countId) {
     // fresh from the database, not the possibly stale screen copy
     const _fresh=await db.from(it.isAsm?'assemblies':'parts').select(it.isAsm?'total_on_hand':'total_unpckgd').eq('id',it.rec.id).maybeSingle();
     const cur=(!_fresh.error&&_fresh.data)?Number(it.isAsm?_fresh.data.total_on_hand:_fresh.data.total_unpckgd)||0:(Number(it.isAsm?it.rec.total_on_hand:it.rec.total_unpckgd)||0);
-    const sysAtCount=_histOk?(cur-(_moved.get(it)||0)):cur;
+    const sysAtCount=Math.max(0,_histOk?(cur-(_moved.get(it)||0)):cur); // on-hand is never below 0 physically
     const _d=Number(line.actual_qty)-sysAtCount;
     if(!_d)continue;
     const _why=it.isAsm?('Cycle Count (finished/sub \u2014 components untouched)'+(line.notes?' \u2014 '+line.notes:'')):('Cycle Count '+(line.notes?'\u2014 '+line.notes:''));
@@ -25260,10 +25376,62 @@ function renderAuditLog(){
   </tr></thead><tbody>${rows}</tbody></table></div>`}`;
 }
 
+// [AUDIT] One stock rule: on hand is never below 0; anything owed beyond what is on the shelf is
+// backorder_qty. Rows written under the old "negative means backorder" convention are relabelled here.
+function _negStockRows(){
+  return [].concat(
+    (S.parts||[]).filter(function(p){return (Number(p.total_unpckgd)||0)<0;}).map(function(p){return {k:'part',r:p,oh:Number(p.total_unpckgd)};}),
+    (S.assemblies||[]).filter(function(a){return (Number(a.total_on_hand)||0)<0;}).map(function(a){return {k:'assembly',r:a,oh:Number(a.total_on_hand)};})
+  );
+}
+async function normalizeNegativeStock(){
+  const rows=_negStockRows();
+  if(!rows.length){toast('No negative stock figures - nothing to do');return;}
+  if(!confirm('Rewrite '+rows.length+' negative on-hand figure'+(rows.length!==1?'s':'')+' as backorder?\n\nExample: on hand -3 becomes on hand 0 with 3 on backorder. Nothing physical changes; the number just moves into the one format the whole app uses.'))return;
+  let ok=0,bad=0;
+  for(const it of rows){
+    const tbl=it.k==='part'?'parts':'assemblies',f=it.k==='part'?'total_unpckgd':'total_on_hand';
+    const fr=await db.from(tbl).select(f+',backorder_qty').eq('id',it.r.id).maybeSingle();
+    if(fr.error||!fr.data){bad++;continue;}
+    const oh=Number(fr.data[f])||0;if(oh>=0)continue;
+    const upd={backorder_qty:(Number(fr.data.backorder_qty)||0)+(-oh),updated_at:new Date().toISOString()};upd[f]=0;
+    const u=await db.from(tbl).update(upd).eq('id',it.r.id).lt(f,0);
+    if(u.error){bad++;continue;}
+    await db.from('inv_corrections').insert({pn:it.r.pn,previous_qty:oh,new_qty:0,adjustment:0,reason:'Normalized: on hand '+oh+' rewritten as 0 on hand + '+(-oh)+' backorder',user_email:S.currentUser||null,source:'normalize'});
+    ok++;
+  }
+  await loadAll();
+  toast(ok+' figure'+(ok!==1?'s':'')+' rewritten as backorder'+(bad?(' -- '+bad+' failed, see console'):''),bad?9000:5000);
+}
+window.normalizeNegativeStock=normalizeNegativeStock;
+async function retryPendingDeductions(silent){
+  try{
+    const r=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({action:'retry_pending_deductions'})});
+    const d=await r.json().catch(function(){return {};});
+    if(!r.ok||d.error){if(!silent)toast('Retry failed: '+(d.error||r.status)+' -- redeploy shipstation-ship and run the sales migration',9000);return d;}
+    if(!silent||d.done||d.failed)toast('Pending stock deductions: '+(d.tried||0)+' checked, '+(d.done||0)+' completed'+(d.failed?(', '+d.failed+' still failing (see Error Log)'):''),d.failed?9000:5000);
+    if(d.done){await refreshSales();render();}
+    S._pendingDeductions=d.remaining!=null?d.remaining:S._pendingDeductions;
+    return d;
+  }catch(e){if(!silent)toast('Retry failed: '+e.message,7000);return null;}
+}
+window.retryPendingDeductions=retryPendingDeductions;
+function _diStockPanel(){
+  const neg=_negStockRows();
+  return '<div class="panel" style="margin-bottom:12px;padding:12px 16px">'
+    +'<div class="panel-title"><span>Stock format &amp; shipment deductions</span></div>'
+    +'<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:var(--t-sm)">'
+    +'<div style="flex:1;min-width:240px">'+(neg.length
+      ?('<b style="color:var(--orange)">'+neg.length+'</b> item'+(neg.length!==1?'s':'')+' still use the old negative on-hand format ('+neg.slice(0,4).map(function(x){return escHtml(dispPn(x.r))+' '+x.oh;}).join(', ')+(neg.length>4?', ...':'')+').')
+      :'<span style="color:var(--green)">No negative on-hand figures - every item uses on hand + backorder.</span>')+'</div>'
+    +(neg.length?'<button class="btn btn-sm" onclick="normalizeNegativeStock()">Rewrite as backorder</button>':'')
+    +'<button class="btn btn-sm" onclick="retryPendingDeductions(false)" title="Shipments whose stock deduction failed are retried automatically every 5 minutes and on every ShipStation webhook. This runs it now.">Retry pending deductions</button>'
+    +'</div></div>';
+}
 function renderDataIntegrity(){
   if(!S._diResults)S._diResults=null;
   if(!S._diLoading)S._diLoading=false;
-  return `
+  return _diStockPanel()+`
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
     <div>
       <div style="font-size:var(--t-md);color:var(--text2);margin-bottom:4px">Automated checks for the specific failure patterns found in this system historically — not a general health check, a targeted one. Run any time you want to verify nothing has silently drifted.</div>
@@ -27916,7 +28084,7 @@ function openPartOrderModal(pn){
         </div>
         <div style="background:var(--bg3);border-radius:var(--r-md);padding:8px;text-align:center">
           <div style="font-size:var(--t-xs);color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">On Order</div>
-          <div style="font-size:var(--t-2xl);font-weight:700;color:var(--teal)">${onOrder}</div>
+          <div style="font-size:var(--t-2xl);font-weight:700;color:var(--teal)">${onOrder}</div>${openDraftQty(pn)>0?'<div style="font-size:var(--t-xs);color:var(--orange);font-weight:600">incl. '+openDraftQty(pn)+' on draft PO</div>':''}
         </div>
         <div style="background:var(--bg3);border-radius:var(--r-md);padding:8px;text-align:center">
           <div style="font-size:var(--t-xs);color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">Vendor</div>
@@ -31247,7 +31415,10 @@ function recNavGo(dir){
   if(i<0){console.warn('[recnav] current record',cur,'is not in the nav list ('+rn.ids.length+' ids, kind: '+rn.kind+') -- likely stale after a filter/sort change since this record was opened');return;}
   var next=Math.max(0,Math.min(rn.ids.length-1,i+dir));
   if(next===i)return; // already at the start/end of the list -- not an error, just a boundary
-  try{rn.opener(rn.ids[next]);}catch(e){console.warn('[recnav]',e);}
+  // [FIX] A failing opener used to be swallowed into a console warning, so Prev/Next just looked dead
+  // (the PO list pointed at an openPO() that does not exist). Say so on screen instead.
+  try{var _r=rn.opener(rn.ids[next]);if(_r&&typeof _r.catch==='function')_r.catch(function(e){console.error('[recnav]',e);toast('Could not open the '+(next>i?'next':'previous')+' '+rn.kind+': '+(e&&e.message||e),7000);});}
+  catch(e){console.error('[recnav]',e);toast('Could not open the '+(next>i?'next':'previous')+' '+rn.kind+': '+(e&&e.message||e),7000);}
   var content=document.getElementById('content');
   if(content)content.scrollTop=0;
 }
@@ -31423,7 +31594,7 @@ function renderPOBuilderTab(){
       '<td style="font-size:var(--t-xs);color:var(--text3);padding:4px 8px">'+escHtml(l.vendor)+'</td>'+
       '<td style="text-align:center;font-size:var(--t-sm);padding:4px 6px">'+(pb.computed?l.neededQty:'')+'</td>'+
       '<td style="text-align:center;font-size:var(--t-sm);color:'+(l.oh>0?'var(--teal)':'var(--text3)')+';padding:4px 6px">'+(pb.computed?l.oh:'')+'</td>'+
-      '<td style="text-align:center;font-size:var(--t-sm);color:var(--text3);padding:4px 6px">'+(pb.computed&&l.onOrder?l.onOrder:'')+'</td>'+
+      '<td style="text-align:center;font-size:var(--t-sm);color:var(--text3);padding:4px 6px">'+(pb.computed&&l.onOrder?l.onOrder+draftNote(l.pn):'')+'</td>'+
       '<td style="text-align:center;font-weight:700;padding:4px 6px;color:'+(isNeeded?'var(--orange)':'var(--teal)')+'">'+(pb.computed?(isNeeded?l.net:'\u2713'):'')+'</td>'+
       '<td style="padding:2px 6px"><input class="inline-edit" type="number" min="0" value="'+l.orderQty+'" style="width:60px;text-align:center;font-weight:700;font-size:var(--t-md)" onclick="event.stopPropagation()" oninput="poBuildRowUpdate('+i+',\'orderQty\',Math.max(0,+this.value||0))"></td>'+
       '<td style="padding:2px 6px"><input class="inline-edit" type="number" min="0" step="0.0001" value="'+l.unitCost.toFixed(4)+'" style="width:72px;text-align:right;font-family:var(--mono);font-size:var(--t-sm)" onclick="event.stopPropagation()" oninput="poBuildRowUpdate('+i+',\'unitCost\',parseFloat(this.value)||0)"></td>'+
