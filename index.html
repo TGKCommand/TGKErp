@@ -461,7 +461,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.63';
+const TGK_ERP_VERSION = 'v23.64';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -2024,15 +2024,6 @@ function syncShopifyTemplate(pn,newOh){
   // where the stock number actually changed always goes through, so packing two orders back-to-
   // back (1 -> 0) still syncs correctly rather than having the second, more-correct call dropped.
   // Keyed per SKU, so unrelated items continue syncing in parallel.
-  if(!S._syncThrottle)S._syncThrottle={};
-  var _tk=String(pn);
-  var _now=Date.now();
-  var _prev=S._syncThrottle[_tk];
-  if(_prev&&(_now-_prev.at)<30000&&_prev.oh===newOh){
-    console.log('[Shopify template] '+pn+': skipped -- identical sync (oh='+newOh+') '+Math.round((_now-_prev.at)/1000)+'s ago');
-    return;
-  }
-  S._syncThrottle[_tk]={at:_now,oh:newOh};
   var _item=S.assemblies.find(function(a){return a.pn===pn||a.new_sku===pn;})||S.parts.find(function(p){return p.pn===pn||p.new_sku===pn;});
   if(_item&&!eligibleForBackorderSync(_item)){console.log('[Shopify template] skipped — not eligible (subassembly/hardware pack/pre-order/discontinued/dev):',pn);return;}
   // [SKU] Shopify variant SKUs are the customer-facing SKU (new_sku when use_new_sku). Callers hand us the
@@ -2058,7 +2049,6 @@ function syncShopifyTemplate(pn,newOh){
     }
   }
   const template=isBackorder?(S.settings.shopify_backorder_template||'backorder'):'';
-  if(!isBackorder&&_item&&typeof boReleaseLock==='function')boReleaseLock(_item.pn); // came off backorder: any manual date lock ends here
   console.log('[Shopify template] '+pn+': newOh='+newOh+' -> template='+(template||'(revert to normal)'));
   var restockDate='';
   if(isBackorder){
@@ -2081,6 +2071,18 @@ function syncShopifyTemplate(pn,newOh){
       console.log('[Shopify backorder] '+pn+': new backorder — restock_date='+restockDate+' ('+restockDays+' days)');
     }
   }
+  // [AUDIT] Throttle moved here and keyed on the DECISION. It used to skip any repeat within 30s at the same
+  // stock number - but a finished good at 0 on hand changes backorder state when its COMPONENTS change
+  // (cascadeShopifySync), with its own number still 0. Receive parts then pack them inside 30s and the second,
+  // correct sync was dropped, leaving Shopify selling an item that can no longer be built.
+  if(!S._syncThrottle)S._syncThrottle={};
+  var _tk=String(pn),_now=Date.now(),_prev=S._syncThrottle[_tk],_sig=(isBackorder?'BO':'OK')+'|'+(restockDate||'');
+  if(_prev&&(_now-_prev.at)<30000&&_prev.sig===_sig){
+    console.log('[Shopify template] '+pn+': skipped -- same decision ('+_sig+') '+Math.round((_now-_prev.at)/1000)+'s ago');
+    return;
+  }
+  S._syncThrottle[_tk]={at:_now,sig:_sig};
+  if(!isBackorder&&_item&&typeof boReleaseLock==='function')boReleaseLock(_item.pn); // came off backorder: any manual date lock ends here
   // Variant-level backorder: each SKU is its own Shopify variant, so control THAT variant
   // (sold out on backorder, always-available on restock) instead of the whole product template.
   // If the new edge action isn't deployed yet, fall back to the product-template behavior.
@@ -24721,40 +24723,69 @@ async function updateCountLineNote(lineId, note) {
 
 async function applyCountCorrections(countId) {
   let _corrErrors=0;
-  const variances=S.countLines.filter(l=>l.actual_qty!=null&&l.actual_qty!==(l.expected_qty||0));
-  if(!variances.length){
+  const _anyCounted=S.countLines.some(l=>l.actual_qty!=null);
+  if(!_anyCounted){
     await db.from('cycle_counts').update({status:'Complete',completed_at:new Date().toISOString()}).eq('id',countId);
     S.cycleCounts=S.cycleCounts.map(c=>c.id===countId?{...c,status:'Complete'}:c);
     toast('No variances — count closed');render();return;
   }
-  if(!confirm('Apply '+variances.length+' inventory corrections?')) return;
-  for(const line of variances){
-    const newQty=line.actual_qty;
-    if(line.item_type==='assembly'){
-      const asm=asmByPn(line.pn);
-      if(!asm) continue;
-      const _d=newQty-(asm.total_on_hand||0);
-      if(_d!==0){
-        const _nv=await adjustStock('assembly',asm,_d,{reason:'Cycle Count (finished/sub \u2014 components untouched)'+(line.notes?' \u2014 '+line.notes:''),source:'cycle_count',reference_id:countId});
-        if(_nv===null){_corrErrors++;continue;}
-        if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
+  // [AUDIT] Corrections used to SET stock to the counted number against today's system figure, and only for
+  // lines whose count differed from the expected number snapshotted when the count was CREATED. Stock that
+  // moved between counting a shelf and pressing Apply was silently undone (count 8, ship 3, apply -> 8, not
+  // 5), and a line counted after stock moved but matching the old expected number was skipped entirely.
+  // Now: for every counted line, system-at-count-time = current DB qty minus every movement logged since
+  // that line was counted; the correction is (counted - system-at-count-time), applied as a delta.
+  const _counted=S.countLines.filter(l=>l.actual_qty!=null);
+  if(!confirm('Apply corrections for '+_counted.length+' counted line'+(_counted.length!==1?'s':'')+'?\n\nEach line is compared with what the system showed at the moment it was counted, so anything shipped, packed or received since then is kept.'))return;
+  const _items=_counted.map(function(line){
+    const isAsm=line.item_type==='assembly';
+    const rec=isAsm?asmByPn(line.pn):partByPn(line.pn);
+    return {line:line,isAsm:isAsm,rec:rec};
+  });
+  const _aliases={};
+  _items.forEach(function(it){if(!it.rec)return;[it.rec.pn,it.rec.new_sku,it.line.pn].forEach(function(k){if(k)_aliases[k]=it;});});
+  const _times=_counted.map(l=>l.counted_at).filter(Boolean).sort();
+  const _moved=new Map(); // item -> on-hand change logged after its count
+  let _histOk=true;
+  if(_times.length&&Object.keys(_aliases).length){
+    try{
+      const _keys=Object.keys(_aliases);
+      for(let i=0;i<_keys.length;i+=200){
+        const r=await db.from('inv_corrections').select('pn,previous_qty,new_qty,adjustment,source,reference_id,created_at')
+          .in('pn',_keys.slice(i,i+200)).gt('created_at',_times[0]);
+        if(r.error)throw r.error;
+        (r.data||[]).forEach(function(row){
+          const it=_aliases[row.pn]; if(!it||!it.line.counted_at)return;
+          if(row.source==='cycle_count'&&row.reference_id===countId)return;
+          if(String(row.created_at)<=String(it.line.counted_at))return;
+          const d=(row.previous_qty!=null&&row.new_qty!=null)?(Number(row.new_qty)-Number(row.previous_qty)):(Number(row.adjustment)||0);
+          _moved.set(it,(_moved.get(it)||0)+d);
+        });
       }
-    } else {
-      const part=partByPn(line.pn);
-      if(!part){_corrErrors++;continue;}
-      const _d=newQty-(part.total_unpckgd||0);
-      if(_d!==0){
-        const _nv=await adjustStock('part',part,_d,{reason:'Cycle Count '+(line.notes?'\u2014 '+line.notes:''),source:'cycle_count',reference_id:countId});
-        if(_nv===null){_corrErrors++;continue;}
-        if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
-      }
-    }
+    }catch(e){_histOk=false;console.warn('[cycle count] movement history unavailable - falling back to set-to-counted',e);}
   }
+  let _applied=0;
+  for(const it of _items){
+    const line=it.line;
+    if(!it.rec){_corrErrors++;continue;}
+    // fresh from the database, not the possibly stale screen copy
+    const _fresh=await db.from(it.isAsm?'assemblies':'parts').select(it.isAsm?'total_on_hand':'total_unpckgd').eq('id',it.rec.id).maybeSingle();
+    const cur=(!_fresh.error&&_fresh.data)?Number(it.isAsm?_fresh.data.total_on_hand:_fresh.data.total_unpckgd)||0:(Number(it.isAsm?it.rec.total_on_hand:it.rec.total_unpckgd)||0);
+    const sysAtCount=_histOk?(cur-(_moved.get(it)||0)):cur;
+    const _d=Number(line.actual_qty)-sysAtCount;
+    if(!_d)continue;
+    const _why=it.isAsm?('Cycle Count (finished/sub \u2014 components untouched)'+(line.notes?' \u2014 '+line.notes:'')):('Cycle Count '+(line.notes?'\u2014 '+line.notes:''));
+    const _nv=await adjustStock(it.isAsm?'assembly':'part',it.rec,_d,{reason:_why,source:'cycle_count',reference_id:countId});
+    if(_nv===null){_corrErrors++;continue;}
+    _applied++;
+    if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
+  }
+  const variances={length:_applied}; // keeps the closing log/toast below accurate
   await db.from('cycle_counts').update({status:'Complete',completed_at:new Date().toISOString()}).eq('id',countId);
   S.cycleCounts=S.cycleCounts.map(c=>c.id===countId?{...c,status:'Complete'}:c);
   updateBadge();
   logAction('Applied cycle count — '+variances.length+' stock corrections','cycle_counts',null,null,null).catch(()=>{});
-  toast(variances.length+' corrections applied');
+  toast(variances.length+' correction'+(variances.length!==1?'s':'')+' applied'+(_corrErrors?(' \u2014 \u26a0 '+_corrErrors+' line(s) could not be corrected (item not found or stock write failed)'):''),_corrErrors?9000:4000);
   render();
 }
 
