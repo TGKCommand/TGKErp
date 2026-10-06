@@ -461,7 +461,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.67';
+const TGK_ERP_VERSION = 'v23.68';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -8107,7 +8107,7 @@ Deno.serve(async (req) =&gt; {
     const page_info = body.page_info || ''
     const url = page_info
       ? 'https://' + store + '/admin/api/2024-01/orders.json?limit=250&amp;page_info=' + page_info
-      : 'https://' + store + '/admin/api/2024-01/orders.json?status=any&amp;limit=250&amp;updated_at_min=' + encodeURIComponent(since)
+      : 'https://' + store + '/admin/api/2024-01/orders.json?status=any&amp;limit=250&amp;updated_at_min=' + encodeURIComponent(since) + (body.created_min ? '&amp;created_at_min=' + encodeURIComponent(body.created_min) : '') + (body.created_max ? '&amp;created_at_max=' + encodeURIComponent(body.created_max) : '')
     const shopRes = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
     if (!shopRes.ok) {
       return new Response(JSON.stringify({error:'Shopify ' + shopRes.status}), {status:shopRes.status, headers:{...CORS,'Content-Type':'application/json'}})
@@ -12940,48 +12940,9 @@ async function syncOrdersNow(){
 }
 
 async function importOrdersFromShopify(){
-  const token=prompt('Paste your Shopify Admin API token (Settings → Apps → Private apps or API credentials):\nNeeded one-time to pull historical orders.');
-  if(!token)return;
-  const store=S.shopify?.store||prompt('Your store URL (e.g. mystore.myshopify.com):');
-  if(!store)return;
-  toast('Fetching orders from Shopify… this may take a moment');
-  let imported=0,skipped=0,page=1,keepGoing=true;
-  while(keepGoing){
-    try{
-      const res=await fetch(`https://${store.replace(/^https?:\/\//,'')}/admin/api/2024-01/orders.json?status=any&limit=250&page=${page}`,{
-        headers:{'X-Shopify-Access-Token':token,'Content-Type':'application/json'}
-      });
-      if(!res.ok){toast('Shopify error '+res.status+' — check token and store URL');break;}
-      const {orders=[]}=await res.json();
-      if(!orders.length){keepGoing=false;break;}
-      for(const order of orders){
-        const orderNum=order.name;
-        for(const li of (order.line_items||[])){
-          const pn=li.sku?li.sku.trim().toUpperCase():(li.title||'').trim();
-          if(!pn)continue;
-          if(shopifyLineIsRemoved(li))continue; // zeroed-out line = removed, same as the sync path
-          const exists=S.sales.some(s=>s.order_number===orderNum&&(s.pn||'').toUpperCase()===(pn||'').toUpperCase());
-          if(exists){skipped++;continue;}
-          const fs=order.financial_status==='refunded'?'Cancelled':
-            order.fulfillment_status==='fulfilled'?'Delivered':
-            order.fulfillment_status==='partial'?'Shipped':'Open';
-          const{data}=await db.from('sales').insert({
-            order_number:orderNum,pn,qty:shopifyLineQty(li),
-            source:'Shopify Import',fulfillment_status:fs,
-            sale_date:centralDateOnly(order.created_at),
-            discount_code:(order.discount_codes?.length?order.discount_codes[0].code:null)||null,
-            ...(salesHavePrice()?{unit_price:shopifyLineUnitPrice(li),price_source:'shopify'}:{}),
-          }).select().single();
-          if(data){S.sales=[data,...S.sales];imported++;}
-        }
-      }
-      page++;
-      if(orders.length<250)keepGoing=false;
-      toast(`Importing… ${imported} orders pulled so far (page ${page-1})`);
-    }catch(e){toast('Error: '+e.message);keepGoing=false;}
-  }
-  await loadAll();autoResolveTrackedTickets();render();
-  toast(`<span class="ic ic-check"></span>Shopify import done — ${imported} new orders, ${skipped} already existed`);
+  // [v23.68] Replaced - see hpOpenImporter(). The old version fetched Shopify straight from the browser
+  // (CORS-blocked), used page-number paging Shopify removed, and imported old unfulfilled orders as Open.
+  hpOpenImporter();
 }
 
 async function syncCustomerNames(){
@@ -31672,6 +31633,10 @@ function hpModel(){
   var H=S._hpHist;if(!H)return null;
   if(!S._asmIdx||!S._partIdx)buildLookupMaps();
   var cfg=hpCfg(),today=hpToday(),histStart=hpD(H.from);
+  // Coverage starts where the DATA starts. If the ERP's sales begin mid-November, last year's pre-event
+  // weeks are partly empty and the lift would come out hugely inflated - so treat that window as missing.
+  var _firstRow=H.rows.length?hpD(H.rows[0].sale_date):null;
+  if(_firstRow&&_firstRow>histStart)histStart=_firstRow;
   var evs=cfg.events.filter(function(e){return e.enabled&&e.start&&e.end&&hpD(e.end)>=hpD(e.start)&&hpD(e.end)>=today;})
     .sort(function(a,b){return hpD(a.start)-hpD(b.start);});
   // --- sales by canonical item -----------------------------------------------------------------
@@ -31710,7 +31675,12 @@ function hpModel(){
       st.e+=e;st.p+=p;var c=hpCatOf(k),o=cat[c]||(cat[c]={e:0,p:0});o.e+=e;o.p+=p;
     });
     var lift=function(o){return (o&&o.p>0)?((o.e/lyLen)/(o.p/56)):null;};
-    var storeLift=lift(st);
+    // Coverage test: sales in at least 6 of the 8 pre-event weeks and in the window itself. A stray old
+    // order or an ERP that started mid-November must not produce a lift from a half-empty window.
+    var wkCover=0;
+    if(haveLY)for(var _w=0;_w<8;_w++){var _a=preS+_w*7*HP_DAY,_b=_a+7*HP_DAY-1;if(keys.some(function(k){return sum(k,_a,_b)>0;}))wkCover++;}
+    if(wkCover<6||st.e<=0)haveLY=false;
+    var storeLift=haveLY?lift(st):null;
     return {ev:ev,len:(hpD(ev.end)-hpD(ev.start))/HP_DAY+1,lyS:w.s,lyE:w.e,haveLY:haveLY&&storeLift!=null,storeLift:storeLift,
       catLift:function(c){var o=cat[c],cl=lift(o);if(storeLift==null)return null;if(cl==null)return storeLift;var wt=o.e/(o.e+20);return wt*cl+(1-wt)*storeLift;},
       itemLY:function(k){return it[k]||{e:0,p:0};},lift:lift};
@@ -31892,11 +31862,11 @@ function renderHolidayPlanner(){
     +'<p><b>Products with no sales yet</b> (launching now) need a starting point: "sells like" another SKU at a %, or a weekly number you expect.</p>'
     +'<p><b>Need</b> covers normal sales from today to the end of the last event plus every event, plus safety stock - minus stock not already promised to open orders and open POs. Shortfalls are broken down through BOMs (subassembly stock is used first) into parts to buy, rounded to MOQ, each with an order-by date: first event start &minus; lead time &minus; build buffer.</p></div></details>';
   if(S._hpLoading||!S._hpHist){
-    return head+explain+'<div class="panel section-empty">'+(S._hpLoading?'Loading 13 months of sales history&hellip;':'Sales history not loaded. <button class="btn btn-sm" onclick="hpLoadHistory(true)">Load</button>')+'</div>';
+    return head+hpImportPanel(null)+explain+'<div class="panel section-empty">'+(S._hpLoading?'Loading 13 months of sales history&hellip;':'Sales history not loaded. <button class="btn btn-sm" onclick="hpLoadHistory(true)">Load</button>')+'</div>';
   }
   S._hpPlan=null; // recompute every render so stock, orders and POs changed elsewhere show up immediately
   var P=hpModel();
-  if(!P||!P.evs.length)return head+explain+'<div class="panel section-empty">Turn on at least one event that has not ended yet.</div>';
+  if(!P||!P.evs.length)return head+hpImportPanel(P)+explain+'<div class="panel section-empty">Turn on at least one event that has not ended yet.</div>';
   var sel=S._hpEvSel&&P.evInfo.some(function(x){return x.ev.id===S._hpEvSel;})?S._hpEvSel:P.evInfo[0].ev.id;
   var X=P.evInfo.find(function(x){return x.ev.id===sel;});
   var T=P.totals,daysToStart=Math.round((P.firstStart-P.today)/HP_DAY);
@@ -31970,9 +31940,234 @@ function renderHolidayPlanner(){
     +'<div class="tbl-wrap"><table><thead><tr><th>Part</th><th>Vendor</th><th style="text-align:right">Needed</th><th style="text-align:right">On hand</th><th style="text-align:right">On PO</th><th style="text-align:right">Buy</th><th>Lead</th><th>Order by</th><th style="text-align:right">Est. cost</th></tr></thead><tbody>'
     +(partRows||'<tr><td colspan="9" class="section-empty">Stock and open POs already cover the plan</td></tr>')+'</tbody></table></div>'
     +(missing.length?'<div class="t3xs" style="padding:6px 14px;color:var(--red)">'+missing.length+' BOM line(s) point at SKUs that are not in Parts: '+esc(missing.slice(0,6).map(function(x){return x.pn;}).join(', '))+'</div>':'')+'</div>';
-  return head+explain+kpis+urgentHtml+prod+partsHtml;
+  return head+hpImportPanel(P)+explain+kpis+urgentHtml+prod+partsHtml;
 }
 window.renderHolidayPlanner=renderHolidayPlanner;
+// ===================================================================================================
+// [HISTORY IMPORT v23.68] Backfill past Shopify orders so the planner (and reports) can see last year.
+// Two routes: the Shopify API through the shopify-orders edge function (cursor-paged), or the CSV from
+// Shopify admin > Orders > Export. Imported lines are HISTORY: never Open, never deduct stock, never
+// touch ShipStation. Rules: cancelled orders are skipped (never a sale); refunded lines still count
+// (decided v23.65); lines removed by an order edit are not counted; a recent unfulfilled order is skipped
+// because it may be live work that belongs to the normal order sync. Duplicates are checked against the
+// database (order number + item, SKU aliases resolved), not just what is loaded on screen.
+// ===================================================================================================
+async function hpEarliestSale(force){
+  if(S._hpEarliest!==undefined&&!force)return S._hpEarliest;
+  try{
+    var r=await db.from('sales').select('sale_date').not('sale_date','is',null).order('sale_date',{ascending:true}).limit(1);
+    S._hpEarliest=(!r.error&&r.data&&r.data[0])?String(r.data[0].sale_date).slice(0,10):null;
+  }catch(e){S._hpEarliest=null;}
+  return S._hpEarliest;
+}
+function _hpHistStatus(fin,ful){
+  if(ful==='fulfilled'||ful==='partial')return 'Delivered';
+  if(fin==='refunded'||fin==='voided')return 'Refunded';
+  return 'Delivered';
+}
+// One Shopify API order -> history rows (one per item, quantities summed)
+function hpMapApiOrder(o,st){
+  if(o.cancelled_at){st.cancelled++;return [];}
+  var created=String(centralDateOnly(o.created_at)||'').slice(0,10);
+  var recent=hpD(created)>hpToday()-60*HP_DAY;
+  if(recent&&o.fulfillment_status!=='fulfilled'&&o.fulfillment_status!=='partial'&&o.financial_status!=='refunded'){st.recentOpen++;return [];}
+  var refunded={};
+  (o.refunds||[]).forEach(function(r){(r.refund_line_items||[]).forEach(function(x){refunded[x.line_item_id]=(refunded[x.line_item_id]||0)+(Number(x.quantity)||0);});});
+  var agg={};
+  (o.line_items||[]).forEach(function(li){
+    var sku=String(li.sku||'').trim().toUpperCase();if(!sku||li.gift_card)return;
+    var q=Number(li.quantity)||0;
+    if(li.current_quantity!=null){var edited=q-Number(li.current_quantity)-(refunded[li.id]||0);if(edited>0)q-=edited;} // removed by an order edit
+    if(q<=0)return;
+    var a=agg[sku]||(agg[sku]={qty:0,li:li});a.qty+=q;
+  });
+  var cname=((o.shipping_address&&o.shipping_address.name)||(o.billing_address&&o.billing_address.name)||(o.customer?((o.customer.first_name||'')+' '+(o.customer.last_name||'')):'')||'').trim()||null;
+  var status=_hpHistStatus(o.financial_status,o.fulfillment_status);
+  return Object.keys(agg).map(function(sku){
+    var row={order_number:o.name,pn:sku,qty:agg[sku].qty,sale_date:created,source:'Shopify History',fulfillment_status:status,
+      financial_status:o.financial_status||null,customer_name:cname,customer_email:(o.email||(o.customer&&o.customer.email)||null)};
+    if(typeof salesHavePrice==='function'&&salesHavePrice()){var up=shopifyLineUnitPrice(agg[sku].li);if(up!=null){row.unit_price=up;row.price_source='shopify';}}
+    return row;
+  });
+}
+// Insert history rows, skipping anything the database already has for that order + item.
+async function hpInsertHistory(rows){
+  var out={inserted:0,dupes:0};
+  var canon=function(pn){return ((_canonItem(pn)||{}).pn||pn||'').toUpperCase();};
+  for(var i=0;i<rows.length;i+=200){
+    var batch=rows.slice(i,i+200);
+    var names=[...new Set(batch.map(function(r){return r.order_number;}))];
+    var ex=await db.from('sales').select('order_number,pn').in('order_number',names);
+    if(ex.error)throw new Error('duplicate check failed: '+ex.error.message);
+    var have=new Set((ex.data||[]).map(function(r){return r.order_number+'|'+canon(r.pn);}));
+    var ins=batch.filter(function(r){var k=r.order_number+'|'+canon(r.pn);if(have.has(k)){out.dupes++;return false;}have.add(k);return true;});
+    if(!ins.length)continue;
+    var res=await db.from('sales').insert(ins);
+    if(res.error)throw new Error('insert failed: '+res.error.message);
+    out.inserted+=ins.length;
+  }
+  return out;
+}
+function _hpImpState(src){
+  return S._hpImport={running:true,src:src,pages:0,orders:0,inserted:0,dupes:0,outOfRange:0,cancelled:0,recentOpen:0,oldest:null,newest:null,error:null,warn60:false,cancel:false};
+}
+function _hpImpRange(){
+  var from=(document.getElementById('hp-imp-from')||{}).value||hpISO(hpToday()-450*HP_DAY);
+  S._hpImpFrom=from;
+  return {from:from,mode:'all'};
+}
+function _hpImpSeen(st,d){if(!st.oldest||d<st.oldest)st.oldest=d;if(!st.newest||d>st.newest)st.newest=d;}
+async function hpImportFromShopify(){
+  if(S._hpImport&&S._hpImport.running)return;
+  var rg=_hpImpRange(),cutoff=rg.mode==='gap'?await hpEarliestSale(true):null;
+  if(!confirm('Import Shopify orders created from '+rg.from+' to today as sales history?\n\nImported lines are marked Delivered/Refunded with source "Shopify History". They never deduct stock or create open orders. Orders already in the ERP are skipped.'))return;
+  var st=_hpImpState('Shopify API');render();
+  var page_info='',fromIso=new Date(hpD(rg.from)).toISOString(),tries=0;
+  try{
+    for(;;){
+      if(st.cancel){st.error='Stopped by you - everything imported so far is kept';break;}
+      var body={action:'sync',since:fromIso,created_min:fromIso,page_info:page_info,store:S.shopify&&S.shopify.store,key:S.shopify&&S.shopify.key};
+      if(cutoff)body.created_max=new Date(hpD(cutoff)).toISOString();
+      var r=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify(body)});
+      var j=await r.json().catch(function(){return {};});
+      if(r.status===429||/429/.test(String(j.error||''))){if(++tries>6)throw new Error('Shopify rate limit - try again in a minute');await new Promise(function(res){setTimeout(res,2500);});continue;}
+      tries=0;
+      if(!r.ok||j.error)throw new Error(j.error||('HTTP '+r.status));
+      var orders=j.orders||[],rows=[];
+      st.pages++;
+      orders.forEach(function(o){
+        var d=String(centralDateOnly(o.created_at)||'').slice(0,10);
+        if(d<rg.from||(cutoff&&d>=cutoff)){st.outOfRange++;return;}
+        st.orders++;_hpImpSeen(st,d);
+        rows=rows.concat(hpMapApiOrder(o,st));
+      });
+      if(rows.length){var res=await hpInsertHistory(rows);st.inserted+=res.inserted;st.dupes+=res.dupes;}
+      render();
+      page_info=j.next_page_info||'';
+      if(!page_info)break;
+    }
+  }catch(e){st.error=e.message||String(e);}
+  // Without the read_all_orders permission Shopify silently returns only the last 60 days.
+  if(!st.error&&hpD(rg.from)<hpToday()-75*HP_DAY&&(!st.oldest||hpD(st.oldest)>hpToday()-62*HP_DAY))st.warn60=true;
+  st.running=false;S._hpHist=null;S._hpEarliest=undefined;
+  toast('History import: '+st.inserted+' line'+(st.inserted!==1?'s':'')+' added'+(st.error?' - '+st.error:''),st.error?9000:5000);
+  render();
+}
+// Minimal RFC-4180 CSV parser (quotes, escaped quotes, CRLF, line breaks inside quoted fields)
+function hpParseCSV(text){
+  var rows=[],row=[],f='',q=false,i=0,c;
+  text=String(text).replace(/^\uFEFF/,'');
+  for(;i<text.length;i++){
+    c=text[i];
+    if(q){if(c==='"'){if(text[i+1]==='"'){f+='"';i++;}else q=false;}else f+=c;}
+    else if(c==='"')q=true;
+    else if(c===','){row.push(f);f='';}
+    else if(c==='\n'||c==='\r'){if(c==='\r'&&text[i+1]==='\n')i++;row.push(f);rows.push(row);row=[];f='';}
+    else f+=c;
+  }
+  if(f!==''||row.length){row.push(f);rows.push(row);}
+  return rows.filter(function(r){return r.length>1||r[0]!=='';});
+}
+async function hpImportCSV(input){
+  var file=input&&input.files&&input.files[0];if(!file)return;
+  if(S._hpImport&&S._hpImport.running){input.value='';return;}
+  var rg=_hpImpRange(),cutoff=rg.mode==='gap'?await hpEarliestSale(true):null;
+  var st=_hpImpState('Shopify CSV ('+file.name+')');render();
+  try{
+    var rows=hpParseCSV(await file.text());
+    if(rows.length<2)throw new Error('the file is empty');
+    var H=rows[0].map(function(h){return String(h).trim().toLowerCase();}),ix=function(n){return H.indexOf(n.toLowerCase());};
+    var cName=ix('Name'),cCreated=ix('Created at'),cQty=ix('Lineitem quantity'),cSku=ix('Lineitem sku');
+    if(cName<0||cCreated<0||cQty<0||cSku<0)throw new Error('this does not look like a Shopify orders export (needs Name, Created at, Lineitem quantity, Lineitem sku)');
+    var cFin=ix('Financial Status'),cFul=ix('Fulfillment Status'),cCan=ix('Cancelled at'),cEmail=ix('Email'),cShip=ix('Shipping Name'),cBill=ix('Billing Name');
+    var orders={},order=[];
+    rows.slice(1).forEach(function(r){
+      var name=(r[cName]||'').trim();if(!name)return;
+      var o=orders[name];
+      if(!o){o=orders[name]={name:name,created:'',fin:'',ful:'',cancelled:'',email:'',cname:'',lines:{}};order.push(name);}
+      // order-level columns are only filled on an order's first row
+      if(!o.created&&r[cCreated])o.created=String(r[cCreated]).trim().slice(0,10);
+      if(cFin>=0&&!o.fin&&r[cFin])o.fin=String(r[cFin]).trim().toLowerCase();
+      if(cFul>=0&&!o.ful&&r[cFul])o.ful=String(r[cFul]).trim().toLowerCase();
+      if(cCan>=0&&!o.cancelled&&r[cCan])o.cancelled=String(r[cCan]).trim();
+      if(cEmail>=0&&!o.email&&r[cEmail])o.email=String(r[cEmail]).trim();
+      if(!o.cname)o.cname=String((cShip>=0&&r[cShip])||(cBill>=0&&r[cBill])||'').trim();
+      var sku=String(r[cSku]||'').trim().toUpperCase(),q=parseInt(r[cQty],10)||0;
+      if(sku&&q>0)o.lines[sku]=(o.lines[sku]||0)+q;
+    });
+    var out=[];
+    order.forEach(function(name){
+      var o=orders[name],d=o.created;
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(d))return;
+      if(d<rg.from||(cutoff&&d>=cutoff)){st.outOfRange++;return;}
+      st.orders++;_hpImpSeen(st,d);
+      if(o.cancelled){st.cancelled++;return;}
+      var recent=hpD(d)>hpToday()-60*HP_DAY;
+      if(recent&&o.ful!=='fulfilled'&&o.ful!=='partial'&&o.fin!=='refunded'){st.recentOpen++;return;}
+      var status=_hpHistStatus(o.fin,o.ful);
+      Object.keys(o.lines).forEach(function(sku){
+        out.push({order_number:name,pn:sku,qty:o.lines[sku],sale_date:d,source:'Shopify History',fulfillment_status:status,
+          financial_status:o.fin||null,customer_name:o.cname||null,customer_email:o.email||null});
+      });
+    });
+    st.pages=1;
+    for(var i=0;i<out.length&&!st.cancel;i+=1000){
+      var res=await hpInsertHistory(out.slice(i,i+1000));st.inserted+=res.inserted;st.dupes+=res.dupes;render();
+    }
+    if(st.cancel)st.error='Stopped by you - everything imported so far is kept';
+  }catch(e){st.error=e.message||String(e);}
+  st.running=false;S._hpHist=null;S._hpEarliest=undefined;input.value='';
+  toast('CSV history import: '+st.inserted+' line'+(st.inserted!==1?'s':'')+' added'+(st.error?' - '+st.error:''),st.error?9000:5000);
+  render();
+}
+window.hpImportFromShopify=hpImportFromShopify;window.hpImportCSV=hpImportCSV;window.hpEarliestSale=hpEarliestSale;
+// The old "Import All Shopify Orders" called Shopify straight from the browser (blocked by CORS) with
+// page-number paging Shopify no longer supports, and imported old unfulfilled orders as Open work.
+// It now opens the history importer above.
+function hpOpenImporter(){S.planTab='events';S._hpShowImport=true;nav('planning');}
+window.hpOpenImporter=hpOpenImporter;
+
+function hpImportPanel(P){
+  var st=S._hpImport,earliest=S._hpEarliest;
+  if(earliest===undefined)setTimeout(function(){hpEarliestSale(false).then(function(){render();});},0);
+  var need=null;
+  if(P&&P.evInfo&&P.evInfo.length)need=Math.min.apply(null,P.evInfo.map(function(x){return x.lyS-56*HP_DAY;}));
+  else{var cfg=hpCfg();var s=cfg.events.filter(function(e){return e.start;}).map(function(e){return hpLyWindow(e).s-56*HP_DAY;});if(s.length)need=Math.min.apply(null,s);}
+  var thin=P&&P.evInfo?P.evInfo.filter(function(x){return !x.haveLY;}).map(function(x){return x.ev.name;}):[];
+  var gap=thin.length>0||(!P&&earliest&&need&&hpD(earliest)>need);
+  var open=S._hpShowImport||gap||(st&&(st.running||st.error));
+  var esc=escHtml;
+  var banner=gap?'<div style="padding:8px 14px;background:rgba(255,140,0,.08);border-bottom:1px solid var(--border);font-size:var(--t-sm)"><b style="color:var(--orange)">Missing history.</b> '+(thin.length?('Last year has too little sales data around '+esc(thin.join(' and '))+' (needs sales in most of the 8 weeks before it, from <b>'+hpISO(need)+'</b>).'):('Your ERP\'s sales start on <b>'+esc(earliest)+'</b>; last year\'s event windows need data from <b>'+hpISO(need)+'</b>.'))+' Import it below - until then the History column falls back to manual lifts.</div>':'';
+  var prog='';
+  if(st){
+    prog='<div style="padding:8px 14px;font-size:var(--t-sm);border-top:1px solid var(--border)">'
+      +(st.running?'<b>Importing from '+esc(st.src)+'&hellip;</b> ':'<b>Last import ('+esc(st.src)+'):</b> ')
+      +st.inserted+' line'+(st.inserted!==1?'s':'')+' added from '+st.orders+' order'+(st.orders!==1?'s':'')
+      +(st.oldest?' ('+esc(st.oldest)+' to '+esc(st.newest)+')':'')
+      +' &middot; '+st.dupes+' already in the ERP &middot; '+st.cancelled+' cancelled skipped'
+      +(st.recentOpen?' &middot; '+st.recentOpen+' recent unfulfilled skipped (live orders - use the normal sync)':'')
+      +(st.running?' <button class="btn btn-sm" onclick="S._hpImport.cancel=true">Stop</button>':'')
+      +(st.error?'<div style="color:var(--red);margin-top:4px">'+esc(st.error)+'</div>':'')
+      +(st.warn60?'<div style="color:var(--orange);margin-top:4px">Shopify only returned the last ~60 days. Your Shopify app needs the <b>read_all_orders</b> permission (Shopify admin &rarr; Apps &rarr; Develop apps &rarr; your app &rarr; Admin API scopes) - or use the CSV route instead, which has no limit.</div>':'')
+      +'</div>';
+  }
+  var busy=st&&st.running?' disabled':'';
+  var defFrom=S._hpImpFrom||hpISO(need?Math.min(need,hpToday()-400*HP_DAY):hpToday()-450*HP_DAY);
+  return '<details class="panel" style="padding:0;margin-bottom:12px"'+(open?' open':'')+'>'
+    +'<summary style="cursor:pointer;padding:10px 14px;font-weight:700">Sales history '+(earliest?'<span style="font-weight:400;color:var(--text3);font-size:var(--t-sm)">&middot; ERP sales start '+esc(earliest)+'</span>':'')+(gap?' <span class="pill pill-orange">missing last year</span>':'')+'</summary>'
+    +banner
+    +'<div style="padding:10px 14px;display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end;font-size:var(--t-sm)">'
+    +'<label>From<br><input type="date" id="hp-imp-from" class="form-input" style="padding:4px 6px;width:auto" value="'+esc(defFrom)+'"></label>'
+    +'<div class="t3xs" style="color:var(--text3);max-width:260px">Imports every order from this date to today. Anything already in the ERP (same order and item, SKU aliases matched) is skipped, so re-running is safe.</div>'
+    +'<div><button class="btn btn-primary btn-sm" onclick="hpImportFromShopify()"'+busy+'>Import from Shopify</button>'
+      +'<div class="t3xs" style="color:var(--text3);margin-top:2px">uses your saved Shopify connection</div></div>'
+    +'<div><label class="btn btn-sm" style="cursor:pointer'+(busy?';opacity:.5;pointer-events:none':'')+'">Upload Shopify orders CSV<input type="file" accept=".csv,text/csv" style="display:none" onchange="hpImportCSV(this)"></label>'
+      +'<div class="t3xs" style="color:var(--text3);margin-top:2px">Shopify admin &rarr; Orders &rarr; Export &rarr; All orders, CSV</div></div>'
+    +'</div>'
+    +'<div class="t3xs" style="padding:0 14px 10px;color:var(--text3);line-height:1.5">Imported lines are history only: marked Delivered or Refunded, source "Shopify History". They never change stock, never create open orders and never reach ShipStation. Cancelled orders are skipped; refunded lines count (same rule as the forecast); orders already in the ERP are skipped, matching SKU aliases. They also appear in sales reports.</div>'
+    +prog+'</details>';
+}
+
 
 function renderPOBuilderTab(){
   var pb=S.poBuild||(S.poBuild={asmPn:'',qty:1,lines:[],computed:false});
