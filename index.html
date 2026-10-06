@@ -461,7 +461,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.66';
+const TGK_ERP_VERSION = 'v23.67';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -20469,6 +20469,7 @@ function renderPlanning() {
     <div class="tab ${S.planTab==='builder'?'active':''}" onclick="S.planTab='builder';render()">&#127959; Finished Goods</div>
     <div class="tab ${S.planTab==='dev'?'active':''}" style="${S.planTab==='dev'?'':' color:var(--purple)'}" onclick="S.planTab='dev';render()" title="Plan and order the full build-out of each DEV assembly">&#128300; DEV Build-Out (${S.assemblies.filter(a=>isDev(a)&&(S.boms[a.pn]||[]).length>0).length})</div>
     <div class="tab ${S.planTab==='roi'?'active':''}" onclick="S.planTab='roi';render()" title="Track startup investment per assembly against real gross profit">&#128176; ROI</div>
+    <div class="tab ${S.planTab==='events'?'active':''}" onclick="S.planTab='events';render()" title="Black Friday, holiday and promo planning - forecast, build and buy ahead of the event">&#127873; Holiday Planner</div>
   </div>
   ${(S.planTab!=='builder'&&S.planTab!=='dev'&&S.planTab!=='roi')?`  <div class="panel" style="padding:12px 16px">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
@@ -20517,7 +20518,7 @@ function renderPlanning() {
       })()}
     </div>
   </div>`:''}
-  ${S.planTab==='minmax'?renderMinMaxTab(parts):S.planTab==='builder'?renderPOBuilderTab():S.planTab==='dev'?renderDevPartsTab(devOnlyParts):S.planTab==='roi'?renderROITab():`
+  ${S.planTab==='minmax'?renderMinMaxTab(parts):S.planTab==='builder'?renderPOBuilderTab():S.planTab==='dev'?renderDevPartsTab(devOnlyParts):S.planTab==='roi'?renderROITab():S.planTab==='events'?renderHolidayPlanner():`
   <div class="tbl-wrap">
   <table data-tid="planning" style="font-size:var(--t-md)"><thead class="sticky-header"><tr>
     <th style="cursor:pointer;padding:6px 8px" onclick="(()=>{const d=(S.filters.planning||{}).sort==='pn'&&(S.filters.planning||{}).dir==='asc'?'desc':'asc';setFilter('planning','sort','pn');setFilter('planning','dir',d)})()">Part # ${sortField==='pn'?(sortDir==='asc'?'↑':'↓'):''}</th>
@@ -31572,6 +31573,406 @@ function poBuildToCart(){
   renderCartPanel();
   render();
 }
+
+// ===================================================================================================
+// [HOLIDAY PLANNER v23.67] Event-based demand planning (Black Friday / Cyber Monday, Holiday, any promo).
+//
+// How a forecast is built, per item and per event:
+//   1. Current rate  - weekly sales over the last 12 weeks, or over the weeks since the item's FIRST sale
+//                      if it is newer than that (the standard demand calc divides by 12 regardless, which
+//                      makes a 3-week-old product look 4x slower than it is). With 6+ weeks of data a
+//                      trend line is fitted and the rate nudged half-way toward where that line is now,
+//                      capped between 0.5x and 2x the plain average, so one hot week can't run away.
+//   2. Lift          - "History": last year's sales rate in the same event window divided by the 8 weeks
+//                      before it. The item's own lift is trusted in proportion to how many units it sold
+//                      in that window last year (n / (n + 5)); the rest comes from its category's lift,
+//                      which is itself pulled toward the whole store's lift when the category is thin.
+//                      New products have no own history, so they get category -> store lift.
+//                      "Manual": a multiplier you set per event, overridable per SKU.
+//   3. Event units   - rate x lift x event length. Plan with History, Manual, or the higher of the two,
+//                      and any single number can be overridden.
+//   4. Horizon need  - normal-rate sales for the non-event days from today to the end of the last event,
+//                      plus every event's units, plus a safety %.
+//   5. Supply        - need minus (on hand - units already promised to open orders) minus open POs,
+//                      exploded through BOMs level by level (subassembly stock is used before parts are
+//                      bought), netted against part stock and open POs (drafts included and labelled),
+//                      rounded up to MOQ, with an order-by date = first event start - lead time - buffer.
+// Nothing here writes stock or orders; the only write is the planner's own settings (key event_plans).
+// ===================================================================================================
+var HP_DAY=86400000;
+var HP_DEFAULT_EVENTS=[
+  {id:'bfcm',name:'Black Friday / Cyber Monday',start:'2026-11-27',end:'2026-11-30',align:'thanksgiving',manualLift:3,planWith:'max',enabled:true},
+  {id:'holiday',name:'Holiday',start:'2026-12-01',end:'2026-12-18',align:'calendar',manualLift:1.6,planWith:'max',enabled:true}
+];
+function hpD(s){var p=String(s||'').slice(0,10).split('-');return Date.UTC(+p[0],(+p[1]||1)-1,+p[2]||1);}
+function hpISO(ms){return new Date(ms).toISOString().slice(0,10);}
+function hpToday(){var n=new Date();return Date.UTC(n.getFullYear(),n.getMonth(),n.getDate());}
+function hpFmtDate(ms){return new Date(ms).toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'});}
+function hpThanksgiving(y){var dow=new Date(Date.UTC(y,10,1)).getUTCDay();return Date.UTC(y,10,1+((4-dow+7)%7)+21);}
+// Last year's equivalent window. Black Friday moves with Thanksgiving; Christmas-driven windows keep the calendar date.
+function hpLyWindow(ev){
+  var s=hpD(ev.start),e=hpD(ev.end),d=new Date(s),y=d.getUTCFullYear();
+  var shift=ev.align==='thanksgiving'?(hpThanksgiving(y)-hpThanksgiving(y-1)):(s-Date.UTC(y-1,d.getUTCMonth(),d.getUTCDate()));
+  return {s:s-shift,e:e-shift};
+}
+function hpCfg(){
+  if(!S._hpCfg){
+    var saved=S.settings&&S.settings.event_plans;
+    var c=(saved&&typeof saved==='object'&&Array.isArray(saved.events))?JSON.parse(JSON.stringify(saved))
+      :{events:JSON.parse(JSON.stringify(HP_DEFAULT_EVENTS)),safetyPct:15,bufferDays:7,overrides:{}};
+    if(!c.overrides||typeof c.overrides!=='object')c.overrides={};
+    if(c.safetyPct==null)c.safetyPct=15;
+    if(c.bufferDays==null)c.bufferDays=7;
+    S._hpCfg=c;
+  }
+  return S._hpCfg;
+}
+var _hpSaveT=null;
+function hpSave(){
+  S._hpPlan=null;
+  clearTimeout(_hpSaveT);
+  _hpSaveT=setTimeout(async function(){
+    var c=hpCfg();S.settings=S.settings||{};S.settings.event_plans=c;
+    try{var r=await db.from('settings').upsert({key:'event_plans',value:c},{onConflict:'key'});
+      if(r&&r.error)toast('Planner settings not saved: '+r.error.message,7000);}
+    catch(e){toast('Planner settings not saved: '+(e.message||e),7000);}
+  },500);
+  render();
+}
+async function hpLoadHistory(force){
+  if(S._hpHist&&!force)return S._hpHist;
+  if(S._hpLoading)return null;
+  S._hpLoading=true;render();
+  try{
+    var cfg=hpCfg();
+    var lyStarts=cfg.events.filter(function(e){return e.start;}).map(function(e){return hpLyWindow(e).s;});
+    var from=hpISO(Math.min(hpToday()-400*HP_DAY,(lyStarts.length?Math.min.apply(null,lyStarts):hpToday())-70*HP_DAY));
+    var rows=[],i=0;
+    for(;;){
+      var r=await db.from('sales').select('pn,qty,sale_date,fulfillment_status').gte('sale_date',from)
+        .order('sale_date',{ascending:true}).order('id',{ascending:true}).range(i,i+999);
+      if(r.error)throw r.error;
+      var d=r.data||[];rows=rows.concat(d);
+      if(d.length<1000||i>300000)break;
+      i+=1000;
+    }
+    S._hpHist={rows:rows,from:from,loadedAt:Date.now()};
+  }catch(e){toast('Could not load sales history: '+(e.message||e),8000);S._hpHist=null;}
+  S._hpLoading=false;S._hpPlan=null;render();
+  return S._hpHist;
+}
+window.hpLoadHistory=hpLoadHistory;
+function hpCatOf(k){
+  var a=S._asmIdx&&S._asmIdx[k],p=a?null:(S._partIdx&&S._partIdx[k]);
+  var c=((a||p||{}).category||'').split('/')[0].trim();
+  return c||'(uncategorised)';
+}
+function hpModel(){
+  if(S._hpPlan)return S._hpPlan;
+  var H=S._hpHist;if(!H)return null;
+  if(!S._asmIdx||!S._partIdx)buildLookupMaps();
+  var cfg=hpCfg(),today=hpToday(),histStart=hpD(H.from);
+  var evs=cfg.events.filter(function(e){return e.enabled&&e.start&&e.end&&hpD(e.end)>=hpD(e.start)&&hpD(e.end)>=today;})
+    .sort(function(a,b){return hpD(a.start)-hpD(b.start);});
+  // --- sales by canonical item -----------------------------------------------------------------
+  var byK={},firstSale={};
+  H.rows.forEach(function(s){
+    if(!s.pn||!s.sale_date||s.fulfillment_status==='Cancelled')return; // Refunded/Returned still count as demand
+    var k=(_canonItem(s.pn)||{}).pn||s.pn,d=hpD(s.sale_date),q=Number(s.qty)||1;
+    (byK[k]=byK[k]||[]).push([d,q]);
+    if(firstSale[k]==null||d<firstSale[k])firstSale[k]=d;
+  });
+  function sum(k,a,b){var t=0,L=byK[k];if(!L)return 0;for(var i=0;i<L.length;i++){var d=L[i][0];if(d>=a&&d<=b)t+=L[i][1];}return t;}
+  // --- 1. current weekly rate + damped trend ------------------------------------------------------
+  function rateOf(k){
+    var fs=firstSale[k],old=fs!=null&&fs<=histStart+14*HP_DAY;
+    var weeksActive=fs==null?0:Math.floor((today-fs)/(7*HP_DAY))+1;
+    var n=old?12:Math.min(12,weeksActive),ser=[];
+    for(var w=n-1;w>=0;w--){var b=today-w*7*HP_DAY;ser.push(sum(k,b-7*HP_DAY,b-1));}
+    if(!n)return {mean:0,proj:0,trend:1,n:0,weeksActive:0,isNew:true};
+    var mean=ser.reduce(function(x,y){return x+y;},0)/n,proj=mean,trend=1;
+    if(n>=6&&mean>0){
+      var tb=(n-1)/2,num=0,den=0;
+      ser.forEach(function(y,t){num+=(t-tb)*(y-mean);den+=(t-tb)*(t-tb);});
+      var lin=mean+(num/den)*((n-1)-tb);
+      proj=Math.max(0.5*mean,Math.min(2*mean,mean+0.5*(lin-mean)));
+      trend=proj/mean;
+    }
+    return {mean:mean,proj:proj,trend:trend,n:n,weeksActive:old?99:weeksActive,isNew:!old&&weeksActive<26};
+  }
+  // --- 2. lifts per event: store, category, item (shrunk toward category, category toward store) ----
+  var keys=Object.keys(byK);
+  var evInfo=evs.map(function(ev){
+    var w=hpLyWindow(ev),lyLen=(w.e-w.s)/HP_DAY+1,preS=w.s-56*HP_DAY,preE=w.s-HP_DAY;
+    var haveLY=preS>=histStart,st={e:0,p:0},cat={},it={};
+    if(haveLY)keys.forEach(function(k){
+      var e=sum(k,w.s,w.e),p=sum(k,preS,preE);it[k]={e:e,p:p};
+      st.e+=e;st.p+=p;var c=hpCatOf(k),o=cat[c]||(cat[c]={e:0,p:0});o.e+=e;o.p+=p;
+    });
+    var lift=function(o){return (o&&o.p>0)?((o.e/lyLen)/(o.p/56)):null;};
+    var storeLift=lift(st);
+    return {ev:ev,len:(hpD(ev.end)-hpD(ev.start))/HP_DAY+1,lyS:w.s,lyE:w.e,haveLY:haveLY&&storeLift!=null,storeLift:storeLift,
+      catLift:function(c){var o=cat[c],cl=lift(o);if(storeLift==null)return null;if(cl==null)return storeLift;var wt=o.e/(o.e+20);return wt*cl+(1-wt)*storeLift;},
+      itemLY:function(k){return it[k]||{e:0,p:0};},lift:lift};
+  });
+  function clampLift(x){return Math.max(0.5,Math.min(15,x));}
+  // --- 3. items to forecast ----------------------------------------------------------------------
+  var cand={};
+  S.assemblies.forEach(function(a){if(!a.discontinued&&!isDev(a))cand[a.pn]=1;});
+  keys.forEach(function(k){if(sum(k,today-182*HP_DAY,today)>0){var a=S._asmIdx[k];if(!(a&&(a.discontinued||isDev(a))))cand[k]=1;}});
+  var horizonEnd=evs.length?hpD(evs[evs.length-1].end):today;
+  var firstStart=evs.length?hpD(evs[0].start):today;
+  var eventDays=0;evInfo.forEach(function(x){eventDays+=x.len;});
+  var nonEventDays=Math.max(0,(horizonEnd-today)/HP_DAY+1-eventDays);
+  var safety=1+(Number(cfg.safetyPct)||0)/100;
+  var rates={};
+  Object.keys(cand).forEach(function(k){rates[k]=rateOf(k);});
+  var items=Object.keys(cand).map(function(k){
+    var ov=cfg.overrides[k]||{},r=rates[k],src=k,basis='own';
+    var a=S._asmIdx[k],p=a?null:S._partIdx[k];
+    var wk=r.proj;
+    if(ov.like&&rates[(_canonItem(ov.like)||{}).pn||ov.like]){src=(_canonItem(ov.like)||{}).pn||ov.like;wk=rates[src].proj*((Number(ov.likePct)||100)/100);basis='like';}
+    else if(Number(ov.baseWk)>0){wk=Number(ov.baseWk);basis='manual';}
+    var cat=hpCatOf(k),perEv={},evTotal=0,conf;
+    evInfo.forEach(function(x){
+      var ly=x.itemLY(src),cl=x.catLift(hpCatOf(src)),own=x.lift(ly),histLift=null,how='';
+      if(x.haveLY){
+        if(own!=null&&ly.e>0){var wt=ly.e/(ly.e+5);histLift=wt*own+(1-wt)*(cl!=null?cl:own);how=Math.round(wt*100)+'% own history';}
+        else{histLift=cl;how=(rates[src].isNew&&basis==='own')?'new item: category/store lift':'category/store lift';}
+        histLift=clampLift(histLift);
+      }
+      var manLift=(ov.lift&&ov.lift[x.ev.id]!=null&&ov.lift[x.ev.id]!=='')?Number(ov.lift[x.ev.id]):Number(x.ev.manualLift)||1;
+      var day=wk/7,fH=histLift!=null?day*x.len*histLift:null,fM=day*x.len*manLift;
+      var plan=x.ev.planWith==='manual'||fH==null?fM:(x.ev.planWith==='hist'?fH:Math.max(fH,fM));
+      var oq=ov.qty&&ov.qty[x.ev.id];
+      if(oq!=null&&oq!=='')plan=Number(oq)||0;
+      perEv[x.ev.id]={histLift:histLift,how:how,lyUnits:ly.e,manLift:manLift,fH:fH,fM:fM,plan:plan,overridden:oq!=null&&oq!==''};
+      evTotal+=plan;
+    });
+    var ly0=evInfo.length?evInfo[0].itemLY(src).e:0;
+    if(wk<=0)conf='input';
+    else if(basis!=='own')conf='low';
+    else if(r.isNew)conf='low';
+    else if(ly0>=10&&r.n>=12)conf='high';
+    else conf='med';
+    var need=Math.ceil((wk/7*nonEventDays+evTotal)*safety);
+    var avail=0,onPO=0,committed=0;
+    if(a){committed=openOrderDemand(a.pn)||0;avail=(a.total_on_hand||0)-committed;onPO=openOrderedQty(a.pn)||0;}
+    return {k:k,a:a,p:p,cat:cat,r:r,wk:wk,basis:basis,src:src,perEv:perEv,evTotal:evTotal,need:need,avail:avail,committed:committed,onPO:onPO,conf:conf,ov:ov};
+  });
+  // --- 5. explode through BOMs, level by level ---------------------------------------------------
+  var lvl={};
+  (function(){
+    function walk(pn,d,path){
+      if(d>8||path[pn])return;
+      if(lvl[pn]!=null&&lvl[pn]>=d)return;
+      lvl[pn]=d;var np=Object.assign({},path);np[pn]=1;
+      (S.boms[pn]||[]).forEach(function(i){var key=_upKey(i.child_pn,i.item_type);if(key.charAt(0)==='A')walk(key.slice(2),d+1,np);});
+    }
+    items.forEach(function(it){if(it.a)walk(it.a.pn,0,{});});
+  })();
+  var gross={},partGross={},usedBy={};
+  items.forEach(function(it){if(it.a)gross[it.a.pn]=(gross[it.a.pn]||0)+it.need;else partGross[it.k]=(partGross[it.k]||0)+it.need;});
+  var asmNet={},order=Object.keys(lvl).sort(function(x,y){return lvl[x]-lvl[y];});
+  order.forEach(function(pn){
+    var g=gross[pn]||0;if(g<=0)return;
+    var a=S._asmIdx[pn];if(!a)return;
+    var net=Math.max(0,g-Math.max(0,(a.total_on_hand||0)-(openOrderDemand(a.pn)||0))-(openOrderedQty(a.pn)||0));
+    asmNet[pn]=net;if(!net)return;
+    (S.boms[pn]||[]).forEach(function(i){
+      var key=_upKey(i.child_pn,i.item_type),cp=key.slice(2),q=net*(Number(i.qty)||1);
+      if(key.charAt(0)==='A')gross[cp]=(gross[cp]||0)+q;else partGross[cp]=(partGross[cp]||0)+q;
+      (usedBy[cp]=usedBy[cp]||{})[pn]=1;
+    });
+  });
+  var weeksToBuild=Math.max(1,Math.floor((firstStart-(Number(cfg.bufferDays)||0)*HP_DAY-today)/(7*HP_DAY)));
+  items.forEach(function(it){it.build=it.a?(asmNet[it.a.pn]||0):0;it.perWeek=it.build?Math.ceil(it.build/weeksToBuild):0;});
+  var parts=Object.keys(partGross).map(function(pn){
+    var p=S._partIdx[pn];if(!p)return {pn:pn,missing:true,gross:partGross[pn],buy:0};
+    var oh=Math.max(0,p.total_unpckgd||0),onPO=openOrderedQty(p.pn)||0,net=Math.ceil(partGross[pn]-oh-onPO),buy=Math.max(0,net);
+    if(buy>0&&(Number(p.moq)||0)>buy)buy=Number(p.moq);
+    var lt=ltWeeks(p),orderBy=firstStart-lt*7*HP_DAY-(Number(cfg.bufferDays)||0)*HP_DAY;
+    var unit=buy>0?costForQty(p,buy):(p.unit_cost||0);
+    return {pn:p.pn,p:p,gross:Math.ceil(partGross[pn]),oh:oh,onPO:onPO,draft:openDraftQty(p.pn),buy:buy,lt:lt,orderBy:orderBy,
+      daysLeft:Math.round((orderBy-today)/HP_DAY),cost:buy*unit,unit:unit,vendor:p.vendor||'',usedBy:Object.keys(usedBy[pn]||{})};
+  });
+  var buyParts=parts.filter(function(x){return x.buy>0;});
+  S._hpPlan={items:items,parts:parts,evInfo:evInfo,evs:evs,firstStart:firstStart,horizonEnd:horizonEnd,today:today,weeksToBuild:weeksToBuild,
+    totals:{units:items.reduce(function(s,i){return s+i.evTotal;},0),build:items.reduce(function(s,i){return s+i.build;},0),
+      buyLines:buyParts.length,late:buyParts.filter(function(x){return x.daysLeft<0;}).length,soon:buyParts.filter(function(x){return x.daysLeft>=0&&x.daysLeft<=7;}).length,
+      cost:buyParts.reduce(function(s,x){return s+x.cost;},0),missing:parts.filter(function(x){return x.missing;}).length}};
+  return S._hpPlan;
+}
+window.hpModel=hpModel;
+
+// ---- Holiday planner: actions ----------------------------------------------------------------------
+function hpSetEv(id,field,val){
+  var ev=hpCfg().events.find(function(e){return e.id===id;});if(!ev)return;
+  if(field==='manualLift')val=Math.max(0,parseFloat(val)||0);
+  if(field==='enabled')val=!!val;
+  ev[field]=val;
+  if(field==='start'||field==='end'||field==='align')S._hpHist=null; // history window may need to widen
+  hpSave();
+}
+function hpAddEvent(){
+  var c=hpCfg(),t=hpToday();
+  c.events.push({id:'ev'+Date.now(),name:'New event',start:hpISO(t+14*HP_DAY),end:hpISO(t+16*HP_DAY),align:'calendar',manualLift:1.5,planWith:'max',enabled:true});
+  hpSave();
+}
+function hpDelEvent(id){
+  var c=hpCfg(),ev=c.events.find(function(e){return e.id===id;});
+  if(!ev||!confirm('Remove the event "'+ev.name+'"?'))return;
+  c.events=c.events.filter(function(e){return e.id!==id;});
+  Object.keys(c.overrides).forEach(function(k){var o=c.overrides[k];if(o.lift)delete o.lift[id];if(o.qty)delete o.qty[id];});
+  if(S._hpEvSel===id)S._hpEvSel=null;
+  hpSave();
+}
+function hpSetGlobal(field,val){hpCfg()[field]=Math.max(0,parseFloat(val)||0);hpSave();}
+function hpSetOv(k,kind,evId,val){
+  var c=hpCfg(),o=c.overrides[k]||(c.overrides[k]={});
+  val=String(val==null?'':val).trim();
+  if(kind==='lift'||kind==='qty'){o[kind]=o[kind]||{};if(val==='')delete o[kind][evId];else o[kind][evId]=Math.max(0,parseFloat(val)||0);}
+  else if(kind==='like'){if(val==='')delete o.like;else{var it=_canonItem(val);if(!it){toast(val+' is not a known SKU');return;}o.like=it.pn;if(!o.likePct)o.likePct=100;}}
+  else if(kind==='likePct'){o.likePct=Math.max(1,parseFloat(val)||100);}
+  else if(kind==='baseWk'){if(val==='')delete o.baseWk;else o.baseWk=Math.max(0,parseFloat(val)||0);}
+  if(!Object.keys(o).some(function(x){var v=o[x];return v!=null&&(typeof v!=='object'||Object.keys(v).length);}))delete c.overrides[k];
+  hpSave();
+}
+function hpAddToCart(vendor){
+  var P=hpModel();if(!P)return;
+  var list=P.parts.filter(function(x){return x.buy>0&&!x.missing&&(vendor==null||x.vendor===vendor);});
+  if(!list.length){toast('Nothing to add');return;}
+  if(!confirm('Add '+list.length+' part line'+(list.length!==1?'s':'')+(vendor?' from '+vendor:'')+' to the PO cart?\n\nQuantities already in the cart are added to, not replaced.'))return;
+  S.poCart=S.poCart||[];
+  list.forEach(function(x){
+    var ex=S.poCart.find(function(c){return c.pn===x.pn;});
+    if(ex){ex.qty+=x.buy;ex.unitCost=costForQty(x.p,ex.qty);}else S.poCart.push({pn:x.pn,qty:x.buy,unitCost:x.unit});
+  });
+  saveCart();
+  toast(list.length+' line'+(list.length!==1?'s':'')+' added to the PO cart',5000);
+  render();
+}
+window.hpSetEv=hpSetEv;window.hpAddEvent=hpAddEvent;window.hpDelEvent=hpDelEvent;window.hpSetGlobal=hpSetGlobal;window.hpSetOv=hpSetOv;window.hpAddToCart=hpAddToCart;
+
+// ---- Holiday planner: screen -----------------------------------------------------------------------
+function renderHolidayPlanner(){
+  var cfg=hpCfg();
+  if(!S._hpHist&&!S._hpLoading)setTimeout(function(){hpLoadHistory(false);},0);
+  var esc=escHtml,n0=function(v){return Math.round(v||0).toLocaleString('en-US');},n1=function(v){return (Math.round((v||0)*10)/10).toLocaleString('en-US');};
+  var inpS=function(extra){return 'class="form-input" style="padding:4px 6px;font-size:var(--t-sm);height:auto;'+(extra||'')+'"';},inp=inpS('');
+  var evRows=cfg.events.map(function(ev){
+    var ly=ev.start?hpLyWindow(ev):null;
+    return '<tr>'
+      +'<td style="text-align:center"><input type="checkbox" '+(ev.enabled?'checked':'')+' onchange="hpSetEv(\''+ev.id+'\',\'enabled\',this.checked)"></td>'
+      +'<td><input '+inp+' value="'+esc(ev.name)+'" onchange="hpSetEv(\''+ev.id+'\',\'name\',this.value)"></td>'
+      +'<td><input type="date" '+inp+' value="'+esc(ev.start)+'" onchange="hpSetEv(\''+ev.id+'\',\'start\',this.value)"></td>'
+      +'<td><input type="date" '+inp+' value="'+esc(ev.end)+'" onchange="hpSetEv(\''+ev.id+'\',\'end\',this.value)"></td>'
+      +'<td><select '+inp+' onchange="hpSetEv(\''+ev.id+'\',\'align\',this.value)" title="How to find the same window last year">'
+        +'<option value="thanksgiving"'+(ev.align==='thanksgiving'?' selected':'')+'>Moves with Thanksgiving</option>'
+        +'<option value="calendar"'+(ev.align!=='thanksgiving'?' selected':'')+'>Same calendar dates</option></select>'
+        +(ly?'<div class="t3xs" style="color:var(--text3);margin-top:2px">last year: '+hpFmtDate(ly.s)+' - '+hpFmtDate(ly.e)+'</div>':'')+'</td>'
+      +'<td><input type="number" step="0.1" min="0" '+inpS('width:70px;padding:4px 6px;flex:none;display:inline-block')+' value="'+ev.manualLift+'" onchange="hpSetEv(\''+ev.id+'\',\'manualLift\',this.value)"></td>'
+      +'<td><select '+inp+' onchange="hpSetEv(\''+ev.id+'\',\'planWith\',this.value)">'
+        +'<option value="max"'+(ev.planWith==='max'?' selected':'')+'>Higher of the two</option>'
+        +'<option value="hist"'+(ev.planWith==='hist'?' selected':'')+'>Last year\'s history</option>'
+        +'<option value="manual"'+(ev.planWith==='manual'?' selected':'')+'>Manual multiplier</option></select></td>'
+      +'<td><button class="btn btn-sm" onclick="hpDelEvent(\''+ev.id+'\')" title="Remove event">&times;</button></td></tr>';
+  }).join('');
+  var head='<div class="panel" style="padding:0;margin-bottom:12px"><div class="section-header" style="display:flex;justify-content:space-between;align-items:center">'
+    +'<span>Events</span><span style="display:flex;gap:12px;align-items:center;font-size:var(--t-sm);text-transform:none;letter-spacing:0">'
+    +'<label>Safety stock <input type="number" min="0" step="5" '+inpS('width:60px;padding:4px 6px;flex:none;display:inline-block')+' value="'+cfg.safetyPct+'" onchange="hpSetGlobal(\'safetyPct\',this.value)">%</label>'
+    +'<label title="Days between parts arriving and the event starting - time to build, pack and ship">Build buffer <input type="number" min="0" step="1" '+inpS('width:60px;padding:4px 6px;flex:none;display:inline-block')+' value="'+cfg.bufferDays+'" onchange="hpSetGlobal(\'bufferDays\',this.value)"> days</label>'
+    +'<button class="btn btn-sm" onclick="hpAddEvent()">+ Event</button></span></div>'
+    +'<div class="tbl-wrap"><table><thead><tr><th>On</th><th>Event</th><th>Starts</th><th>Ends</th><th>Last-year match</th><th>Manual lift &times;</th><th>Plan with</th><th></th></tr></thead><tbody>'+evRows+'</tbody></table></div></div>';
+  var explain='<details class="panel" style="padding:10px 14px;margin-bottom:12px"><summary style="cursor:pointer;font-weight:700">How the forecast works (trends, last year, new products)</summary>'
+    +'<div style="font-size:var(--t-sm);color:var(--text2);line-height:1.55;margin-top:8px">'
+    +'<p><b>Current rate.</b> Weekly sales over the last 12 weeks - or, for anything newer, over the weeks since its first sale, so a 3-week-old product is not averaged against 9 empty weeks. With 6+ weeks of data a trend line is fitted and the rate is moved half-way toward where that line is now (never below 0.5&times; or above 2&times; the plain average), so a real ramp shows up but one spike does not.</p>'
+    +'<p><b>History lift.</b> Last year: sales rate during the same event window &divide; the rate in the 8 weeks before it. An item\'s own lift is trusted in proportion to how much it sold in that window last year (5 units = half trusted, 20 units = 80%); the rest comes from its category\'s lift, and thin categories lean on the whole store\'s lift. <b>New products</b> have no own history, so they use category &rarr; store lift and are marked Low confidence.</p>'
+    +'<p><b>Manual lift.</b> Your multiplier for the event, overridable per SKU (e.g. 4&times; on the items you are discounting). The planner shows both and plans with whichever you pick; any single number can be typed over.</p>'
+    +'<p><b>Products with no sales yet</b> (launching now) need a starting point: "sells like" another SKU at a %, or a weekly number you expect.</p>'
+    +'<p><b>Need</b> covers normal sales from today to the end of the last event plus every event, plus safety stock - minus stock not already promised to open orders and open POs. Shortfalls are broken down through BOMs (subassembly stock is used first) into parts to buy, rounded to MOQ, each with an order-by date: first event start &minus; lead time &minus; build buffer.</p></div></details>';
+  if(S._hpLoading||!S._hpHist){
+    return head+explain+'<div class="panel section-empty">'+(S._hpLoading?'Loading 13 months of sales history&hellip;':'Sales history not loaded. <button class="btn btn-sm" onclick="hpLoadHistory(true)">Load</button>')+'</div>';
+  }
+  S._hpPlan=null; // recompute every render so stock, orders and POs changed elsewhere show up immediately
+  var P=hpModel();
+  if(!P||!P.evs.length)return head+explain+'<div class="panel section-empty">Turn on at least one event that has not ended yet.</div>';
+  var sel=S._hpEvSel&&P.evInfo.some(function(x){return x.ev.id===S._hpEvSel;})?S._hpEvSel:P.evInfo[0].ev.id;
+  var X=P.evInfo.find(function(x){return x.ev.id===sel;});
+  var T=P.totals,daysToStart=Math.round((P.firstStart-P.today)/HP_DAY);
+  var kpi=function(label,val,color,sub){return '<div class="panel" style="padding:10px 14px;flex:1;min-width:150px"><div class="t3xs" style="color:var(--text3);text-transform:uppercase;letter-spacing:.06em">'+label+'</div><div style="font-size:var(--t-2xl);font-weight:700;color:'+(color||'var(--text)')+'">'+val+'</div>'+(sub?'<div class="t3xs" style="color:var(--text3)">'+sub+'</div>':'')+'</div>';};
+  var kpis='<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">'
+    +kpi('Event units forecast',n0(T.units),null,P.evs.length+' event'+(P.evs.length!==1?'s':'')+' &middot; first starts in '+daysToStart+' days')
+    +kpi('Units to build',n0(T.build),'var(--teal)','~'+P.weeksToBuild+' build week'+(P.weeksToBuild!==1?'s':'')+' before the buffer')
+    +kpi('Parts to buy',T.buyLines,null,fc(T.cost,0)+' estimated')
+    +kpi('Order-by date passed',T.late,T.late?'var(--red)':'var(--green)',T.soon?(T.soon+' more due within 7 days'):'')
+    +'</div>';
+  var hist=S._hpHist;
+  var status='<div class="t3xs" style="color:var(--text3);margin:-4px 0 10px">Based on '+n0(hist.rows.length)+' order lines since '+hpFmtDate(hpD(hist.from))+' &middot; '
+    +(X.haveLY?('store-wide lift last year for '+esc(X.ev.name)+': <b>'+n1(X.storeLift)+'&times;</b>'):'<span style="color:var(--orange)">no sales history for last year\'s '+esc(X.ev.name)+' window - History column falls back to Manual</span>')
+    +' &middot; <a href="#" onclick="hpLoadHistory(true);return false">reload</a></div>';
+  // urgent parts
+  var urgent=P.parts.filter(function(x){return x.buy>0&&x.daysLeft<=7;}).sort(function(a,b){return a.daysLeft-b.daysLeft;});
+  var urgentHtml=urgent.length?('<div class="panel" style="padding:0;margin-bottom:12px;border-left:3px solid var(--red)"><div class="section-header">Order now - lead time already reaches the event</div><div class="tbl-wrap"><table><thead><tr><th>Part</th><th>Vendor</th><th style="text-align:right">Buy</th><th>Lead</th><th>Order by</th><th>Used in</th></tr></thead><tbody>'
+    +urgent.slice(0,40).map(function(x){return '<tr><td class="pn">'+esc(dispPn(x.p))+'</td><td>'+esc(x.vendor||'-')+'</td><td style="text-align:right;font-weight:700">'+n0(x.buy)+'</td><td>'+x.lt+'w</td>'
+      +'<td style="color:'+(x.daysLeft<0?'var(--red)':'var(--orange)')+';font-weight:700">'+hpFmtDate(x.orderBy)+(x.daysLeft<0?' ('+(-x.daysLeft)+'d late)':' ('+x.daysLeft+'d)')+'</td>'
+      +'<td class="t3xs">'+esc(x.usedBy.slice(0,3).map(dispSku).join(', '))+(x.usedBy.length>3?' +'+(x.usedBy.length-3):'')+'</td></tr>';}).join('')
+    +'</tbody></table></div><div class="t3xs" style="padding:6px 14px;color:var(--text3)">Late items will likely arrive after the event starts at normal lead time - expedite, use another vendor, or lower the plan for the products they feed.</div></div>'):'';
+  // products
+  var evPick='<span style="display:flex;gap:6px;align-items:center;text-transform:none;letter-spacing:0">'+P.evInfo.map(function(x){
+    return '<button class="filter-chip '+(x.ev.id===sel?'on-teal':'')+'" onclick="S._hpEvSel=\''+x.ev.id+'\';render()">'+esc(x.ev.name)+'</button>';}).join('')
+    +'<label style="font-size:var(--t-sm);margin-left:8px"><input type="checkbox" '+(S._hpOnlyBuild?'checked':'')+' onchange="S._hpOnlyBuild=this.checked;render()"> only items to build / needing input</label></span>';
+  var confPill={high:['High','pill-green'],med:['Medium','pill-yellow'],low:['Low','pill-orange'],input:['Needs input','pill-red']};
+  var rows=P.items.filter(function(it){return !S._hpOnlyBuild||it.build>0||it.conf==='input';})
+    .sort(function(a,b){return (b.conf==='input')-(a.conf==='input')||(b.perEv[sel]?b.perEv[sel].plan:0)-(a.perEv[sel]?a.perEv[sel].plan:0)||b.build-a.build;});
+  var shown=rows.slice(0,250);
+  var prodRows=shown.map(function(it){
+    var e=it.perEv[sel],cp=confPill[it.conf],k=it.k,ov=it.ov||{};
+    var trendTxt=it.basis!=='own'?(it.basis==='like'?'like '+esc(dispSku(it.src))+' '+(ov.likePct||100)+'%':'manual'):(it.r.n>=6?((it.r.trend>=1?'&uarr; ':'&darr; ')+Math.round(Math.abs(it.r.trend-1)*100)+'%'):(it.r.n===0?'no sales yet':it.r.isNew?it.r.weeksActive+'w old':''));
+    var noBom=it.a&&it.build>0&&!(S.boms[it.a.pn]||[]).length;
+    return '<tr>'
+      +'<td><div class="pn">'+esc(it.a?dispPn(it.a):(it.p?dispPn(it.p):k))+'</div><div class="t3xs" style="color:var(--text3);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(((it.a||it.p||{}).description)||'')+'</div></td>'
+      +'<td><span class="pill '+cp[1]+'" title="'+(it.conf==='input'?'No sales to base a forecast on - set Sells like or a weekly number':esc(e?e.how:''))+'">'+cp[0]+'</span></td>'
+      +'<td style="text-align:right">'+n1(it.wk)+'<div class="t3xs" style="color:var(--text3)">'+trendTxt+'</div></td>'
+      +'<td style="text-align:right">'+(X.haveLY?n0(e.lyUnits):'-')+'</td>'
+      +'<td style="text-align:right">'+(e.fH!=null?n0(e.fH)+'<div class="t3xs" style="color:var(--text3)">'+n1(e.histLift)+'&times;</div>':'-')+'</td>'
+      +'<td style="text-align:right">'+n0(e.fM)+'<div class="t3xs"><input type="number" step="0.1" min="0" placeholder="'+X.ev.manualLift+'" value="'+(ov.lift&&ov.lift[sel]!=null?ov.lift[sel]:'')+'" title="Manual lift for this SKU only (blank = event default)" style="width:52px;font-size:var(--t-xs);padding:1px 3px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text)" onchange="hpSetOv(\''+k+'\',\'lift\',\''+sel+'\',this.value)">&times;</div></td>'
+      +'<td style="text-align:right"><input type="number" min="0" step="1" value="'+(e.overridden?e.plan:'')+'" placeholder="'+n0(e.plan)+'" title="Planned units for this event (blank = use the chosen method)" style="width:70px;font-weight:700;text-align:right;padding:3px 5px;background:var(--bg2);border:1px solid '+(e.overridden?'var(--orange)':'var(--border)')+';border-radius:4px;color:var(--text)" onchange="hpSetOv(\''+k+'\',\'qty\',\''+sel+'\',this.value)"></td>'
+      +'<td style="text-align:right">'+n0(it.need)+'</td>'
+      +'<td style="text-align:right" title="On hand '+(it.a?(it.a.total_on_hand||0):'-')+' minus '+it.committed+' promised to open orders">'+(it.a?n0(it.avail):'-')+(it.onPO?'<div class="t3xs" style="color:var(--teal)">+'+n0(it.onPO)+' on PO'+draftNote(k)+'</div>':'')+'</td>'
+      +'<td style="text-align:right;font-weight:700;color:'+(it.build?'var(--orange)':'var(--text3)')+'">'+(it.build?n0(it.build)+'<div class="t3xs" style="font-weight:400">'+it.perWeek+'/wk</div>':'-')+(noBom?'<div class="t3xs" style="color:var(--red)">no BOM - buy finished?</div>':'')+'</td>'
+      +'<td><input placeholder="Sells like SKU" value="'+esc(ov.like?dispSku(ov.like):'')+'" title="Borrow another SKU\'s rate and history - for new products" style="width:120px;font-size:var(--t-xs);padding:2px 4px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text)" onchange="hpSetOv(\''+k+'\',\'like\',null,this.value)">'
+        +(ov.like?' <input type="number" min="1" value="'+(ov.likePct||100)+'" title="% of that SKU\'s rate" style="width:52px;font-size:var(--t-xs);padding:2px 4px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text)" onchange="hpSetOv(\''+k+'\',\'likePct\',null,this.value)">%'
+          :' <input type="number" min="0" step="0.5" placeholder="/wk" value="'+(ov.baseWk!=null?ov.baseWk:'')+'" title="Expected units per week (when there is no sales history)" style="width:52px;font-size:var(--t-xs);padding:2px 4px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text)" onchange="hpSetOv(\''+k+'\',\'baseWk\',null,this.value)">')+'</td>'
+      +'</tr>';
+  }).join('');
+  var prod='<div class="panel" style="padding:0;margin-bottom:12px"><div class="section-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px"><span>Products</span>'+evPick+'</div>'
+    +status.replace('margin:-4px 0 10px','margin:0;padding:6px 14px')
+    +'<div class="tbl-wrap"><table><thead><tr><th>Product</th><th>Confidence</th><th style="text-align:right">Rate /wk<div class="t3xs">trend</div></th><th style="text-align:right">Sold LY<div class="t3xs">same window</div></th>'
+    +'<th style="text-align:right">History<div class="t3xs">forecast &middot; lift</div></th><th style="text-align:right">Manual<div class="t3xs">forecast &middot; lift</div></th><th style="text-align:right">Plan<div class="t3xs">this event</div></th>'
+    +'<th style="text-align:right">Need<div class="t3xs">to '+hpFmtDate(P.horizonEnd)+' +'+cfg.safetyPct+'%</div></th><th style="text-align:right">Available</th><th style="text-align:right">Build</th><th>New product basis</th></tr></thead><tbody>'
+    +(prodRows||'<tr><td colspan="11" class="section-empty">Nothing to show</td></tr>')+'</tbody></table></div>'
+    +(rows.length>shown.length?'<div class="t3xs" style="padding:6px 14px;color:var(--text3)">Showing the top '+shown.length+' of '+rows.length+'.</div>':'')+'</div>';
+  // parts to buy
+  var buy=P.parts.filter(function(x){return x.buy>0;}).sort(function(a,b){return a.daysLeft-b.daysLeft||String(a.vendor).localeCompare(String(b.vendor));});
+  var vendors=[...new Set(buy.map(function(x){return x.vendor;}).filter(Boolean))].sort();
+  var partRows=buy.map(function(x){
+    return '<tr><td class="pn">'+esc(dispPn(x.p))+'<div class="t3xs" style="color:var(--text3)">'+esc((x.p.description||'').slice(0,40))+'</div></td><td>'+esc(x.vendor||'-')+'</td>'
+      +'<td style="text-align:right">'+n0(x.gross)+'</td><td style="text-align:right">'+n0(x.oh)+'</td><td style="text-align:right">'+(x.onPO?n0(x.onPO)+(x.draft?'<div class="t3xs" style="color:var(--orange)">'+x.draft+' draft</div>':''):'-')+'</td>'
+      +'<td style="text-align:right;font-weight:700;color:var(--orange)">'+n0(x.buy)+(x.p.moq&&x.buy===Number(x.p.moq)?'<div class="t3xs" style="font-weight:400;color:var(--text3)">MOQ</div>':'')+'</td>'
+      +'<td>'+x.lt+'w</td><td style="font-weight:700;color:'+(x.daysLeft<0?'var(--red)':x.daysLeft<=7?'var(--orange)':'var(--text)')+'">'+hpFmtDate(x.orderBy)+'</td>'
+      +'<td style="text-align:right">'+fc(x.cost,0)+'</td></tr>';
+  }).join('');
+  var missing=P.parts.filter(function(x){return x.missing;});
+  var partsHtml='<div class="panel" style="padding:0"><div class="section-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px"><span>Parts to buy ('+buy.length+')</span>'
+    +'<span style="display:flex;gap:6px;flex-wrap:wrap;text-transform:none;letter-spacing:0">'+(buy.length?'<button class="btn btn-primary btn-sm" onclick="hpAddToCart(null)">Add all to PO cart</button>':'')
+    +vendors.slice(0,8).map(function(v){return '<button class="btn btn-sm" onclick="hpAddToCart(\''+String(v).replace(/'/g,"\\'")+'\')">'+esc(v)+'</button>';}).join('')+'</span></div>'
+    +'<div class="tbl-wrap"><table><thead><tr><th>Part</th><th>Vendor</th><th style="text-align:right">Needed</th><th style="text-align:right">On hand</th><th style="text-align:right">On PO</th><th style="text-align:right">Buy</th><th>Lead</th><th>Order by</th><th style="text-align:right">Est. cost</th></tr></thead><tbody>'
+    +(partRows||'<tr><td colspan="9" class="section-empty">Stock and open POs already cover the plan</td></tr>')+'</tbody></table></div>'
+    +(missing.length?'<div class="t3xs" style="padding:6px 14px;color:var(--red)">'+missing.length+' BOM line(s) point at SKUs that are not in Parts: '+esc(missing.slice(0,6).map(function(x){return x.pn;}).join(', '))+'</div>':'')+'</div>';
+  return head+explain+kpis+urgentHtml+prod+partsHtml;
+}
+window.renderHolidayPlanner=renderHolidayPlanner;
 
 function renderPOBuilderTab(){
   var pb=S.poBuild||(S.poBuild={asmPn:'',qty:1,lines:[],computed:false});
