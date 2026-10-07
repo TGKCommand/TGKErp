@@ -360,7 +360,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 
         <div class="sidebar-section">Purchasing</div>
     <button class="nav-item" id="nav-planning" onclick="nav('planning')"><span class="nav-dot"></span>Purchasing</button>
-    <button class="nav-item" id="nav-purchases" onclick="nav('purchases')"><span class="nav-dot"></span>Purchase Orders</button>
+    <button class="nav-item" id="nav-purchases" onclick="nav('purchases')"><span class="nav-dot"></span>Purchase Orders<span class="nav-badge" id="po-badge" style="display:none" title="POs due for a vendor check-in or overdue">0</span></button>
 
     <div class="sidebar-section">Contacts</div>
     <button class="nav-item" id="nav-vendors" onclick="nav('vendors')"><span class="nav-dot"></span>Vendors</button>
@@ -461,7 +461,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.68';
+const TGK_ERP_VERSION = 'v23.69';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1091,6 +1091,9 @@ function updateBadge(){
   }).length;
   const dsb=$('dropship-badge');
   if(dsb){dsb.textContent=dsCount;dsb.style.display=dsCount>0?'inline':'none';}
+  try{const _pf=poFollowCounts(),_pn=_pf.due+_pf.overdue,_pb=$('po-badge');
+    if(_pb){_pb.textContent=_pn;_pb.style.display=_pn>0?'inline':'none';}
+    const _pe=$('nav-purchases');if(_pe)_pe.classList.toggle('alert-nav',_pf.overdue>0);}catch(_e){}
 }
 
 async function fetchAll(query){
@@ -1170,6 +1173,7 @@ async function loadAll(){
     (poLinesAll.data||[]).forEach(l=>{if(!S.poLines[l.po_id])S.poLines[l.po_id]=[];S.poLines[l.po_id].push(l);});
     S.poTracking={};
     (poTrackingAll.data||[]).forEach(t=>{if(!S.poTracking[t.po_id])S.poTracking[t.po_id]=[];S.poTracking[t.po_id].push(t);});
+    poSplitTracking(); // vendor updates live in po_tracking too - keep them out of the shipment chips
     S.fitments=null; // loaded on-demand when Fitments page opens
     if(labelFilesResult.error){console.warn('loadAll: part_files label query failed —',labelFilesResult.error.message,'— label buttons will load on demand');}
     else{S.labelFiles={};(labelFilesResult.data||[]).forEach(function(lf){if(!S.labelFiles[lf.entity_pn])S.labelFiles[lf.entity_pn]=[];S.labelFiles[lf.entity_pn].push(lf);});}
@@ -4693,6 +4697,7 @@ function renderPurchases(){
 
   return `
   ${draftBanner}
+  ${poFollowPanel()}
   <div class="kpi-grid kpi-grid-4" style="margin-bottom:14px">
     <div class="kpi" style="cursor:pointer" onclick="setFilter('po','status','')">
       <div class="kpi-label">${filterLabel==='All'?'Total POs':filterLabel+' POs'}</div>
@@ -4747,6 +4752,7 @@ function renderPurchases(){
     <td>
       <div style="display:flex;flex-direction:column;gap:3px">
         <div>${poStatusBadge(p)}</div>
+        ${poFollowChip(p)}
         ${tracking.length?`<div style="display:flex;gap:4px;flex-wrap:wrap">${trackChips}${moreTrack}</div>`:''}
       </div>
     </td>
@@ -21458,6 +21464,7 @@ async function openPODetail(id) {
 async function loadPOTracking(poId){
   const{data}=await db.from('po_tracking').select('*').eq('po_id',poId).order('created_at');
   S.poTracking[poId]=data||[];
+  poSplitTracking(poId);
 }
 
 async function addPOTracking(poId){
@@ -21691,6 +21698,7 @@ function renderPODetail(po) {
     <div class="kpi kpi-orange"><div class="kpi-label">Ordered Value</div><div class="kpi-value" style="font-size:var(--t-xl)">${fc(totalOrdered)}</div></div>
     <div class="kpi kpi-teal"><div class="kpi-label">Received Value</div><div class="kpi-value" style="font-size:var(--t-xl)">${fc(totalReceived)}</div></div>
   </div>
+  ${poFollowDetail(po)}
   <div class="panel" style="padding:0;margin-bottom:14px">
     <div class="section-header"><span class="ic ic-box"></span>Shipment Tracking ${(S.poTracking[po.id]||[]).length?'('+(S.poTracking[po.id]||[]).length+(((S.poTracking[po.id]||[]).length)>1?' shipments — split shipped':' shipment')+')':''}</div>
     ${(S.poTracking[po.id]||[]).map(t=>{const daysToEta=t.estimated_delivery?Math.ceil((new Date(t.estimated_delivery)-new Date())/(86400000)):null;const etaLabel=t.estimated_delivery?(daysToEta<0?'Overdue by '+Math.abs(daysToEta)+'d':daysToEta===0?'Due today':daysToEta+'d out'):null;const etaColor=daysToEta!==null?(daysToEta<0?'var(--red)':daysToEta<=2?'var(--orange)':'var(--teal)'):null;return`<div class="check-row">
@@ -30709,9 +30717,11 @@ function _buildWorkflowAlerts() {
   var alerts = [];
 
   var today = new Date().toISOString().slice(0, 10);
-  var overduePOs = S.purchases.filter(function(p) {
-    return p.status !== 'Received' && p.status !== 'Recovered' && p.status !== 'Lost' && p.expected_date && p.expected_date < today;
-  });
+  var _pfc = poFollowCounts();
+  var overduePOs = _pfc.list.filter(function(f) { return f.state === 'overdue'; });
+  if (_pfc.due) {
+    alerts.push({ level: 'orange', icon: '\u260e', text: _pfc.due + ' PO' + (_pfc.due > 1 ? 's' : '') + ' due for a vendor check-in', nav: "S._poFollowOpen=true;nav('purchases')", lbl: 'Follow up' });
+  }
   if (overduePOs.length) {
     alerts.push({ level: 'red', icon: '\u23f0', text: overduePOs.length + ' overdue PO' + (overduePOs.length > 1 ? 's' : '') + ' \u2014 past expected delivery date', nav: "nav('purchases')", lbl: 'View POs' });
   }
@@ -31928,7 +31938,7 @@ function renderHolidayPlanner(){
   var vendors=[...new Set(buy.map(function(x){return x.vendor;}).filter(Boolean))].sort();
   var partRows=buy.map(function(x){
     return '<tr><td class="pn">'+esc(dispPn(x.p))+'<div class="t3xs" style="color:var(--text3)">'+esc((x.p.description||'').slice(0,40))+'</div></td><td>'+esc(x.vendor||'-')+'</td>'
-      +'<td style="text-align:right">'+n0(x.gross)+'</td><td style="text-align:right">'+n0(x.oh)+'</td><td style="text-align:right">'+(x.onPO?n0(x.onPO)+(x.draft?'<div class="t3xs" style="color:var(--orange)">'+x.draft+' draft</div>':''):'-')+'</td>'
+      +'<td style="text-align:right">'+n0(x.gross)+'</td><td style="text-align:right">'+n0(x.oh)+'</td><td style="text-align:right">'+(x.onPO?n0(x.onPO)+(x.draft?'<div class="t3xs" style="color:var(--orange)">'+x.draft+' draft</div>':'')+(function(){var a=poArrivalForPart(x.pn);if(!a)return '';var late=a>P.firstStart-(Number(cfg.bufferDays)||0)*HP_DAY;return '<div class="t3xs" style="color:'+(late?'var(--red);font-weight:700':'var(--text3)')+'">'+(late?'lands '+hpFmtDate(a)+' - after event':'due '+hpFmtDate(a))+'</div>';})():'-')+'</td>'
       +'<td style="text-align:right;font-weight:700;color:var(--orange)">'+n0(x.buy)+(x.p.moq&&x.buy===Number(x.p.moq)?'<div class="t3xs" style="font-weight:400;color:var(--text3)">MOQ</div>':'')+'</td>'
       +'<td>'+x.lt+'w</td><td style="font-weight:700;color:'+(x.daysLeft<0?'var(--red)':x.daysLeft<=7?'var(--orange)':'var(--text)')+'">'+hpFmtDate(x.orderBy)+'</td>'
       +'<td style="text-align:right">'+fc(x.cost,0)+'</td></tr>';
@@ -32126,6 +32136,215 @@ window.hpImportFromShopify=hpImportFromShopify;window.hpImportCSV=hpImportCSV;wi
 // It now opens the history importer above.
 function hpOpenImporter(){S.planTab='events';S._hpShowImport=true;nav('planning');}
 window.hpOpenImporter=hpOpenImporter;
+// ===================================================================================================
+// [PO FOLLOW-UPS v23.69] Reminds you to chase a vendor BEFORE a PO is late.
+//  Expected arrival, best information first: the newest date a vendor or carrier gave (vendor update or
+//  shipment tracking ETA) -> the PO's Expected Arrival -> order date + the longest lead time on its lines.
+//  Check-in: arrival minus 14 days (setting po_checkin_days), or half the lead time for short-lead POs.
+//  Logging a vendor update clears the alert; the next check-in becomes 3 days before the confirmed date.
+//  Updates are po_tracking rows with carrier 'Vendor update' (no schema change). They are kept out of the
+//  shipment-tracking chips (S.poVendorUpd), but their date counts as the vendor's ETA.
+// ===================================================================================================
+var PO_VU='Vendor update';
+var PO_DAY=86400000;
+function _poOpenForFollow(p){return p&&['Received','Recovered','Cancelled','Lost','Draft'].indexOf(p.status)<0;}
+function _poD(s){return s?hpD(s):null;}
+function poCheckinDays(){var v=Number(S.settings&&S.settings.po_checkin_days);return v>0?v:14;}
+// Split tracking rows into real shipments vs vendor updates. Called wherever po_tracking is (re)loaded.
+function poSplitTracking(poId){
+  S.poVendorUpd=S.poVendorUpd||{};
+  var ids=poId?[poId]:Object.keys(S.poTracking||{});
+  if(!poId)S.poVendorUpd={};
+  ids.forEach(function(id){
+    var all=(S.poTracking[id]||[]);
+    var vu=all.filter(function(t){return t&&t.carrier===PO_VU;});
+    if(vu.length||poId)S.poVendorUpd[id]=vu;
+    S.poTracking[id]=all.filter(function(t){return t&&t.carrier!==PO_VU;});
+  });
+}
+function _poOutstandingLines(p){
+  var lines=(S.poLines[p.id]||[]).filter(function(l){return !(typeof isShippingLine==='function'&&isShippingLine(l));});
+  return lines.filter(function(l){return (l.qty_ordered||0)>(l.qty_received||0);});
+}
+function poEta(p){
+  var best=null;
+  [].concat(S.poTracking[p.id]||[],(S.poVendorUpd&&S.poVendorUpd[p.id])||[]).forEach(function(t){
+    if(!t.estimated_delivery)return;
+    if(!best||String(t.created_at||'')>String(best.created_at||''))best=t;
+  });
+  if(best)return {ms:_poD(best.estimated_delivery),src:best.carrier===PO_VU?'vendor':'carrier tracking'};
+  if(p.expected_date)return {ms:_poD(p.expected_date),src:'PO expected date'};
+  if(p.order_date){
+    var lt=0;
+    var lines=S.poLines[p.id]||[];
+    (lines.length?lines.map(function(l){return l.pn;}):[p.pn]).forEach(function(pn){var x=pn&&partByPn(pn);if(x)lt=Math.max(lt,ltWeeks(x));});
+    if(!lt)lt=2;
+    return {ms:_poD(p.order_date)+lt*7*PO_DAY,src:'order date + '+lt+'w lead time'};
+  }
+  return null;
+}
+function poFollowInfo(p){
+  if(!_poOpenForFollow(p))return null;
+  var eta=poEta(p);if(!eta||!eta.ms)return null;
+  var today=hpToday();
+  var leadDays=p.order_date?Math.max(1,(eta.ms-_poD(p.order_date))/PO_DAY):poCheckinDays()*2;
+  var win=Math.min(poCheckinDays(),Math.max(2,Math.round(leadDays/2)));
+  var check=eta.ms-win*PO_DAY;
+  var ups=((S.poVendorUpd&&S.poVendorUpd[p.id])||[]).slice().sort(function(a,b){return String(b.created_at||'').localeCompare(String(a.created_at||''));});
+  var last=ups[0]||null;
+  var real=ups.filter(function(u){return !/^No reply/i.test(String(u.notes||''));})[0]||null; // "No reply" is logged but does not clear the alert
+  var lastMs=real&&real.created_at?hpD(String(real.created_at).slice(0,10)):null;
+  if(lastMs!=null&&lastMs>=check)check=Math.max(lastMs+PO_DAY,eta.ms-3*PO_DAY); // already chased this cycle
+  var state=today>eta.ms?'overdue':(today>=check?'due':(today>=check-7*PO_DAY?'soon':'ok'));
+  if(state==='overdue'&&lastMs!=null&&today-lastMs<3*PO_DAY)state='overdue-contacted';
+  var delayed=!!(last&&/^delayed/i.test(String(last.notes||'')));
+  return {p:p,eta:eta.ms,src:eta.src,check:check,state:state,last:last,lastMs:lastMs,delayed:delayed,
+    daysToEta:Math.round((eta.ms-today)/PO_DAY),daysToCheck:Math.round((check-today)/PO_DAY),afterEvent:poAfterEvent(p,eta.ms)};
+}
+// Holiday planner link: an open PO with parts that lands after the first upcoming event (minus build buffer)
+function poAfterEvent(p,etaMs){
+  try{
+    var c=hpCfg(),t=hpToday();
+    var ev=c.events.filter(function(e){return e.enabled&&e.start&&hpD(e.end||e.start)>=t;}).sort(function(a,b){return hpD(a.start)-hpD(b.start);})[0];
+    if(!ev)return null;
+    var need=hpD(ev.start)-(Number(c.bufferDays)||0)*PO_DAY;
+    if(etaMs<=need||!_poOutstandingLines(p).length)return null;
+    return ev.name;
+  }catch(e){return null;}
+}
+// Latest expected arrival among open POs still owing this part (for the planner's parts table)
+function poArrivalForPart(pn){
+  var k=(_canonItem(pn)||{}).pn||pn,best=null;
+  (S.purchases||[]).forEach(function(p){
+    if(!_poOpenForFollow(p))return;
+    if(!(S.poLines[p.id]||[]).some(function(l){return ((_canonItem(l.pn)||{}).pn||l.pn)===k&&(l.qty_ordered||0)>(l.qty_received||0);}))return;
+    var e=poEta(p);if(e&&e.ms&&(best==null||e.ms>best))best=e.ms;
+  });
+  return best;
+}
+function poFollowList(){
+  if(!S.poVendorUpd)poSplitTracking();
+  return (S.purchases||[]).map(poFollowInfo).filter(Boolean);
+}
+function poFollowCounts(){
+  var L=poFollowList();
+  return {due:L.filter(function(x){return x.state==='due';}).length,overdue:L.filter(function(x){return x.state==='overdue';}).length,
+    contacted:L.filter(function(x){return x.state==='overdue-contacted';}).length,soon:L.filter(function(x){return x.state==='soon';}).length,list:L};
+}
+window.poFollowInfo=poFollowInfo;window.poFollowCounts=poFollowCounts;window.poArrivalForPart=poArrivalForPart;
+function _poFmt(ms){return hpFmtDate(ms);}
+function poFollowChip(p){
+  var f=poFollowInfo(p);if(!f)return '';
+  var m={overdue:['var(--red)','Overdue '+(-f.daysToEta)+'d - chase vendor'],'overdue-contacted':['var(--orange)','Late - vendor contacted'],
+    due:['var(--orange)','Check in with vendor'],soon:['var(--text2)','Check in '+_poFmt(f.check)],ok:['var(--text3)','Check in '+_poFmt(f.check)]}[f.state];
+  return '<div style="font-size:var(--t-xs);font-weight:'+(f.state==='ok'||f.state==='soon'?'400':'700')+';color:'+m[0]+';margin:2px 0" title="Expected '+_poFmt(f.eta)+' ('+escHtml(f.src)+')">'
+    +m[1]+(f.delayed?' &middot; delayed':'')+(f.afterEvent?' &middot; <span style="color:var(--red)">lands after '+escHtml(f.afterEvent)+'</span>':'')+'</div>';
+}
+function poFollowPanel(){
+  var C=poFollowCounts();
+  var rows=C.list.filter(function(x){return x.state!=='ok';})
+    .sort(function(a,b){var o={overdue:0,due:1,'overdue-contacted':2,soon:3};return (o[a.state]-o[b.state])||(a.check-b.check);});
+  var open=S._poFollowOpen!==false&&(C.due+C.overdue)>0;
+  var esc=escHtml;
+  var body=rows.length?rows.map(function(f){
+    var p=f.p,lines=_poOutstandingLines(p);
+    var what=lines.length?lines.slice(0,3).map(function(l){var it=partByPn(l.pn)||asmByPn(l.pn);return esc(it?dispPn(it):l.pn)+' &times;'+((l.qty_ordered||0)-(l.qty_received||0));}).join(', ')+(lines.length>3?' +'+(lines.length-3):''):esc(p.pn||'');
+    var badge={overdue:['pill-red','Overdue'],due:['pill-orange','Check in now'],'overdue-contacted':['pill-yellow','Late, contacted'],soon:['pill-muted','Check in soon']}[f.state]||['pill-muted',''];
+    return '<tr class="rowlink" onclick="rowClick(event,function(){openPODetail(\''+p.id+'\')})">'
+      +'<td><span class="pill '+badge[0]+'">'+badge[1]+'</span>'+(f.delayed?' <span class="pill pill-red">delayed</span>':'')+'</td>'
+      +'<td class="main-col">'+esc(p.vendor||'')+'<div class="t3xs" style="color:var(--text3)">ordered '+esc(p.order_date||'?')+'</div></td>'
+      +'<td style="font-size:var(--t-sm)">'+what+'</td>'
+      +'<td style="white-space:nowrap"><b>'+_poFmt(f.eta)+'</b> <span class="t3xs" style="color:var(--text3)">('+(f.daysToEta>=0?'in '+f.daysToEta+'d':(-f.daysToEta)+'d ago')+')</span><div class="t3xs" style="color:var(--text3)">'+esc(f.src)+'</div>'
+        +(f.afterEvent?'<div class="t3xs" style="color:var(--red);font-weight:700">lands after '+esc(f.afterEvent)+'</div>':'')+'</td>'
+      +'<td class="t3xs" style="color:var(--text3)">'+(f.last?('last update '+esc(String(f.last.created_at||'').slice(0,10))+(f.last.notes?'<div style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(f.last.notes)+'</div>':'')):'no update logged')+'</td>'
+      +'<td onclick="event.stopPropagation()" style="white-space:nowrap"><button class="btn btn-sm btn-teal" onclick="poLogVendorUpdate(\''+p.id+'\')">Log update</button> '
+        +'<button class="btn btn-sm" onclick="poEmailVendor(\''+p.id+'\')">Email vendor</button></td></tr>';
+  }).join(''):'<tr><td colspan="6" class="section-empty">No open POs need a vendor check-in right now.</td></tr>';
+  return '<details class="panel" style="padding:0;margin-bottom:14px'+((C.due+C.overdue)?';border-left:3px solid var(--orange)':'')+'"'+(open?' open':'')+' ontoggle="S._poFollowOpen=this.open">'
+    +'<summary style="cursor:pointer;padding:10px 14px;font-weight:700;display:flex;align-items:center;gap:10px;flex-wrap:wrap">Vendor follow-ups'
+    +(C.overdue?' <span class="pill pill-red">'+C.overdue+' overdue</span>':'')+(C.due?' <span class="pill pill-orange">'+C.due+' to check in</span>':'')
+    +(C.contacted?' <span class="pill pill-yellow">'+C.contacted+' late, contacted</span>':'')+(C.soon?' <span class="pill pill-muted">'+C.soon+' this week</span>':'')
+    +'<span style="margin-left:auto;font-weight:400;font-size:var(--t-sm)" onclick="event.stopPropagation()">Check in <input type="number" min="1" max="60" value="'+poCheckinDays()+'" style="width:52px;padding:2px 4px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text)" onchange="poSetCheckinDays(this.value)"> days before arrival</span></summary>'
+    +'<div class="tbl-wrap"><table><thead><tr><th>Status</th><th>Vendor</th><th>Outstanding</th><th>Expected</th><th>Last vendor update</th><th></th></tr></thead><tbody>'+body+'</tbody></table></div></details>';
+}
+async function poSetCheckinDays(v){
+  v=Math.max(1,Math.min(60,parseInt(v,10)||14));
+  S.settings=S.settings||{};S.settings.po_checkin_days=v;
+  var r=await db.from('settings').upsert({key:'po_checkin_days',value:v},{onConflict:'key'});
+  if(r&&r.error)toast('Not saved: '+r.error.message,6000);
+  updateBadge();render();
+}
+// PO detail panel
+function poFollowDetail(po){
+  var f=poFollowInfo(po),esc=escHtml;
+  var ups=((S.poVendorUpd&&S.poVendorUpd[po.id])||[]).slice().sort(function(a,b){return String(b.created_at||'').localeCompare(String(a.created_at||''));});
+  if(!f&&!ups.length)return '';
+  var head=f?('<div style="display:flex;gap:24px;flex-wrap:wrap;padding:10px 16px;font-size:var(--t-sm)">'
+      +'<div><div class="t3xs" style="color:var(--text3)">EXPECTED</div><b>'+_poFmt(f.eta)+'</b> <span class="t3xs" style="color:var(--text3)">'+esc(f.src)+'</span></div>'
+      +'<div><div class="t3xs" style="color:var(--text3)">NEXT CHECK-IN</div><b style="color:'+(f.state==='due'||f.state==='overdue'?'var(--orange)':'var(--text)')+'">'+(f.state==='overdue'?'Now - overdue':(f.state==='due'?'Now':_poFmt(f.check)))+'</b></div>'
+      +(f.afterEvent?'<div><div class="t3xs" style="color:var(--text3)">HOLIDAY PLAN</div><b style="color:var(--red)">lands after '+esc(f.afterEvent)+'</b></div>':'')
+      +'<div style="margin-left:auto;display:flex;gap:6px"><button class="btn btn-sm btn-teal" onclick="poLogVendorUpdate(\''+po.id+'\')">Log vendor update</button><button class="btn btn-sm" onclick="poEmailVendor(\''+po.id+'\')">Email vendor</button></div></div>'):'';
+  var hist=ups.length?('<div style="padding:0 16px 10px">'+ups.map(function(u){
+      return '<div style="font-size:var(--t-sm);padding:4px 0;border-top:1px solid var(--border)"><span class="t3xs" style="color:var(--text3)">'+esc(String(u.created_at||'').slice(0,10))+'</span> &middot; '
+        +esc(u.notes||'')+(u.estimated_delivery?' <span class="t3xs" style="color:var(--teal)">ETA '+esc(u.estimated_delivery)+'</span>':'')
+        +' <a href="#" class="t3xs" style="color:var(--text3)" onclick="poDeleteVendorUpdate(\''+po.id+'\',\''+u.id+'\');return false">remove</a></div>';
+    }).join('')+'</div>'):'';
+  return '<div class="panel" style="padding:0;margin-bottom:14px"><div class="section-header">Vendor follow-up</div>'+head+hist+'</div>';
+}
+function poLogVendorUpdate(poId){
+  var po=S.purchases.find(function(p){return p.id===poId;});if(!po)return;
+  var f=poFollowInfo(po),esc=escHtml;
+  var box=$('modal-box'),ov=$('modal-overlay');
+  box.innerHTML='<div class="modal-title">Vendor update - '+esc(po.vendor||'')+'<button class="modal-close" onclick="closeModal()"><span class="ic ic-x"></span></button></div>'
+    +'<div class="form-group"><label class="form-label">What did they say?</label><select id="vu-status" class="form-input">'
+      +'<option value="On track">On track - shipping as expected</option><option value="Shipped">Shipped (add tracking separately)</option><option value="Delayed">Delayed - new date below</option><option value="No reply">No reply yet</option></select></div>'
+    +'<div class="form-group"><label class="form-label">Expected arrival'+(f?' <span class="t3xs" style="color:var(--text3)">(currently '+_poFmt(f.eta)+')</span>':'')+'</label><input id="vu-eta" type="date" class="form-input" value="'+(f?hpISO(f.eta):'')+'"></div>'
+    +'<div class="form-group"><label class="form-label">Note</label><input id="vu-note" class="form-input" placeholder="e.g. spoke to Mike, ships Friday"></div>'
+    +'<div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="poSubmitVendorUpdate(\''+poId+'\')">Save update</button></div>';
+  ov.classList.remove('hidden');
+}
+async function poSubmitVendorUpdate(poId){
+  var st=($('vu-status')||{}).value||'On track',eta=($('vu-eta')||{}).value||null,note=(($('vu-note')||{}).value||'').trim();
+  // "No reply" is logged for the record but must not count as the vendor confirming a date
+  var row={po_id:poId,carrier:PO_VU,tracking_number:'',notes:st+(note?' - '+note:''),estimated_delivery:st==='No reply'?null:eta,created_at:new Date().toISOString()}; // timestamp drives the check-in reset
+  var r=await db.from('po_tracking').insert(row).select().single();
+  if(r.error){toast('Update not saved: '+r.error.message,7000);return;}
+  if(st!=='No reply'&&eta){
+    var po=S.purchases.find(function(p){return p.id===poId;});
+    if(po&&po.expected_date!==eta){
+      var u=await db.from('purchases').update({expected_date:eta,updated_at:new Date().toISOString()}).eq('id',poId);
+      if(!u.error)S.purchases=S.purchases.map(function(p){return p.id===poId?Object.assign({},p,{expected_date:eta}):p;});
+    }
+  }
+  S.poVendorUpd=S.poVendorUpd||{};(S.poVendorUpd[poId]=S.poVendorUpd[poId]||[]).push(r.data);
+  logAction('Vendor update on PO ('+st+')','purchases',poId,null,row).catch(function(){});
+  closeModal();updateBadge();render();
+  toast('Vendor update saved'+(st==='No reply'?' - the check-in stays open':''));
+}
+async function poDeleteVendorUpdate(poId,id){
+  if(!confirm('Remove this vendor update?'))return;
+  var r=await db.from('po_tracking').delete().eq('id',id);
+  if(r.error){toast('Not removed: '+r.error.message,6000);return;}
+  if(S.poVendorUpd&&S.poVendorUpd[poId])S.poVendorUpd[poId]=S.poVendorUpd[poId].filter(function(t){return t.id!==id;});
+  updateBadge();render();
+}
+function poEmailVendor(poId){var u=poMailto(poId);if(!u)return;if(!u.to)toast('No email on file for this vendor - add one under Vendors. Opening a draft without a recipient.',7000);window.location.href=u.url;}
+function poMailto(poId){
+  var po=S.purchases.find(function(p){return p.id===poId;});if(!po)return null;
+  var v=(S.vendors||[]).find(function(x){return (x.name||'').trim().toLowerCase()===(po.vendor||'').trim().toLowerCase();});
+  var to=v?(v.contact_email||v.email||''):'';
+  var f=poFollowInfo(po),lines=_poOutstandingLines(po);
+  var ref=po.po_number||po.reference||('PO dated '+(po.order_date||''));
+  var list=lines.length?lines.map(function(l){var it=partByPn(l.pn)||asmByPn(l.pn);return '- '+(it?dispPn(it):l.pn)+(l.description?' ('+l.description+')':'')+': '+((l.qty_ordered||0)-(l.qty_received||0))+' pcs';}).join('\n'):'- '+(po.pn||'')+': '+(po.qty||'');
+  var body='Hi,\n\nCould you give us a status update on our order '+ref+'?\n\nStill outstanding:\n'+list+'\n\n'
+    +(f?'We have it expected around '+_poFmt(f.eta)+'. Is that still on track? If it has shipped, could you send the tracking number?\n\n':'Could you confirm the ship date and send tracking when available?\n\n')
+    +'Thanks,\n'+'TGK Motorsport';
+  return {to:to,subject:'Order status - '+ref+' - TGK Motorsport',body:body,url:'mailto:'+encodeURIComponent(to)+'?subject='+encodeURIComponent('Order status - '+ref+' - TGK Motorsport')+'&body='+encodeURIComponent(body)};
+}
+window.poMailto=poMailto;
+window.poLogVendorUpdate=poLogVendorUpdate;window.poSubmitVendorUpdate=poSubmitVendorUpdate;window.poDeleteVendorUpdate=poDeleteVendorUpdate;
+window.poEmailVendor=poEmailVendor;window.poSetCheckinDays=poSetCheckinDays;window.poSplitTracking=poSplitTracking;
+
 
 function hpImportPanel(P){
   var st=S._hpImport,earliest=S._hpEarliest;
