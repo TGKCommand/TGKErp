@@ -461,7 +461,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.72';
+const TGK_ERP_VERSION = 'v23.73';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -19320,7 +19320,7 @@ async function submitPOCart(){
   const pm={};S.parts.forEach(p=>pm[p.pn]=p);
   const groups={};
   S.poCart.forEach(c=>{
-    const v=(pm[c.pn]?.vendor)||'TBD';
+    const v=c.vendor||(pm[c.pn]?.vendor)||'TBD';
     (groups[v]=groups[v]||[]).push(c);
   });
   const vendors=Object.keys(groups);
@@ -19335,7 +19335,7 @@ async function submitPOCart(){
       unit_cost:0,status:'Draft',order_date:new Date().toISOString().slice(0,10),updated_at:new Date().toISOString()
     }).select().single();
     if(error){toast('Error on '+v+': '+error.message);continue;}
-    const lines=items.map(c=>({po_id:po.id,pn:c.pn,description:pm[c.pn]?.description||'',qty_ordered:c.qty,unit_cost:c.unitCost!=null?c.unitCost:costForQty(pm[c.pn]||{},c.qty),qty_received:0,status:'Pending'}));
+    const lines=items.map(c=>({po_id:po.id,pn:c.pn,description:pm[c.pn]?.description||c.description||'',qty_ordered:c.qty,unit_cost:c.unitCost!=null?c.unitCost:costForQty(pm[c.pn]||{},c.qty),qty_received:0,status:'Pending'}));
     const shipping=parseFloat((S.poCartShipping||{})[v])||0;
     if(shipping>0)lines.push({po_id:po.id,pn:'SHIPPING',description:'Shipping & Handling',qty_ordered:1,unit_cost:shipping,qty_received:0,status:'Pending'});
     const {data:insertedLines}=await db.from('po_lines').insert(lines).select();
@@ -29800,7 +29800,7 @@ function renderCartPanel(){
   var pm={};S.parts.forEach(function(p){pm[p.pn]=p;});
   var groups={};
   S.poCart.forEach(function(c){
-    var v=(pm[c.pn]&&pm[c.pn].vendor)||'Unknown';
+    var v=c.vendor||(pm[c.pn]&&pm[c.pn].vendor)||'Unknown';
     if(!groups[v])groups[v]=[];
     groups[v].push(c);
   });
@@ -31707,9 +31707,17 @@ function hpModel(){
   });
   function clampLift(x){return Math.max(0.5,Math.min(15,x));}
   // --- 3. items to forecast ----------------------------------------------------------------------
-  var cand={};
-  S.assemblies.forEach(function(a){if(!a.discontinued&&!isDev(a))cand[a.pn]=1;});
-  keys.forEach(function(k){if(sum(k,today-182*HP_DAY,today)>0){var a=S._asmIdx[k];if(!(a&&(a.discontinued||isDev(a))))cand[k]=1;}});
+  // Products to forecast: active finished goods, plus ANYTHING actually sold in the last 26 weeks.
+  // Subassemblies and hardware packs are not offered as products unless they really sell on their own -
+  // their demand arrives through the BOMs of what does sell.
+  var cand={},unmatched=[];
+  S.assemblies.forEach(function(a){if(!a.discontinued&&!isDev(a)&&!a.is_subassembly&&!isHWPack(a.pn))cand[a.pn]=1;});
+  keys.forEach(function(k){
+    var u=sum(k,today-182*HP_DAY,today);if(u<=0)return;
+    if(!_canonItem(k)){unmatched.push({pn:k,units:u});return;} // sold under a SKU the ERP does not know
+    var a=S._asmIdx[k];if(!(a&&(a.discontinued||isDev(a))))cand[k]=1;
+  });
+  unmatched.sort(function(x,y){return y.units-x.units;});
   var horizonEnd=evs.length?hpD(evs[evs.length-1].end):today;
   var firstStart=evs.length?hpD(evs[0].start):today;
   var eventDays=0;evInfo.forEach(function(x){eventDays+=x.len;});
@@ -31761,8 +31769,12 @@ function hpModel(){
     }
     items.forEach(function(it){if(it.a)walk(it.a.pn,0,{});});
   })();
-  var gross={},partGross={},usedBy={};
-  items.forEach(function(it){if(it.a)gross[it.a.pn]=(gross[it.a.pn]||0)+it.need;else partGross[it.k]=(partGross[it.k]||0)+it.need;});
+  var gross={},partGross={},usedBy={},src={}; // src[pn] = [{from, builds, per, qty}] - why this much is needed
+  var addSrc=function(pn,from,builds,per,qty){(src[pn]=src[pn]||[]).push({from:from,builds:builds,per:per,qty:qty});};
+  items.forEach(function(it){
+    if(it.a){gross[it.a.pn]=(gross[it.a.pn]||0)+it.need;if(it.need)addSrc(it.a.pn,null,0,0,it.need);}
+    else{partGross[it.k]=(partGross[it.k]||0)+it.need;if(it.need)addSrc(it.k,null,0,0,it.need);}
+  });
   var asmNet={},order=Object.keys(lvl).sort(function(x,y){return lvl[x]-lvl[y];});
   order.forEach(function(pn){
     var g=gross[pn]||0;if(g<=0)return;
@@ -31773,21 +31785,49 @@ function hpModel(){
       var key=_upKey(i.child_pn,i.item_type),cp=key.slice(2),q=net*(Number(i.qty)||1);
       if(key.charAt(0)==='A')gross[cp]=(gross[cp]||0)+q;else partGross[cp]=(partGross[cp]||0)+q;
       (usedBy[cp]=usedBy[cp]||{})[pn]=1;
+      addSrc(cp,pn,net,Number(i.qty)||1,q);
     });
   });
   var weeksToBuild=Math.max(1,Math.floor((firstStart-(Number(cfg.bufferDays)||0)*HP_DAY-today)/(7*HP_DAY)));
   items.forEach(function(it){it.build=it.a?(asmNet[it.a.pn]||0):0;it.perWeek=it.build?Math.ceil(it.build/weeksToBuild):0;});
+  // Latest PO per item (vendor, price, real order-to-receipt time) - fills gaps in the item records
+  var lastPO={};
+  (S.purchases||[]).forEach(function(po){
+    if(!po||['Cancelled','Lost'].indexOf(po.status)>=0)return;
+    (S.poLines[po.id]||[]).forEach(function(l){
+      if(!l.pn||l.pn==='SHIPPING')return;
+      var k=(_canonItem(l.pn)||{}).pn||l.pn,cur=lastPO[k];
+      if(!cur||String(po.order_date||'')>String(cur.date||''))
+        lastPO[k]={vendor:po.vendor||'',date:po.order_date||'',cost:Number(l.unit_cost)||0,
+          ltw:(po.order_date&&po.status==='Received'&&po.updated_at)?Math.max(1,Math.round((hpD(po.updated_at)-hpD(po.order_date))/(7*HP_DAY))):null}; // receipt is the PO's last update
+    });
+  });
   var parts=Object.keys(partGross).map(function(pn){
-    var p=S._partIdx[pn];if(!p)return {pn:pn,missing:true,gross:partGross[pn],buy:0};
-    var oh=Math.max(0,p.total_unpckgd||0),onPO=openOrderedQty(p.pn)||0,net=Math.ceil(partGross[pn]-oh-onPO),buy=Math.max(0,net);
+    var p=S._partIdx[pn];if(!p)return {pn:pn,missing:true,gross:partGross[pn],buy:0,src:src[pn]||[]};
+    var committed=openOrderDemand(p.pn)||0; // units of this part already promised to open orders that sell it directly
+    var oh=Math.max(0,(p.total_unpckgd||0)-committed),onPO=openOrderedQty(p.pn)||0,net=Math.ceil(partGross[pn]-oh-onPO),buy=Math.max(0,net);
     if(buy>0&&(Number(p.moq)||0)>buy)buy=Number(p.moq);
     var lt=ltWeeks(p),orderBy=firstStart-lt*7*HP_DAY-(Number(cfg.bufferDays)||0)*HP_DAY;
     var unit=buy>0?costForQty(p,buy):(p.unit_cost||0);
-    return {pn:p.pn,p:p,gross:Math.ceil(partGross[pn]),oh:oh,onPO:onPO,draft:openDraftQty(p.pn),buy:buy,lt:lt,orderBy:orderBy,
-      daysLeft:Math.round((orderBy-today)/HP_DAY),cost:buy*unit,unit:unit,vendor:p.vendor||'',usedBy:Object.keys(usedBy[pn]||{})};
+    var lp=lastPO[p.pn]||{};
+    if(!unit&&lp.cost)unit=lp.cost;
+    return {kind:'part',pn:p.pn,p:p,gross:Math.ceil(partGross[pn]),oh:oh,committed:committed,onPO:onPO,draft:openDraftQty(p.pn),buy:buy,lt:lt,orderBy:orderBy,
+      daysLeft:Math.round((orderBy-today)/HP_DAY),cost:buy*unit,unit:unit,vendor:p.vendor||lp.vendor||'',vendorFromPO:!p.vendor&&!!lp.vendor,
+      supply:isNonRawSupplyItem(p.item_type||'part',p.category,p.description,p.pn),usedBy:Object.keys(usedBy[pn]||{}),src:src[pn]||[],moq:Number(p.moq)||0};
+  });
+  // Finished goods with no BOM (bought in, resale products): the shortfall is something to ORDER, not build
+  items.forEach(function(it){
+    if(!it.a||!it.build||(S.boms[it.a.pn]||[]).length)return;
+    var a=it.a,lp=lastPO[a.pn]||{},lt=(a.lead_time_weeks>0?a.lead_time_weeks:(lp.ltw||2));
+    var orderBy=firstStart-lt*7*HP_DAY-(Number(cfg.bufferDays)||0)*HP_DAY,unit=Number(a.unit_cost)||lp.cost||0;
+    it.buyFinished=it.build;
+    parts.push({kind:'finished',pn:a.pn,p:a,gross:it.need,oh:Math.max(0,it.avail),committed:it.committed,onPO:it.onPO,draft:openDraftQty(a.pn),buy:it.build,
+      lt:lt,ltGuess:!(a.lead_time_weeks>0)&&!lp.ltw,orderBy:orderBy,daysLeft:Math.round((orderBy-today)/HP_DAY),cost:it.build*unit,unit:unit,
+      vendor:a.vendor||lp.vendor||'',vendorFromPO:!a.vendor&&!!lp.vendor,supply:false,usedBy:[],src:src[a.pn]||[],moq:0});
+    it.build=0;it.perWeek=0;
   });
   var buyParts=parts.filter(function(x){return x.buy>0;});
-  S._hpPlan={items:items,parts:parts,evInfo:evInfo,evs:evs,firstStart:firstStart,horizonEnd:horizonEnd,today:today,weeksToBuild:weeksToBuild,
+  S._hpPlan={items:items,parts:parts,unmatched:unmatched,src:src,asmNet:asmNet,evInfo:evInfo,evs:evs,firstStart:firstStart,horizonEnd:horizonEnd,today:today,weeksToBuild:weeksToBuild,
     totals:{units:items.reduce(function(s,i){return s+i.evTotal;},0),build:items.reduce(function(s,i){return s+i.build;},0),
       buyLines:buyParts.length,late:buyParts.filter(function(x){return x.daysLeft<0;}).length,soon:buyParts.filter(function(x){return x.daysLeft>=0&&x.daysLeft<=7;}).length,
       cost:buyParts.reduce(function(s,x){return s+x.cost;},0),missing:parts.filter(function(x){return x.missing;}).length}};
@@ -31832,11 +31872,12 @@ function hpAddToCart(vendor){
   var P=hpModel();if(!P)return;
   var list=P.parts.filter(function(x){return x.buy>0&&!x.missing&&(vendor==null||x.vendor===vendor);});
   if(!list.length){toast('Nothing to add');return;}
-  if(!confirm('Add '+list.length+' part line'+(list.length!==1?'s':'')+(vendor?' from '+vendor:'')+' to the PO cart?\n\nQuantities already in the cart are added to, not replaced.'))return;
+  if(!confirm('Add '+list.length+' line'+(list.length!==1?'s':'')+(vendor?' from '+vendor:'')+' to the PO cart?\n\nQuantities already in the cart are added to, not replaced.'))return;
   S.poCart=S.poCart||[];
   list.forEach(function(x){
     var ex=S.poCart.find(function(c){return c.pn===x.pn;});
-    if(ex){ex.qty+=x.buy;ex.unitCost=costForQty(x.p,ex.qty);}else S.poCart.push({pn:x.pn,qty:x.buy,unitCost:x.unit});
+    if(ex){ex.qty+=x.buy;if(x.kind==='part')ex.unitCost=costForQty(x.p,ex.qty);}
+    else S.poCart.push({pn:x.pn,qty:x.buy,unitCost:x.unit,vendor:x.vendor||undefined,description:(x.p&&x.p.description)||''});
   });
   saveCart();
   toast(list.length+' line'+(list.length!==1?'s':'')+' added to the PO cart',5000);
@@ -31845,6 +31886,36 @@ function hpAddToCart(vendor){
 window.hpSetEv=hpSetEv;window.hpAddEvent=hpAddEvent;window.hpDelEvent=hpDelEvent;window.hpSetGlobal=hpSetGlobal;window.hpSetOv=hpSetOv;window.hpAddToCart=hpAddToCart;
 
 // ---- Holiday planner: screen -----------------------------------------------------------------------
+// Why a line needs what it needs: every assembly that consumes it (builds x per unit), direct sales,
+// then the netting down to the buy quantity.
+function hpPartBreakdown(x){
+  var esc=escHtml,n0=function(v){return Math.round(v||0).toLocaleString('en-US');};
+  var rows=(x.src||[]).slice().sort(function(a,b){return b.qty-a.qty;}).map(function(s){
+    if(!s.from)return '<div>'+(x.kind==='finished'?'Forecast sales through the plan':'Sold directly')+' &rarr; <b>'+n0(s.qty)+'</b></div>';
+    var a=asmByPn(s.from),sub=a&&a.is_subassembly;
+    return '<div><span class="pn">'+esc(a?dispPn(a):s.from)+'</span> <span class="t3xs" style="color:var(--text3)">'+esc(((a&&a.description)||'').slice(0,36))+(sub?' &middot; subassembly':'')+'</span> &mdash; '
+      +n0(s.builds)+' to build &times; '+s.per+' each = <b>'+n0(s.qty)+'</b></div>';
+  }).join('');
+  var net='<div style="margin-top:6px;color:var(--text2)">Needed <b>'+n0(x.gross)+'</b> &minus; on hand '+n0(x.oh)+(x.committed?' (after '+n0(x.committed)+' promised to open orders)':'')
+    +' &minus; on PO '+n0(x.onPO)+(x.draft?' ('+x.draft+' on draft)':'')+' = '+n0(Math.max(0,x.gross-x.oh-x.onPO))
+    +(x.moq&&x.buy===x.moq&&x.moq>Math.max(0,x.gross-x.oh-x.onPO)?' &rarr; rounded up to MOQ <b>'+x.moq+'</b>':'')+' &rarr; <b style="color:var(--orange)">buy '+n0(x.buy)+'</b></div>';
+  return '<div style="font-size:var(--t-sm);line-height:1.7">'+(rows||'<div class="t3xs">No source recorded</div>')+net+'</div>';
+}
+// What one product's builds consume, component by component
+function hpProdBreakdown(it,P){
+  var esc=escHtml,n0=function(v){return Math.round(v||0).toLocaleString('en-US');};
+  var builds=(P.asmNet&&P.asmNet[it.a.pn])||0;
+  var byPn={};P.parts.forEach(function(x){byPn[x.pn]=x;});
+  var lines=(S.boms[it.a.pn]||[]).map(function(i){
+    var key=_upKey(i.child_pn,i.item_type),cp=key.slice(2),isA=key.charAt(0)==='A',rec=isA?asmByPn(cp):partByPn(cp);
+    var x=byPn[cp],per=Number(i.qty)||1;
+    var st=isA?('subassembly - '+n0((P.asmNet&&P.asmNet[cp])||0)+' to build'):(x?(x.buy>0?'<b style="color:var(--orange)">short - buy '+n0(x.buy)+'</b> (all assemblies)':'covered by stock / POs'):'covered');
+    return '<tr><td class="pn">'+esc(rec?dispPn(rec):cp)+'</td><td class="t3xs" style="color:var(--text3)">'+esc(((rec&&rec.description)||'').slice(0,40))+'</td><td style="text-align:right">'+per+'</td><td style="text-align:right">'+n0(builds*per)+'</td><td>'+st+'</td></tr>';
+  }).join('');
+  return '<tr><td colspan="11" style="background:var(--bg2);padding:8px 14px 10px 28px"><div style="font-size:var(--t-sm);margin-bottom:4px"><b>'+n0(builds)+'</b> to build uses:</div>'
+    +'<table style="width:auto;min-width:520px"><thead><tr><th>Component</th><th></th><th style="text-align:right">Per unit</th><th style="text-align:right">For these builds</th><th>Status</th></tr></thead><tbody>'+lines+'</tbody></table></td></tr>';
+}
+window.hpPartBreakdown=hpPartBreakdown;window.hpProdBreakdown=hpProdBreakdown;
 function renderHolidayPlanner(){
   var cfg=hpCfg();
   if(!S._hpHist&&!S._hpLoading)setTimeout(function(){hpLoadHistory(false);},0);
@@ -31919,9 +31990,10 @@ function renderHolidayPlanner(){
   var prodRows=shown.map(function(it){
     var e=it.perEv[sel],cp=confPill[it.conf],k=it.k,ov=it.ov||{};
     var trendTxt=it.basis!=='own'?(it.basis==='like'?'like '+esc(dispSku(it.src))+' '+(ov.likePct||100)+'%':'manual'):(it.r.n>=6?((it.r.trend>=1?'&uarr; ':'&darr; ')+Math.round(Math.abs(it.r.trend-1)*100)+'%'):(it.r.n===0?'no sales yet':it.r.isNew?it.r.weeksActive+'w old':''));
-    var noBom=it.a&&it.build>0&&!(S.boms[it.a.pn]||[]).length;
-    return '<tr>'
-      +'<td><div class="pn">'+esc(it.a?dispPn(it.a):(it.p?dispPn(it.p):k))+'</div><div class="t3xs" style="color:var(--text3);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(((it.a||it.p||{}).description)||'')+'</div></td>'
+    var noBom=false;
+    var hasBom=it.a&&(S.boms[it.a.pn]||[]).length>0,openP=S._hpOpenProd&&S._hpOpenProd[k];
+    return '<tr'+(hasBom?' style="cursor:pointer" onclick="if(event.target.closest(\'input,select,button,a\'))return;S._hpOpenProd=S._hpOpenProd||{};S._hpOpenProd[\''+k+'\']=!S._hpOpenProd[\''+k+'\'];render()"':'')+'>'
+      +'<td><div class="pn">'+(hasBom?'<span style="color:var(--text3);font-size:var(--t-xs)">'+(openP?'&#9662;':'&#9656;')+'</span> ':'')+esc(it.a?dispPn(it.a):(it.p?dispPn(it.p):k))+'</div><div class="t3xs" style="color:var(--text3);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(((it.a||it.p||{}).description)||'')+'</div></td>'
       +'<td><span class="pill '+cp[1]+'" title="'+(it.conf==='input'?'No sales to base a forecast on - set Sells like or a weekly number':esc(e?e.how:''))+'">'+cp[0]+'</span></td>'
       +'<td style="text-align:right">'+n1(it.wk)+'<div class="t3xs" style="color:var(--text3)">'+trendTxt+'</div></td>'
       +'<td style="text-align:right">'+(X.haveLY?n0(e.lyUnits):'-')+'</td>'
@@ -31930,11 +32002,11 @@ function renderHolidayPlanner(){
       +'<td style="text-align:right"><input type="number" min="0" step="1" value="'+(e.overridden?e.plan:'')+'" placeholder="'+n0(e.plan)+'" title="Planned units for this event (blank = use the chosen method)" style="width:70px;font-weight:700;text-align:right;padding:3px 5px;background:var(--bg2);border:1px solid '+(e.overridden?'var(--orange)':'var(--border)')+';border-radius:4px;color:var(--text)" onchange="hpSetOv(\''+k+'\',\'qty\',\''+sel+'\',this.value)"></td>'
       +'<td style="text-align:right">'+n0(it.need)+'</td>'
       +'<td style="text-align:right" title="On hand '+(it.a?(it.a.total_on_hand||0):'-')+' minus '+it.committed+' promised to open orders">'+(it.a?n0(it.avail):'-')+(it.onPO?'<div class="t3xs" style="color:var(--teal)">+'+n0(it.onPO)+' on PO'+draftNote(k)+'</div>':'')+'</td>'
-      +'<td style="text-align:right;font-weight:700;color:'+(it.build?'var(--orange)':'var(--text3)')+'">'+(it.build?n0(it.build)+'<div class="t3xs" style="font-weight:400">'+it.perWeek+'/wk</div>':'-')+(noBom?'<div class="t3xs" style="color:var(--red)">no BOM - buy finished?</div>':'')+'</td>'
+      +'<td style="text-align:right;font-weight:700;color:'+((it.build||it.buyFinished)?'var(--orange)':'var(--text3)')+'">'+(it.buyFinished?('Buy '+n0(it.buyFinished)+'<div class="t3xs" style="font-weight:400;color:var(--text3)">bought in</div>'):(it.build?n0(it.build)+'<div class="t3xs" style="font-weight:400">'+it.perWeek+'/wk</div>':'-'))+'</td>'
       +'<td><input placeholder="Sells like SKU" value="'+esc(ov.like?dispSku(ov.like):'')+'" title="Borrow another SKU\'s rate and history - for new products" style="width:120px;font-size:var(--t-xs);padding:2px 4px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text)" onchange="hpSetOv(\''+k+'\',\'like\',null,this.value)">'
         +(ov.like?' <input type="number" min="1" value="'+(ov.likePct||100)+'" title="% of that SKU\'s rate" style="width:52px;font-size:var(--t-xs);padding:2px 4px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text)" onchange="hpSetOv(\''+k+'\',\'likePct\',null,this.value)">%'
           :' <input type="number" min="0" step="0.5" placeholder="/wk" value="'+(ov.baseWk!=null?ov.baseWk:'')+'" title="Expected units per week (when there is no sales history)" style="width:52px;font-size:var(--t-xs);padding:2px 4px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;color:var(--text)" onchange="hpSetOv(\''+k+'\',\'baseWk\',null,this.value)">')+'</td>'
-      +'</tr>';
+      +'</tr>'+(openP&&hasBom?hpProdBreakdown(it,P):'');
   }).join('');
   var prod='<div class="panel" style="padding:0;margin-bottom:12px"><div class="section-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px"><span>Products</span>'+evPick+'</div>'
     +status.replace('margin:-4px 0 10px','margin:0;padding:6px 14px')
@@ -31943,24 +32015,47 @@ function renderHolidayPlanner(){
     +'<th style="text-align:right">Need<div class="t3xs">to '+hpFmtDate(P.horizonEnd)+' +'+cfg.safetyPct+'%</div></th><th style="text-align:right">Available</th><th style="text-align:right">Build</th><th>New product basis</th></tr></thead><tbody>'
     +(prodRows||'<tr><td colspan="11" class="section-empty">Nothing to show</td></tr>')+'</tbody></table></div>'
     +(rows.length>shown.length?'<div class="t3xs" style="padding:6px 14px;color:var(--text3)">Showing the top '+shown.length+' of '+rows.length+'.</div>':'')+'</div>';
-  // parts to buy
+  // sold SKUs the ERP cannot match - their demand is NOT in the plan
+  var um=P.unmatched||[],umHtml='';
+  if(um.length){
+    var umUnits=um.reduce(function(t,x){return t+x.units;},0);
+    umHtml='<div class="panel" style="padding:10px 14px;margin-bottom:12px;border-left:3px solid var(--orange);font-size:var(--t-sm)">'
+      +'<b style="color:var(--orange)">'+um.length+' sold SKU'+(um.length!==1?'s':'')+' are not in the ERP</b> - '+n0(umUnits)+' unit'+(umUnits!==1?'s':'')+' sold in the last 26 weeks that the plan cannot count or break down into parts. '
+      +'Fix the SKU on the product (or set its new SKU) so it matches Shopify:<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">'
+      +um.slice(0,15).map(function(x){return '<span class="pn" style="background:var(--bg2);padding:2px 6px;border-radius:4px">'+esc(x.pn)+' <span class="t3xs" style="color:var(--text3)">'+n0(x.units)+'</span></span>';}).join('')
+      +(um.length>15?'<span class="t3xs" style="color:var(--text3)">+'+(um.length-15)+' more</span>':'')+'</div></div>';
+  }
+  // parts to buy, grouped: finished goods to buy / parts / packaging & supplies
   var buy=P.parts.filter(function(x){return x.buy>0;}).sort(function(a,b){return a.daysLeft-b.daysLeft||String(a.vendor).localeCompare(String(b.vendor));});
   var vendors=[...new Set(buy.map(function(x){return x.vendor;}).filter(Boolean))].sort();
-  var partRows=buy.map(function(x){
-    return '<tr><td class="pn">'+esc(dispPn(x.p))+'<div class="t3xs" style="color:var(--text3)">'+esc((x.p.description||'').slice(0,40))+'</div></td><td>'+esc(x.vendor||'-')+'</td>'
-      +'<td style="text-align:right">'+n0(x.gross)+'</td><td style="text-align:right">'+n0(x.oh)+'</td><td style="text-align:right">'+(x.onPO?n0(x.onPO)+(x.draft?'<div class="t3xs" style="color:var(--orange)">'+x.draft+' draft</div>':'')+(function(){var a=poArrivalForPart(x.pn);if(!a)return '';var late=a>P.firstStart-(Number(cfg.bufferDays)||0)*HP_DAY;return '<div class="t3xs" style="color:'+(late?'var(--red);font-weight:700':'var(--text3)')+'">'+(late?'lands '+hpFmtDate(a)+' - after event':'due '+hpFmtDate(a))+'</div>';})():'-')+'</td>'
-      +'<td style="text-align:right;font-weight:700;color:var(--orange)">'+n0(x.buy)+(x.p.moq&&x.buy===Number(x.p.moq)?'<div class="t3xs" style="font-weight:400;color:var(--text3)">MOQ</div>':'')+'</td>'
-      +'<td>'+x.lt+'w</td><td style="font-weight:700;color:'+(x.daysLeft<0?'var(--red)':x.daysLeft<=7?'var(--orange)':'var(--text)')+'">'+hpFmtDate(x.orderBy)+'</td>'
-      +'<td style="text-align:right">'+fc(x.cost,0)+'</td></tr>';
+  var groups=[['finished','Finished goods to buy (no BOM - bought in)'],['part','Parts'],['supply','Packaging & supplies']];
+  var gOf=function(x){return x.kind==='finished'?'finished':(x.supply?'supply':'part');};
+  var partRow=function(x){
+    var open=S._hpOpenPart&&S._hpOpenPart[x.pn],k=x.pn.replace(/'/g,"\\'");
+    return '<tr style="cursor:pointer" onclick="S._hpOpenPart=S._hpOpenPart||{};S._hpOpenPart[\''+k+'\']=!S._hpOpenPart[\''+k+'\'];render()">'
+      +'<td class="pn"><span style="color:var(--text3);font-size:var(--t-xs)">'+(open?'&#9662;':'&#9656;')+'</span> '+esc(dispPn(x.p))+'<div class="t3xs" style="color:var(--text3)">'+esc((x.p.description||'').slice(0,40))+'</div></td>'
+      +'<td>'+esc(x.vendor||'-')+(x.vendorFromPO?'<div class="t3xs" style="color:var(--text3)">from last PO</div>':'')+'</td>'
+      +'<td style="text-align:right">'+n0(x.gross)+'<div class="t3xs" style="color:var(--text3)">'+(x.src.filter(function(s){return s.from;}).length?x.src.filter(function(s){return s.from;}).length+' assembl'+(x.src.filter(function(s){return s.from;}).length!==1?'ies':'y'):(x.kind==='finished'?'forecast sales':'sold direct'))+'</div></td>'
+      +'<td style="text-align:right">'+n0(x.oh)+(x.committed?'<div class="t3xs" style="color:var(--text3)">after '+x.committed+' promised</div>':'')+'</td>'
+      +'<td style="text-align:right">'+(x.onPO?n0(x.onPO)+(x.draft?'<div class="t3xs" style="color:var(--orange)">'+x.draft+' draft</div>':'')+(function(){var a=poArrivalForPart(x.pn);if(!a)return '';var late=a>P.firstStart-(Number(cfg.bufferDays)||0)*HP_DAY;return '<div class="t3xs" style="color:'+(late?'var(--red);font-weight:700':'var(--text3)')+'">'+(late?'lands '+hpFmtDate(a)+' - after event':'due '+hpFmtDate(a))+'</div>';})():'-')+'</td>'
+      +'<td style="text-align:right;font-weight:700;color:var(--orange)">'+n0(x.buy)+(x.moq&&x.buy===x.moq?'<div class="t3xs" style="font-weight:400;color:var(--text3)">MOQ</div>':'')+'</td>'
+      +'<td>'+x.lt+'w'+(x.ltGuess?'<div class="t3xs" style="color:var(--text3)">default</div>':'')+'</td><td style="font-weight:700;color:'+(x.daysLeft<0?'var(--red)':x.daysLeft<=7?'var(--orange)':'var(--text)')+'">'+hpFmtDate(x.orderBy)+'</td>'
+      +'<td style="text-align:right">'+(x.cost?fc(x.cost,0):'<span class="t3xs" style="color:var(--text3)">no cost</span>')+'</td></tr>'
+      +(open?'<tr><td colspan="9" style="background:var(--bg2);padding:8px 14px 10px 28px">'+hpPartBreakdown(x)+'</td></tr>':'');
+  };
+  var body=groups.map(function(g){
+    var rows=buy.filter(function(x){return gOf(x)===g[0];});if(!rows.length)return '';
+    var tot=rows.reduce(function(t,x){return t+x.cost;},0);
+    return '<tr><td colspan="9" style="background:var(--bg3);font-size:var(--t-xs);font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--text2);padding:6px 14px">'+g[1]+' &middot; '+rows.length+' &middot; '+fc(tot,0)+'</td></tr>'+rows.map(partRow).join('');
   }).join('');
   var missing=P.parts.filter(function(x){return x.missing;});
-  var partsHtml='<div class="panel" style="padding:0"><div class="section-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px"><span>Parts to buy ('+buy.length+')</span>'
+  var partsHtml='<div class="panel" style="padding:0"><div class="section-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px"><span>To order ('+buy.length+') <span style="text-transform:none;letter-spacing:0;font-weight:400;color:var(--text3)">&middot; click a line to see which assemblies need it</span></span>'
     +'<span style="display:flex;gap:6px;flex-wrap:wrap;text-transform:none;letter-spacing:0">'+(buy.length?'<button class="btn btn-primary btn-sm" onclick="hpAddToCart(null)">Add all to PO cart</button>':'')
     +vendors.slice(0,8).map(function(v){return '<button class="btn btn-sm" onclick="hpAddToCart(\''+String(v).replace(/'/g,"\\'")+'\')">'+esc(v)+'</button>';}).join('')+'</span></div>'
-    +'<div class="tbl-wrap"><table><thead><tr><th>Part</th><th>Vendor</th><th style="text-align:right">Needed</th><th style="text-align:right">On hand</th><th style="text-align:right">On PO</th><th style="text-align:right">Buy</th><th>Lead</th><th>Order by</th><th style="text-align:right">Est. cost</th></tr></thead><tbody>'
-    +(partRows||'<tr><td colspan="9" class="section-empty">Stock and open POs already cover the plan</td></tr>')+'</tbody></table></div>'
+    +'<div class="tbl-wrap"><table><thead><tr><th>Item</th><th>Vendor</th><th style="text-align:right">Needed</th><th style="text-align:right">On hand</th><th style="text-align:right">On PO</th><th style="text-align:right">Buy</th><th>Lead</th><th>Order by</th><th style="text-align:right">Est. cost</th></tr></thead><tbody>'
+    +(body||'<tr><td colspan="9" class="section-empty">Stock and open POs already cover the plan</td></tr>')+'</tbody></table></div>'
     +(missing.length?'<div class="t3xs" style="padding:6px 14px;color:var(--red)">'+missing.length+' BOM line(s) point at SKUs that are not in Parts: '+esc(missing.slice(0,6).map(function(x){return x.pn;}).join(', '))+'</div>':'')+'</div>';
-  return head+hpImportPanel(P)+explain+kpis+urgentHtml+prod+partsHtml;
+  return head+hpImportPanel(P)+explain+kpis+urgentHtml+umHtml+prod+partsHtml;
 }
 window.renderHolidayPlanner=renderHolidayPlanner;
 // ===================================================================================================
