@@ -461,7 +461,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.74';
+const TGK_ERP_VERSION = 'v23.75';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -1297,10 +1297,17 @@ function setupRealtime(){
     .on('postgres_changes',{event:'*',schema:'public',table:'sales'},p=>{
       if(p.eventType==='INSERT'){
         if(!S.sales.find(s=>s.id===p.new.id)){
-          S.sales=[p.new,...S.sales];
+          // [FIX v23.75] Insert in date order (newest first, same as the initial load) instead of always at the
+          // front - a history import used to put last year's orders ahead of today's everywhere.
+          var _nd=String(p.new.sale_date||''),_ix=S.sales.findIndex(function(s){return String(s.sale_date||'')<=_nd;});
+          S.sales=_ix<0?[...S.sales,p.new]:[...S.sales.slice(0,_ix),p.new,...S.sales.slice(_ix)];
+          // Backfilled history (Shopify History import, ShipStation audit imports of old orders) is not a new order.
+          var _isBackfill=p.new.source==='Shopify History'||(p.new.sale_date&&p.new.sale_date<daysAgo(3));
+          if(!_isBackfill){
           showOrderAlert(p.new.order_number||'',p.new.pn||'');
           pushActivity({icon:'<span class="ic ic-cart"></span>',type:'order',text:'New order #'+(p.new.order_number||''),sub:dispSku(p.new.pn)+(p.new.qty>1?' ×'+p.new.qty:'')+(p.new.customer_name?' — '+p.new.customer_name:''),ts:p.new.sale_date||new Date().toISOString(),cls:'var(--teal)'});
           if(p.new.fulfillment_status==='On Hold')notifyHoldAlert(p.new);
+          }
         }
       } else if(p.eventType==='UPDATE'){
         const prev=S.sales.find(s=>s.id===p.new.id);
@@ -13044,9 +13051,11 @@ async function ssManualSync(orderNum,tracking,carrier){
     const _msPrt=_msAsm?null:((S._partIdx&&S._partIdx[sale.pn])||S.parts.find(p=>p.pn===sale.pn||(p.new_sku&&p.new_sku===sale.pn)));
     if(await _manualCreateDeducted(orderNum,(_msAsm||_msPrt||{}).pn)){console.log('[ship] '+sale.pn+' on '+orderNum+' was deducted when the manual order was created - not deducting again');}
     else if(_msAsm){
-      await adjustStock('assembly',_msAsm,-(sale.qty||1),{reason:'Manual ship \u2014 order '+orderNum+' tracking '+tracking,source:'shipment'}); // allow negative = backorder
+      const _na=await adjustStock('assembly',_msAsm,-(sale.qty||1),{reason:'Manual ship \u2014 order '+orderNum+' tracking '+tracking,source:'shipment'}); // allow negative = backorder
+      if(_na!==null)undoOps.push({action:'update',table:'assemblies',data:{id:_msAsm.id,pn:_msAsm.pn,total_on_hand:(_msAsm.total_on_hand||0)-(sale.qty||1)},prev:{id:_msAsm.id,pn:_msAsm.pn,total_on_hand:_msAsm.total_on_hand||0}}); // [FIX v23.75] undo restores stock too
     } else if(_msPrt){
-      await adjustStock('part',_msPrt,-(sale.qty||1),{reason:'Manual ship \u2014 order '+orderNum+' tracking '+tracking,source:'shipment'});
+      const _np=await adjustStock('part',_msPrt,-(sale.qty||1),{reason:'Manual ship \u2014 order '+orderNum+' tracking '+tracking,source:'shipment'});
+      if(_np!==null)undoOps.push({action:'update',table:'parts',data:{id:_msPrt.id,pn:_msPrt.pn,total_unpckgd:(_msPrt.total_unpckgd||0)-(sale.qty||1)},prev:{id:_msPrt.id,pn:_msPrt.pn,total_unpckgd:_msPrt.total_unpckgd||0}});
     }
     }
   }
@@ -18659,10 +18668,17 @@ function assemblyDossier(pn){
   if(!a)return'<div class="panel section-empty">Not found</div>';
   const b=buildability(pn);
   const demand=openOrderDemand(pn);
-  const sold30=S.sales.filter(s=>s.pn===pn&&s.sale_date>=daysAgo(30)).reduce((t,s)=>t+(s.qty||1),0);
-  const sold90=S.sales.filter(s=>s.pn===pn&&s.sale_date>=daysAgo(90)).reduce((t,s)=>t+(s.qty||1),0);
+  // [FIX v23.75] Match every SKU form of this item (old pn and new SKU), not just the exact string.
+  const _canonPn=(_canonItem(pn)||{}).pn||pn;
+  const _mySales=S.sales.filter(s=>s.pn&&(s.pn===pn||((_canonItem(s.pn)||{}).pn||s.pn)===_canonPn));
+  const sold30=_mySales.filter(s=>s.sale_date>=daysAgo(30)&&s.fulfillment_status!=='Cancelled').reduce((t,s)=>t+(s.qty||1),0);
+  const sold90=_mySales.filter(s=>s.sale_date>=daysAgo(90)&&s.fulfillment_status!=='Cancelled').reduce((t,s)=>t+(s.qty||1),0);
   const claims=S.warrantyClaims.filter(w=>w.pn===pn);
-  const recentSales=S.sales.filter(s=>s.pn===pn).slice(0,8);
+  // [FIX v23.75] Was "the first 8 in whatever order S.sales happened to be in" - never sorted. Live inserts
+  // (including history imports) go to the front of that list, so old orders could crowd out new ones.
+  const recentSales=_mySales.slice().sort(function(a,b){
+    return String(b.sale_date||'').localeCompare(String(a.sale_date||''))||String(b.created_at||'').localeCompare(String(a.created_at||''));
+  }).slice(0,10);
   const corr=itemCorrections(pn,60);
   const bomCost=bomCostOf(pn,0);
   const _amsrp=msrpOfAsm(a);
