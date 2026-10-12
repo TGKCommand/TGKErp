@@ -203,6 +203,20 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 .bom-line-edit:hover{color:var(--teal);border-color:var(--teal)!important;background:var(--teal-dim);opacity:1}
 .bom-line-del{background:transparent;border:none;color:var(--text3);cursor:pointer;font-size:var(--t-xl);line-height:1.25;padding:2px}
 .bom-line-del:hover{color:var(--red)}
+.po-pick-dd{position:absolute;left:0;right:0;top:100%;margin-top:2px;z-index:50;background:var(--bg);border:1px solid var(--border2,var(--border));border-radius:var(--r-md);box-shadow:0 8px 24px rgba(0,0,0,.14);max-height:320px;overflow-y:auto}
+.po-pick-opt{display:flex;align-items:baseline;gap:8px;padding:6px 10px;cursor:pointer;border-bottom:1px solid var(--border);font-size:var(--t-sm)}
+.po-pick-opt:last-child{border-bottom:none}
+.po-pick-opt.on,.po-pick-opt:hover{background:rgba(13,148,136,.08)}
+.po-pick-opt .pn{flex-shrink:0;color:var(--teal);font-weight:600}
+.po-pick-desc{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)}
+.po-pick-meta{flex-shrink:0;font-size:var(--t-xs);color:var(--text3)}
+.po-pick-tag{font-size:10px;font-weight:700;border:1px solid var(--border);border-radius:3px;padding:0 4px;margin-right:4px}
+.po-pick-empty{padding:8px 10px;font-size:var(--t-sm);color:var(--text3)}
+.bom-grip{cursor:grab;color:var(--text3);padding:2px 4px;margin-right:2px;user-select:none;-webkit-user-select:none;font-size:15px;line-height:1;border-radius:4px;flex-shrink:0;display:inline-block}
+.bom-grip:hover{color:var(--teal);background:var(--bg3)}
+[data-bomdrag].bom-dragging{opacity:.45}
+[data-bomdrag].bom-drop-above{box-shadow:inset 0 3px 0 var(--teal)}
+[data-bomdrag].bom-drop-below{box-shadow:inset 0 -3px 0 var(--teal)}
 .m-bom-ex-row{display:flex;align-items:center;gap:8px;padding:5px 8px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-md);margin-bottom:4px}
 .bom-row.bom-row-editing,.m-bom-ex-row.bom-row-editing{display:block;background:rgba(13,148,136,.06)}
 .bom-ef{display:flex;flex-wrap:wrap;align-items:flex-end;gap:8px;width:100%}
@@ -461,7 +475,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.75';
+const TGK_ERP_VERSION = 'v23.76';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 document.addEventListener('DOMContentLoaded',function(){
@@ -4345,7 +4359,7 @@ function renderBOMs(){
           ondragover="bomDragOver(this,'${item.id}',event)"
           ondrop="bomDrop(this,'${item.id}','${sel}',event)"
           onclick="rowClick(event,function(){lookupGo('${_findAsm2(item.child_pn)?'assembly':'part'}','${item.child_pn}')})">
-          <div class="bom-drag-handle" title="Drag to reorder" onclick="event.stopPropagation()">&#8942;</div>
+          <div class="bom-drag-handle bom-grip" title="Drag to reorder" onclick="event.stopPropagation()">&#10303;</div>
           <div class="type-accent" style="background:${accentMap[bb.cls]}"></div>
           <div style="display:flex;align-items:center;justify-content:center">${(()=>{const _ci=(typeof _canonItem==='function')?_canonItem(item.child_pn):null;return _ci?imgThumb(_ci,26):'';})()}</div>
           <div style="flex:1;min-width:0">
@@ -14110,6 +14124,69 @@ window.bomDragOver=function(el,id,ev){
   el.classList.add(ev.clientY<mid?'bom-drop-above':'bom-drop-below');
 };
 
+// [v23.76] Shared BOM reorder used by every screen that lists a BOM. Saves sort_order (the order the BOM
+// loads in everywhere), checks each write, and puts the old order back if any write fails - the previous
+// version ignored errors and always reported "saved".
+async function bomSaveOrder(pn,newItems){
+  var before=(S.boms[pn]||[]).slice();
+  var updated=newItems.map(function(item,idx){return Object.assign({},item,{sort_order:(idx+1)*10});});
+  S.boms[pn]=updated;
+  var bad=null;
+  for(var i=0;i<updated.length;i++){
+    if(before.find(function(b){return b.id===updated[i].id&&b.sort_order===updated[i].sort_order;}))continue;
+    var r=await db.from('bom_items').update({sort_order:updated[i].sort_order}).eq('id',updated[i].id);
+    if(r&&r.error){bad=r.error;break;}
+  }
+  if(bad){S.boms[pn]=before;toast('BOM order NOT saved: '+bad.message,7000);render();return false;}
+  if(typeof _clearBomCostCache==='function')_clearBomCostCache();
+  S._buildabilityCache=null;
+  logAction('Reordered BOM lines for '+pn,'bom_items',null,null,null).catch(function(){});
+  toast('\u2713 BOM order saved');
+  return true;
+}
+window.bomSaveOrder=bomSaveOrder;
+// Delegated drag for any row marked data-bomdrag="<parent pn>" data-bomrow="<line id>" with a .bom-grip.
+// The row only becomes draggable while the grip is held, so clicking rows, editing lines and selecting
+// text all work as before.
+(function(){
+  var drag=null;
+  function rowOf(el){return el&&el.closest?el.closest('[data-bomdrag][data-bomrow]'):null;}
+  function clear(){document.querySelectorAll('[data-bomdrag]').forEach(function(r){r.classList.remove('bom-drop-above','bom-drop-below','bom-dragging');});}
+  document.addEventListener('mousedown',function(e){
+    var g=e.target.closest&&e.target.closest('.bom-grip');var r=g&&rowOf(g);
+    if(r&&r.getAttribute('data-bomrow'))r.setAttribute('draggable','true');
+  },true);
+  document.addEventListener('mouseup',function(){document.querySelectorAll('[data-bomdrag][draggable="true"]').forEach(function(r){if(!drag)r.removeAttribute('draggable');});},true);
+  document.addEventListener('dragstart',function(e){
+    var r=rowOf(e.target);if(!r||r.getAttribute('draggable')!=='true')return;
+    drag={id:r.getAttribute('data-bomrow'),pn:r.getAttribute('data-bomdrag'),el:r};
+    r.classList.add('bom-dragging');
+    try{e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',drag.id);}catch(_){}
+  });
+  document.addEventListener('dragover',function(e){
+    if(!drag)return;var r=rowOf(e.target);
+    if(!r||r.getAttribute('data-bomdrag')!==drag.pn||r===drag.el)return;
+    e.preventDefault();
+    var rc=r.getBoundingClientRect(),above=e.clientY<rc.top+rc.height/2;
+    document.querySelectorAll('[data-bomdrag]').forEach(function(x){if(x!==r)x.classList.remove('bom-drop-above','bom-drop-below');});
+    r.classList.toggle('bom-drop-above',above);r.classList.toggle('bom-drop-below',!above);
+  });
+  document.addEventListener('drop',async function(e){
+    if(!drag)return;var r=rowOf(e.target);var d=drag;drag=null;clear();d.el.removeAttribute('draggable');
+    if(!r||r.getAttribute('data-bomdrag')!==d.pn||r===d.el)return;
+    e.preventDefault();
+    var rc=r.getBoundingClientRect(),before=e.clientY<rc.top+rc.height/2,tid=r.getAttribute('data-bomrow');
+    var items=(S.boms[d.pn]||[]).slice(),from=items.findIndex(function(i){return i.id===d.id;});
+    if(from<0||!items.some(function(i){return i.id===tid;}))return;
+    var moved=items.splice(from,1)[0],at=items.findIndex(function(i){return i.id===tid;})+(before?0:1);
+    items.splice(at,0,moved);
+    r.parentNode.insertBefore(d.el,before?r:r.nextSibling); // move it on screen right away (modals are not re-rendered)
+    if(await bomSaveOrder(d.pn,items))render();
+  });
+  document.addEventListener('dragend',function(){if(drag){drag.el.removeAttribute('draggable');drag=null;}clear();});
+})();
+function bomGrip(){return '<span class="bom-grip" title="Drag to reorder" onclick="event.stopPropagation()">&#10303;</span>';}
+window.bomGrip=bomGrip;
 window.bomDrop=async function(el,targetId,pn,ev){
   ev.preventDefault();
   document.querySelectorAll('.bom-row').forEach(r=>{r.classList.remove('bom-drop-above');r.classList.remove('bom-drop-below');});
@@ -14128,17 +14205,8 @@ window.bomDrop=async function(el,targetId,pn,ev){
   if(!insertBefore)insertAt+=1;
   items.splice(insertAt,0,moved);
 
-  const updated=items.map((item,idx)=>({...item,sort_order:(idx+1)*10}));
-  S.boms[pn]=updated;
   _bomDragId=null;
-  render();
-
-  try{
-    await Promise.all(updated.map(item=>
-      db.from('bom_items').update({sort_order:item.sort_order}).eq('id',item.id)
-    ));
-    toast('\u2713 BOM order saved');
-  }catch(e){toast('Order saved locally — DB update failed: '+e.message);}
+  if(await bomSaveOrder(pn,items))render();
 };
 
 async function delBOMItem(id,parentPn){
@@ -14181,7 +14249,7 @@ function bomLineEditBtn(id,parentPn,surface){
 }
 function bomModalRowInner(b,parentPn){
   var src=_findPart(b.child_pn)||_findAsm2(b.child_pn);
-  return '<span style="font-family:var(--mono);font-size:var(--t-sm);color:var(--teal);min-width:80px">'+escHtml(src?dispPn(src):b.child_pn)+'</span>'
+  return (parentPn?bomGrip():'')+'<span style="font-family:var(--mono);font-size:var(--t-sm);color:var(--teal);min-width:80px">'+escHtml(src?dispPn(src):b.child_pn)+'</span>'
     +'<span style="font-size:var(--t-xs);color:var(--text3);flex:1">'+escHtml((src&&src.description)||'')+'</span>'
     +'<span class="bom-qty-val">\u00d7'+b.qty+'</span>'
     +'<span style="font-size:var(--t-xs);background:var(--bg4);border-radius:var(--r-sm);padding:1px 6px;color:var(--text3)">'+escHtml(b.item_type||'part')+'</span>'
@@ -14490,8 +14558,8 @@ function openModal(type,data){
   }
   else if(type==='editPOLine'){
     title='Edit Line — '+(data.pn||'');
-    body=`<div class="form-row">${fi('epl-pn','Part # / SKU',data.pn||'','list="epl-pn-list" autocomplete="off"')}</div>
-    <datalist id="epl-pn-list">${[...S.parts.filter(p=>!p.discontinued).map(p=>p.pn),...S.assemblies.filter(a=>!a.discontinued).map(a=>a.pn)].sort().map(pn=>pnOpt(pn)).join('')}</datalist>
+    body=`<div class="form-row">${fi('epl-pn','Part # / SKU',data.pn||'','autocomplete="off"')}</div>
+    <div id="epl-info"></div>
     <div class="form-row">${fi('epl-desc','Description',data.description||'')}</div>
     <div class="form-row cols-2">${fi('epl-qty','Qty Ordered',data.qty_ordered||1,'type="number" min="1" step="1"')} ${fi('epl-cost','Unit Cost',data.unit_cost||0,'type="number" step="0.0001" min="0"')}</div>
     ${(data.qty_received||0)>0?`<div class="alert-row alert-row-yellow" style="margin-top:4px"><div style="font-size:var(--t-sm)"><b>Note:</b> ${data.qty_received} unit${data.qty_received!==1?'s':''} already received against this line. Lowering Qty Ordered below ${data.qty_received} will not undo the receipt — adjust inventory separately if needed.</div></div>`:''}
@@ -14642,7 +14710,7 @@ function openModal(type,data){
     S.pendingBOMLines=[];
     const existingBOM=data.pn?(S.boms[data.pn]||[]):[];
     const existingRows=existingBOM.map(function(b){
-      return '<div id="m-bom-ex-'+b.id+'" class="m-bom-ex-row" data-bomrow="'+escHtml(b.id)+'">'
+      return '<div id="m-bom-ex-'+b.id+'" class="m-bom-ex-row" data-bomrow="'+escHtml(b.id)+'" data-bomdrag="'+escHtml(data.pn||'')+'">'
         +bomModalRowInner(b,data.pn||'')
       +'</div>';
     }).join('');
@@ -14885,8 +14953,10 @@ function openModal(type,data){
   }
   else if(type==='addPOLine'){
     title='Add Line Item';
-    body=`<div class="form-row cols-2">${fi('pol-pn','Part #','','placeholder="TGK-PART-XX"')} ${fi('pol-qty','Qty',1,'type="number" min="1" step="1"')}</div>
-    <div class="form-row cols-2">${fi('pol-cost','Unit Cost',0,'type="number" step="0.0001"')} ${fi('pol-desc','Description','')}</div>
+    body=`<div class="form-row">${fi('pol-pn','Part #','','placeholder="Type a SKU, description or vendor..."')}</div>
+    <div id="pol-info"></div>
+    <div class="form-row">${fi('pol-desc','Description','')}</div>
+    <div class="form-row cols-2">${fi('pol-qty','Qty',1,'type="number" min="1" step="1"')} ${fi('pol-cost','Unit Cost',0,'type="number" step="0.0001"')}</div>
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitPOLine('${data.poId||''}')">Add Line</button></div>`;
   }
   else if(type==='manualCorrection'){
@@ -15088,6 +15158,8 @@ function openModal(type,data){
 
   box.innerHTML=`<div class="modal-title">${title}<button class="modal-close" onclick="closeModal()"><span class="ic ic-x"></span></button></div>${body}`;
   overlay.classList.remove('hidden');
+  if(type==='addPOLine')poPickerAttach('pol',data.poId);
+  else if(type==='editPOLine')poPickerAttach('epl',data.po_id);
 }
 function closeModal(){$('modal-overlay').classList.add('hidden');}
 
@@ -18728,8 +18800,8 @@ function assemblyDossier(pn){
         const _ext=_uc*c.need;
         const _asmC=_findAsm2(c.pn);
         const _up=_isSub?(_asmC?((_asmC.msrp||0)):0):((_p?msrpOfPart(_p).val:0));
-        return `<tr style="cursor:pointer" data-bomrow="${c.id||''}" onclick="lookupGo('${_findAsm2(c.pn)?'assembly':'part'}','${c.pn}')">
-          <td class="pn" style="white-space:nowrap">${(_p||_asmC)?dispPn(_p||_asmC):c.pn}<br>${bomTag(c.pn,_isSub?'assembly':'part')}</td>
+        return `<tr style="cursor:pointer" data-bomrow="${c.id||''}"${c.id?` data-bomdrag="${escHtml(pn)}"`:''} onclick="lookupGo('${_findAsm2(c.pn)?'assembly':'part'}','${c.pn}')">
+          <td class="pn" style="white-space:nowrap">${c.id?bomGrip():''}${(_p||_asmC)?dispPn(_p||_asmC):c.pn}<br>${bomTag(c.pn,_isSub?'assembly':'part')}</td>
           <td style="font-size:var(--t-sm);color:var(--text2);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(c.desc||'')}</td>
           <td style="text-align:right;white-space:nowrap">${c.id?`<span class="bom-qty-cell"><span class="bom-qty-val">${c.need}</span>${bomLineEditBtn(c.id,pn,'lookup')}</span>`:`<span class="money-neutral">${c.need}</span>`}</td>
           <td class="money-cost" style="text-align:right;white-space:nowrap">${fc(_uc)}</td>
@@ -21981,6 +22053,122 @@ async function checkInLineQuick(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived
   if(S.poLines[poId]) S.poLines[poId]=S.poLines[poId].map(l=>l.id===lineId?{...l,qty_received:newReceived,status:'Complete'}:l);
 }
 
+// ===================================================================================================
+// [PO LINE PICKER v23.76] Search-as-you-type for the Part # on Add Line / Edit Line of a PO. Choosing an
+// item fills description, quantity (Purchasing's suggestion, never below MOQ) and unit cost (price-break
+// cost for that qty, else the last price paid - this vendor first). Cost follows qty changes until the
+// user types their own price. An info line shows stock, what is already on order, lead time and vendor,
+// and warns about a different vendor, an item already on this PO, or a discontinued item.
+// ===================================================================================================
+function _poLastPaid(pn,vendor){
+  var k=(_canonItem(pn)||{}).pn||pn,best=null,bestV=null;
+  (S.purchases||[]).forEach(function(po){
+    if(!po||['Cancelled','Lost'].indexOf(po.status)>=0)return;
+    (S.poLines[po.id]||[]).forEach(function(l){
+      if(!l.pn||!(Number(l.unit_cost)>0)||((_canonItem(l.pn)||{}).pn||l.pn)!==k)return;
+      var rec={cost:Number(l.unit_cost),date:po.order_date||'',vendor:po.vendor||''};
+      if(!best||rec.date>best.date)best=rec;
+      if(vendor&&rec.vendor===vendor&&(!bestV||rec.date>bestV.date))bestV=rec;
+    });
+  });
+  return bestV||best;
+}
+function poPickSearch(q,vendor){
+  q=String(q||'').trim().toLowerCase();if(!q)return [];
+  var toks=q.split(/\s+/),out=[];
+  var add=function(it,kind){
+    var pn=String(it.pn||'').toLowerCase(),ns=String(it.new_sku||'').toLowerCase(),desc=String(it.description||'').toLowerCase();
+    var hay=pn+' '+ns+' '+desc+' '+String(it.category||'').toLowerCase()+' '+String(it.vendor||'').toLowerCase();
+    if(!toks.every(function(t){return hay.indexOf(t)>=0;}))return;
+    var sc=(pn===q||ns===q)?0:((pn.indexOf(q)===0||ns.indexOf(q)===0)?1:((pn.indexOf(q)>=0||ns.indexOf(q)>=0)?2:3));
+    if(vendor&&it.vendor&&String(it.vendor).toLowerCase()===String(vendor).toLowerCase())sc-=0.5; // this PO's vendor first
+    if(it.discontinued||(kind==='assembly'&&typeof isDev==='function'&&isDev(it)))sc+=5;
+    out.push({it:it,kind:kind,sc:sc});
+  };
+  (S.parts||[]).forEach(function(p){add(p,'part');});
+  (S.assemblies||[]).forEach(function(a){add(a,'assembly');});
+  out.sort(function(a,b){return a.sc-b.sc||String(dispPn(a.it)).localeCompare(String(dispPn(b.it)));});
+  return out.slice(0,12);
+}
+function _poPickCost(it,kind,qty,vendor){
+  var c=0;
+  if(kind==='part')c=costForQty(it,qty)||Number(it.unit_cost)||0;
+  else c=Number(it.unit_cost)||0;
+  if(!c){var lp=_poLastPaid(it.pn,vendor);if(lp)c=lp.cost;}
+  return Math.round(c*10000)/10000;
+}
+function _poPickInfo(prefix,poId,it,kind){
+  var el=document.getElementById(prefix+'-info');if(!el)return;
+  if(!it){el.innerHTML='';return;}
+  var po=(S.purchases||[]).find(function(p){return p.id===poId;})||{},esc=escHtml;
+  var oh=kind==='part'?(it.total_unpckgd||0):(it.total_on_hand||0);
+  var onPO=openOrderedQty(it.pn)||0,draft=openDraftQty(it.pn)||0,lp=_poLastPaid(it.pn,po.vendor);
+  var warn=[];
+  if(it.vendor&&po.vendor&&String(it.vendor).trim().toLowerCase()!==String(po.vendor).trim().toLowerCase())warn.push('Usually bought from <b>'+esc(it.vendor)+'</b>, not '+esc(po.vendor));
+  var dup=(S.poLines[poId]||[]).filter(function(l){return ((_canonItem(l.pn)||{}).pn||l.pn)===it.pn;});
+  if(dup.length&&!(prefix==='epl'&&dup.length===1))warn.push('Already on this PO ('+dup.map(function(l){return '&times;'+(l.qty_ordered||0);}).join(', ')+') - you may want to change that line instead');
+  if(it.discontinued)warn.push('This item is discontinued');
+  el.innerHTML='<div style="font-size:var(--t-xs);color:var(--text2);background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-md);padding:7px 10px;margin:-4px 0 10px;line-height:1.6">'
+    +'<b>'+esc(dispPn(it))+'</b> <span style="color:var(--text3)">'+(kind==='part'?'part':'assembly')+'</span> &middot; on hand <b>'+oh+'</b>'
+    +' &middot; on order '+onPO+(draft?' ('+draft+' draft)':'')
+    +(it.moq?' &middot; MOQ '+it.moq:'')+(kind==='part'?' &middot; lead '+ltWeeks(it)+'w':'')+(it.vendor?' &middot; vendor '+esc(it.vendor):'')
+    +(lp?'<br>Last paid <b>'+fc(lp.cost,lp.cost<1?4:2)+'</b> on '+esc(lp.date||'?')+(lp.vendor?' from '+esc(lp.vendor):''):'')
+    +(warn.length?'<div style="color:var(--orange);font-weight:600;margin-top:2px">'+warn.join('<br>')+'</div>':'')+'</div>';
+}
+function poPickerAttach(prefix,poId){
+  var inp=document.getElementById(prefix+'-pn'),qty=document.getElementById(prefix+'-qty'),cost=document.getElementById(prefix+'-cost'),desc=document.getElementById(prefix+'-desc');
+  if(!inp||inp._poPick)return;
+  inp._poPick=true;inp.setAttribute('autocomplete','off');inp.setAttribute('placeholder','Type a SKU, description or vendor...');
+  var po=(S.purchases||[]).find(function(p){return p.id===poId;})||{};
+  var host=inp.parentNode;host.style.position='relative';
+  var dd=document.createElement('div');dd.className='po-pick-dd';dd.style.display='none';host.appendChild(dd);
+  var state={list:[],idx:-1,sel:null,costTouched:prefix==='epl',qtyTouched:prefix==='epl'};
+  var cur=_canonItem(inp.value);if(cur){state.sel={it:cur,kind:findAsm(cur.pn)?'assembly':'part'};_poPickInfo(prefix,poId,cur,state.sel.kind);}
+  function paint(){
+    if(!state.list.length){dd.innerHTML=inp.value.trim()?'<div class="po-pick-empty">No matching part or assembly - it will be added as typed</div>':'';dd.style.display=inp.value.trim()?'block':'none';return;}
+    dd.innerHTML=state.list.map(function(r,i){
+      var it=r.it,oh=r.kind==='part'?(it.total_unpckgd||0):(it.total_on_hand||0);
+      return '<div class="po-pick-opt'+(i===state.idx?' on':'')+'" data-i="'+i+'">'
+        +'<span class="pn">'+escHtml(dispPn(it))+'</span>'
+        +'<span class="po-pick-desc">'+escHtml((it.description||'').slice(0,60))+'</span>'
+        +'<span class="po-pick-meta">'+(r.kind==='assembly'?'<span class="po-pick-tag">ASM</span>':'')+(it.discontinued?'<span class="po-pick-tag" style="color:var(--red)">DISC</span>':'')
+        +(it.vendor?escHtml(it.vendor)+' &middot; ':'')+'on hand '+oh+'</span></div>';
+    }).join('');
+    dd.style.display='block';
+  }
+  function choose(i){
+    var r=state.list[i];if(!r)return;
+    var it=r.it;state.sel=r;state.list=[];dd.style.display='none';
+    inp.value=dispPn(it);
+    if(desc)desc.value=it.description||'';
+    if(qty&&!state.qtyTouched){
+      var sug=(r.kind==='part'&&typeof calcSuggestedQty==='function')?(calcSuggestedQty(it)||0):0;
+      qty.value=Math.max(Number(it.moq)||1,sug||1);
+    }
+    if(cost&&!state.costTouched)cost.value=_poPickCost(it,r.kind,Number(qty&&qty.value)||1,po.vendor);
+    _poPickInfo(prefix,poId,it,r.kind);
+    if(qty){qty.focus();qty.select&&qty.select();}
+  }
+  inp.addEventListener('input',function(){state.sel=null;state.list=poPickSearch(inp.value,po.vendor);state.idx=state.list.length?0:-1;paint();_poPickInfo(prefix,poId,null);});
+  inp.addEventListener('focus',function(){if(inp.value.trim()&&!state.sel){state.list=poPickSearch(inp.value,po.vendor);paint();}});
+  inp.addEventListener('keydown',function(e){
+    if(dd.style.display==='none'||!state.list.length)return;
+    if(e.key==='ArrowDown'){e.preventDefault();state.idx=Math.min(state.list.length-1,state.idx+1);paint();}
+    else if(e.key==='ArrowUp'){e.preventDefault();state.idx=Math.max(0,state.idx-1);paint();}
+    else if(e.key==='Enter'||e.key==='Tab'){if(state.idx>=0){e.preventDefault();choose(state.idx);}}
+    else if(e.key==='Escape'){e.stopPropagation();dd.style.display='none';}
+  });
+  inp.addEventListener('blur',function(){setTimeout(function(){dd.style.display='none';},150);});
+  dd.addEventListener('mousedown',function(e){var o=e.target.closest('.po-pick-opt');if(o){e.preventDefault();choose(+o.getAttribute('data-i'));}});
+  if(qty)qty.addEventListener('input',function(){
+    state.qtyTouched=true;
+    if(cost&&!state.costTouched&&state.sel)cost.value=_poPickCost(state.sel.it,state.sel.kind,Number(qty.value)||1,po.vendor); // price breaks follow qty
+  });
+  if(cost)cost.addEventListener('input',function(){state.costTouched=true;});
+  if(prefix==='pol')setTimeout(function(){inp.focus();},30);
+}
+window.poPickerAttach=poPickerAttach;window.poPickSearch=poPickSearch;
+
 function openAddPOLine(poId) {
   const cats=[...new Set(S.parts.map(p=>p.pn))].sort();
   openModal('addPOLine',{poId});
@@ -21992,6 +22180,7 @@ async function submitPOLine(poId) {
   const cost=parseFloat(document.getElementById('pol-cost').value)||0;
   const desc=document.getElementById('pol-desc').value.trim();
   if(!pn||!qty){toast('Part # and qty required');return;}
+  if(!_canonItem(pn)&&!confirm(pn+' is not in Parts or Assemblies, so receiving this line will not add any stock.\n\nAdd it anyway (non-stock item)?'))return;
   const {data,error}=await db.from('po_lines').insert({po_id:poId,pn,description:desc,qty_ordered:qty,unit_cost:cost,qty_received:0,status:'Pending'}).select().single();
   if(error){toast('Error: '+error.message);return;}
   if(!S.poLines[poId]) S.poLines[poId]=[];
@@ -23463,8 +23652,8 @@ function renderBuildPlanner(asm){
           :buildableReady
             ?'<span class="ok-dot" style="background:var(--orange);display:inline-block" title="Build the subassembly first, then this is covered"></span>'
             :'<span class="ok-dot" style="background:var(--red);display:inline-block" title="Short — not enough stock"></span>';
-        return `<tr class="rowlink" style="${short>0?'background:rgba(224,85,85,.05)':''}" onclick="rowClick(event,function(){lookupGo('${c.isSub?'assembly':'part'}','${c.pn}')})">
-          <td class="pn">${c.isSub?(dispPn(asmByPn(c.pn))||c.pn):c.pn}<br>${bomTag(c.pn,c.isSub?'assembly':'part')}</td>
+        return `<tr class="rowlink" data-bomrow="${c.id||''}"${c.id?` data-bomdrag="${escHtml(asm.pn)}"`:''} style="${short>0?'background:rgba(224,85,85,.05)':''}" onclick="rowClick(event,function(){lookupGo('${c.isSub?'assembly':'part'}','${c.pn}')})">
+          <td class="pn">${c.id?bomGrip():''}${c.isSub?(dispPn(asmByPn(c.pn))||c.pn):c.pn}<br>${bomTag(c.pn,c.isSub?'assembly':'part')}</td>
           <td style="font-size:var(--t-xs);color:var(--text2);max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escHtml(desc)}">${escHtml(desc)||'—'}</td>
           <td style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3)">${c.loc||'—'}</td>
           <td class="money-neutral">${c.need}</td>
