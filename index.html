@@ -475,9 +475,35 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.76';
+const TGK_ERP_VERSION = 'v23.77';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
+// [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
+// functions can refuse anonymous callers (EDGE_AUTH_MODE=enforce). Done once here instead of at ~20 call sites:
+// a request to SUPA_URL/functions/v1/* that has no Authorization, or only the public anon key, gets the
+// session token. Anything else (Shopify, ShipStation, other sites) is untouched.
+(function(){
+  if(!window.fetch||window.fetch._tgkAuth)return;
+  var _orig=window.fetch.bind(window);
+  var wrapped=function(input,init){
+    try{
+      var url=typeof input==='string'?input:((input&&input.url)||'');
+      if(db&&typeof SUPA_URL!=='undefined'&&url.indexOf(SUPA_URL+'/functions/v1/')===0){
+        return db.auth.getSession().then(function(r){
+          var tok=r&&r.data&&r.data.session&&r.data.session.access_token;
+          if(!tok)return _orig(input,init);
+          var opts=Object.assign({},init||{}),h=new Headers(opts.headers||(input&&input.headers)||{});
+          var cur=h.get('Authorization')||'';
+          if(!cur||cur==='Bearer '+SUPA_KEY)h.set('Authorization','Bearer '+tok);
+          if(!h.get('apikey'))h.set('apikey',SUPA_KEY);
+          opts.headers=h;return _orig(input,opts);
+        },function(){return _orig(input,init);});
+      }
+    }catch(_){}
+    return _orig(input,init);
+  };
+  wrapped._tgkAuth=true;window.fetch=wrapped;
+})();
 document.addEventListener('DOMContentLoaded',function(){
   var vb=document.getElementById('erp-version-badge');if(vb)vb.textContent=TGK_ERP_VERSION;
   var bd=document.getElementById('erp-build-date');if(bd)bd.textContent=TGK_ERP_BUILD_DATE;
@@ -1124,6 +1150,65 @@ async function fetchAll(query){
   return rows;
 }
 
+// [v23.77 #13] Sales loading. Supabase returns at most 1000 rows per request, so the old ".limit(5000)"
+// really loaded ~1000 lines, while the refreshes re-downloaded EVERY line ever (up to 50k) sorted by
+// created_at. Now: every OPEN line (however old - open demand must never fall out of memory) plus the last
+// SALES_WINDOW_DAYS of everything, paged, sorted newest sale first. Screens that need older history ask for
+// it with ensureSalesSince(); searches fall back to the database.
+var SALES_WINDOW_DAYS=180;
+var SALES_DONE=['Shipped','Delivered','Cancelled','Refunded','Returned'];
+function _sortSales(rows){
+  return rows.sort(function(a,b){return String(b.sale_date||'').localeCompare(String(a.sale_date||''))||String(b.created_at||'').localeCompare(String(a.created_at||''));});
+}
+async function loadSalesWindow(){
+  var from=daysAgo(SALES_WINDOW_DAYS);
+  var res=await Promise.all([
+    fetchAll(function(f,t){return db.from('sales').select('*').or('fulfillment_status.is.null,fulfillment_status.not.in.('+SALES_DONE.join(',')+')').order('sale_date',{ascending:false}).range(f,t);}),
+    fetchAll(function(f,t){return db.from('sales').select('*').gte('sale_date',from).order('sale_date',{ascending:false}).range(f,t);})
+  ]);
+  var seen={},rows=[];
+  res[0].concat(res[1]).forEach(function(r){if(!seen[r.id]){seen[r.id]=1;rows.push(r);}});
+  // keep any older rows a screen already pulled in (reports, searches) so they don't vanish on refresh
+  if(S._salesExtra){Object.keys(S._salesExtra).forEach(function(id){if(!seen[id]){seen[id]=1;rows.push(S._salesExtra[id]);}});}
+  S._salesFrom=S._salesAll?S._salesFrom:(S._salesFrom&&S._salesFrom<from?S._salesFrom:from);
+  return _sortSales(rows);
+}
+function _mergeSales(rows){
+  if(!rows||!rows.length)return 0;
+  S._salesExtra=S._salesExtra||{};
+  var have={};S.sales.forEach(function(r){have[r.id]=1;});
+  var add=rows.filter(function(r){S._salesExtra[r.id]=r;return !have[r.id];});
+  if(add.length){S.sales=_sortSales(S.sales.concat(add));if(S._odm)S._odm=null;}
+  return add.length;
+}
+// Make sure every sale on/after `from` (null = all history) is in memory. Returns a promise; renders when done.
+async function ensureSalesSince(from){
+  if(S._salesAll)return;
+  if(from&&S._salesFrom&&from>=S._salesFrom)return;
+  var key=from||'ALL';if(S._salesLoadingFrom===key)return;
+  S._salesLoadingFrom=key;
+  try{
+    var rows=await fetchAll(function(f,t){var q=db.from('sales').select('*');if(from)q=q.gte('sale_date',from);if(S._salesFrom)q=q.lt('sale_date',S._salesFrom);return q.order('sale_date',{ascending:false}).range(f,t);});
+    _mergeSales(rows);
+    if(from)S._salesFrom=from;else S._salesAll=true;
+  }catch(e){console.warn('[sales] history load failed',e);toast('Could not load older orders: '+(e.message||e),6000);}
+  S._salesLoadingFrom=null;
+  render();
+}
+window.ensureSalesSince=ensureSalesSince;
+// Search the database when the loaded window doesn't have it (orders older than 180 days)
+var _salesSearchTimer=null,_salesSearchDone={};
+function salesServerSearch(q){
+  q=String(q||'').trim().replace(/[,()%*]/g,' ').trim();
+  if(q.length<3||S._salesAll||_salesSearchDone[q.toLowerCase()])return;
+  clearTimeout(_salesSearchTimer);
+  _salesSearchTimer=setTimeout(async function(){
+    _salesSearchDone[q.toLowerCase()]=1;
+    var r=await db.from('sales').select('*').or('order_number.ilike.%'+q+'%,customer_name.ilike.%'+q+'%,pn.ilike.%'+q+'%').order('sale_date',{ascending:false}).limit(500);
+    if(!r.error&&_mergeSales(r.data))render();
+  },400);
+}
+window.salesServerSearch=salesServerSearch;
 function normalizeAssemblies(rows){
   return(rows||[]).map(a=>{
     const patternSaysSub=/^\d{2}-\d{4}/.test(a.pn||'')&&!isHWPack(a.pn);
@@ -1136,10 +1221,10 @@ function normalizeAssemblies(rows){
 async function loadAll(){
   try{
     const[parts,assemblies,sales,purchases,dealers,vendors,settings,bomItems,warrantyClaims,shipmentErrors,corrections,cycleCounts,poLinesAll,poTrackingAll,labelFilesResult,shopifySyncLog]=await Promise.all([
-      db.from('parts').select('*').order('pn'),
-      db.from('assemblies').select('*').order('pn'),
-      db.from('sales').select('*').order('sale_date',{ascending:false}).limit(5000),
-      db.from('purchases').select('*').order('order_date',{ascending:false}),
+      fetchAll((f,t)=>db.from('parts').select('*').order('pn').range(f,t)).then(d=>({data:d}),e=>({error:e})),
+      fetchAll((f,t)=>db.from('assemblies').select('*').order('pn').range(f,t)).then(d=>({data:d}),e=>({error:e})),
+      loadSalesWindow().then(d=>({data:d}),e=>({error:e})),
+      fetchAll((f,t)=>db.from('purchases').select('*').order('order_date',{ascending:false}).range(f,t)).then(d=>({data:d}),e=>({error:e})),
       db.from('dealers').select('*').order('name'),
       db.from('vendors').select('*').order('name'),
       db.from('settings').select('*'),
@@ -1148,8 +1233,8 @@ async function loadAll(){
       db.from('shipment_errors').select('*').order('created_at',{ascending:false}).limit(1000),
       db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,user_email,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
       db.from('cycle_counts').select('*').order('created_at',{ascending:false}).limit(50),
-      db.from('po_lines').select('*').order('po_id'),
-      db.from('po_tracking').select('*').order('created_at'),
+      fetchAll((f,t)=>db.from('po_lines').select('*').order('po_id').range(f,t)).then(d=>({data:d}),e=>({error:e})),
+      fetchAll((f,t)=>db.from('po_tracking').select('*').order('created_at').range(f,t)).then(d=>({data:d}),e=>({error:e})),
       db.from('part_files').select('*').eq('category','Label'),
       db.from('shopify_sync_log').select('pn,action,restock_date,created_at').order('created_at',{ascending:false}).limit(3000),
     ]);
@@ -4861,6 +4946,7 @@ function renderSales(){
 
   const sf=S.filters.sales||{};
   const q=(sf.search||S.searchQ||'').toLowerCase();
+  if(q)salesServerSearch(q); // [#13] also find orders older than the loaded window
 
   let list=allGrouped;
   if(q)list=list.filter(s=>{
@@ -6506,7 +6592,18 @@ async function submitShipment(saleId,pn,qty){
   }catch(_e){console.warn('[ship] status re-check failed',_e);}
   const _legacyManual=await _manualCreateDeducted(_shipChk&&_shipChk.order_number,(asm||prt||{}).pn||pn);
   var _shipDeducted=null; // what was actually taken, so it can be reversed if the status write fails
-  if(_legacyManual){console.log('[ship] '+pn+' was deducted when the manual order was created - not deducting again');}
+  // [v23.77 #2] Status + stock + history in one transaction when erp_apply is installed.
+  var _atomic=false;
+  try{
+    var _ap=await erpApply({guards:[{table:'sales',id:saleId,field:'fulfillment_status',not_in:['Shipped','Delivered','Cancelled','Refunded']}],
+      updates:[{table:'sales',id:saleId,set:{fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier,shipped_at:new Date().toISOString()}}],
+      moves:(!_legacyManual&&(asm||prt))?[{kind:asm?'assembly':'part',id:(asm||prt).id,delta:-qty}]:[],
+      reason:'Shipped order '+((_shipChk&&_shipChk.order_number)||'')+(tracking?' \u2014 '+tracking:''),source:'shipment',reference_id:saleId});
+    if(_ap&&!_ap.ok){toast(pn+' is already '+(_ap.current||'shipped')+' (updated elsewhere) - not deducting again',7000);await refreshSales();render();return;}
+    if(_ap&&_ap.ok){_atomic=true;if(_ap.moves&&_ap.moves.length)_shipDeducted={kind:asm?'assembly':'part',rec:asm||prt};}
+  }catch(_ae){toast('Shipment NOT saved ('+_ae.message+') - nothing was changed',9000);return;}
+  if(_atomic){}
+  else if(_legacyManual){console.log('[ship] '+pn+' was deducted when the manual order was created - not deducting again');}
   else if(asm){
     if(await adjustStock('assembly',asm,-qty,{reason:'Shipped order'+(tracking?' \u2014 '+tracking:''),source:'shipment'})!==null)_shipDeducted={kind:'assembly',rec:asm}; // may go negative = backorder
     if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
@@ -6515,7 +6612,7 @@ async function submitShipment(saleId,pn,qty){
     if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
   }
   const preSale=S.sales.find(s=>s.id===saleId);
-  if(!await salesWrite(db.from('sales').update({fulfillment_status:'Shipped',tracking_number:tracking,carrier,shipped_at:new Date().toISOString()}).eq('id',saleId),'shipment')){
+  if(!_atomic&&!await salesWrite(db.from('sales').update({fulfillment_status:'Shipped',tracking_number:tracking,carrier,shipped_at:new Date().toISOString()}).eq('id',saleId),'shipment')){
     // The line is still Open in the database, so it WILL be shipped again. Put the stock back now,
     // with its own audit row, or that second ship deducts the same unit twice.
     if(_shipDeducted){
@@ -7605,7 +7702,9 @@ async function checkEdgeFunctions(){
 function renderIntegrations(){
   const t=S.intTab;
   const edgeUrl=SUPA_URL.replace('.supabase.co','')+'.supabase.co/functions/v1';
-  return `
+  return renderEdgeVersionPanel()+`<details class="panel" style="padding:0;margin-bottom:12px"><summary style="cursor:pointer;padding:10px 14px;font-weight:700">Database migration v23.77 <span style="font-weight:400;font-size:var(--t-sm);color:var(--text3)">all-or-nothing ship/receive/pack + daily stock check - run once in the Supabase SQL editor</span></summary>
+    <div style="padding:0 14px 12px"><div style="margin:6px 0"><button class="btn btn-sm" onclick="copyText(ERP_MIGRATION_V2377,this)">Copy SQL</button> <span class="t3xs" style="color:var(--text3)">safe to run more than once; until it runs, the ERP uses its previous step-by-step path</span></div>
+    <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:12px;font-size:var(--t-xs);max-height:300px;overflow:auto;white-space:pre-wrap">${escHtml(ERP_MIGRATION_V2377)}</pre></div></details>`+`
   <div class="tabs-row">
     <div class="tab ${t==='shopify'?'active':''}" onclick="S.intTab='shopify';render()">Shopify</div>
     <div class="tab ${t==='shipstation'?'active':''}" onclick="S.intTab='shipstation';render()">ShipStation</div>
@@ -8101,6 +8200,28 @@ async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;
   return out
 }
 
+// [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
+// the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
+// so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
+const EDGE_BUILD = 'v23.77'
+const _gateLogged: Record&lt;string, number&gt; = {}
+async function authGate(req: Request, fn: string, action: string): Promise&lt;Response | null&gt; {
+  const mode = (Deno.env.get('EDGE_AUTH_MODE') || 'log').toLowerCase()
+  if (mode === 'off') return null
+  const tok = (req.headers.get('Authorization') || '').replace(/^Bearer\\s+/i, '')
+  let ok = false
+  if (tok) { try { const r = await db.auth.getUser(tok); ok = !!(r &amp;&amp; r.data &amp;&amp; r.data.user) } catch (_) { ok = false } }
+  if (ok) return null
+  const origin = req.headers.get('origin') || req.headers.get('referer') || 'no origin'
+  const key = action + '|' + origin
+  if (!_gateLogged[key] || Date.now() - _gateLogged[key] &gt; 3600000) { // at most once an hour per action+caller
+    _gateLogged[key] = Date.now()
+    try { await db.from('error_log').insert({ page: fn, app_version: 'edge ' + fn + ' ' + EDGE_BUILD, message: (mode === 'enforce' ? 'Refused' : 'Allowed (log mode)') + ' call without an ERP login: action "' + action + '" from ' + origin }) } catch (_) { /* logging must never block */ }
+  }
+  if (mode === 'enforce') return new Response(JSON.stringify({ error: 'Not signed in to the ERP - request refused' }), { status: 401, headers: { ...CORS, 'Content-Type': 'application/json' } })
+  return null
+}
+
 Deno.serve(async (req) =&gt; {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
   if (req.method === 'GET') return new Response('pong', { headers: CORS })
@@ -8108,6 +8229,11 @@ Deno.serve(async (req) =&gt; {
   let _rawBody = ''
   try { _rawBody = await req.text(); body = _rawBody ? JSON.parse(_rawBody) : {} } catch (_) {}
   if (body.ping) return new Response('pong', { headers: CORS })
+  if (body.action === 'version') return new Response(JSON.stringify({ fn: 'shopify-orders', build: EDGE_BUILD }), { headers: { ...CORS, 'Content-Type': 'application/json' } })
+  if (body.action &amp;&amp; !req.headers.get('x-shopify-topic')) {
+    const _gate = await authGate(req, 'shopify-orders', String(body.action))
+    if (_gate) return _gate
+  }
   if (body.action === 'oauth_exchange') {
     const clientId = Deno.env.get('SHOPIFY_CLIENT_ID') || ''
     const clientSecret = Deno.env.get('SHOPIFY_CLIENT_SECRET') || ''
@@ -9976,10 +10102,37 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
   return true
 }
 
+// [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
+// the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
+// so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
+const EDGE_BUILD = 'v23.77'
+const _gateLogged: Record&lt;string, number&gt; = {}
+async function authGate(req: Request, fn: string, action: string): Promise&lt;Response | null&gt; {
+  const mode = (Deno.env.get('EDGE_AUTH_MODE') || 'log').toLowerCase()
+  if (mode === 'off') return null
+  const tok = (req.headers.get('Authorization') || '').replace(/^Bearer\\s+/i, '')
+  let ok = false
+  if (tok) { try { const r = await db.auth.getUser(tok); ok = !!(r &amp;&amp; r.data &amp;&amp; r.data.user) } catch (_) { ok = false } }
+  if (ok) return null
+  const origin = req.headers.get('origin') || req.headers.get('referer') || 'no origin'
+  const key = action + '|' + origin
+  if (!_gateLogged[key] || Date.now() - _gateLogged[key] &gt; 3600000) { // at most once an hour per action+caller
+    _gateLogged[key] = Date.now()
+    try { await db.from('error_log').insert({ page: fn, app_version: 'edge ' + fn + ' ' + EDGE_BUILD, message: (mode === 'enforce' ? 'Refused' : 'Allowed (log mode)') + ' call without an ERP login: action "' + action + '" from ' + origin }) } catch (_) { /* logging must never block */ }
+  }
+  if (mode === 'enforce') return new Response(JSON.stringify({ error: 'Not signed in to the ERP - request refused' }), { status: 401, headers: { ...CORS, 'Content-Type': 'application/json' } })
+  return null
+}
+
 Deno.serve(async (req) =&gt; {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
   const body = await req.json().catch(() =&gt; ({})) as any
   if (req.method === 'GET' || body.ping) return new Response('pong', { headers: CORS })
+  if (body.action === 'version') return json({ fn: 'shipstation-ship', build: EDGE_BUILD })
+  if (body.action || body.check_secrets) { // ShipStation's own webhooks carry resource_url, never an action
+    const _gate = await authGate(req, 'shipstation-ship', String(body.action || 'check_secrets'))
+    if (_gate) return _gate
+  }
   if (body.check_secrets) {
     const k = Deno.env.get('SS_KEY') || '', s = Deno.env.get('SS_SECRET') || ''
     return json({ ss_key_set: k.length &gt; 0, ss_key_length: k.length, ss_key_preview: k.length &gt; 4 ? k.slice(0,2)+'...'+k.slice(-2) : '(empty)', ss_secret_set: s.length &gt; 0, ss_secret_length: s.length, ss_secret_preview: s.length &gt; 4 ? s.slice(0,2)+'...'+s.slice(-2) : '(empty)', ss_v2_key_set: (Deno.env.get('SS_V2_KEY') || '').length &gt; 0 })
@@ -13047,6 +13200,27 @@ async function ssManualSync(orderNum,tracking,carrier){
   const undoOps=[];
   let _msShipped=0;
   for(const sale of rows){
+    // [v23.77 #2] Lines not yet shipped: status + stock + history in one transaction when erp_apply is installed.
+    if(!['Shipped','Delivered','Cancelled','Refunded'].includes(sale.fulfillment_status||'Open')){
+      const _mA=findAsm(sale.pn),_mP=_mA?null:((S._partIdx&&S._partIdx[sale.pn])||S.parts.find(p=>p.pn===sale.pn||(p.new_sku&&p.new_sku===sale.pn)));
+      let _apM=null;
+      try{
+        const _legM=await _manualCreateDeducted(orderNum,(_mA||_mP||{}).pn);
+        _apM=await erpApply({guards:[{table:'sales',id:sale.id,field:'fulfillment_status',not_in:['Shipped','Delivered','Cancelled','Refunded']}],
+          updates:[{table:'sales',id:sale.id,set:{fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier||'',shipped_at:new Date().toISOString()}}],
+          moves:(!_legM&&(_mA||_mP))?[{kind:_mA?'assembly':'part',id:(_mA||_mP).id,delta:-(sale.qty||1)}]:[],
+          reason:'Manual ship \u2014 order '+orderNum+' tracking '+tracking,source:'shipment',reference_id:sale.id});
+      }catch(_me){toast('Line '+sale.pn+' NOT shipped ('+_me.message+') - nothing changed for it',8000);continue;}
+      if(_apM){
+        if(_apM.ok){
+          _msShipped++;
+          undoOps.push({action:'update',table:'sales',data:{...sale,fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier},prev:{...sale}});
+          S.sales=S.sales.map(s=>s.id===sale.id?{...s,fulfillment_status:'Shipped',tracking_number:tracking,carrier:carrier||''}:s);
+          (_apM.moves||[]).forEach(function(mv){undoOps.push({action:'update',table:mv.kind==='assembly'?'assemblies':'parts',data:{id:mv.id,pn:mv.pn,[mv.kind==='assembly'?'total_on_hand':'total_unpckgd']:Number(mv.new)},prev:{id:mv.id,pn:mv.pn,[mv.kind==='assembly'?'total_on_hand':'total_unpckgd']:Number(mv.prev)}});});
+        }
+        continue;
+      }
+    }
     // Status first, and nothing else for this line unless it saved: the deduction below used to run
     // regardless, so a failed write left the line Open with its stock already gone - and the next
     // sync or ship of that still-Open line deducted it again.
@@ -16160,7 +16334,11 @@ function wtyLookupOrder(orderNum){
     const n=(s.order_number||'').replace(/^#/,'');
     return n===q||n===(('#'+q).replace(/^#+/,'#'));
   })||S.sales.find(s=>(s.order_number||'').replace(/^#/,'').includes(q));
-  if(!match){toast('Order not found in ERP');return;}
+  if(!match){
+    // [#13] not in the loaded window - ask the database before giving up
+    if(!wtyLookupOrder._tried){wtyLookupOrder._tried=1;db.from('sales').select('*').in('order_number',[q,'#'+q]).then(function(r){var n=_mergeSales(r.data);wtyLookupOrder(orderNum);wtyLookupOrder._tried=0;});return;}
+    toast('Order not found in ERP');return;
+  }
   const nameEl=document.getElementById('wty-name');
   const emailEl=document.getElementById('wty-email');
   const shipNameEl=document.getElementById('wty-ship-name');
@@ -17765,9 +17943,9 @@ function startAutoRefresh(){
     if(_idle<IDLE_MS)return; // user active — skip background refresh
     try{
       const[salesData,partsData,purchData,corr]=await Promise.all([
-        fetchAll((f,t)=>db.from('sales').select('*').order('created_at',{ascending:false}).range(f,t)),
-        db.from('parts').select('*').order('pn'),
-        db.from('purchases').select('*').order('order_date',{ascending:false}),
+        loadSalesWindow(),
+        fetchAll((f,t)=>db.from('parts').select('*').order('pn').range(f,t)).then(d=>({data:d}),e=>({error:e})),
+        fetchAll((f,t)=>db.from('purchases').select('*').order('order_date',{ascending:false}).range(f,t)).then(d=>({data:d}),e=>({error:e})),
         db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,user_email,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
       ]);
       S.sales=salesData||[];
@@ -18046,6 +18224,7 @@ function filterByDate(rows, dateField, from, to){
 
 function buildReportRows(id, preset, customFrom, customTo){
   const{from,to}=getDateRange(preset,customFrom,customTo);
+  ensureSalesSince(from); // [#13] older than the loaded window? fetch it, then this report re-renders
   const fd=(rows,field)=>filterByDate(rows,field,from,to);
 
   switch(id){
@@ -20884,6 +21063,7 @@ window.roiDeleteInvestment=async function(id){
   }catch(e){toast(_roiErr(e,'delete'),12000);}
 };
 function renderROITab(){
+  ensureSalesSince(null); // [#13] ROI is lifetime - needs every sale
   if(!S._roiLoaded){roiLoadInvestments();return '<div class="panel" style="margin-top:14px;padding:24px;text-align:center;color:var(--text3)">Loading investment log...</div>';}
   if(S._roiTableMissing){
     return '<div class="panel" style="margin-top:14px;padding:22px;border-left:3px solid var(--orange)">'
@@ -21902,32 +22082,50 @@ async function _checkInLineImpl(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived
   const _lineUpd=remaining>0
     ?{qty_received:newReceived,status:'Partial',notes:remaining+' still outstanding',updated_at:new Date().toISOString()}
     :{qty_received:newReceived,status:'Complete',updated_at:new Date().toISOString()};
-  const _lu=await db.from('po_lines').update(_lineUpd).eq('id',lineId);
-  if(_lu&&_lu.error){toast('Receipt NOT saved ('+_lu.error.message+') - no stock was added',9000);return;}
-
-  const part = partByPn(pn);
-  if(part){
-    const po=S.purchases.find(p=>p.id===poId);
-    const poRef=po?(' ['+po.vendor+(po.order_date?' '+po.order_date:'')+']'):'';
-    const reason='PO Receipt'+poRef+lostRecvTag(poId)+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial \u2014 '+remaining+' outstanding)':'')+(note?' \u2014 '+note:'');
-    undoOps.push({action:'update',table:'parts',data:{...part,total_unpckgd:(part.total_unpckgd||0)+qty},prev:{...part}});
-    const newQty=await adjustStock('part',part,qty,{reason:reason,source:'po_receipt',skipSync:true});
-    if(adjustStock.lastCorrection){undoOps.push({action:'insert',table:'inv_corrections',data:adjustStock.lastCorrection});S.corrections=[adjustStock.lastCorrection,...S.corrections];}
-    if(newQty!==null){syncShopifyTemplate(pn,newQty);cascadeShopifySync(pn);}
+  // [v23.77 #2] PO line + stock + history in one transaction when erp_apply is installed. The guard refuses
+  // if the line's received count changed since it was read (someone else received it) - nothing is added twice.
+  const _rPart=partByPn(pn),_rAsm=_rPart?null:findAsm(pn),_rRec=_rPart||_rAsm;
+  const _rPo=S.purchases.find(p=>p.id===poId);
+  const _rReason='PO Receipt'+(_rPo?(' ['+_rPo.vendor+(_rPo.order_date?' '+_rPo.order_date:'')+']'):'')+lostRecvTag(poId)+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial \u2014 '+remaining+' outstanding)':'')+(note?' \u2014 '+note:'');
+  let _rAp=null;
+  try{
+    _rAp=await erpApply({guards:[{table:'po_lines',id:lineId,field:'qty_received',equals_num:Number(qtyAlreadyReceived)||0}],
+      updates:[{table:'po_lines',id:lineId,set:_lineUpd}],
+      moves:_rRec?[{kind:_rPart?'part':'assembly',id:_rRec.id,delta:qty}]:[],
+      reason:_rReason,source:'po_receipt',reference_id:lineId});
+  }catch(_re){toast('Receipt NOT saved ('+_re.message+') - nothing was changed',9000);return;}
+  if(_rAp&&!_rAp.ok){toast('This line was just received by someone else - nothing was added. Reloading it.',8000);await loadPOLines(poId);render();return;}
+  if(_rAp&&_rAp.ok){
+    if(_rRec)undoOps.push({action:'update',table:_rPart?'parts':'assemblies',data:{..._rRec,[_rPart?'total_unpckgd':'total_on_hand']:((_rPart?_rRec.total_unpckgd:_rRec.total_on_hand)||0)+qty},prev:{..._rRec}});
   } else {
-    // [FIX E] Assembly received on a PO. Receiving was parts-only, so buying a finished sub-assembly
-    // from a vendor updated PO status but never added to total_on_hand.
-    const _rasm=findAsm(pn);
-    if(_rasm){
-      const _po=S.purchases.find(p=>p.id===poId);
-      const _poRef=_po?(' ['+_po.vendor+(_po.order_date?' '+_po.order_date:'')+']'):'';
-      const _reason='PO Receipt'+_poRef+lostRecvTag(poId)+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial \u2014 '+remaining+' outstanding)':'')+(note?' \u2014 '+note:'');
-      undoOps.push({action:'update',table:'assemblies',data:{..._rasm,total_on_hand:(_rasm.total_on_hand||0)+qty},prev:{..._rasm}});
-      await adjustStock('assembly',_rasm,qty,{reason:_reason,source:'po_receipt'});
-      if(adjustStock.lastCorrection){undoOps.push({action:'insert',table:'inv_corrections',data:adjustStock.lastCorrection});S.corrections=[adjustStock.lastCorrection,...S.corrections];}
-    }
-  }
+    const _lu=await db.from('po_lines').update(_lineUpd).eq('id',lineId);
+    if(_lu&&_lu.error){toast('Receipt NOT saved ('+_lu.error.message+') - no stock was added',9000);return;}
 
+    const part = partByPn(pn);
+    if(part){
+      const po=S.purchases.find(p=>p.id===poId);
+      const poRef=po?(' ['+po.vendor+(po.order_date?' '+po.order_date:'')+']'):'';
+      const reason='PO Receipt'+poRef+lostRecvTag(poId)+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial \u2014 '+remaining+' outstanding)':'')+(note?' \u2014 '+note:'');
+      undoOps.push({action:'update',table:'parts',data:{...part,total_unpckgd:(part.total_unpckgd||0)+qty},prev:{...part}});
+      const newQty=await adjustStock('part',part,qty,{reason:reason,source:'po_receipt',skipSync:true});
+      if(adjustStock.lastCorrection){undoOps.push({action:'insert',table:'inv_corrections',data:adjustStock.lastCorrection});S.corrections=[adjustStock.lastCorrection,...S.corrections];}
+      if(newQty!==null){syncShopifyTemplate(pn,newQty);cascadeShopifySync(pn);}
+    } else {
+      // [FIX E] Assembly received on a PO. Receiving was parts-only, so buying a finished sub-assembly
+      // from a vendor updated PO status but never added to total_on_hand.
+      const _rasm=findAsm(pn);
+      if(_rasm){
+        const _po=S.purchases.find(p=>p.id===poId);
+        const _poRef=_po?(' ['+_po.vendor+(_po.order_date?' '+_po.order_date:'')+']'):'';
+        const _reason='PO Receipt'+_poRef+lostRecvTag(poId)+(surplus>0?' (+'+surplus+' surplus)':'')+(remaining>0?' (partial \u2014 '+remaining+' outstanding)':'')+(note?' \u2014 '+note:'');
+        undoOps.push({action:'update',table:'assemblies',data:{..._rasm,total_on_hand:(_rasm.total_on_hand||0)+qty},prev:{..._rasm}});
+        await adjustStock('assembly',_rasm,qty,{reason:_reason,source:'po_receipt'});
+        if(adjustStock.lastCorrection){undoOps.push({action:'insert',table:'inv_corrections',data:adjustStock.lastCorrection});S.corrections=[adjustStock.lastCorrection,...S.corrections];}
+      }
+    }
+
+
+  }
   if(remaining>0){
     if(S.poLines[poId])S.poLines[poId]=S.poLines[poId].map(l=>l.id===lineId?{...l,qty_received:newReceived,status:'Partial',notes:remaining+' still outstanding'}:l);
     toast('Received '+qty+'× '+pn+' — '+remaining+' still outstanding on this PO');
@@ -24213,38 +24411,57 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
   const undoOps=[];
   S._packInFlight=true; // set only now: every early return above (incl. Cancel on the shortage dialog) leaves it unset, so it can never get stuck. confirm() is synchronous, so nothing can slip in between.
   try {
-  if(effectiveBom.length>0){
-    for(const item of effectiveBom){
-      const delta = isUnpack ? item.qty*qty : -(item.qty*qty);
-      if(!delta||!isFinite(delta)){_zeroLines.push(item.child_pn);continue;} // qty 0/blank line: nothing to move (adjustStock returns null for 0 and the old code threw mid-run)
-      const _asL=(typeof _findAsm2==='function'?_findAsm2(item.child_pn):null)||asmMap[item.child_pn];
-      const _isAsmLine=!!_asL; // table membership, not item_type
-      if(_isAsmLine){
-        const sa=_asL;
-        if(!sa) continue;
-        undoOps.push({action:'update',table:'assemblies',data:{...sa,total_on_hand:(sa.total_on_hand||0)+delta},prev:{...sa}});
-        const newOhS=await adjustStock('assembly',sa,delta,{reason:(isUnpack?'Unpack':'Pack')+' '+qty+'\u00d7'+pn+' (subassembly)',source:isUnpack?'unpack':'pack',skipSync:true});
-        if(newOhS===null) throw new Error('Stock update failed for '+item.child_pn+' \u2014 pack stopped');
-        asmMap[item.child_pn]={...sa,total_on_hand:newOhS}; // keep running balance (mirrors liveAsmMap fix)
-        _noteLanding(item.child_pn,delta,adjustStock.lastResult);
-        cascadeShopifySync(item.child_pn);
-      } else {
-        const p=(typeof _findPart==='function'?_findPart(item.child_pn):null)||partMap[item.child_pn];
-        if(!p) continue;
-        undoOps.push({action:'update',table:'parts',data:{...p,total_unpckgd:(p.total_unpckgd||0)+delta},prev:{...p}});
-        const newQty=await adjustStock('part',p,delta,{reason:(isUnpack?'Unpack':'Pack')+' '+qty+'\u00d7'+pn,source:isUnpack?'unpack':'pack',skipSync:true});
-        if(newQty===null) throw new Error('Stock update failed for '+item.child_pn+' \u2014 pack stopped');
-        partMap[item.child_pn]={...partMap[item.child_pn],total_unpckgd:newQty}; // keep running balance
-        _noteLanding(item.child_pn,delta,adjustStock.lastResult);
-        cascadeShopifySync(item.child_pn);
-      }
-    }
+  // [v23.77 #2] Work out every stock move first, then apply them all in ONE database transaction (erp_apply):
+  // if anything fails nothing moves - never a half-packed kit. Without erp_apply installed the moves run one
+  // at a time as before.
+  const _plan=[];
+  for(const item of effectiveBom){
+    const delta = isUnpack ? item.qty*qty : -(item.qty*qty);
+    if(!delta||!isFinite(delta)){_zeroLines.push(item.child_pn);continue;} // qty 0/blank line: nothing to move
+    const _asL=(typeof _findAsm2==='function'?_findAsm2(item.child_pn):null)||asmMap[item.child_pn];
+    if(_asL){_plan.push({kind:'assembly',rec:_asL,delta:delta,child:item.child_pn,label:' (subassembly)'});continue;}
+    const p=(typeof _findPart==='function'?_findPart(item.child_pn):null)||partMap[item.child_pn];
+    if(!p) continue;
+    _plan.push({kind:'part',rec:p,delta:delta,child:item.child_pn,label:''});
   }
-
   const delta2 = isUnpack ? -qty : qty;
-  undoOps.push({action:'update',table:'assemblies',data:{...asm,total_on_hand:(asm.total_on_hand||0)+delta2},prev:{...asm}});
-  const newOh=await adjustStock('assembly',asm,delta2,{reason:(isUnpack?'Unpack':'Pack')+' '+qty+'\u00d7'+pn,source:isUnpack?'unpack':'pack',skipSync:true});
-  if(newOh===null) throw new Error('Stock update failed for '+pn+' \u2014 pack stopped');
+  const _pWhy=(isUnpack?'Unpack':'Pack')+' '+qty+'\u00d7'+pn,_pSrc=isUnpack?'unpack':'pack';
+  let newOh=null;
+  let _pAp=null;
+  try{
+    _pAp=await erpApply({moves:_plan.map(function(m){return {kind:m.kind,id:m.rec.id,delta:m.delta,reason:_pWhy+m.label};}).concat([{kind:'assembly',id:asm.id,delta:delta2,reason:_pWhy}]),source:_pSrc,skipSync:true});
+  }catch(_pe){throw new Error('nothing was changed - '+_pe.message);}
+  if(_pAp&&_pAp.ok){
+    _plan.forEach(function(m,i){
+      const r=_pAp.moves[i];
+      if(m.kind==='assembly'){undoOps.push({action:'update',table:'assemblies',data:{...m.rec,total_on_hand:(m.rec.total_on_hand||0)+m.delta},prev:{...m.rec}});asmMap[m.child]={...m.rec,total_on_hand:Number(r.new)};}
+      else{undoOps.push({action:'update',table:'parts',data:{...m.rec,total_unpckgd:(m.rec.total_unpckgd||0)+m.delta},prev:{...m.rec}});partMap[m.child]={...m.rec,total_unpckgd:Number(r.new)};}
+      _noteLanding(m.child,m.delta,{delta:m.delta,prevQty:Number(r.prev),newQty:Number(r.new),backorder:Number(r.backorder)});
+      cascadeShopifySync(m.child);
+    });
+    undoOps.push({action:'update',table:'assemblies',data:{...asm,total_on_hand:(asm.total_on_hand||0)+delta2},prev:{...asm}});
+    newOh=Number(_pAp.moves[_pAp.moves.length-1].new);
+  } else {
+    for(const m of _plan){
+      const rec=(m.kind==='assembly'?(((typeof _findAsm2==='function')?_findAsm2(m.child):null)||asmMap[m.child]):(((typeof _findPart==='function')?_findPart(m.child):null)||partMap[m.child]))||m.rec;
+      if(m.kind==='assembly'){
+        undoOps.push({action:'update',table:'assemblies',data:{...rec,total_on_hand:(rec.total_on_hand||0)+m.delta},prev:{...rec}});
+        const newOhS=await adjustStock('assembly',rec,m.delta,{reason:_pWhy+m.label,source:_pSrc,skipSync:true});
+        if(newOhS===null) throw new Error('Stock update failed for '+m.child+' \u2014 pack stopped');
+        asmMap[m.child]={...rec,total_on_hand:newOhS};
+      } else {
+        undoOps.push({action:'update',table:'parts',data:{...rec,total_unpckgd:(rec.total_unpckgd||0)+m.delta},prev:{...rec}});
+        const newQty=await adjustStock('part',rec,m.delta,{reason:_pWhy,source:_pSrc,skipSync:true});
+        if(newQty===null) throw new Error('Stock update failed for '+m.child+' \u2014 pack stopped');
+        partMap[m.child]={...rec,total_unpckgd:newQty};
+      }
+      _noteLanding(m.child,m.delta,adjustStock.lastResult);
+      cascadeShopifySync(m.child);
+    }
+    undoOps.push({action:'update',table:'assemblies',data:{...asm,total_on_hand:(asm.total_on_hand||0)+delta2},prev:{...asm}});
+    newOh=await adjustStock('assembly',asm,delta2,{reason:_pWhy,source:_pSrc,skipSync:true});
+    if(newOh===null) throw new Error('Stock update failed for '+pn+' \u2014 pack stopped');
+  }
   if(!isUnpack){
     const newAssembled=(asm.total_assembled||0)+qty;
     await dbq(db.from('assemblies').update({total_assembled:newAssembled,updated_at:new Date().toISOString()}).eq('id',asm.id),'pack:assembled');
@@ -25613,10 +25830,241 @@ function _diStockPanel(){
     +'<button class="btn btn-sm" onclick="retryPendingDeductions(false)" title="Shipments whose stock deduction failed are retried automatically every 5 minutes and on every ShipStation webhook. This runs it now.">Retry pending deductions</button>'
     +'</div></div>';
 }
+var ERP_MIGRATION_V2377="-- =====================================================================================================\n-- TGK ERP v23.77 migration - run once in the Supabase SQL editor. Safe to run again.\n--   #2  erp_apply()        : ship / receive / pack / unpack as ONE all-or-nothing database transaction\n--   #3  erp_stock_audit()  : the daily stock check (drift, gaps in the history, negative stock,\n--                            pending deductions, shipped lines with no deduction)\n-- Until this is run the ERP keeps using its previous step-by-step path, so nothing breaks in between.\n-- =====================================================================================================\n\n-- per-line shipment ledger (also part of the v23.65 migration - repeated here so this file stands alone)\nalter table sales add column if not exists deduct_pending boolean default false;\nalter table sales add column if not exists stock_deducted_at timestamptz;\ncreate index if not exists sales_deduct_pending_idx on sales (deduct_pending) where deduct_pending;\ncreate index if not exists inv_corrections_pn_created_idx on inv_corrections (pn, created_at);\n\n-- -----------------------------------------------------------------------------------------------------\n-- One stock change: lock the row, apply the ERP's single stock rule (on hand never below 0, the shortfall\n-- is backorder, stock coming in pays backorder off first), write the history row. Raises on any problem,\n-- which rolls back the whole erp_apply() call that invoked it.\n-- -----------------------------------------------------------------------------------------------------\ncreate or replace function erp_stock_move(p_kind text, p_id text, p_delta numeric, p_reason text,\n                                          p_source text, p_ref text, p_user text)\nreturns jsonb language plpgsql as $$\ndeclare\n  v_tbl text; v_fld text; v_pn text; v_prev numeric; v_bo numeric; v_new numeric; v_settle numeric;\n  v_ref_type text;\nbegin\n  if p_kind = 'assembly' then v_tbl := 'assemblies'; v_fld := 'total_on_hand';\n  elsif p_kind = 'part' then v_tbl := 'parts'; v_fld := 'total_unpckgd';\n  else raise exception 'erp_stock_move: unknown kind %', p_kind; end if;\n  if p_delta is null or p_delta = 0 then raise exception 'erp_stock_move: zero move for % %', p_kind, p_id; end if;\n\n  execute format('select pn, coalesce(%I,0)::numeric, coalesce(backorder_qty,0)::numeric from %I where id::text = $1 for update',\n                 v_fld, v_tbl) into v_pn, v_prev, v_bo using p_id;\n  if v_pn is null then raise exception 'erp_stock_move: % % not found', p_kind, p_id; end if;\n\n  if p_delta > 0 then\n    v_settle := least(v_bo, p_delta); v_bo := v_bo - v_settle; v_new := v_prev + (p_delta - v_settle);\n  else\n    v_new := v_prev + p_delta;\n    if v_new < 0 then v_bo := v_bo - v_new; v_new := 0; end if;\n  end if;\n\n  execute format('update %I set %I = $1, backorder_qty = $2, updated_at = now() where id::text = $3', v_tbl, v_fld)\n    using v_new, v_bo, p_id;\n\n  select data_type into v_ref_type from information_schema.columns\n   where table_schema = 'public' and table_name = 'inv_corrections' and column_name = 'reference_id';\n  if v_ref_type = 'uuid' then\n    insert into inv_corrections (pn, previous_qty, new_qty, adjustment, reason, source, user_email, reference_id)\n    values (v_pn, v_prev, v_new, p_delta, p_reason, p_source, p_user,\n            case when p_ref ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then p_ref::uuid end);\n  else\n    insert into inv_corrections (pn, previous_qty, new_qty, adjustment, reason, source, user_email, reference_id)\n    values (v_pn, v_prev, v_new, p_delta, p_reason, p_source, p_user, p_ref);\n  end if;\n\n  return jsonb_build_object('kind', p_kind, 'id', p_id, 'pn', v_pn, 'prev', v_prev, 'new', v_new,\n                            'backorder', v_bo, 'delta', p_delta);\nend $$;\n\n-- -----------------------------------------------------------------------------------------------------\n-- erp_apply(p): guards + row updates + stock moves in ONE transaction. Anything fails -> nothing changes.\n-- p = {\n--   guards : [{table, id, field, not_in:[...] | equals:'x' | equals_num:n}]  lock the row; refuse if it no longer matches\n--   updates: [{table, id, set:{col:value,...}} ]        whitelisted tables/columns only\n--   moves  : [{kind:'part'|'assembly', id, delta, reason?, source?, reference_id?}]\n--   reason, source, reference_id, user                   defaults for the moves\n-- }\n-- Returns {ok:true, moves:[{kind,id,pn,prev,new,backorder,delta}]} or {ok:false, guard, current}.\n-- Runs with the caller's own permissions (security invoker), so it can do nothing the ERP can't already do.\n-- -----------------------------------------------------------------------------------------------------\ncreate or replace function erp_apply(p jsonb)\nreturns jsonb language plpgsql as $$\ndeclare\n  g jsonb; u jsonb; m jsonb; v_tbl text; v_cur text; v_cols text; v_bad text; v_n int;\n  v_allowed text[]; v_res jsonb := '[]'::jsonb;\nbegin\n  for g in select * from jsonb_array_elements(coalesce(p->'guards', '[]'::jsonb)) loop\n    v_tbl := g->>'table';\n    if v_tbl not in ('sales', 'po_lines', 'purchases') then raise exception 'erp_apply: guard table % not allowed', v_tbl; end if;\n    if (g->>'field') not in ('fulfillment_status', 'status', 'qty_received') then raise exception 'erp_apply: guard field % not allowed', g->>'field'; end if;\n    execute format('select %I::text from %I where id::text = $1 for update', g->>'field', v_tbl) into v_cur using g->>'id';\n    get diagnostics v_n = row_count;  -- EXECUTE does not set FOUND\n    if v_n = 0 then raise exception 'erp_apply: % % not found', v_tbl, g->>'id'; end if;\n    if g ? 'not_in' and coalesce(v_cur, '') in (select jsonb_array_elements_text(g->'not_in')) then\n      return jsonb_build_object('ok', false, 'guard', g, 'current', v_cur);\n    end if;\n    if g ? 'equals' and coalesce(v_cur, '') <> coalesce(g->>'equals', '') then\n      return jsonb_build_object('ok', false, 'guard', g, 'current', v_cur);\n    end if;\n    if g ? 'equals_num' and coalesce(nullif(v_cur, '')::numeric, 0) <> (g->>'equals_num')::numeric then\n      return jsonb_build_object('ok', false, 'guard', g, 'current', v_cur);\n    end if;\n  end loop;\n\n  for u in select * from jsonb_array_elements(coalesce(p->'updates', '[]'::jsonb)) loop\n    v_tbl := u->>'table';\n    v_allowed := case v_tbl\n      when 'sales' then array['fulfillment_status','tracking_number','carrier','shipped_at','updated_at','is_split_shipment','deduct_pending','stock_deducted_at']\n      when 'po_lines' then array['qty_received','status','notes','updated_at']\n      when 'purchases' then array['status','updated_at']\n      else null end;\n    if v_allowed is null then raise exception 'erp_apply: update table % not allowed', v_tbl; end if;\n    select string_agg(k, ', ') into v_bad from jsonb_object_keys(u->'set') k where not (k = any (v_allowed));\n    if v_bad is not null then raise exception 'erp_apply: column(s) % not allowed on %', v_bad, v_tbl; end if;\n    select string_agg(format('%I = r.%I', k, k), ', ') into v_cols from jsonb_object_keys(u->'set') k;\n    if v_cols is null then continue; end if;\n    execute format('update %I t set %s from jsonb_populate_record(null::%I, $1) r where t.id::text = $2', v_tbl, v_cols, v_tbl)\n      using u->'set', u->>'id';\n    get diagnostics v_n = row_count;\n    if v_n = 0 then raise exception 'erp_apply: % % not found', v_tbl, u->>'id'; end if;\n  end loop;\n\n  for m in select * from jsonb_array_elements(coalesce(p->'moves', '[]'::jsonb)) loop\n    v_res := v_res || jsonb_build_array(erp_stock_move(\n      m->>'kind', m->>'id', (m->>'delta')::numeric,\n      coalesce(m->>'reason', p->>'reason'), coalesce(m->>'source', p->>'source'),\n      coalesce(m->>'reference_id', p->>'reference_id'), p->>'user'));\n  end loop;\n\n  return jsonb_build_object('ok', true, 'moves', v_res);\nend $$;\n\n-- -----------------------------------------------------------------------------------------------------\n-- #3 Daily stock check. Reads only. p_days limits the history-gap and shipped-line checks.\n-- -----------------------------------------------------------------------------------------------------\ncreate or replace function erp_stock_audit(p_days int default 30)\nreturns jsonb language plpgsql stable as $$\ndeclare v jsonb;\nbegin\n  with items as (\n    select 'part'::text kind, id::text id, pn, new_sku, coalesce(total_unpckgd,0)::numeric oh from parts\n    union all\n    select 'assembly', id::text, pn, new_sku, coalesce(total_on_hand,0)::numeric from assemblies\n  ),\n  keys as (\n    select kind, id, pn as key from items\n    union select kind, id, new_sku from items where coalesce(new_sku,'') <> ''\n  ),\n  log as (\n    select k.kind, k.id, c.id::text cid, c.created_at, c.previous_qty::numeric prev, c.new_qty::numeric nw, c.source, c.reason,\n           lag(c.new_qty::numeric) over w prior_new,\n           row_number() over (partition by k.kind, k.id order by c.created_at desc, c.id desc) rn\n    from inv_corrections c join keys k on k.key = c.pn\n    where c.new_qty is not null\n    window w as (partition by k.kind, k.id order by c.created_at, c.id)\n  ),\n  drift as (\n    select i.kind, i.id, i.pn, i.oh on_hand, l.nw last_logged, l.created_at last_logged_at\n    from items i join log l on l.kind = i.kind and l.id = i.id and l.rn = 1\n    where l.nw <> i.oh\n  ),\n  gaps as (\n    select l.kind, i.pn, l.created_at, l.prior_new expected_before, l.prev logged_before, l.source, l.reason\n    from log l join items i on i.kind = l.kind and i.id = l.id\n    where l.prior_new is not null and l.prev is not null and l.prev <> l.prior_new\n      and l.created_at > now() - make_interval(days => p_days)\n  ),\n  neg as (select kind, pn, oh on_hand from items where oh < 0),\n  pend as (select id::text id, order_number, pn, qty from sales where deduct_pending is true),\n  shipped as (\n    select s.id::text sid, s.order_number, s.pn, s.qty, s.tracking_number, s.shipped_at, k.kind, k.id item_id\n    from sales s join keys k on k.key = s.pn\n    where s.fulfillment_status in ('Shipped','Delivered') and s.shipped_at > now() - make_interval(days => p_days)\n      and coalesce(s.source,'') not in ('Shopify History','ShipStation Import')\n  ),\n  undeducted as (\n    select sh.sid, sh.kind, sh.item_id, sh.order_number, sh.pn, sh.qty, sh.tracking_number, sh.shipped_at\n    from shipped sh\n    where not exists (\n      select 1 from inv_corrections c join keys k2 on k2.key = c.pn and k2.kind = sh.kind and k2.id = sh.item_id\n      where c.source in ('shipment','manual') and (\n            c.reference_id::text = sh.sid\n         or (coalesce(sh.order_number,'') <> '' and c.reason ilike '%' || replace(sh.order_number,'#','') || '%')\n         or (coalesce(sh.tracking_number,'') <> '' and c.reason ilike '%' || sh.tracking_number || '%')\n         or (c.source = 'shipment' and c.created_at between sh.shipped_at - interval '1 day' and sh.shipped_at + interval '2 days'))\n    )\n  )\n  select jsonb_build_object(\n    'generated_at', now(), 'days', p_days,\n    'counts', jsonb_build_object(\n      'drift', (select count(*) from drift), 'gaps', (select count(*) from gaps), 'negative', (select count(*) from neg),\n      'pending', (select count(*) from pend), 'undeducted', (select count(*) from undeducted)),\n    'drift', coalesce((select jsonb_agg(d) from (select * from drift order by abs(on_hand - last_logged) desc limit 200) d), '[]'::jsonb),\n    'gaps', coalesce((select jsonb_agg(x) from (select * from gaps order by created_at desc limit 200) x), '[]'::jsonb),\n    'negative', coalesce((select jsonb_agg(n) from (select * from neg order by on_hand limit 200) n), '[]'::jsonb),\n    'pending', coalesce((select jsonb_agg(pq) from (select * from pend limit 200) pq), '[]'::jsonb),\n    'undeducted', coalesce((select jsonb_agg(ud) from (select * from undeducted order by shipped_at desc limit 200) ud), '[]'::jsonb)\n  ) into v;\n  return v;\nend $$;\n\ngrant execute on function erp_stock_move(text, text, numeric, text, text, text, text) to authenticated;\ngrant execute on function erp_apply(jsonb) to authenticated;\ngrant execute on function erp_stock_audit(int) to authenticated;\n";
+// ===================================================================================================
+// [v23.77 #3] DAILY STOCK CHECK - erp_stock_audit() (SQL migration v23.77). Runs once a day on the first
+// ERP load, or on demand. Flags: stock that differs from its last logged value (an unlogged change), gaps in
+// an item's history chain, negative stock, shipments still waiting on a deduction, and shipped lines in the
+// last 30 days with no deduction at all. Each has a one-click fix.
+// ===================================================================================================
+function _scTotal(c){c=c||{};return (c.drift||0)+(c.gaps||0)+(c.negative||0)+(c.pending||0)+(c.undeducted||0);}
+async function runStockCheck(manual){
+  if(S._stockCheckRunning)return;
+  S._stockCheckRunning=true;if(manual)render();
+  try{
+    var r=await db.rpc('erp_stock_audit',{p_days:30});
+    if(r.error){
+      var m=String(r.error.message||'')+' '+String(r.error.code||'');
+      S._stockCheck=/PGRST202|Could not find the function|erp_stock_audit/i.test(m)?{missing:true}:{error:r.error.message};
+    }else{
+      S._stockCheck=Object.assign({},r.data||{});
+      var last={at:new Date().toISOString(),counts:S._stockCheck.counts||{}};
+      S.settings=S.settings||{};S.settings.stock_check_last=last;
+      db.from('settings').upsert({key:'stock_check_last',value:last},{onConflict:'key'}).then(function(){},function(){});
+      if(manual)toast(_scTotal(S._stockCheck.counts)?('Stock check: '+_scTotal(S._stockCheck.counts)+' thing'+(_scTotal(S._stockCheck.counts)!==1?'s':'')+' to look at'):'Stock check: everything matches');
+    }
+  }catch(e){S._stockCheck={error:e.message||String(e)};}
+  S._stockCheckRunning=false;render();
+}
+window.runStockCheck=runStockCheck;
+function maybeDailyStockCheck(){
+  var last=S.settings&&S.settings.stock_check_last,today=new Date().toISOString().slice(0,10);
+  if(last&&String(last.at||'').slice(0,10)===today){if(!S._stockCheck)S._stockCheck={counts:last.counts||{},generated_at:last.at,summaryOnly:true};return;}
+  setTimeout(function(){runStockCheck(false);},8000); // after the app has settled
+}
+window.maybeDailyStockCheck=maybeDailyStockCheck;
+async function scAcceptDrift(kind,id,pn,lastLogged,onHand){
+  if(!confirm(pn+': on hand is '+onHand+' but the last logged value is '+lastLogged+'.\n\nRecord the current number as correct? (Stock is not changed - this adds the missing history line. If you are not sure, count it instead.)'))return;
+  var r=await db.from('inv_corrections').insert({pn:pn,previous_qty:lastLogged,new_qty:onHand,adjustment:onHand-lastLogged,reason:'Stock check: unlogged change accepted as correct',source:'audit',user_email:S.currentUser||null});
+  if(r.error){toast('Not saved: '+r.error.message,7000);return;}
+  runStockCheck(true);
+}
+async function scDeductNow(sid,kind,itemId,pn,qty,orderNum){
+  if(!confirm('Deduct '+qty+' x '+pn+' for order '+orderNum+' now?\n\nIt shipped without its stock being taken.'))return;
+  var reason='Missed shipment deduction - order '+orderNum+' (stock check)';
+  try{
+    var ap=await erpApply({moves:[{kind:kind,id:itemId,delta:-Number(qty||1)}],reason:reason,source:'shipment',reference_id:sid});
+    if(!ap){var rec=kind==='assembly'?S.assemblies.find(function(a){return String(a.id)===String(itemId);}):S.parts.find(function(p){return String(p.id)===String(itemId);});
+      if(!rec||await adjustStock(kind,rec,-Number(qty||1),{reason:reason,source:'shipment',reference_id:sid})===null)throw new Error('stock update failed');}
+  }catch(e){toast('Not deducted: '+e.message,8000);return;}
+  toast('Deducted '+qty+' x '+pn);runStockCheck(true);
+}
+async function scNoDeduction(sid,kind,itemId,pn,orderNum){
+  if(!confirm('Mark order '+orderNum+' ('+pn+') as not needing a deduction - e.g. it shipped from stock the ERP never counted?'))return;
+  var rec=kind==='assembly'?S.assemblies.find(function(a){return String(a.id)===String(itemId);}):S.parts.find(function(p){return String(p.id)===String(itemId);});
+  var cur=rec?Number(kind==='assembly'?rec.total_on_hand:rec.total_unpckgd)||0:0;
+  var r=await db.from('inv_corrections').insert({pn:pn,previous_qty:cur,new_qty:cur,adjustment:0,reason:'No deduction needed - order '+orderNum+' (stock check)',source:'shipment',reference_id:sid,user_email:S.currentUser||null});
+  if(r.error){toast('Not saved: '+r.error.message,7000);return;}
+  runStockCheck(true);
+}
+window.scAcceptDrift=scAcceptDrift;window.scDeductNow=scDeductNow;window.scNoDeduction=scNoDeduction;
+function renderStockCheckPanel(){
+  var c=S._stockCheck,esc=escHtml,q=function(x){return "'"+String(x==null?'':x).replace(/\\/g,'\\\\').replace(/'/g,"\\'")+"'";};
+  var head='<div class="section-header" style="display:flex;justify-content:space-between;align-items:center"><span>Daily stock check</span>'
+    +'<span style="text-transform:none;letter-spacing:0;font-weight:400;display:flex;gap:8px;align-items:center">'
+    +(c&&c.generated_at?'<span class="t3xs" style="color:var(--text3)">last run '+esc(new Date(c.generated_at).toLocaleString())+'</span>':'')
+    +'<button class="btn btn-sm" onclick="runStockCheck(true)"'+(S._stockCheckRunning?' disabled':'')+'>'+(S._stockCheckRunning?'Checking...':'Run now')+'</button></span></div>';
+  if(!c)return '<div class="panel" style="padding:0;margin-bottom:12px">'+head+'<div class="section-empty">Runs automatically once a day - or press Run now.</div></div>';
+  if(c.missing)return '<div class="panel" style="padding:0;margin-bottom:12px">'+head+'<div style="padding:10px 14px;font-size:var(--t-sm);color:var(--orange)">Run the v23.77 SQL migration (Integrations page) to turn the stock check on.</div></div>';
+  if(c.error)return '<div class="panel" style="padding:0;margin-bottom:12px">'+head+'<div style="padding:10px 14px;font-size:var(--t-sm);color:var(--red)">Stock check failed: '+esc(c.error)+'</div></div>';
+  var n=c.counts||{},tot=_scTotal(n);
+  if(c.summaryOnly&&tot)return '<div class="panel" style="padding:0;margin-bottom:12px;border-left:3px solid var(--orange)">'+head+'<div style="padding:10px 14px;font-size:var(--t-sm)">Today\'s check found <b>'+tot+'</b> thing'+(tot!==1?'s':'')+' to look at. Press Run now to see them.</div></div>';
+  if(!tot)return '<div class="panel" style="padding:0;margin-bottom:12px;border-left:3px solid var(--green)">'+head+'<div style="padding:10px 14px;font-size:var(--t-sm);color:var(--green)">Everything matches: every item\'s stock agrees with its history, nothing negative, no shipment missing its deduction.</div></div>';
+  var sec=function(title,why,rows,cols,fn){if(!rows||!rows.length)return '';
+    return '<div style="padding:8px 14px 2px"><b>'+title+' ('+rows.length+')</b> <span class="t3xs" style="color:var(--text3)">'+why+'</span></div>'
+      +'<div class="tbl-wrap"><table><thead><tr>'+cols.map(function(h){return '<th>'+h+'</th>';}).join('')+'</tr></thead><tbody>'+rows.slice(0,50).map(fn).join('')+'</tbody></table></div>'
+      +(rows.length>50?'<div class="t3xs" style="padding:2px 14px;color:var(--text3)">+'+(rows.length-50)+' more</div>':'');};
+  var d=function(x){return x?esc(String(x).slice(0,16).replace('T',' ')):'';};
+  return '<div class="panel" style="padding:0;margin-bottom:12px;border-left:3px solid var(--orange)">'+head
+    +sec('Shipped with no stock deducted','last 30 days - stock is too high by these amounts',c.undeducted,['Order','Item','Qty','Tracking','Shipped',''],function(x){
+      return '<tr><td class="pn">'+esc(x.order_number||'')+'</td><td class="pn">'+esc(x.pn)+'</td><td>'+x.qty+'</td><td class="t3xs">'+esc(x.tracking_number||'-')+'</td><td class="t3xs">'+d(x.shipped_at)+'</td>'
+        +'<td style="white-space:nowrap"><button class="btn btn-sm btn-teal" onclick="scDeductNow('+[x.sid,x.kind,x.item_id,x.pn,x.qty,x.order_number].map(q).join(',')+')">Deduct now</button> <button class="btn btn-sm" onclick="scNoDeduction('+[x.sid,x.kind,x.item_id,x.pn,x.order_number].map(q).join(',')+')">Not needed</button></td></tr>';})
+    +sec('Stock changed without a history line','on hand differs from the last logged value',c.drift,['Item','On hand','Last logged','Logged at',''],function(x){
+      return '<tr><td class="pn">'+esc(x.pn)+'</td><td><b>'+x.on_hand+'</b></td><td>'+x.last_logged+'</td><td class="t3xs">'+d(x.last_logged_at)+'</td>'
+        +'<td style="white-space:nowrap"><button class="btn btn-sm" onclick="lookupGo('+q(x.kind)+','+q(x.pn)+')">Open</button> <button class="btn btn-sm" onclick="scAcceptDrift('+[x.kind,x.id,x.pn].map(q).join(',')+','+x.last_logged+','+x.on_hand+')">Current is correct</button></td></tr>';})
+    +sec('Gaps in the history','a change happened between these two logged lines - usually an edit outside the ERP',c.gaps,['Item','When','Should have started at','Started at','Logged as'],function(x){
+      return '<tr><td class="pn">'+esc(x.pn)+'</td><td class="t3xs">'+d(x.created_at)+'</td><td>'+x.expected_before+'</td><td>'+x.logged_before+'</td><td class="t3xs">'+esc((x.source||'')+(x.reason?' - '+String(x.reason).slice(0,40):''))+'</td></tr>';})
+    +sec('Negative stock','old format - rewrite as backorder',c.negative,['Item','On hand',''],function(x){
+      return '<tr><td class="pn">'+esc(x.pn)+'</td><td style="color:var(--red)">'+x.on_hand+'</td><td><button class="btn btn-sm" onclick="normalizeNegativeStock()">Rewrite all as backorder</button></td></tr>';})
+    +sec('Shipments waiting on a deduction retry','retried automatically every 5 minutes',c.pending,['Order','Item','Qty',''],function(x){
+      return '<tr><td class="pn">'+esc(x.order_number||'')+'</td><td class="pn">'+esc(x.pn)+'</td><td>'+x.qty+'</td><td><button class="btn btn-sm" onclick="retryPendingDeductions(false)">Retry now</button></td></tr>';})
+    +'<div style="height:8px"></div></div>';
+}
+window.renderStockCheckPanel=renderStockCheckPanel;
+
+// ===================================================================================================
+// [v23.77 #7] MISSING DATA - the fields planning and purchasing depend on. Fill them in place, or from PO
+// history (last vendor, last price paid, real order-to-receipt time).
+// ===================================================================================================
+function _lastPOInfoMap(){
+  var m={};
+  (S.purchases||[]).forEach(function(po){
+    if(!po||['Cancelled','Lost'].indexOf(po.status)>=0)return;
+    (S.poLines[po.id]||[]).forEach(function(l){
+      if(!l.pn||l.pn==='SHIPPING')return;
+      var k=(_canonItem(l.pn)||{}).pn||l.pn,cur=m[k];
+      var lt=(po.order_date&&po.status==='Received'&&po.updated_at)?Math.max(1,Math.round((new Date(po.updated_at)-new Date(po.order_date))/(7*86400000))):null;
+      if(!cur||String(po.order_date||'')>String(cur.date||''))m[k]={vendor:po.vendor||'',cost:Number(l.unit_cost)||0,date:po.order_date||'',lt:lt||(cur&&cur.lt)||null};
+      else if(lt&&!cur.lt)cur.lt=lt;
+    });
+  });
+  return m;
+}
+function dataGapRows(){
+  var ign=(S.settings&&S.settings.data_gaps_ignore)||[],lp=_lastPOInfoMap(),rows=[];
+  (S.parts||[]).forEach(function(p){
+    if(p.discontinued)return;
+    var miss=[];
+    if(!String(p.vendor||'').trim())miss.push('vendor');
+    if(!(Number(p.lead_time_weeks)>0))miss.push('lead');
+    if(!(Number(p.unit_cost)>0))miss.push('cost');
+    if(miss.length)rows.push({kind:'part',rec:p,miss:miss,lp:lp[p.pn]||null});
+  });
+  (S.assemblies||[]).forEach(function(a){
+    if(a.discontinued||isDev(a)||a.is_subassembly||isHWPack(a.pn)||ign.indexOf(a.pn)>=0)return;
+    var miss=[];
+    if(!(S.boms[a.pn]||[]).length&&!lp[a.pn])miss.push('bom');
+    if(!(Number(a.msrp)>0))miss.push('msrp');
+    if(miss.length)rows.push({kind:'assembly',rec:a,miss:miss,lp:lp[a.pn]||null});
+  });
+  return rows;
+}
+async function dgSave(kind,id,field,val){
+  var tbl=kind==='assembly'?'assemblies':'parts',list=kind==='assembly'?S.assemblies:S.parts;
+  var prev=list.find(function(x){return String(x.id)===String(id);});if(!prev)return;
+  if(field!=='vendor'){val=val===''?null:Number(val);if(val!=null&&!(val>=0)){toast('Enter a number');return;}}
+  else val=String(val||'').trim()||null;
+  var _old=prev[field]==null||prev[field]===''?null:(field==='vendor'?String(prev[field]):Number(prev[field]));
+  if(_old===val)return; // unchanged (e.g. Enter then blur) - no write, no extra undo step
+  var upd={};upd[field]=val;upd.updated_at=new Date().toISOString();
+  var r=await db.from(tbl).update(upd).eq('id',id);
+  if(r.error){toast('Not saved: '+r.error.message,7000);return;}
+  var next=Object.assign({},prev,upd);
+  if(kind==='assembly')S.assemblies=S.assemblies.map(function(x){return String(x.id)===String(id)?next:x;});
+  else S.parts=S.parts.map(function(x){return String(x.id)===String(id)?next:x;});
+  pushUndo('update',tbl,next,prev,'Set '+field+' on '+prev.pn);
+  buildLookupMaps();render();
+}
+async function dgFillFromPO(onlyId){
+  var rows=dataGapRows().filter(function(r){return r.kind==='part'&&r.lp&&(!onlyId||String(r.rec.id)===String(onlyId));});
+  var n=0;
+  for(var i=0;i<rows.length;i++){
+    var r=rows[i],p=r.rec,upd={};
+    if(r.miss.indexOf('vendor')>=0&&r.lp.vendor)upd.vendor=r.lp.vendor;
+    if(r.miss.indexOf('cost')>=0&&r.lp.cost>0)upd.unit_cost=r.lp.cost;
+    if(r.miss.indexOf('lead')>=0&&r.lp.lt)upd.lead_time_weeks=r.lp.lt;
+    if(!Object.keys(upd).length)continue;
+    upd.updated_at=new Date().toISOString();
+    var res=await db.from('parts').update(upd).eq('id',p.id);
+    if(res.error){toast('Stopped: '+res.error.message,7000);break;}
+    var next=Object.assign({},p,upd);S.parts=S.parts.map(function(x){return x.id===p.id?next:x;});
+    pushUndo('update','parts',next,p,'Filled from PO history: '+p.pn);n++;
+  }
+  buildLookupMaps();render();
+  toast(n?('Filled '+n+' part'+(n!==1?'s':'')+' from PO history'):'Nothing in PO history to fill from');
+}
+async function dgIgnoreBom(pn){
+  var ign=((S.settings&&S.settings.data_gaps_ignore)||[]).slice();if(ign.indexOf(pn)<0)ign.push(pn);
+  S.settings.data_gaps_ignore=ign;
+  var r=await db.from('settings').upsert({key:'data_gaps_ignore',value:ign},{onConflict:'key'});
+  if(r&&r.error)toast('Not saved: '+r.error.message,6000);
+  render();
+}
+window.dgSave=dgSave;window.dgFillFromPO=dgFillFromPO;window.dgIgnoreBom=dgIgnoreBom;
+function renderDataGapsPanel(){
+  var rows=dataGapRows(),esc=escHtml,f=S._dgFilter||'',q=function(x){return "'"+String(x).replace(/'/g,"\\'")+"'";};
+  var cnt=function(k){return rows.filter(function(r){return r.miss.indexOf(k)>=0;}).length;};
+  var chips=[['','All',rows.length],['lead','No lead time',cnt('lead')],['vendor','No vendor',cnt('vendor')],['cost','No cost',cnt('cost')],['bom','Product with no BOM',cnt('bom')],['msrp','No MSRP',cnt('msrp')]];
+  var shown=rows.filter(function(r){return !f||r.miss.indexOf(f)>=0;});
+  var fillable=rows.filter(function(r){return r.kind==='part'&&r.lp&&((r.miss.indexOf('vendor')>=0&&r.lp.vendor)||(r.miss.indexOf('cost')>=0&&r.lp.cost>0)||(r.miss.indexOf('lead')>=0&&r.lp.lt));}).length;
+  var vendors=[...new Set((S.vendors||[]).map(function(v){return v.name;}).concat(S.parts.map(function(p){return p.vendor;})).filter(Boolean))].sort();
+  var inp=function(r,field,val,w,type){return '<input'+(type?' type="'+type+'" step="any" min="0"':' list="dg-vendors"')+' value="'+esc(val==null?'':val)+'" placeholder="-" style="width:'+w+'px;padding:3px 5px;font-size:var(--t-sm);background:var(--bg2);border:1px solid '+(r.miss.indexOf(field==='lead_time_weeks'?'lead':field==='unit_cost'?'cost':field)>=0?'var(--orange)':'var(--border)')+';border-radius:4px;color:var(--text)" onchange="dgSave('+q(r.kind)+','+q(r.rec.id)+','+q(field)+',this.value)">';};
+  var body=shown.slice(0,300).map(function(r){
+    var it=r.rec,isP=r.kind==='part',hint=r.lp?('<div class="t3xs" style="color:var(--text3)">last PO: '+esc(r.lp.vendor||'?')+(r.lp.cost?' &middot; '+fc(r.lp.cost,r.lp.cost<1?4:2):'')+(r.lp.lt?' &middot; '+r.lp.lt+'w':'')+'</div>'):'';
+    return '<tr><td class="pn" style="cursor:pointer" onclick="lookupGo('+q(r.kind)+','+q(it.pn)+')">'+esc(dispPn(it))+'<div class="t3xs" style="color:var(--text3)">'+esc((it.description||'').slice(0,40))+'</div></td>'
+      +'<td>'+(isP?'part':'product')+'</td>'
+      +(isP?('<td>'+inp(r,'vendor',it.vendor,130)+hint+'</td><td>'+inp(r,'lead_time_weeks',it.lead_time_weeks,56,'number')+'</td><td>'+inp(r,'unit_cost',it.unit_cost,72,'number')+'</td><td>'+inp(r,'moq',it.moq,56,'number')+'</td>'
+        +'<td>'+(r.lp?'<button class="btn btn-sm" onclick="dgFillFromPO('+q(it.id)+')">Fill from PO</button>':'')+'</td>')
+      :('<td colspan="4" style="font-size:var(--t-sm)">'+(r.miss.indexOf('bom')>=0?'<b style="color:var(--orange)">No BOM</b> - the planner treats it as bought in. ':'')+(r.miss.indexOf('msrp')>=0?'MSRP '+inp(r,'msrp',it.msrp,72,'number'):'')+'</td>'
+        +'<td style="white-space:nowrap">'+(r.miss.indexOf('bom')>=0?'<button class="btn btn-sm" onclick=\'openModal("editAsm",'+JSON.stringify(it).replace(/'/g,"&#39;")+')\'>Add BOM</button> <button class="btn btn-sm" onclick="dgIgnoreBom('+q(it.pn)+')" title="We buy this finished - stop listing it">Bought in</button>':'')+'</td>'))
+      +'</tr>';
+  }).join('');
+  return '<div class="panel" style="padding:0;margin-bottom:12px">'
+    +'<div class="section-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px"><span>Missing data ('+rows.length+')</span>'
+    +'<span style="text-transform:none;letter-spacing:0">'+(fillable?'<button class="btn btn-sm btn-teal" onclick="dgFillFromPO(null)">Fill '+fillable+' from PO history</button>':'')+'</span></div>'
+    +'<div style="padding:8px 14px 0;display:flex;gap:6px;flex-wrap:wrap">'+chips.map(function(c){return '<button class="filter-chip '+(f===c[0]?'on-teal':'')+'" onclick="S._dgFilter='+q(c[0])+';render()">'+c[1]+' ('+c[2]+')</button>';}).join('')+'</div>'
+    +'<div class="t3xs" style="padding:6px 14px;color:var(--text3)">Lead time, vendor and cost drive the Holiday Planner, PO follow-ups and reorder suggestions. Edit any box - it saves when you leave it.</div>'
+    +'<datalist id="dg-vendors">'+vendors.map(function(v){return '<option value="'+esc(v)+'">';}).join('')+'</datalist>'
+    +(shown.length?'<div class="tbl-wrap"><table><thead><tr><th>Item</th><th>Type</th><th>Vendor</th><th>Lead (wk)</th><th>Unit cost</th><th>MOQ</th><th></th></tr></thead><tbody>'+body+'</tbody></table></div>'
+      +(shown.length>300?'<div class="t3xs" style="padding:4px 14px;color:var(--text3)">Showing 300 of '+shown.length+'</div>':''):'<div class="section-empty">Nothing missing here.</div>')
+    +'</div>';
+}
+window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
+
+// ===================================================================================================
+// [v23.77 #12] Which build of each server function is actually deployed? Compared with what this ERP
+// version ships, so a missed redeploy shows up instead of hiding.
+// ===================================================================================================
+var EDGE_EXPECTED_BUILD='v23.77';
+async function checkEdgeVersions(){
+  S._edgeVers={checking:true};render();
+  var out={};
+  await Promise.all(['shopify-orders','shipstation-ship'].map(async function(fn){
+    try{
+      var r=await fetch(SUPA_URL+'/functions/v1/'+fn,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({action:'version'})});
+      var t=await r.text(),j=null;try{j=JSON.parse(t);}catch(_){}
+      out[fn]=(j&&j.build)?{build:j.build}:{build:null,note:r.ok?'older than v23.77':'HTTP '+r.status};
+    }catch(e){out[fn]={build:null,note:'unreachable'};}
+  }));
+  S._edgeVers=out;render();
+}
+window.checkEdgeVersions=checkEdgeVersions;
+function renderEdgeVersionPanel(){
+  var v=S._edgeVers;
+  if(!v){setTimeout(checkEdgeVersions,0);v={checking:true};S._edgeVers=v;}
+  var row=function(fn){var x=v[fn];if(!x)return '<span class="t3xs" style="color:var(--text3)">checking...</span>';
+    var ok=x.build===EDGE_EXPECTED_BUILD;
+    return '<span style="font-weight:700;color:'+(ok?'var(--green)':'var(--orange)')+'">'+(x.build||'?')+'</span> '+(ok?'up to date':'<span class="t3xs" style="color:var(--orange)">'+escHtml(x.note||'')+' - redeploy (copy below, or push to GitHub)</span>');};
+  return '<div class="panel" style="padding:10px 14px;margin-bottom:12px;font-size:var(--t-sm)"><b>Deployed server functions</b> <span class="t3xs" style="color:var(--text3)">this ERP expects '+EDGE_EXPECTED_BUILD+'</span>'
+    +' <button class="btn btn-sm" style="margin-left:8px" onclick="checkEdgeVersions()">Check again</button>'
+    +'<div style="margin-top:6px;display:flex;gap:24px;flex-wrap:wrap"><span>shopify-orders: '+row('shopify-orders')+'</span><span>shipstation-ship: '+row('shipstation-ship')+'</span></div></div>';
+}
+window.renderEdgeVersionPanel=renderEdgeVersionPanel;
+
 function renderDataIntegrity(){
   if(!S._diResults)S._diResults=null;
   if(!S._diLoading)S._diLoading=false;
-  return _diStockPanel()+`
+  return renderStockCheckPanel()+renderDataGapsPanel()+_diStockPanel()+`
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
     <div>
       <div style="font-size:var(--t-md);color:var(--text2);margin-bottom:4px">Automated checks for the specific failure patterns found in this system historically — not a general health check, a targeted one. Run any time you want to verify nothing has silently drifted.</div>
@@ -27653,6 +28101,41 @@ async function dbq(promise, ctx){
     try{ toast('\u26a0 DB error ('+(ctx||'db')+'): '+(res.error.message||'unknown')); }catch(_){}
   }
   return res;
+}
+// [v23.77 #2] All-or-nothing stock operations. erp_apply() (SQL migration v23.77) changes the order/PO line,
+// the stock and the history row in ONE database transaction - if any part fails, nothing changes.
+// Returns {ok:true,moves:[...]} when applied; {ok:false,...} when refused because the row already changed
+// (already shipped / already received elsewhere - nothing changed); null when erp_apply is not installed
+// yet (caller falls back to its previous step-by-step path). Throws when the database rejected it.
+var _erpApplyMissing=false;
+async function erpApply(payload){
+  if(_erpApplyMissing)return null;
+  var body=Object.assign({},payload);delete body.skipSync;
+  body.user=body.user||S.currentUser||null;
+  var r;
+  try{r=await db.rpc('erp_apply',{p:body});}catch(e){r={error:{message:String(e&&e.message||e)}};}
+  if(r.error){
+    var msg=String(r.error.message||''),code=String(r.error.code||'');
+    if(code==='PGRST202'||code==='42883'||/Could not find the function|function [^ ]*erp_apply[^ ]* does not exist/i.test(msg)){
+      _erpApplyMissing=true;console.warn('[erpApply] erp_apply not installed - using the step-by-step path. Run the v23.77 migration.');return null;
+    }
+    throw new Error(msg||'database error');
+  }
+  var res=r.data;
+  if(res&&res.ok)_erpApplyLocal(res.moves||[],payload.skipSync);
+  return res;
+}
+window.erpApply=erpApply;
+// Mirror applied moves into on-screen state, the same way adjustStock does, and sync Shopify.
+function _erpApplyLocal(moves,skipSync){
+  moves.forEach(function(m){
+    var isAsm=m.kind==='assembly',patch=isAsm?{total_on_hand:Number(m.new)}:{total_unpckgd:Number(m.new)};
+    patch.backorder_qty=Number(m.backorder||0);
+    if(isAsm)S.assemblies=S.assemblies.map(function(x){return String(x.id)===String(m.id)?Object.assign({},x,patch):x;});
+    else S.parts=S.parts.map(function(x){return String(x.id)===String(m.id)?Object.assign({},x,patch):x;});
+    S.corrections=[{pn:m.pn,previous_qty:Number(m.prev),new_qty:Number(m.new),adjustment:Number(m.delta),created_at:new Date().toISOString(),user_email:S.currentUser||null}].concat(S.corrections||[]);
+    if(!skipSync){try{if(isAsm)syncShopifyTemplate(m.pn,Number(m.new));else cascadeShopifySync(m.pn);}catch(_){}}
+  });
 }
 var _adjustRpcMissing=false;
 var _floorRpcMissing=false; // set true after first "function not found" so we stop retrying per call
@@ -29760,7 +30243,7 @@ async function refreshSales(){
   _refreshSalesInFlight=(async()=>{
   var prevById={};
   S.sales.forEach(function(s){prevById[s.id]=s.fulfillment_status;});
-  const data=await fetchAll((f,t)=>db.from('sales').select('*').order('created_at',{ascending:false}).range(f,t));
+  const data=await loadSalesWindow();
   S.sales=data;
   data.forEach(function(s){
     var was=prevById[s.id];
@@ -29933,10 +30416,10 @@ async function refreshAll(){
   }
   try{
     const[parts,assemblies,sales,purchases,warrantyClaims,shipmentErrors,corrections,labelFilesRefresh,shopifySyncLogRefresh]=await Promise.all([
-      db.from('parts').select('*').order('pn'),
-      db.from('assemblies').select('*').order('pn'),
-      fetchAll((f,t)=>db.from('sales').select('*').order('created_at',{ascending:false}).range(f,t)),
-      db.from('purchases').select('*').order('order_date',{ascending:false}),
+      fetchAll((f,t)=>db.from('parts').select('*').order('pn').range(f,t)).then(d=>({data:d}),e=>({error:e})),
+      fetchAll((f,t)=>db.from('assemblies').select('*').order('pn').range(f,t)).then(d=>({data:d}),e=>({error:e})),
+      loadSalesWindow(),
+      fetchAll((f,t)=>db.from('purchases').select('*').order('order_date',{ascending:false}).range(f,t)).then(d=>({data:d}),e=>({error:e})),
       db.from('warranty_claims').select('*').order('created_at',{ascending:false}).limit(1000),
       db.from('shipment_errors').select('*').order('created_at',{ascending:false}).limit(1000),
       db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,user_email,created_at,reference_id').order('created_at',{ascending:false}).limit(1000),
@@ -30317,6 +30800,7 @@ function printPriceList(){
         try{loadBackups();}catch(e){console.error('loadBackups:',e);}
         try{startAutoBackup();}catch(e){console.error('startAutoBackup:',e);}
         try{startAutoRefresh();}catch(e){console.error('startAutoRefresh:',e);}
+        try{maybeDailyStockCheck();}catch(e){console.warn('stock check:',e);}
         try{
   const _rh=(window.location.hash||'').replace(/^#/,'').split('?')[0].toLowerCase();
   const _validViews=Object.keys(PAGE_TITLES);
@@ -30672,10 +31156,19 @@ async function bulkMarkShipped() {
       // save the status, and only then deduct through adjustStock (atomic, floored, audited).
       var asm = findAsm(line.pn);
       var prt = asm ? null : _partByPn.get(line.pn);
-      var _cur = await db.from('sales').select('fulfillment_status').eq('id', line.id).maybeSingle();
-      if (!_cur.error && _cur.data && ['Shipped','Delivered','Cancelled','Refunded'].includes(_cur.data.fulfillment_status || 'Open')) continue;
       var payload = { fulfillment_status: 'Shipped', shipped_at: now, updated_at: now };
       if (tracking) { payload.tracking_number = tracking; payload.carrier = carrier || null; }
+      // [v23.77 #2] one transaction per line when erp_apply is installed
+      try {
+        var _legacyB = await _manualCreateDeducted(line.order_number, (asm || prt || {}).pn);
+        var _apB = await erpApply({ guards: [{ table: 'sales', id: line.id, field: 'fulfillment_status', not_in: ['Shipped','Delivered','Cancelled','Refunded'] }],
+          updates: [{ table: 'sales', id: line.id, set: payload }],
+          moves: (!_legacyB && (asm || prt)) ? [{ kind: asm ? 'assembly' : 'part', id: (asm || prt).id, delta: -lineQty }] : [],
+          reason: 'Bulk mark Shipped \u2014 order ' + oKey + (tracking ? ' ' + tracking : ''), source: 'shipment', reference_id: line.id });
+        if (_apB) { if (_apB.ok) { _salePatch[line.id] = payload; done++; } continue; }
+      } catch (_be) { errors++; console.warn('[bulk ship]', _be.message); continue; }
+      var _cur = await db.from('sales').select('fulfillment_status').eq('id', line.id).maybeSingle();
+      if (!_cur.error && _cur.data && ['Shipped','Delivered','Cancelled','Refunded'].includes(_cur.data.fulfillment_status || 'Open')) continue;
       var res = await db.from('sales').update(payload).eq('id', line.id);
       if (res.error) { errors++; console.warn('[bulk ship]', res.error.message); continue; }
       _salePatch[line.id] = payload;
@@ -30932,6 +31425,13 @@ function _buildWorkflowAlerts() {
   var alerts = [];
 
   var today = new Date().toISOString().slice(0, 10);
+  // [v23.77 #3/#7] daily stock check + missing data
+  try {
+    var _scC = S._stockCheck && S._stockCheck.counts, _scN = _scTotal(_scC);
+    if (_scN) alerts.push({ level: (_scC.undeducted || _scC.drift) ? 'red' : 'orange', icon: '\u2696', text: 'Stock check: ' + _scN + ' thing' + (_scN !== 1 ? 's' : '') + ' to look at' + (_scC.undeducted ? ' (' + _scC.undeducted + ' shipped without a deduction)' : ''), nav: "nav('dataintegrity')", lbl: 'Review' });
+    var _dg = dataGapRows(), _dgLead = _dg.filter(function (r) { return r.miss.indexOf('lead') >= 0; }).length;
+    if (_dgLead) alerts.push({ level: 'yellow', icon: '\u2610', text: _dgLead + ' part' + (_dgLead !== 1 ? 's have' : ' has') + ' no lead time - planning dates will be guesses', nav: "S._dgFilter='lead';nav('dataintegrity')", lbl: 'Fill in' });
+  } catch (_e) {}
   var _pfc = poFollowCounts();
   var overduePOs = _pfc.list.filter(function(f) { return f.state === 'overdue'; });
   if (_pfc.due) {
