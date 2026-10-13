@@ -475,7 +475,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.82';
+const TGK_ERP_VERSION = 'v23.83';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -8208,7 +8208,7 @@ async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.82'
+const EDGE_BUILD = 'v23.83'
 
 // [v23.82] The vehicle the shopper had saved on the website rides along as cart attribute "Vehicle" and arrives
 // here as an order note attribute. It is stored on each sales line (column added by fitment_7_insights.sql), so
@@ -8435,6 +8435,65 @@ Deno.serve(async (req) =&gt; {
     }
     return new Response(JSON.stringify({skuMap, count: products.length, next_page_info}), {headers:{...CORS,'Content-Type':'application/json'}})
   }
+  // [v23.83] Google-friendly platform pages: real Shopify automated collections, one per platform.
+  // The Fitment tool sends the platform name + the website pages (handles) that fit it. Here we tag exactly those
+  // products 'tgk-fit-&lt;slug&gt;' (and untag products that no longer fit), and make sure an automated collection with
+  // the rule "tag equals tgk-fit-&lt;slug&gt;" exists and is published. Shopify keeps the collection's products in sync.
+  if (body.action === 'sync_platform_collection') {
+    const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
+    const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
+    const J = (o: any, st = 200) =&gt; new Response(JSON.stringify(o), {status: st, headers: {...CORS, 'Content-Type': 'application/json'}})
+    if (!store || !key) return J({error: 'Missing Shopify credentials'}, 400)
+    const slug = String(body.slug || '').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80)
+    const title = String(body.title || '').slice(0, 200)
+    const handles: string[] = Array.isArray(body.handles) ? body.handles.map((h: any) =&gt; String(h)).filter(Boolean).slice(0, 2000) : []
+    if (!slug || !title) return J({error: 'slug and title are required'}, 400)
+    const tag = 'tgk-fit-' + slug
+    const api = 'https://' + store + '/admin/api/2024-01'
+    const H = {'X-Shopify-Access-Token': key, 'Content-Type': 'application/json'}
+    const gql = async (query: string, variables: any = {}) =&gt; {
+      const r = await fetch(api + '/graphql.json', {method: 'POST', headers: H, body: JSON.stringify({query, variables})})
+      const j = await r.json()
+      if (!r.ok || j.errors) throw new Error('Shopify ' + r.status + ': ' + JSON.stringify(j.errors || j).slice(0, 300))
+      return j.data
+    }
+    try {
+      const want = new Map&lt;string, string&gt;()
+      for (let i = 0; i &lt; handles.length; i += 50) {
+        const q = handles.slice(i, i + 50).map(h =&gt; 'handle:' + JSON.stringify(h)).join(' OR ')
+        const d = await gql('query($q:String!){products(first:50,query:$q){nodes{id handle}}}', {q})
+        for (const n of (d.products?.nodes || [])) if (handles.includes(n.handle)) want.set(n.id, n.handle)
+      }
+      const have = new Set&lt;string&gt;(); let after: string | null = null
+      for (let guard = 0; guard &lt; 40; guard++) {
+        const d: any = await gql('query($q:String!,$a:String){products(first:250,after:$a,query:$q){nodes{id} pageInfo{hasNextPage endCursor}}}', {q: 'tag:' + JSON.stringify(tag), a: after})
+        for (const n of (d.products?.nodes || [])) have.add(n.id)
+        if (!d.products?.pageInfo?.hasNextPage) break; after = d.products.pageInfo.endCursor
+      }
+      let added = 0, removed = 0
+      for (const id of want.keys()) if (!have.has(id)) { const d = await gql('mutation($id:ID!,$t:[String!]!){tagsAdd(id:$id,tags:$t){userErrors{message}}}', {id, t: [tag]}); if (!(d.tagsAdd?.userErrors || []).length) added++ }
+      for (const id of have) if (!want.has(id)) { const d = await gql('mutation($id:ID!,$t:[String!]!){tagsRemove(id:$id,tags:$t){userErrors{message}}}', {id, t: [tag]}); if (!(d.tagsRemove?.userErrors || []).length) removed++ }
+      const handle = slug + '-parts'
+      const ex = await fetch(api + '/smart_collections.json?handle=' + encodeURIComponent(handle), {headers: H})
+      const exj = ex.ok ? await ex.json() : {smart_collections: []}
+      let created = false, collectionId = exj.smart_collections?.[0]?.id || null
+      if (!collectionId) {
+        const desc = String(body.description || ('Parts that fit the ' + title + ' - every one checked against our fitment data.')).slice(0, 320)
+        const cr = await fetch(api + '/smart_collections.json', {method: 'POST', headers: H, body: JSON.stringify({smart_collection: {
+          title: title + ' Parts', handle, published: true, disjunctive: false,
+          rules: [{column: 'tag', relation: 'equals', condition: tag}],
+          body_html: '&lt;p&gt;' + desc.replace(/[&lt;&gt;&amp;]/g, '') + '&lt;/p&gt;',
+          metafields_global_title_tag: title + ' Parts | TGK Motorsport', metafields_global_description_tag: desc}})})
+        const crj = await cr.json()
+        if (!cr.ok) throw new Error('Shopify ' + cr.status + ' creating the collection: ' + JSON.stringify(crj.errors || crj).slice(0, 300))
+        collectionId = crj.smart_collection?.id || null; created = true
+      }
+      return J({ok: true, tag, collection_handle: handle, collection_id: collectionId, created, products: want.size, added, removed, not_found: handles.length - want.size})
+    } catch (e) {
+      return J({error: String((e as any)?.message || e)}, 502)
+    }
+  }
+
   if (body.action === 'list_products') {
     const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
     const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
@@ -8442,7 +8501,7 @@ Deno.serve(async (req) =&gt; {
     const page_info = body.page_info || ''
     const url = page_info
       ? 'https://' + store + '/admin/api/2024-01/products.json?limit=250&amp;page_info=' + page_info
-      : 'https://' + store + '/admin/api/2024-01/products.json?limit=250&amp;published_status=any&amp;fields=id,title,handle,status,published_at,variants'
+      : 'https://' + store + '/admin/api/2024-01/products.json?limit=250&amp;published_status=any&amp;fields=id,title,handle,status,published_at,variants,image'
     const res = await fetch(url, {headers:{'X-Shopify-Access-Token': key}})
     if (!res.ok) return new Response(JSON.stringify({error:'Shopify ' + res.status + ' - check API key has read_products scope'}), {status:res.status, headers:{...CORS,'Content-Type':'application/json'}})
     const data = await res.json()
@@ -8455,7 +8514,8 @@ Deno.serve(async (req) =&gt; {
         // [v23.79] variants with a blank SKU are reported separately so the Fitment tool can flag them
         if (!sku) { noSku.push({handle: product.handle || '', title: product.title || '', product_id: product.id, variant_id: variant.id, variant_title: variant.title || ''}); continue }
         skus.push({sku, status: product.status || '', published: !!product.published_at, title: product.title || '', handle: product.handle || '', tracked: !!variant.inventory_management, policy: variant.inventory_policy || '', qty: (typeof variant.inventory_quantity === 'number' ? variant.inventory_quantity : null),
-          product_id: product.id, variant_id: variant.id, variant_title: variant.title || '', price: variant.price || null, position: variant.position || null})
+          product_id: product.id, variant_id: variant.id, variant_title: variant.title || '', price: variant.price || null, position: variant.position || null,
+          image: (product.image &amp;&amp; product.image.src) || null})
       }
     }
     const link = res.headers.get('link') || ''
@@ -26066,7 +26126,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.82','shipstation-ship':'v23.77'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.83','shipstation-ship':'v23.77'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
