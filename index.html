@@ -475,7 +475,7 @@ tbody tr:hover td{background:rgba(13,148,136,.05)}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.81';
+const TGK_ERP_VERSION = 'v23.82';
 const TGK_ERP_BUILD_DATE = '2026-09-14';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -5995,7 +5995,7 @@ function openReturnModal(saleId, pn, qty, orderNum){
     : S.sales.filter(s=>s.id===saleId&&s.pn));
   const shopifyConnected=!!(S.shopify?.key&&S.shopify?.store);
   const ssConnected=!!(S.settings?.ss_key||S.settings?.shipstation);
-  const reasons=['Wrong item shipped','Customer changed mind','Defective / not working','Damaged in shipping','Duplicate order','Other'];
+  const reasons=['Wrong item shipped','Doesn\'t fit vehicle','Customer changed mind','Defective / not working','Damaged in shipping','Duplicate order','Other'];
 
   window._retLines = allLines.map(l=>({id:l.id,msrp:l.msrp||0,qty:l.qty||1}));
   const _shippedLines=allLines.filter(l=>l.fulfillment_status==='Shipped'||l.fulfillment_status==='Delivered');
@@ -8208,7 +8208,27 @@ async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.79'
+const EDGE_BUILD = 'v23.82'
+
+// [v23.82] The vehicle the shopper had saved on the website rides along as cart attribute "Vehicle" and arrives
+// here as an order note attribute. It is stored on each sales line (column added by fitment_7_insights.sql), so
+// returns marked "Doesn't fit vehicle" show which car, and per-platform best sellers become possible later.
+function orderVehicle(order: any): string | null {
+  const na = Array.isArray(order?.note_attributes) ? order.note_attributes : []
+  const hit = na.find((a: any) =&gt; String(a?.name || '').toLowerCase() === 'vehicle')
+  const v = hit ? String(hit.value || '').trim() : ''
+  return v ? v.slice(0, 200) : null
+}
+// Insert a sales line; if the database does not have the vehicle column yet, retry without it (orders never stop).
+async function insertSaleLine(db: any, row: any) {
+  let res = await db.from('sales').insert(row)
+  if (res.error &amp;&amp; row &amp;&amp; 'vehicle' in row &amp;&amp; /vehicle/i.test(String(res.error.message || ''))) {
+    const r2 = { ...row }; delete r2.vehicle
+    res = await db.from('sales').insert(r2)
+  }
+  return res
+}
+
 const _gateLogged: Record&lt;string, number&gt; = {}
 async function authGate(req: Request, fn: string, action: string): Promise&lt;Response | null&gt; {
   const mode = (Deno.env.get('EDGE_AUTH_MODE') || 'log').toLowerCase()
@@ -9209,7 +9229,8 @@ if (body.action === 'list_product_templates') {
         const { data: existing } = await db.from('sales').select('id').eq('order_number', order.name).eq('pn', pn).limit(1)
         if (existing?.length) { console.log('[shopify-orders] skipping duplicate', order.name, pn); continue }
         const shipAddr = order.shipping_address || {}
-        const { error: insErr } = await db.from('sales').insert({
+        const { error: insErr } = await insertSaleLine(db, {
+          vehicle: orderVehicle(order),
           order_number: order.name,
           pn,
           qty: _createQty,
@@ -9399,7 +9420,8 @@ if (body.action === 'list_product_templates') {
         const custEmail = order.email || order.customer?.email || ''
         for (const li of newLineItems) {
           const pn = li.sku ? li.sku.trim().toUpperCase() : (li.title || '').trim()
-          const { error: insErr } = await db.from('sales').insert({
+          const { error: insErr } = await insertSaleLine(db, {
+          vehicle: orderVehicle(order),
             order_number: order.name,
             pn,
             qty: _liQty(li),
@@ -26044,7 +26066,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.79','shipstation-ship':'v23.77'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.82','shipstation-ship':'v23.77'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
