@@ -473,7 +473,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.90</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.91</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -538,7 +538,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.90';
+const TGK_ERP_VERSION = 'v23.91';
 const TGK_ERP_BUILD_DATE = '2026-10-19';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -31780,6 +31780,25 @@ function _slipMoney(n,cur){
 function _slipRound(n){return Math.round((Number(n)||0)*100)/100;}
 function _slipPricePref(){try{return localStorage.getItem('tgk_slip_prices')!=='0';}catch(e){return true;}}
 // The Shopify line for an ERP sales line: by Shopify line id first, then by SKU.
+// [v23.91] The Shopify line behind an ERP line (by Shopify line id, then SKU). Its product title is used as the description
+// when the ERP has none (drop-ship SKUs, SKUs not in the catalog).
+function _slipShopifyLine(l,pr){
+  if(!pr||!pr.lines)return null;
+  var id=l&&l.shopify_line_item_id!=null?String(l.shopify_line_item_id):'',li=null;
+  if(id)li=pr.lines.find(function(x){return String(x.id)===id;})||null;
+  if(!li){var k=String((l&&l.pn)||'').trim().toUpperCase();li=pr.lines.find(function(x){return String(x.sku||'').trim().toUpperCase()===k;})||null;}
+  return li;
+}
+// What a failed price lookup means, and what to do about it. Shown at the top of the slip window.
+function _slipExplain(err){
+  var e=String(err||'');
+  if(/NetworkError|Failed to fetch|Load failed|HTTP 404|timed out/i.test(e))return 'The price function could not be reached. It is probably not deployed yet: in Supabase, open Edge Functions and deploy order-price-summary.';
+  if(/not connected|SHOPIFY_ADMIN_TOKEN/i.test(e))return 'The price function has no Shopify token. Add the SHOPIFY_ADMIN_TOKEN secret to it.';
+  if(/read_orders|cannot read orders|refused the connection/i.test(e))return 'The Shopify token cannot read orders. Give the Shopify app the read_orders permission.';
+  if(/sign in/i.test(e))return 'Your login has expired. Sign out of the ERP and back in.';
+  if(/staff accounts/i.test(e))return 'The price function only allows staff emails (STAFF_EMAIL_DOMAIN) and yours does not match.';
+  return e?('Shopify lookup problem: '+e):'';
+}
 function _slipLinePrice(l,pr){
   if(!pr||!pr.lines)return null;
   var li=null,id=l&&l.shopify_line_item_id!=null?String(l.shopify_line_item_id):'';
@@ -31845,7 +31864,10 @@ async function _slipPricesFor(groups){
   var note='';
   if(res.names.length&&!found)note='Prices could not be loaded'+(res.err?' ('+res.err+')':' (order not found in Shopify)')+' - printing without prices';
   else if(lost>0)note=lost+' order'+(lost!==1?'s':'')+' printed without prices (not found in Shopify)';
-  return {any:found>0,note:note,get:function(n){return res.map[norm(n)]||null;}};
+  var why='';
+  if(res.names.length&&!found)why=res.err?(_slipExplain(res.err)||res.err):'Shopify did not return this order. It may not be a Shopify order, or it is older than 60 days (older orders need the read_all_orders permission on the Shopify token).';
+  else if(lost>0)why=lost+' order'+(lost!==1?'s':'')+' on this job '+(lost!==1?'have':'has')+' no prices: Shopify did not return '+(lost!==1?'them':'it')+' (not a Shopify order, or older than 60 days).';
+  return {any:found>0,note:note,why:why,get:function(n){return res.map[norm(n)]||null;}};
 }
 // The print window is opened right inside the click (a window opened after the price lookup would be blocked as a popup),
 // then filled in once the prices arrive.
@@ -31884,7 +31906,7 @@ function _packingSlipWrapHtml(lines,pr){
 
   var rows=valid.map(function(l){
     var a=asmMap[l.pn];var p=prtMap[l.pn];
-    var desc=_descForPn(l.pn);
+    var desc=_descForPn(l.pn);if(!desc&&pr){var _sl=_slipShopifyLine(l,pr);if(_sl&&_sl.title)desc=_sl.title;}
     return '<tr>'
       +'<td style="padding:9px 14px;font-family:monospace;font-size:var(--t-sm);font-weight:700;color:var(--teal);white-space:nowrap;border-bottom:1px solid var(--bg3)">'+esc(l.pn)+'</td>'
       +'<td style="padding:9px 14px;font-size:var(--t-md);color:var(--text);border-bottom:1px solid var(--bg3)">'+esc(desc||l.pn)+'</td>'
@@ -31940,7 +31962,7 @@ function _packingSlipWrapHtml(lines,pr){
 
 // Each slip sits in its own .slip container that breaks to a new sheet, except the last - so a bulk
 // run is one print job of N pages rather than N separate windows each needing their own print.
-function _packingSlipDocument(wraps,title,hasPrices){
+function _packingSlipDocument(wraps,title,hasPrices,note){
   return '<!DOCTYPE html><html><head><meta charset="UTF-8">'
     +'<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;700&display=swap" rel="stylesheet">'
     +'<title>'+_packingSlipEsc(title)+'</title>'
@@ -31951,7 +31973,8 @@ function _packingSlipDocument(wraps,title,hasPrices){
     +'<button onclick="window.close()" style="padding:8px 14px;background:transparent;border:1px solid var(--border);border-radius:var(--r-md);font-size:var(--t-md);cursor:pointer;font-family:inherit">Close</button>'
     +(hasPrices?'<label style="display:flex;align-items:center;gap:6px;margin-left:8px;font-size:var(--t-md);cursor:pointer"><input type="checkbox" id="px-toggle"'+(_slipPricePref()?' checked':'')+' onchange="document.body.classList.toggle(\'noprice\',!this.checked);try{window.opener.localStorage.setItem(\'tgk_slip_prices\',this.checked?\'1\':\'0\');}catch(e){}"> Show prices</label>':'')
  +'</div>'
-    +wraps.map(function(w){return '<div class="slip">'+w+'</div>';}).join('')
+    +(note?'<div class="no-print slip-note" style="background:#fff7e6;border:1px solid #f5c26b;color:#7a4b00;padding:10px 14px;border-radius:var(--r-md);font-size:var(--t-md);line-height:1.5;margin-bottom:14px"><b>Prices are not on this slip.</b> '+_packingSlipEsc(note)+'</div>':'')
+ +wraps.map(function(w){return '<div class="slip">'+w+'</div>';}).join('')
     +'</body></html>';
 }
 
@@ -31974,7 +31997,7 @@ async function printPackingSlip(orderNum,saleId){
   var priced=await _slipPricesFor([lines]);
   var wrap=_packingSlipWrapHtml(lines,priced.get(lines[0].order_number));
   if(!wrap){try{w.close();}catch(e){}toast('Nothing to print \u2014 all lines are cancelled or refunded');return;}
-  _slipShow(w,_packingSlipDocument([wrap],'Packing Slip '+(lines[0].order_number||''),priced.any));
+  _slipShow(w,_packingSlipDocument([wrap],'Packing Slip '+(lines[0].order_number||''),priced.any,priced.why));
   if(priced.note)toast(priced.note);
  }catch(e){try{w.close();}catch(_e){}toast('Could not build the packing slip: '+((e&&e.message)||e));}
 }
@@ -32000,7 +32023,7 @@ async function bulkPrintPackingSlips(){
    if(wrap)wraps.push(wrap); else skipped.push(g.key);
   });
   if(!wraps.length){try{w.close();}catch(e){}toast('Nothing to print \u2014 the selected orders have no printable lines');return;}
-  _slipShow(w,_packingSlipDocument(wraps,wraps.length+' Packing Slips',priced.any));
+  _slipShow(w,_packingSlipDocument(wraps,wraps.length+' Packing Slips',priced.any,priced.why));
   toast('\uD83D\uDCE6 '+wraps.length+' packing slip'+(wraps.length!==1?'s':'')+' ready to print'
    +(skipped.length?' \u00b7 '+skipped.length+' skipped (no printable lines)':'')
    +(priced.note?' \u00b7 '+priced.note:''));
