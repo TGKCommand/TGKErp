@@ -473,7 +473,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.94</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.97</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -538,7 +538,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.94';
+const TGK_ERP_VERSION = 'v23.97';
 const TGK_ERP_BUILD_DATE = '2026-10-21';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -2162,33 +2162,42 @@ function isPackagingOrSupplyPart(childPn,itemType){
   return false;
 }
 
-function cascadeShopifySync(childPn){
-  // Buildability is a DERIVED property — assembly B's max-buildable depends on component stock that
-  // assembly A's packing can silently deplete. syncShopifyTemplate() only ever fires for whichever SKU
-  // was directly acted on, so if a shared component runs out because of unrelated activity, every OTHER
-  // assembly that also depends on it can sit at Max Buildable: 0 with Shopify never being told. Whenever
-  // a part's stock changes for any reason, walk every assembly's BOM, find the ones using this part,
-  // and re-check backorder status for any of them that are already sitting at zero on-hand.
+function cascadeShopifySync(childPn,_seen){
+  // Buildability is a DERIVED property -- a finished good's max-buildable depends on component stock that other activity can
+  // change. syncShopifyTemplate() only fires for whichever SKU was directly acted on, so whenever a part's (or a
+  // sub-assembly's) stock changes for any reason, find every assembly that uses it and re-check backorder status for the
+  // finished goods that are sitting at zero on-hand.
+  // [v23.95] THE BUG THIS FIXES: the walk used to look only at the DIRECT parent and then stop if that parent was not itself a
+  // sellable finished good. A finished good built from sub-assemblies (finished good -> 12-0001 / 12-0002 -> raw parts) was
+  // therefore never re-checked when its raw parts were received or its sub-assemblies were built: once it went on backorder
+  // it stayed on backorder on the website even though it was fully buildable. Now the walk keeps climbing through every
+  // parent that is not itself a finished good (sub-assemblies, hardware packs, anything not Shopify-managed) until it reaches
+  // the finished goods, and the walk continues above a finished good too, so a bundle that contains it is re-checked as well.
   if(!childPn)return;
-  // [FIX] Packaging/supply components (cards, stickers, boxes, bulk consumables) are used by
-  // nearly every finished good, but buildabilityForBackorder() deliberately EXCLUDES them when
-  // computing maxBuild -- so their stock changing can never alter any assembly's backorder status.
-  // Cascading on them meant every pack/receive/correction touching a sticker fired a full Shopify
-  // round-trip for every zero-stock assembly sharing it (most of the catalog), producing constant
-  // redundant syncs -- and, with no in-flight guard, overlapping async calls for the same SKU that
-  // raced each other and could land on the wrong final answer. Skipping them removes the volume
-  // entirely without weakening the cascade for real components, which still works exactly as before.
+  // Packaging/supply components (cards, stickers, boxes, bulk consumables) are used by nearly every finished good, but
+  // buildabilityForBackorder() deliberately EXCLUDES them when computing maxBuild -- so their stock changing can never alter
+  // any assembly's backorder status. Cascading on them would only cause constant redundant Shopify round-trips.
   if(isPackagingOrSupplyPart(childPn,null)){
     return;
   }
+  var seen=_seen||{};
+  if(seen[childPn])return;          // BOM loops and shared sub-assemblies: visit each item once
+  seen[childPn]=1;
+  if(Object.keys(seen).length>60)return; // safety cap
   Object.entries(S.boms||{}).forEach(([parentPn,lines])=>{
     var line=lines.find(l=>l.child_pn===childPn);
     if(!line)return;
     if(isPackagingOrSupplyPart(childPn,line.item_type))return; // also honors a BOM line explicitly typed as packaging
     const parent=asmByPn(parentPn);
     if(!parent)return;
-    if(!eligibleForBackorderSync(parent))return; // only genuine finished goods — never subassemblies, hardware packs, pre-order items, discontinued, or dev
-    if((parent.total_on_hand||0)<=0)syncShopifyTemplate(parentPn,parent.total_on_hand||0);
+    if(eligibleForBackorderSync(parent)){
+      // a genuine finished good: re-check it once, if it has no stock of its own
+      if(!seen['S:'+parentPn]){
+        seen['S:'+parentPn]=1;
+        if((parent.total_on_hand||0)<=0)syncShopifyTemplate(parentPn,parent.total_on_hand||0);
+      }
+    }
+    cascadeShopifySync(parentPn,seen); // keep climbing: sub-assemblies and hardware packs are not products, and bundles may contain this finished good
   });
 }
 function syncShopifyTemplate(pn,newOh){
@@ -2202,8 +2211,11 @@ function syncShopifyTemplate(pn,newOh){
   // where the stock number actually changed always goes through, so packing two orders back-to-
   // back (1 -> 0) still syncs correctly rather than having the second, more-correct call dropped.
   // Keyed per SKU, so unrelated items continue syncing in parallel.
-  var _item=S.assemblies.find(function(a){return a.pn===pn||a.new_sku===pn;})||S.parts.find(function(p){return p.pn===pn||p.new_sku===pn;});
-  if(_item&&!eligibleForBackorderSync(_item)){console.log('[Shopify template] skipped — not eligible (subassembly/hardware pack/pre-order/discontinued/dev):',pn);return;}
+  var _item=S.assemblies.find(function(a){return a.pn===pn||a.new_sku===pn;})||S.parts.find(function(p){return p.pn===pn||p.new_sku===pn;})||(typeof findAsm==='function'?findAsm(pn):null)||(typeof _findPart==='function'?_findPart(pn):null);
+  if(_item&&!eligibleForBackorderSync(_item)){console.log('[Shopify template] skipped — not eligible (subassembly/hardware pack/pre-order/discontinued/dev):',pn);
+  // [v23.95] A sub-assembly or hardware pack is not a product, but the finished goods built from it are: its stock changing must re-check them.
+  if(S.assemblies.indexOf(_item)!==-1){try{cascadeShopifySync(_item.pn);}catch(_e){console.warn('[Shopify template] cascade from',pn,'failed:',_e);}}
+  return;}
   // [SKU] Shopify variant SKUs are the customer-facing SKU (new_sku when use_new_sku). Callers hand us the
   // internal/canonical pn, so resolve BOTH: canonPn for buildability (BOM keys are canonical) and shopSku
   // (dispPn) for what we actually send to Shopify -- otherwise the edge update_template lookup misses the
@@ -2429,7 +2441,16 @@ function backorderBadge(pn){
 // Shopify doesn't currently show it as backordered - previously nothing distinguished this from a
 // perfectly healthy in-stock item anywhere on this page.
 function backorderMismatchWarning(pn){
-  if(currentBackorderOf(pn))return''; // already correctly flagged - no mismatch to warn about
+ // [v23.95] The reverse mismatch: flagged BACKORDERED on Shopify, but the item is in stock or buildable from real components
+ // (packaging and supplies never count). A manual hold (force_backorder) is deliberate, so it is never called stale.
+ if(currentBackorderOf(pn)){
+  var _sit=findAsm(pn)||_findPart(pn);
+  if(!_sit||_sit.force_backorder||typeof eligibleForBackorderSync!=='function'||!eligibleForBackorderSync(_sit))return'';
+  var _soh=_sit.total_on_hand!=null?_sit.total_on_hand:(_sit.total_unpckgd||0);
+  var _sb=buildabilityForBackorder(_sit.pn);
+  if((_soh||0)>0||(_sb.hasBOM&&_sb.maxBuild>0))return '<span class="pill" style="background:rgba(220,38,38,.12);color:var(--red);border:1px solid rgba(220,38,38,.4);font-size:8.5px;vertical-align:middle;margin-left:4px;font-weight:700" title="Shopify still shows this as backordered, but it is '+((_soh||0)>0?'in stock':'buildable from components')+'. Run Bulk Sync (Integrations) to clear it, or press Re-check on the item.">! STALE BACKORDER</span>';
+  return'';
+ }
   const item=findAsm(pn)||_findPart(pn);
   if(!item||typeof eligibleForBackorderSync!=='function'||!eligibleForBackorderSync(item))return'';
   const _oh=item.total_on_hand!=null?item.total_on_hand:(item.total_unpckgd||0);
@@ -9945,7 +9966,51 @@ function isEligibleForBackorderSync(item: any): boolean {
   return true
 }
 
+// [v23.96] ALIAS RESOLUTION. The catalog keys every bill of materials on an item's CANONICAL pn, but the SKU a shipment or a
+// sales line carries is the Shopify variant SKU: the item's new_sku when use_new_sku is set, and always upper-cased by the order
+// webhook (the catalog has mixed-case part numbers such as TGK-Card-01). Looking a bill of materials up under that alias finds
+// nothing, and "no BOM" is treated as "cannot be built" -- which is how an item that sold out but was still fully buildable
+// got put on backorder on the website. Everything that asks "can this be built?" must resolve to the canonical item first.
+async function resolveItem(raw: string): Promise&lt;{ pn: string, new_sku: string | null } | null&gt; {
+  const v = String(raw || '').trim()
+  if (!v) return null
+  const esc = v.replace(/[\\\\%_]/g, (c) =&gt; '\\\\' + c) // LIKE wildcards must match literally
+  const tries: Array&lt;[string, string, boolean]&gt; = [
+    ['assemblies', 'pn', false], ['assemblies', 'new_sku', false], ['parts', 'pn', false], ['parts', 'new_sku', false],
+    ['assemblies', 'pn', true], ['assemblies', 'new_sku', true], ['parts', 'pn', true], ['parts', 'new_sku', true],
+  ]
+  for (const [table, col, ci] of tries) {
+    const q = db.from(table).select('pn,new_sku')
+    const { data } = await (ci ? q.ilike(col, esc) : q.eq(col, v)).limit(1)
+    if (data?.length) return { pn: data[0].pn, new_sku: data[0].new_sku || null }
+  }
+  return null
+}
+async function canonicalPn(raw: string): Promise&lt;string&gt; {
+  const r = await resolveItem(raw)
+  return r ? r.pn : String(raw || '').trim()
+}
+// alias -&gt; canonical pn for the values in \`list\` that are some item's new_sku (a value that is itself a pn is left alone)
+async function aliasToCanonical(list: string[]): Promise&lt;Record&lt;string, string&gt;&gt; {
+  const out: Record&lt;string, string&gt; = {}
+  const uniq = [...new Set((list || []).filter(Boolean))]
+  if (!uniq.length) return out
+  const isPn = new Set&lt;string&gt;()
+  const { data: ap } = await db.from('assemblies').select('pn').in('pn', uniq)
+  ;(ap || []).forEach((r: any) =&gt; isPn.add(r.pn))
+  const { data: pp } = await db.from('parts').select('pn').in('pn', uniq)
+  ;(pp || []).forEach((r: any) =&gt; isPn.add(r.pn))
+  const rest = uniq.filter((x) =&gt; !isPn.has(x))
+  if (!rest.length) return out
+  const { data: an } = await db.from('assemblies').select('pn,new_sku').in('new_sku', rest)
+  ;(an || []).forEach((r: any) =&gt; { if (r.new_sku) out[r.new_sku] = r.pn })
+  const { data: pn2 } = await db.from('parts').select('pn,new_sku').in('new_sku', rest)
+  ;(pn2 || []).forEach((r: any) =&gt; { if (r.new_sku &amp;&amp; !(r.new_sku in out)) out[r.new_sku] = r.pn })
+  return out
+}
+
 async function bomMaxBuild(pn: string): Promise&lt;{ hasBOM: boolean, maxBuild: number }&gt; {
+  pn = await canonicalPn(pn) // [v23.96] callers may hand us the Shopify SKU; the bill of materials is keyed by the canonical pn
   const bomOf: Record&lt;string, { child_pn: string, qty: number, item_type: string }[]&gt; = {}
   const childPns = new Set&lt;string&gt;()
   let frontier: string[] = [pn]; let depth = 0; const fetched = new Set&lt;string&gt;()
@@ -9953,6 +10018,9 @@ async function bomMaxBuild(pn: string): Promise&lt;{ hasBOM: boolean, maxBuild: 
     const toFetch = frontier.filter(p =&gt; !fetched.has(p)); toFetch.forEach(p =&gt; fetched.add(p))
     if (!toFetch.length) break
     const { data: rows } = await db.from('bom_items').select('parent_pn,child_pn,qty,item_type').in('parent_pn', toFetch)
+    // [v23.96] a BOM line may reference its part / sub-assembly by new_sku: map those to the canonical pn so stock and sub-BOMs are found
+    const _kidAlias = await aliasToCanonical((rows || []).map((r: any) =&gt; r.child_pn))
+    ;(rows || []).forEach((r: any) =&gt; { if (_kidAlias[r.child_pn]) r.child_pn = _kidAlias[r.child_pn] })
     toFetch.forEach(p =&gt; { if (!bomOf[p]) bomOf[p] = [] })
     const next: string[] = []
     ;(rows || []).forEach((r: any) =&gt; {
@@ -10072,9 +10140,10 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
     console.log('[SS-&gt;Shopify] sync disabled via ERP toggle - skipped for', pn)
     return
   }
-  let { data: asmCheck } = await db.from('assemblies').select('pn,new_sku,use_new_sku,discontinued,stage,is_subassembly,category,force_backorder').eq('pn', pn).limit(1)
+  const canonPn = await canonicalPn(pn) // [v23.96] the item's real pn: bills of materials and stock are keyed on it, never on the Shopify SKU
+  let { data: asmCheck } = await db.from('assemblies').select('pn,new_sku,use_new_sku,discontinued,stage,is_subassembly,category,force_backorder').eq('pn', canonPn).limit(1)
   if (!asmCheck?.length) { const _r = await db.from('assemblies').select('pn,new_sku,use_new_sku,discontinued,stage,is_subassembly,category,force_backorder').eq('new_sku', pn).limit(1); asmCheck = _r.data }
-  const { data: partCheck } = asmCheck?.length ? { data: null } : await db.from('parts').select('pn,new_sku,use_new_sku,discontinued,category').eq('pn', pn).limit(1)
+  const { data: partCheck } = asmCheck?.length ? { data: null } : await db.from('parts').select('pn,new_sku,use_new_sku,discontinued,category').eq('pn', canonPn).limit(1)
   const eligItem = asmCheck?.[0] || partCheck?.[0]
   if (!eligItem) {
     // No assemblies/parts record at all - a resale or drop-ship SKU the ERP neither builds nor
@@ -10100,7 +10169,7 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
     template = Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder'
     console.log('[SS-&gt;Shopify]', pn, 'FORCED on backorder by manual override')
   } else if (newOh &lt;= 0) {
-    const { hasBOM, maxBuild } = await bomMaxBuild(pn)
+    const { hasBOM, maxBuild } = await bomMaxBuild(canonPn)
     const isBackorder = !hasBOM || maxBuild &lt;= 0
     if (isBackorder) {
       template = Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder'
@@ -10162,22 +10231,36 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
     if (pId) await reconcileProductTemplate(gqlBO, pId)
     const ssRestockDate = ssRestock || ''
     try {
-      const { maxBuild: logMaxBuild } = await bomMaxBuild(pn)
-      await db.from('shopify_sync_log').insert({ pn, action: isBO ? 'backorder' : 'reverted', trigger_source: 'shipstation_webhook', new_oh: newOh, max_build: logMaxBuild || null, restock_date: ssRestockDate || null })
+      const { maxBuild: logMaxBuild } = await bomMaxBuild(canonPn)
+      await db.from('shopify_sync_log').insert({ pn: canonPn, action: isBO ? 'backorder' : 'reverted', trigger_source: 'shipstation_webhook', new_oh: newOh, max_build: logMaxBuild || null, restock_date: ssRestockDate || null })
     } catch (e) { console.warn('[SS-&gt;Shopify] log insert failed:', e) }
   } catch (e) {
     console.warn('[SS-&gt;Shopify] error for', pn, e)
   }
 }
 
-async function cascadeShopifyBackorder(childPn: string): Promise&lt;void&gt; {
-  const { data: boms } = await db.from('bom_items').select('parent_pn').eq('child_pn', childPn)
+// [v23.95] Re-check the finished goods built from a part whose stock just changed.
+// This used to look only at the part's DIRECT parents and skip any parent that is not itself a sellable finished good, so a
+// finished good built from sub-assemblies (finished good -&gt; 12-0001 / 12-0002 -&gt; raw parts) was never re-checked when its raw
+// parts changed. Now it keeps climbing through every parent that is not a finished good (sub-assemblies, hardware packs,
+// anything not Shopify-managed) until it reaches the finished goods, and keeps going above a finished good too (bundles).
+// [v23.96] The part is resolved to its canonical item first, and the BOM is searched under every name it may be stored by.
+async function cascadeShopifyBackorder(childPn: string, seen: Set&lt;string&gt; = new Set()): Promise&lt;void&gt; {
+  const it = await resolveItem(childPn)
+  const canon = it ? it.pn : childPn
+  if (seen.has(canon) || seen.size &gt; 60) return
+  seen.add(canon)
+  const keys = [...new Set([childPn, canon, ...(it &amp;&amp; it.new_sku ? [it.new_sku] : [])])]
+  const { data: boms } = await db.from('bom_items').select('parent_pn').in('child_pn', keys)
   const parentPns = [...new Set((boms || []).map((b: any) =&gt; b.parent_pn))]
   if (!parentPns.length) return
   const { data: parents } = await db.from('assemblies').select('pn,new_sku,total_on_hand,discontinued,stage,is_subassembly,category').in('pn', parentPns)
   for (const parent of (parents || [])) {
-    if (!isEligibleForBackorderSync(parent)) continue
-    if ((parent.total_on_hand || 0) &lt;= 0) await syncShopifyBackorder(parent.pn, parent.total_on_hand || 0)
+    if (isEligibleForBackorderSync(parent) &amp;&amp; !seen.has('S:' + parent.pn)) {
+      seen.add('S:' + parent.pn)
+      if ((parent.total_on_hand || 0) &lt;= 0) await syncShopifyBackorder(parent.pn, parent.total_on_hand || 0)
+    }
+    await cascadeShopifyBackorder(parent.pn, seen)
   }
 }
 
@@ -10258,7 +10341,7 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.77'
+const EDGE_BUILD = 'v23.96'
 const _gateLogged: Record&lt;string, number&gt; = {}
 async function authGate(req: Request, fn: string, action: string): Promise&lt;Response | null&gt; {
   const mode = (Deno.env.get('EDGE_AUTH_MODE') || 'log').toLowerCase()
@@ -22680,16 +22763,19 @@ function renderPurchasesEnhanced() {
 
 // [SHARED] Valid OVER-estimate of buildable units (sub avail = on-hand + independent build capacity,
 // ignoring cross-line sharing). Bounds the feasibility search in _maxBuildShared.
+// [v23.96] A BOM line may reference its part or sub-assembly by its new_sku. Stock pools and sub-BOMs are keyed by canonical pn,
+// so every lookup below goes through this first (the lookup indexes are alias-aware; S.boms and the pools are not).
+function _bomChildCanon(c,pm,am){var a=am&&am[c];if(a&&a.pn)return a.pn;var p=pm&&pm[c];if(p&&p.pn)return p.pn;return c;}
 function _ubMax(pn,pm,am,includeItem,_d){
   _d=_d||0; if(_d>6)return 0;
   var bom=S.boms[pn]||[]; if(!bom.length)return Infinity;
   var per=[];
-  for(var k=0;k<bom.length;k++){var i=bom[k];
+  for(var k=0;k<bom.length;k++){var i=bom[k];var cc=_bomChildCanon(i.child_pn,pm,am);
     if(includeItem&&!includeItem(i))continue;
-    var isSub=i.item_type==='assembly'||i.item_type==='subassembly'||!!am[i.child_pn];
+    var isSub=i.item_type==='assembly'||i.item_type==='subassembly'||!!am[cc];
     var avail;
-    if(isSub){var s=am[i.child_pn];var oh=s?Math.max(0,s.total_on_hand||0):0;var cap=_ubMax(i.child_pn,pm,am,includeItem,_d+1);avail=oh+(cap===Infinity?0:cap);}
-    else{var p=pm[i.child_pn];avail=p?Math.max(0,p.total_unpckgd||0):0;}
+    if(isSub){var s=am[cc];var oh=s?Math.max(0,s.total_on_hand||0):0;var cap=_ubMax(cc,pm,am,includeItem,_d+1);avail=oh+(cap===Infinity?0:cap);}
+    else{var p=pm[cc];avail=p?Math.max(0,p.total_unpckgd||0):0;}
     per.push(i.qty>0?Math.floor(avail/i.qty):Infinity);
   }
   if(!per.length)return Infinity;
@@ -22708,19 +22794,19 @@ function _maxBuildShared(pn,pm,am,includeItem){
       if(!ok||count<=0)return;
       if(depth>8){ok=false;return;}
       var bom=S.boms[node]||[];
-      for(var k=0;k<bom.length&&ok;k++){var i=bom[k];
+      for(var k=0;k<bom.length&&ok;k++){var i=bom[k];var cc=_bomChildCanon(i.child_pn,pm,am);
         if(includeItem&&!includeItem(i))continue;
         var need=count*(i.qty||1); if(need<=0)continue;
-        var isSub=i.item_type==='assembly'||i.item_type==='subassembly'||!!am[i.child_pn];
+        var isSub=i.item_type==='assembly'||i.item_type==='subassembly'||!!am[cc];
         if(isSub){
-          if(subLeft[i.child_pn]===undefined){var sa=am[i.child_pn];subLeft[i.child_pn]=sa?Math.max(0,sa.total_on_hand||0):0;}
-          var fromStock=Math.min(need,subLeft[i.child_pn]); subLeft[i.child_pn]-=fromStock;
+          if(subLeft[cc]===undefined){var sa=am[cc];subLeft[cc]=sa?Math.max(0,sa.total_on_hand||0):0;}
+          var fromStock=Math.min(need,subLeft[cc]); subLeft[cc]-=fromStock;
           var toBuild=need-fromStock;
-          if(toBuild>0){ if((S.boms[i.child_pn]||[]).length===0){ok=false;return;} explode(i.child_pn,toBuild,depth+1); }
+          if(toBuild>0){ if((S.boms[cc]||[]).length===0){ok=false;return;} explode(cc,toBuild,depth+1); }
         } else {
-          partUsed[i.child_pn]=(partUsed[i.child_pn]||0)+need;
-          var p=pm[i.child_pn]; var stock=p?(p.total_unpckgd||0):0;
-          if(partUsed[i.child_pn]>stock){ok=false;return;}
+          partUsed[cc]=(partUsed[cc]||0)+need;
+          var p=pm[cc]; var stock=p?(p.total_unpckgd||0):0;
+          if(partUsed[cc]>stock){ok=false;return;}
         }
       }
     })(pn,N,0);
@@ -26265,7 +26351,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.83','shipstation-ship':'v23.77'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.83','shipstation-ship':'v23.96'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
