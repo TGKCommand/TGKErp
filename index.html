@@ -473,7 +473,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.99</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.100</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -538,7 +538,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.99';
+const TGK_ERP_VERSION = 'v23.100';
 const TGK_ERP_BUILD_DATE = '2026-10-21';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -19702,128 +19702,304 @@ function minMaxDrift(p){
 }
 window.minMaxDrift=minMaxDrift;
 
+// ===================================================================================================================
+// [v23.100] AI MIN/MAX - rebuilt for accuracy and reliability.
+//   * "AI Suggest All" now means the parts IN VIEW (what the button label counts), not "everything with demand".
+//   * Every part asked about is accounted for: the model's answer is retried (rate limits, overload, cut-off replies,
+//     missing parts) before any part falls back to the statistical baseline, and fallbacks are labelled as such.
+//   * The prompt asks for a reorder POLICY (demand-based), is not fed on-hand / on-order stock, and no longer tells the
+//     model to ratchet upward from the stored values.
+//   * Every number that comes back is validated and held to guardrails (whole numbers, safety <= min <= max, max a
+//     multiple of the MOQ, within 50%-200% of the statistical baseline).
+//   * Apply writes through a small worker pool, reports every failure, never uses a native confirm(), and records ONE
+//     undo step for the whole batch.
+// ===================================================================================================================
+function _mmInt(v){var n=(typeof v==='string')?parseFloat(v):v;return(typeof n==='number'&&isFinite(n))?Math.round(n):null;}
+function _mmGuard(v,base){if(!(base>0))return v;var lo=Math.floor(base*0.5),hi=Math.ceil(base*2);return Math.min(hi,Math.max(lo,v));}
+function _mmFixMax(min,max,moq,gap){
+  if(max<min)max=min+Math.max(1,gap||1);          // order-up-to can never sit below the reorder point
+  if(moq>0)max=Math.ceil(max/moq)*moq;            // and must be an orderable quantity
+  return max;
+}
+function _mmPrompt(chunk){
+  var fc=S.forecastWeeks||8;
+  var lines=chunk.map(function(b){
+    return b.pn+(b.desc?' ('+b.desc.slice(0,30)+')':'')+' | avg/wk:'+b.avg+' | stdev:'+b.sd+' | trend:'+(b.trend||'flat')
+      +' | last12wk:['+b.hist.join(',')+'] | lead:'+b.lead+'w'+(b.leadAssumed?'(assumed)':'')+' | moq:'+b.moq
+      +' | curMin:'+b.curMin+' | curMax:'+b.curMax+' | statMin:'+b.statMin+' | statMax:'+b.statMax+' | statSafety:'+b.statSafety;
+  }).join('\n');
+  return 'You are an inventory planning analyst for a motorsport parts manufacturer. For each part below set the reorder POLICY: min (reorder point), max (order-up-to level) and safety (safety stock).\n\n'
+   +'How the numbers are defined:\n'
+   +'- min = expected demand over the lead time + safety stock. Safety stock covers demand variability during the lead time.\n'
+   +'- max = min + the demand expected over the next ordering cycle (about '+fc+' weeks).\n'
+   +'- These are policy values that describe DEMAND. They do NOT depend on today\'s stock or on open purchase orders, so never change them because of what happens to be on hand or inbound.\n\n'
+   +'Rules:\n'
+   +'1. statMin / statMax / statSafety are the statistical baseline for a 95% service level. Start from them and stay within about 50% to 200% of them. Deviate only when the demand data justifies it.\n'
+   +'2. Raise values for volatile demand (high stdev relative to avg, or long runs of zero weeks followed by large orders - keep safety at least one typical order) and for a rising trend. Trim them for a falling trend. Keep slow movers lean.\n'
+   +'3. curMin / curMax are the stored values under review and may be stale in EITHER direction. Do not anchor on them: replace them whenever demand says so.\n'
+   +'4. Whole numbers only. safety must not exceed min. max must be at least min. When moq > 0, max must be a multiple of moq.\n'
+   +'5. If the baseline already looks right, return the baseline values.\n'
+   +'6. A lead time marked (assumed) is a 2-week default, not real data: stay close to the baseline for those parts.\n\n'
+   +'Return ONLY a JSON array with one object per part, in the same order, no markdown: [{"pn":"...","min":N,"max":N,"safety":N,"note":"max 8 words giving the main reason"}]\n\nPARTS:\n'+lines;
+}
+// One request to the model with retries for everything that is worth retrying (rate limits, overload, 5xx, network).
+var _mmNoTemp=false;   // set once the proxy/model rejects the temperature parameter
+async function _mmCall(prompt){
+  var lastErr='',noTemp=_mmNoTemp;
+  for(var attempt=0;attempt<4;attempt++){
+    try{
+      var body={model:'claude-sonnet-4-6',max_tokens:5000,messages:[{role:'user',content:prompt}]};
+      if(!noTemp)body.temperature=0;
+      var res=await fetch(SUPA_URL+'/functions/v1/anthropic-proxy',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify(body)});
+      var data=null;try{data=await res.json();}catch(_e){data=null;}
+      var errTxt=data&&data.error?String(data.error.type||data.error.message||'error')+(data.error.message?': '+data.error.message:''):'';
+      if(res.ok&&data&&!data.error&&data.content){
+        return {ok:true,text:(data.content||[]).map(function(c){return(c&&c.text)||'';}).join(''),stop:data.stop_reason||''};
+      }
+      lastErr=errTxt||('HTTP '+res.status);
+      if(!noTemp&&/temperature/i.test(lastErr)){noTemp=true;_mmNoTemp=true;attempt--;continue;}   // this model/proxy does not accept it: retry without
+      var retryable=[408,425,429,500,502,503,504,529].indexOf(res.status)>=0||/overloaded|rate_limit|api_error|timeout|temporar/i.test(lastErr);
+      if(!retryable)break;
+    }catch(e){lastErr=String((e&&e.message)||e);}
+    await new Promise(function(r){setTimeout(r,(attempt+1)*2500);});
+  }
+  return {ok:false,err:lastErr};
+}
+// Pull the JSON array out of a reply. A reply cut off mid-way still yields every complete object before the cut.
+function _mmParse(text){
+  var t=String(text||'').replace(/```json|```/g,'').trim(),arr=null;
+  var a=t.indexOf('['),b=t.lastIndexOf(']');
+  if(a>=0&&b>a){try{arr=JSON.parse(t.slice(a,b+1));}catch(_e){arr=null;}}
+  if(!Array.isArray(arr)){
+    arr=[];var re=/\{[^{}]*\}/g,m;
+    while((m=re.exec(t))){try{var o=JSON.parse(m[0]);if(o&&o.pn!==undefined)arr.push(o);}catch(_e2){}}
+  }
+  return arr.filter(function(o){return o&&typeof o==='object'&&o.pn!==undefined;});
+}
+// Ask about a group of parts. Returns {got:{pn:item}, err}. Anything the model leaves out is simply not in `got`.
+async function _mmAsk(group){
+  var r=await _mmCall(_mmPrompt(group));
+  var got={};
+  if(!r.ok)return {got:got,err:r.err};
+  var byKey={};group.forEach(function(b){byKey[String(b.pn).trim().toUpperCase()]=b.pn;});
+  _mmParse(r.text).forEach(function(o){var k=byKey[String(o.pn).trim().toUpperCase()];if(k&&!got[k])got[k]=o;});   // ignore unknown parts and duplicates
+  return {got:got,err:r.stop==='max_tokens'?'reply was cut off':''};
+}
+// Validate what the model said and hold it to the guardrails. Returns the final suggestion for one part.
+function _mmFinalize(b,a){
+  var notes=[];
+  var mn=_mmInt(a.min),mx=_mmInt(a.max),sf=_mmInt(a.safety);
+  var bad=(mn===null||mx===null);
+  if(mn===null)mn=b.statMin;
+  if(mx===null)mx=b.statMax;
+  if(sf===null)sf=b.statSafety;
+  mn=Math.max(0,mn);mx=Math.max(0,mx);sf=Math.max(0,sf);
+  var mn0=mn,mx0=mx;
+  mn=_mmGuard(mn,b.statMin);mx=_mmGuard(mx,b.statMax);
+  var clamped=(mn!==mn0||mx!==mx0);
+  mx=_mmFixMax(mn,mx,b.moq,Math.max(1,b.statMax-b.statMin));
+  if(sf>mn)sf=mn;                                    // the reorder point already contains the safety stock
+  var note=String(a.note||b.note||'').trim().slice(0,80);
+  if(clamped)note+=(note?' ':'')+'[held to guardrail]';
+  return {mn:mn,mx:mx,sf:sf,note:note,clamped:clamped,bad:bad};
+}
 async function aiSuggestMinMax(singlePn, pnList){
-  const tracked=singlePn
-    ? S.parts.filter(p=>p.pn===singlePn)
-    : (pnList&&pnList.length)
-      ? S.parts.filter(p=>pnList.includes(p.pn)&&!p.discontinued)
-      : S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||(p.avg_sales_wk||0)>0||weeklySeries(p.pn,26).some(x=>x>0)));
-  if(!tracked.length){toast('No items with demand history to analyze');return;}
+  if(S.mmLoading||S.mmApplying){toast('Already working - wait for it to finish');return;}
+  var pool;
+  if(singlePn)pool=S.parts.filter(function(p){return p.pn===singlePn;});
+  else if(pnList&&pnList.length){var want=new Set(pnList);pool=S.parts.filter(function(p){return want.has(p.pn)&&!p.discontinued;});}
+  else pool=S.parts.filter(function(p){return !p.discontinued&&(avgWk(p)>0||(p.avg_sales_wk||0)>0||weeklySeries(p.pn,26).some(function(x){return x>0;}));});
+  if(!pool.length){toast('Nothing to analyze');return;}
 
-  const base=tracked.map(p=>{
-    const st=statSuggest(p);
-    const importedAvg=p.avg_sales_wk||0;
-    const effectiveAvg=st.avg>0?st.avg:importedAvg;
-    const _effOH=Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn));
-    const _onOrd=openOrderedQty(p.pn);
-    return{pn:p.pn,desc:p.description||'',curMin:p.min_qty||0,curMax:p.max_qty||0,curSafety:p.safety_stock||0,
-      lead:p.lead_time_weeks||2,onHand:_effOH,onOrder:_onOrd,moq:p.moq||0,importedAvg,...st,
-      avg:effectiveAvg>0?+effectiveAvg.toFixed(3):st.avg,
-      note:st.avg>0?('Live: '+st.avg+'/wk avg, σ'+st.sd+', '+(p.lead_time_weeks||2)+'w lead'):importedAvg>0?('Spreadsheet avg: '+importedAvg+'/wk'):'No sales data'};
+  var base=pool.map(function(p){
+    var st=statSuggest(p);
+    var importedAvg=p.avg_sales_wk||0;
+    var effectiveAvg=st.avg>0?st.avg:importedAvg;
+    var ser=weeklySeries(p.pn,12).slice().reverse();                 // oldest -> newest, 12 weeks
+    var moq=p.moq||0;
+    // With live sales, the statistical baseline is statSuggest(). With ONLY a spreadsheet average (no live sales) statSuggest just
+    // hands back the stored min/max, and anchoring the guardrail to those would pin the answer to the very values under review.
+    // Derive the baseline from the spreadsheet average instead (no variance data, so no safety stock).
+    var useImported=(st.avg<=0&&importedAvg>0),Lw=Math.max(1,p.lead_time_weeks||2);
+    var statMin=useImported?Math.ceil(importedAvg*Lw):st.min;
+    var statSafety=useImported?0:Math.min(st.safety,st.min);
+    var statMax=_mmFixMax(statMin,useImported?Math.ceil(statMin+importedAvg*(S.forecastWeeks||8)):st.max,moq,1);
+    return {pn:p.pn,desc:p.description||'',curMin:p.min_qty||0,curMax:p.max_qty||0,curSafety:p.safety_stock||0,
+      lead:p.lead_time_weeks||2,leadAssumed:!(p.lead_time_weeks>0),moq:moq,importedAvg:importedAvg,
+      sd:st.sd,trend:st.trend,hist:ser,
+      avg:effectiveAvg>0?+effectiveAvg.toFixed(3):st.avg,hasDemand:effectiveAvg>0,
+      statMin:statMin,statMax:statMax,statSafety:statSafety,
+      min:statMin,max:statMax,safety:statSafety,
+      note:st.avg>0?('Live: '+st.avg+'/wk avg, sd '+st.sd+', '+(p.lead_time_weeks||2)+'w lead'):importedAvg>0?('Spreadsheet avg: '+importedAvg+'/wk'):'No sales data'};
   });
+  var withDemand=base.filter(function(b){return b.hasDemand;});
+  var noDemand=base.length-withDemand.length;
+  if(!withDemand.length){toast('None of the '+base.length+' parts has demand data - nothing to analyze, values left unchanged');return;}
 
-  toast('Asking Claude to analyze '+tracked.length+' items…');
-  S.mmLoading=true;render();
-  const results=[];
-  const chunkSize=40;
+  S.mmLoading=true;S.mmProgress={done:0,total:withDemand.length};S.mmSuggest=null;S.mmApplyResult=null;
+  toast('Asking Claude to analyze '+withDemand.length+' parts'+(noDemand?' ('+noDemand+' with no demand data are left unchanged)':'')+'...');
+  render();
+  var aiMap={},why={},chunkSize=30,hard=0;
+  function bump(n){S.mmProgress.done=Math.min(S.mmProgress.total,S.mmProgress.done+n);var el=document.querySelector('[data-mm-all]');if(el)el.textContent='Analyzing '+S.mmProgress.done+'/'+S.mmProgress.total+'...';}
   try{
-    for(let i=0;i<base.length;i+=chunkSize){
-      const chunk=base.slice(i,i+chunkSize);
-      const lines=chunk.map(b=>b.pn+(b.desc?' ('+b.desc.slice(0,30)+')':'')+' | avg/wk:'+b.avg+' | stdev:'+b.sd+' | trend:'+(b.trend||'flat')+' | lead:'+b.lead+'w | moq:'+b.moq+' | onhand:'+b.onHand+' | onOrder:'+b.onOrder+' | curMin:'+b.curMin+' | curMax:'+b.curMax+' | statMin:'+b.min+' | statMax:'+b.max).join('\n');
-      const prompt='You are an inventory planning expert for a motorsport parts manufacturer. For each part below, recommend min_qty (reorder point) and max_qty (order-up-to level) and safety_stock. Fields: onhand=effective available stock (already minus backorder reservations), onOrder=qty already on open POs (already inbound, counts toward coverage). The statistical baseline (95% service) is given as statMin/statMax; adjust with judgment: round to sensible order quantities (always ensure max is a multiple of MOQ when moq>0), raise mins for volatile items (high stdev vs avg), keep slow movers lean, treat trend as direction of travel - lift min/max for rising items and trim them for falling ones, raise if curMin/curMax was already higher (may reflect business rules). Respond with ONLY a JSON array, no markdown: [{"pn":"...","min":N,"max":N,"safety":N,"note":"max 8 words"}]\n\nPARTS:\n'+lines;
-      let data=null;
-      for(let attempt=0;attempt<3;attempt++){
-        const res=await fetch(SUPA_URL+'/functions/v1/anthropic-proxy',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:4000,messages:[{role:'user',content:prompt}]})});
-        data=await res.json();
-        if(data.error&&data.error.type==='overloaded_error'&&attempt<2){await new Promise(r=>setTimeout(r,(attempt+1)*2000));continue;}
-        break;
+    for(var i=0;i<withDemand.length;i+=chunkSize){
+      var group=withDemand.slice(i,i+chunkSize);
+      var r=await _mmAsk(group);
+      Object.keys(r.got).forEach(function(k){aiMap[k]=r.got[k];});
+      var missing=group.filter(function(b){return !aiMap[b.pn];});
+      // The AI service itself is failing (every retry inside the call already failed): do not ask again part by part, and after
+      // two such batches stop calling it and say so, instead of stalling for minutes.
+      if(r.err&&!Object.keys(r.got).length&&r.err!=='reply was cut off'){
+        hard++;
+        missing.forEach(function(b){why[b.pn]='AI unavailable: '+r.err;});
+        if(hard>=2){
+          withDemand.slice(i+chunkSize).forEach(function(b){why[b.pn]='AI unavailable: '+r.err;});
+          bump(withDemand.length);break;
+        }
+        bump(group.length);continue;
       }
-      if(data&&!data.error){
-        const txt=(data.content&&data.content[0]&&data.content[0].text)||'[]';
-        const clean=txt.replace(/```json|```/g,'').trim();
-        try{
-          const arr=JSON.parse(clean);
-          const gotPn=new Set();
-          arr.forEach(a=>{
-            const b=chunk.find(x=>x.pn===a.pn);
-            if(!b)return;
-            if(gotPn.has(b.pn))return; // [FIX] guard against Claude returning a duplicate entry for the same part in one chunk - would otherwise create a phantom duplicate row
-            gotPn.add(b.pn);
-            const rawMin=Math.max(0,Math.round(a.min));
-            const rawMax=Math.max(0,Math.round(a.max));
-            const rawSafety=Math.max(0,Math.round(a.safety||b.safety));
-            const moq=b.moq||0;
-            const enforcedMax=moq>0?Math.ceil(rawMax/moq)*moq:rawMax;
-            results.push({...b,min:rawMin,max:enforcedMax,safety:rawSafety,note:a.note||b.note,ai:true});
-          });
-          // [FIX] Claude's response array can come back shorter than the chunk sent -- no error,
-          // just fewer entries than parts asked about. Without this, those specific parts silently
-          // vanished from the final suggestion count (the "447 selected, only 343 suggested, no
-          // explanation" symptom) instead of falling back to the statistical baseline like a fully
-          // failed chunk already does below.
-          chunk.forEach(b=>{if(!gotPn.has(b.pn))results.push(b);});
-        }catch(e){chunk.forEach(b=>results.push(b));}
-      }else{
-        chunk.forEach(b=>results.push(b));
+      // anything the model skipped or cut off is asked again in smaller groups before it is given up on
+      for(var j=0;j<missing.length;j+=10){
+        var sub=missing.slice(j,j+10);
+        var r2=await _mmAsk(sub);
+        Object.keys(r2.got).forEach(function(k){aiMap[k]=r2.got[k];});
+        sub.forEach(function(b){if(!aiMap[b.pn])why[b.pn]=r2.err||r.err||'the model did not return this part';});
       }
-      if(base.length>chunkSize)toast('Analyzed '+Math.min(i+chunkSize,base.length)+' / '+base.length+'…');
+      bump(group.length);
     }
   }catch(e){
-    base.forEach(b=>{if(!results.find(r=>r.pn===b.pn))results.push(b);});
-    toast('AI partially unavailable — statistical values used where needed');
+    withDemand.forEach(function(b){if(!aiMap[b.pn]&&!why[b.pn])why[b.pn]=String((e&&e.message)||e);});
   }
-  S.mmSuggest=results;
-  S.mmLoading=false;
-  toast(results.length+' suggestions ready — review below');
+  var results=[],stats={ai:0,fallback:0,clamped:0,noDemand:noDemand,assumedLead:0,reasons:{}};
+  withDemand.forEach(function(b){
+    var a=aiMap[b.pn];
+    if(a){
+      var f=_mmFinalize(b,a);
+      if(!f.bad){
+        stats.ai++;if(f.clamped)stats.clamped++;if(b.leadAssumed)stats.assumedLead++;
+        results.push(Object.assign({},b,{min:f.mn,max:f.mx,safety:f.sf,note:f.note,ai:true,clamped:f.clamped}));
+        return;
+      }
+      why[b.pn]='the model returned invalid numbers';
+    }
+    stats.fallback++;var rs=String(why[b.pn]||'no answer').slice(0,70);stats.reasons[rs]=(stats.reasons[rs]||0)+1;
+    if(b.leadAssumed)stats.assumedLead++;
+    results.push(Object.assign({},b,{ai:false,note:'Statistical baseline ('+rs+')'}));
+  });
+  results.forEach(function(s){s.changed=(s.min!==s.curMin||s.max!==s.curMax||s.safety!==s.curSafety);});
+  S.mmSuggest=results;S.mmStats=stats;S.mmLoading=false;S.mmProgress=null;
+  toast(results.length+' suggestions ready: '+stats.ai+' by AI'+(stats.fallback?', '+stats.fallback+' statistical (AI did not answer)':'')+(stats.noDemand?', '+stats.noDemand+' unchanged (no demand)':'')+' - review below');
   render();
 }
 
+// Apply: validated, written through a small worker pool, every failure reported, ONE undo step for the batch.
+function _mmArmReset(){S._mmArm=0;var b=document.getElementById('mm-apply-all');if(b&&!S.mmApplying)b.textContent=b.getAttribute('data-label')||'Apply All';}
+function mmApplyAll(){
+  if(S.mmApplying||S.mmLoading)return;
+  var changed=(S.mmSuggest||[]).filter(function(s){return s.changed!==false;}).length;
+  if(!changed){toast('Nothing to change - every suggestion already matches the stored values');return;}
+  if(!(S._mmArm&&Date.now()-S._mmArm<7000)){                       // first click arms it (no native dialog that a browser can suppress)
+    S._mmArm=Date.now();
+    var b=document.getElementById('mm-apply-all');if(b)b.textContent='Click again to apply '+changed+' change'+(changed!==1?'s':'');
+    setTimeout(function(){if(S._mmArm&&Date.now()-S._mmArm>=6900)_mmArmReset();},7000);
+    return;
+  }
+  S._mmArm=0;applyMMSuggestions();
+}
+window.mmApplyAll=mmApplyAll;
 async function applyMMSuggestions(onlyPn){
-  const toApply=(S.mmSuggest||[]).filter(s=>!onlyPn||s.pn===onlyPn);
-  if(!toApply.length)return;
-  if(!onlyPn&&!confirm('Apply min/max/safety to '+toApply.length+' parts?'))return;
-  let applied=0;
-  for(const s of toApply){
-    const part=partByPn(s.pn);
-    if(!part)continue;
-    const prev={...part};
-    const payload={min_qty:s.min,max_qty:s.max,safety_stock:s.safety,updated_at:new Date().toISOString()};
-    const{error}=await db.from('parts').update(payload).eq('id',part.id);
-    if(!error){
-      S.parts=S.parts.map(p=>p.pn===s.pn?{...p,...payload}:p);
-      pushUndo('update','parts',{...part,...payload},prev,'AI min/max: '+s.pn);
-      applied++;
+  if(S.mmApplying){toast('Already applying - please wait');return;}
+  var list=(S.mmSuggest||[]).filter(function(s){return !onlyPn||s.pn===onlyPn;});
+  if(!list.length){toast('Nothing to apply');return;}
+  S.mmApplying=true;S._mmArm=0;
+  var failed=[],unchanged=[],jobs=[];
+  list.forEach(function(s){
+    var part=partByPn(s.pn);
+    var mn=_mmInt(s.min),mx=_mmInt(s.max),sf=_mmInt(s.safety);
+    var bad=!part?'part not found':(mn===null||mx===null||sf===null||mn<0||mx<0||sf<0)?'invalid numbers':(mx<mn)?'max is below min':null;
+    if(bad){failed.push({pn:s.pn,err:bad});return;}
+    if((part.min_qty||0)===mn&&(part.max_qty||0)===mx&&(part.safety_stock||0)===sf){unchanged.push(s.pn);return;}
+    jobs.push({pn:s.pn,part:part,payload:{min_qty:mn,max_qty:mx,safety_stock:sf}});
+  });
+  var ops=[],appliedPns=new Set(),idx=0,done=0;
+  function tick(){var el=document.getElementById('mm-apply-all');if(el)el.textContent='Applying '+done+'/'+jobs.length+'...';}
+  async function worker(){
+    while(idx<jobs.length){
+      var j=jobs[idx++];
+      try{
+        var res=await db.from('parts').update(Object.assign({},j.payload,{updated_at:new Date().toISOString()})).eq('id',j.part.id);
+        if(res&&res.error)throw res.error;
+        ops.push({action:'update',table:'parts',data:Object.assign({},j.part,j.payload),prev:Object.assign({},j.part)});
+        appliedPns.add(j.pn);
+      }catch(e){failed.push({pn:j.pn,err:String((e&&e.message)||e)});}
+      done++;tick();
     }
   }
-  S.mmSuggest=(S.mmSuggest||[]).filter(s=>onlyPn?s.pn!==onlyPn:false);
+  tick();
+  await Promise.all(Array.from({length:Math.min(6,jobs.length)},worker));
+  if(ops.length){
+    var upd={};ops.forEach(function(o){upd[o.data.id]=o.data;});
+    S.parts=S.parts.map(function(p){var o=upd[p.id];return o?Object.assign({},p,{min_qty:o.min_qty,max_qty:o.max_qty,safety_stock:o.safety_stock}):p;});
+    pushUndoMulti('AI min/max: '+ops.length+' part'+(ops.length!==1?'s':''),ops);   // one Undo reverses the whole batch
+  }
+  var failMap={};failed.forEach(function(f){failMap[f.pn]=f.err;});
+  S.mmSuggest=(S.mmSuggest||[]).filter(function(s){return failMap[s.pn]!==undefined||(onlyPn&&s.pn!==onlyPn);}).map(function(s){return failMap[s.pn]!==undefined?Object.assign({},s,{err:failMap[s.pn]}):s;});
   if(!S.mmSuggest.length)S.mmSuggest=null;
-  toast(applied+' part'+(applied!==1?'s':'')+' updated');
+  S.mmApplyResult={applied:ops.length,unchanged:unchanged.length,failed:failed};
+  S.mmApplying=false;
+  var msg=ops.length+' part'+(ops.length!==1?'s':'')+' updated';
+  if(unchanged.length)msg+=', '+unchanged.length+' already current';
+  if(failed.length)msg+=', '+failed.length+' FAILED ('+failed[0].pn+': '+failed[0].err+')';
+  toast(msg,failed.length?7000:4000);
   render();
 }
+window.applyMMSuggestions=applyMMSuggestions;
 
 function renderMMReview(){
-  const list=S.mmSuggest||[];
-  return '<div class="panel" style="border-left:3px solid var(--teal)">'
-    +'<div class="panel-title"><span><span class="ic ic-sparkle"></span>Suggested Min/Max — Review &amp; Apply ('+list.length+')</span>'
-    +'<div style="display:flex;gap:8px"><button class="btn btn-primary btn-sm" onclick="applyMMSuggestions()">Apply All</button>'
-    +'<button class="btn btn-sm" onclick="S.mmSuggest=null;render()">Dismiss</button></div></div>'
-    +'<div class="tbl-wrap" style="max-height:340px;overflow-y:auto"><table><thead><tr><th>Part #</th><th>Avg/Wk</th><th>Source</th><th>Min (cur → new)</th><th>Max (cur → new)</th><th>Safety</th><th>Rationale</th><th></th></tr></thead><tbody>'
-    +list.map(function(s){
-      const minChg=s.min!==s.curMin, maxChg=s.max!==s.curMax;
-      const demandSrc=s.importedAvg>0&&s.avg<=s.importedAvg?'<span class="ic ic-clipboard"></span>Spreadsheet':s.avg>0?'<span class="ic ic-chart"></span>Live':'—';
-      return '<tr>'
-      +'<td class="pn">'+s.pn+'</td>'
-      +'<td class="money-neutral">'+s.avg+'</td>'
-      +'<td class="t3xxs">'+demandSrc+'</td>'
-      +'<td><span style="color:var(--text3);font-family:var(--mono);font-size:var(--t-sm)">'+s.curMin+'</span> <span style="color:var(--text3)">→</span> <span class="money" style="font-weight:700;color:'+(minChg?'var(--teal)':'var(--text3)')+'">'+s.min+'</span></td>'
-      +'<td><span style="color:var(--text3);font-family:var(--mono);font-size:var(--t-sm)">'+s.curMax+'</span> <span style="color:var(--text3)">→</span> <span class="money" style="font-weight:700;color:'+(maxChg?'var(--teal)':'var(--text3)')+'">'+s.max+'</span></td>'
-      +'<td class="money-neutral">'+s.safety+'</td>'
-      +'<td style="font-size:var(--t-xs);color:var(--text3);max-width:200px">'+(s.ai?'<span class="ic ic-sparkle"></span>':'')+(s.note||'')+'</td>'
-      +'<td><button class="action-btn" onclick="applyMMSuggestions(\''+s.pn+'\')">Apply</button></td>'
-      +'</tr>';
-    }).join('')
-    +'</tbody></table></div></div>';
+  var list=S.mmSuggest||[],st=S.mmStats||null,res=S.mmApplyResult||null;
+  var changed=list.filter(function(s){return s.changed!==false&&!s.err;}).length;
+  var label='Apply All'+(list.length?' ('+changed+' change'+(changed!==1?'s':'')+')':'');
+  var h='<div class="panel" style="border-left:3px solid var(--teal)">'
+   +'<div class="panel-title"><span><span class="ic ic-sparkle"></span>'+(list.length?'Suggested Min/Max - Review &amp; Apply ('+list.length+')':'AI Min/Max - Result')+'</span>'
+   +'<div style="display:flex;gap:8px">'+(list.length?'<button class="btn btn-primary btn-sm" id="mm-apply-all" data-label="'+label+'" '+(S.mmApplying?'disabled':'')+' onclick="mmApplyAll()">'+(S.mmApplying?'Applying...':label)+'</button>':'')
+   +'<button class="btn btn-sm" '+(S.mmApplying?'disabled':'')+' onclick="S.mmSuggest=null;S.mmApplyResult=null;S.mmStats=null;render()">Dismiss</button></div></div>';
+  if(res){
+    h+='<div style="padding:8px 14px;font-size:var(--t-sm);color:var(--text2)">Last apply: <b style="color:var(--teal)">'+res.applied+' updated</b>'+(res.unchanged?', '+res.unchanged+' already current':'')
+     +(res.failed.length?', <b style="color:var(--red)">'+res.failed.length+' failed</b> (kept below with the reason)':'')+'. One Undo reverses the whole batch.</div>';
+  }
+  if(st){
+    var rs=Object.keys(st.reasons||{}).map(function(k){return escHtml(k)+' ('+st.reasons[k]+')';}).join('; ');
+    h+='<div style="padding:8px 14px;font-size:var(--t-sm);color:var(--text2);border-bottom:1px solid var(--border)">'
+     +'<b style="color:var(--teal)">'+st.ai+' analyzed by AI</b>'
+     +(st.fallback?' &middot; <b style="color:var(--orange)">'+st.fallback+' statistical baseline</b> (the AI did not answer: '+rs+')':'')
+     +(st.clamped?' &middot; '+st.clamped+' held to the guardrail':'')
+     +(st.noDemand?' &middot; '+st.noDemand+' with no demand data left unchanged':'')
+     +(st.assumedLead?' &middot; '+st.assumedLead+' use an assumed 2-week lead time':'')+'</div>';
+  }
+  if(list.length){
+    h+='<div class="tbl-wrap" style="max-height:420px;overflow-y:auto"><table><thead><tr><th>Part #</th><th>Avg/Wk</th><th>Source</th><th>Min (cur &rarr; new)</th><th>Max (cur &rarr; new)</th><th>Safety</th><th>Rationale</th><th></th></tr></thead><tbody>'
+     +list.map(function(s){
+        var minChg=s.min!==s.curMin,maxChg=s.max!==s.curMax,sfChg=s.safety!==s.curSafety;
+        var demandSrc=s.importedAvg>0&&s.avg<=s.importedAvg?'<span class="ic ic-clipboard"></span>Spreadsheet':s.avg>0?'<span class="ic ic-chart"></span>Live':'-';
+        var cell=function(cur,nw,chg){return '<span style="color:var(--text3);font-family:var(--mono);font-size:var(--t-sm)">'+cur+'</span> <span style="color:var(--text3)">&rarr;</span> <span class="money" style="font-weight:700;color:'+(chg?'var(--teal)':'var(--text3)')+'">'+nw+'</span>';};
+        return '<tr'+(s.err?' style="background:rgba(220,38,38,.08)"':'')+'>'
+         +'<td class="pn">'+escHtml(s.pn)+'</td>'
+         +'<td class="money-neutral">'+s.avg+'</td>'
+         +'<td class="t3xxs">'+demandSrc+'</td>'
+         +'<td>'+cell(s.curMin,s.min,minChg)+'</td>'
+         +'<td>'+cell(s.curMax,s.max,maxChg)+'</td>'
+         +'<td class="money-neutral">'+cell(s.curSafety,s.safety,sfChg)+'</td>'
+         +'<td style="font-size:var(--t-xs);color:var(--text3);max-width:240px">'+(s.ai?'<span class="ic ic-sparkle"></span> ':'<span style="color:var(--orange)">stat </span>')+escHtml(s.note||'')
+           +(s.leadAssumed?' <span title="No lead time on this part - 2 weeks assumed" style="color:var(--orange)">[lead assumed]</span>':'')
+           +(s.err?'<div style="color:var(--red);font-weight:700">Not applied: '+escHtml(s.err)+'</div>':'')+'</td>'
+         +'<td>'+((s.changed===false&&!s.err)?'<span class="t3xs" style="color:var(--text3)">no change</span>':'<button class="action-btn" '+(S.mmApplying?'disabled':'')+' onclick="applyMMSuggestions(\''+String(s.pn).replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">Apply</button>')+'</td>'
+         +'</tr>';
+      }).join('')
+     +'</tbody></table></div>';
+  }
+  return h+'</div>';
 }
+
 
 function nextBreakHint(p, qty){
   const breaks=(Array.isArray(p.price_breaks)?p.price_breaks:[]).filter(b=>b&&b.qty&&b.price>0).sort((a,b)=>a.qty-b.qty);
@@ -21678,14 +21854,15 @@ window.quickAddDevPO=async function(pn){
 
 function renderMinMaxTab(parts){
   if(!S.mmSelectedPns)S.mmSelectedPns=new Set();
+  S._mmVisible=parts.map(p=>p.pn);setTimeout(_mmSyncSel,0); // [v23.100] the list the table was built from: what "all" means
   const selCount=S.mmSelectedPns.size;
   const allSelected=parts.length>0&&parts.every(p=>S.mmSelectedPns.has(p.pn));
   const someSelected=selCount>0&&!allSelected;
   return `
-  ${S.mmSuggest?renderMMReview():''}
+  ${(S.mmSuggest||S.mmApplyResult)?renderMMReview():''}
   <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap;padding:4px 0">
-    <button class="btn btn-teal btn-sm" ${S.mmLoading?'disabled':''} onclick="aiSuggestMinMax()">
-      ${S.mmLoading?'Analyzing...':'&#10024; AI Suggest All ('+parts.length+')'}
+    <button class="btn btn-teal btn-sm" data-mm-all="1" ${S.mmLoading?'disabled':''} title="Analyzes the ${parts.length} parts shown below (the current search/filters). Parts with no demand data are left unchanged." onclick="aiSuggestMinMax(null,S._mmVisible)">
+      ${S.mmLoading?('Analyzing '+(S.mmProgress?S.mmProgress.done+'/'+S.mmProgress.total:'')+'...'):'&#10024; AI Suggest All ('+parts.length+')'}
     </button>
     <button class="btn btn-sm ${selCount>0?'chip-teal':''}" ${selCount===0||S.mmLoading?'disabled':''}
       data-mm-sel="1" onclick="aiSuggestMinMax(null,[...S.mmSelectedPns])">
@@ -32585,30 +32762,27 @@ function ccCountKeydown(e,inp){
   }
 }
 
+function _mmSyncSel(){
+  var vis=S._mmVisible||[],sel=S.mmSelectedPns||new Set();
+  var n=sel.size,inView=0;vis.forEach(function(pn){if(sel.has(pn))inView++;});
+  var btn=document.querySelector('[data-mm-sel]');
+  if(btn){btn.textContent='\u2728 AI Suggest Selected'+(n>0?' ('+n+')':'');btn.disabled=n===0||!!S.mmLoading;}
+  var lbl=document.getElementById('mm-sel-count');
+  if(lbl)lbl.textContent=n>0?(n+' selected'+(inView!==n?' ('+inView+' in view)':'')):'';
+  var allChk=document.getElementById('mm-chk-all');
+  if(allChk){allChk.checked=vis.length>0&&inView===vis.length;allChk.indeterminate=inView>0&&inView<vis.length;}
+}
+// Select / deselect EVERY part in the current view (the list the table was built from), not just the checkboxes that happen to be drawn.
+function mmSelAll(checked){
+  if(!S.mmSelectedPns)S.mmSelectedPns=new Set();
+  (S._mmVisible||[]).forEach(function(pn){if(checked)S.mmSelectedPns.add(pn);else S.mmSelectedPns.delete(pn);});
+  document.querySelectorAll('.mm-row-chk').forEach(function(chk){chk.checked=!!checked;});
+  _mmSyncSel();
+}
 function mmSelToggle(pn, checked){
   if(!S.mmSelectedPns)S.mmSelectedPns=new Set();
   if(checked)S.mmSelectedPns.add(pn);else S.mmSelectedPns.delete(pn);
-  const n=S.mmSelectedPns.size;
-  const total=document.querySelectorAll('.mm-row-chk').length;
-  const btn=document.querySelector('[data-mm-sel]');
-  if(btn){btn.textContent='AI Suggest Selected'+(n>0?' ('+n+')':'');btn.disabled=n===0||S.mmLoading;}
-  const lbl=document.getElementById('mm-sel-count');
-  if(lbl)lbl.textContent=n>0?n+' selected':'';
-  const allChk=document.getElementById('mm-chk-all');
-  if(allChk){allChk.checked=n===total&&total>0;allChk.indeterminate=n>0&&n<total;}
-}
-function mmSelAll(checked){
-  if(!S.mmSelectedPns)S.mmSelectedPns=new Set();
-  document.querySelectorAll('.mm-row-chk').forEach(function(chk){
-    chk.checked=checked;
-    if(checked)S.mmSelectedPns.add(chk.dataset.pn);
-    else S.mmSelectedPns.delete(chk.dataset.pn);
-  });
-  const n=S.mmSelectedPns.size;
-  const btn=document.querySelector('[data-mm-sel]');
-  if(btn){btn.textContent='AI Suggest Selected'+(n>0?' ('+n+')':'');btn.disabled=n===0||S.mmLoading;}
-  const lbl=document.getElementById('mm-sel-count');
-  if(lbl)lbl.textContent=n>0?n+' selected':'';
+  _mmSyncSel();
 }
 
 function navSaleOrder(dir){
