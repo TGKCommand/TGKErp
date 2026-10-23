@@ -473,7 +473,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.97</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.98</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -538,7 +538,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.97';
+const TGK_ERP_VERSION = 'v23.98';
 const TGK_ERP_BUILD_DATE = '2026-10-21';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -15285,7 +15285,7 @@ function openModal(type,data){
     var _ords=data.orders||[],_blds=data.buildSkus||[];
     title=_ords.length+' on-hold order'+(_ords.length!==1?'s':'')+' ready to fulfil';
     body=`<div style="font-size:var(--t-md);color:var(--text2);margin-bottom:14px">
-      Worked out oldest-first against current on-hand stock, with each order's parts set aside as it goes \u2014 so this is what you can actually release, in this order, not a per-order guess that double-counts shared components. Stock already committed to orders that are not on hold is excluded.
+      Worked out oldest-first against current on-hand stock, with each order's parts set aside as it goes \u2014 so this is what you can actually release, in this order, not a per-order guess that double-counts shared components. Stock already committed to open orders that can actually ship is excluded; an open order that cannot ship does not hold stock back.
     </div>
     ${_blds.length?`<div class="panel" style="padding:10px 14px;margin-bottom:12px;border-left:3px solid var(--orange)">
       <div style="font-size:var(--t-sm);font-weight:700;color:var(--orange);margin-bottom:6px">Needs assembling first (${_blds.length} SKU${_blds.length!==1?'s':''})</div>
@@ -15293,8 +15293,8 @@ function openModal(type,data){
         ${_blds.map(function(b){return '<span class="pill" style="font-family:var(--mono);font-size:var(--t-sm)">'+escHtml(dispSku(b.pn))+' <b>\u00d7'+b.qty+'</b></span>';}).join('')}
       </div>
       <div style="font-size:var(--t-xs);color:var(--text3);margin-top:6px">Totals across every order below. Components are in stock; these just have not been built yet.</div>
-    </div>`:'<div style="font-size:var(--t-sm);color:var(--teal);margin-bottom:12px">Everything is already assembled \u2014 nothing to build, just pack and ship.</div>'}
-    <div class="tbl-wrap" style="max-height:320px;overflow-y:auto">
+    </div>`:(_ords.length?'<div style="font-size:var(--t-sm);color:var(--teal);margin-bottom:12px">Everything is already assembled \u2014 nothing to build, just pack and ship.</div>':'')}
+    ${_ords.length?`<div class="tbl-wrap" style="max-height:320px;overflow-y:auto">
       <table><thead><tr><th>Order</th><th>Customer</th><th>Date</th><th>Lines</th><th>Needs Assembly</th></tr></thead><tbody>
       ${_ords.map(function(o){return '<tr>'
         +'<td class="pn">'+escHtml(o.orderNum)+'</td>'
@@ -15304,10 +15304,11 @@ function openModal(type,data){
         +'<td style="font-size:var(--t-sm)">'+(o.needsBuild.length?o.needsBuild.map(function(b){return escHtml(dispSku(b.pn))+' \u00d7'+b.qty;}).join(', '):'<span style="color:var(--teal)">from stock</span>')+'</td>'
         +'</tr>';}).join('')}
       </tbody></table>
-    </div>
-    <div class="modal-footer">
+    </div>`:'<div style="font-size:var(--t-md);color:var(--text2);margin-bottom:8px">No on-hold order can be released from current stock right now.</div>'}
+    ${ohBlockedHtml(data.blocked)}
+  <div class="modal-footer">
       <button class="btn" onclick="closeModal()">Close</button>
-      <button class="btn btn-primary" onclick="releaseFulfillableHolds()">View These Orders \u2192</button>
+      ${_ords.length?'<button class="btn btn-primary" onclick="releaseFulfillableHolds()">View These Orders \u2192</button>':''}
     </div>`;
   }
   else if(type==='dropShipGroup'){
@@ -31590,16 +31591,12 @@ async function bulkMarkCancelled() {
 // cloned pool and only committed if the WHOLE order can be satisfied - a partially-fillable order
 // must not silently eat components that a fully-fillable one behind it needs.
 function computeOnHoldFulfillable(){
-  if(!S.assemblies||!S.sales)return{orders:[],buildSkus:[]};
+  if(!S.assemblies||!S.sales)return{orders:[],buildSkus:[],blocked:[]};
   if(!S._partIdx||!S._asmIdx)buildLookupMaps();
   var pm=S._partIdx,am=S._asmIdx;
-  // [FIX] Root cause of buildable on-hold orders never appearing here. The lookup indexes are keyed
-  // by BOTH pn and new_sku, but the stock pool and S.boms are keyed by canonical pn only. A line
-  // recorded under an alias (the "Superseded: TGK-ACC-04" style SKUs) was recognised as an
-  // assembly by the index, then read 0 on hand from the pool and found no BOM - so the whole order
-  // reported unfulfillable however much stock existed. The mirror image hit the reservation pass:
-  // an OPEN order under an alias reserved nothing, so this over-promised. Every SKU is resolved to
-  // its canonical pn before it touches the pool or a BOM.
+  // Every SKU is resolved to its canonical pn before it touches the pool or a BOM: the lookup indexes are keyed by BOTH pn and
+  // new_sku, but the stock pool and S.boms are keyed by canonical pn only (a line recorded under an alias would otherwise read
+  // 0 on hand and find no BOM).
   function canonOf(pn){
     var a=am[pn]||am[String(pn||'').toUpperCase()];
     if(a&&a.pn)return a.pn;
@@ -31607,58 +31604,66 @@ function computeOnHoldFulfillable(){
     if(p&&p.pn)return p.pn;
     return pn;
   }
-
   // Working pool. Only what is genuinely on the shelf - no inbound POs, no speculative supply.
   var pool={asm:{},part:{}};
   (S.assemblies||[]).forEach(function(a){pool.asm[a.pn]=Number(a.total_on_hand)||0;});
   (S.parts||[]).forEach(function(p){pool.part[p.pn]=Number(p.total_unpckgd)||0;});
+  var onHand0={asm:Object.assign({},pool.asm),part:Object.assign({},pool.part)}; // before anything is set aside (for the explanations)
 
-  // Stock already spoken for by orders that are NOT on hold and still owe product. Without this the
-  // pill would count components that an open order in front of it is already going to consume.
-  (S.sales||[]).forEach(function(l){
-    var st=l.fulfillment_status||'Open';
-    if(['Shipped','Delivered','Cancelled','Refunded','On Hold'].indexOf(st)!==-1)return;
-    if(isInternal(l.order_number))return;
-    var q=Number(l.qty)||1, cpn=canonOf(l.pn);
-    if(pool.asm[cpn]!==undefined)pool.asm[cpn]=Math.max(0,pool.asm[cpn]-q);
-    else if(pool.part[cpn]!==undefined)pool.part[cpn]=Math.max(0,pool.part[cpn]-q);
-  });
-
-  function clone(p){return{asm:Object.assign({},p.asm),part:Object.assign({},p.part)};}
-
-  // Consumes qty of pn from the pool, building from components where stock is short. Returns the
-  // number of units that had to be BUILT (so the caller can report what needs assembling), or null
-  // if it cannot be satisfied at all.
-  function consume(pn,qty,p,depth,builtOut){
-    if(depth>8)return null;
+  // Consumes qty of pn from the pool, building from components where stock is short. Every write goes through `log` so a failed
+  // attempt can be undone exactly (no copying the whole pool per attempt). Returns the units that had to be BUILT, or null if it
+  // cannot be satisfied; on failure `why.fail` says which item was short.
+  function consume(pn,qty,depth,builtOut,log,why){
+    if(depth>8){if(why&&!why.fail)why.fail={pn:pn,kind:'depth'};return null;}
     pn=canonOf(pn); // BOM children can carry an alias too
     var need=qty;
-    var isAsm=(pool.asm[pn]!==undefined);
-    if(isAsm){
-      var have=Math.max(0,p.asm[pn]||0);
+    if(pool.asm[pn]!==undefined){
+      var have=Math.max(0,pool.asm[pn]||0);
       var fromStock=Math.min(have,need);
-      p.asm[pn]=have-fromStock;
+      log.push(['asm',pn,pool.asm[pn]]);pool.asm[pn]=have-fromStock;
       need-=fromStock;
       if(need<=0)return 0;
       var bom=(S.boms&&S.boms[pn])||[];
-      if(!bom.length)return null; // nothing on hand and no recipe - cannot be produced
+      if(!bom.length){if(why&&!why.fail)why.fail={pn:pn,kind:'nobom',need:need,have:have};return null;} // nothing on hand and no recipe - cannot be produced
       for(var i=0;i<bom.length;i++){
         var it=bom[i];
         var cp=pm[it.child_pn];
-        // Packaging/shipping supplies must never block a build decision - same rule the backorder
-        // buildability uses, so the two cannot disagree about what counts as a real component.
+        // Packaging/shipping supplies must never block a build decision - same rule the backorder buildability uses.
         if(isNonRawSupplyItem(it.item_type,(cp&&cp.category),(cp&&cp.description),it.child_pn))continue;
         var per=Number(it.qty)||1;
-        var r=consume(it.child_pn,per*need,p,depth+1,builtOut);
+        var r=consume(it.child_pn,per*need,depth+1,builtOut,log,why);
         if(r===null)return null;
       }
       builtOut[pn]=(builtOut[pn]||0)+need;
       return need;
     }
-    var havep=Math.max(0,p.part[pn]||0);
-    if(havep>=need){p.part[pn]=havep-need;return 0;}
+    var havep=Math.max(0,pool.part[pn]||0);
+    if(havep>=need){log.push(['part',pn,pool.part[pn]]);pool.part[pn]=havep-need;return 0;}
+    if(why&&!why.fail)why.fail={pn:pn,kind:'part',need:need,have:havep};
     return null;
   }
+  function undo(log){for(var i=log.length-1;i>=0;i--){pool[log[i][0]][log[i][1]]=log[i][2];}}
+  function freeOf(cpn){return pool.asm[cpn]!==undefined?pool.asm[cpn]:(pool.part[cpn]!==undefined?pool.part[cpn]:0);}
+  function ageOrder(a,b){return String(a.sale_date||'').localeCompare(String(b.sale_date||''))||String(a.created_at||'').localeCompare(String(b.created_at||''))||String(a.id).localeCompare(String(b.id));}
+
+  // Stock already spoken for by orders that are NOT on hold and still owe product - but ONLY orders that can really ship.
+  // [v23.98] This used to take stock for EVERY such line. An open line that could never ship (it wanted 5 and 3 existed, or it
+  // was already Returned) still emptied the pool, so an on-hold order that could ship was never reported. Open lines are now
+  // worked oldest-first like the on-hold ones: a line takes stock only if it can be satisfied (from stock or by building),
+  // and the finished statuses are the ERP's own SALES_DONE list.
+  var reservedBy={};
+  (S.sales||[]).filter(function(l){
+    var st=l.fulfillment_status||'Open';
+    if(SALES_DONE.indexOf(st)!==-1||st==='On Hold')return false;
+    return !isInternal(l.order_number);
+  }).sort(ageOrder).forEach(function(l){
+    var cpn=canonOf(l.pn);
+    if(pool.asm[cpn]===undefined&&pool.part[cpn]===undefined)return;
+    var before=freeOf(cpn),log=[],built={};
+    if(consume(cpn,Number(l.qty)||1,0,built,log,null)===null){undo(log);return;}  // cannot ship: reserves nothing
+    var took=before-freeOf(cpn);
+    if(took>0)(reservedBy[cpn]=reservedBy[cpn]||[]).push({order:l.order_number,qty:took});
+  });
 
   var byOrder={};
   (S.sales||[]).forEach(function(l){
@@ -31669,35 +31674,62 @@ function computeOnHoldFulfillable(){
     byOrder[k].lines.push(l);
     if(l.sale_date&&(!byOrder[k].date||l.sale_date<byOrder[k].date))byOrder[k].date=l.sale_date;
   });
-
   // Oldest first: if stock only covers some of them, the ones that have waited longest win.
   var groups=Object.values(byOrder).sort(function(a,b){return String(a.date||'').localeCompare(String(b.date||''));});
 
-  var out=[],buildTotals={};
+  var out=[],blocked=[],buildTotals={};
   groups.forEach(function(g){
-    var trial=clone(pool),built={},ok=true;
+    var orderLog=[],built={},fails=[];
     for(var i=0;i<g.lines.length;i++){
       var l=g.lines[i];
-      // A SKU with no assemblies/parts record is drop-ship or vendor-supplied - not something we
-      // hold or build, so it never blocks a release decision.
+      // A SKU with no assemblies/parts record is drop-ship or vendor-supplied - not something we hold or build, so it never
+      // blocks a release decision.
       var lcpn=canonOf(l.pn);
       if(pool.asm[lcpn]===undefined&&pool.part[lcpn]===undefined)continue;
-      if(consume(lcpn,Number(l.qty)||1,trial,0,built)===null){ok=false;break;}
+      var qty=Number(l.qty)||1,lineLog=[],lineBuilt={},why={};
+      var freeBefore=freeOf(lcpn);
+      if(consume(lcpn,qty,0,lineBuilt,lineLog,why)===null){
+        undo(lineLog);
+        var res=reservedBy[lcpn]||[];
+        fails.push({pn:lcpn,qty:qty,onHand:(onHand0.asm[lcpn]!==undefined?onHand0.asm[lcpn]:(onHand0.part[lcpn]||0)),free:freeBefore,
+          reserved:res,reservedQty:res.reduce(function(a,x){return a+x.qty;},0),fail:why.fail||null});
+      }else{
+        for(var j=0;j<lineLog.length;j++)orderLog.push(lineLog[j]);
+        Object.keys(lineBuilt).forEach(function(k){built[k]=(built[k]||0)+lineBuilt[k];});
+      }
     }
-    if(!ok)return;
-    pool=trial; // commit only a fully satisfiable order
+    if(fails.length){undo(orderLog);blocked.push({orderNum:g.orderNum,customer:g.customer,date:g.date,lines:g.lines.length,reasons:fails});return;} // an order is released whole or not at all
     var needsBuild=Object.keys(built).map(function(k){return{pn:k,qty:built[k]};});
     needsBuild.forEach(function(b){buildTotals[b.pn]=(buildTotals[b.pn]||0)+b.qty;});
     out.push({orderNum:g.orderNum,customer:g.customer,date:g.date,lines:g.lines.length,needsBuild:needsBuild});
   });
 
-  return{orders:out,buildSkus:Object.keys(buildTotals).sort().map(function(k){return{pn:k,qty:buildTotals[k]};})};
+  return{orders:out,blocked:blocked,buildSkus:Object.keys(buildTotals).sort().map(function(k){return{pn:k,qty:buildTotals[k]};})};
 }
+// [v23.98] Why an on-hold order cannot be released yet, in plain words.
+function ohReasonText(r){
+  var f=r.fail||{},sku=dispSku(r.pn),own=(f.pn===r.pn);
+  var held=r.reserved&&r.reserved.length
+    ?(' ('+r.reservedQty+' held for open orders: '+r.reserved.slice(0,4).map(function(x){return x.order+' \u00d7'+x.qty;}).join(', ')+(r.reserved.length>4?' +'+(r.reserved.length-4)+' more':'')+')'):'';
+  if(own&&(f.kind==='part'||f.kind==='nobom'))return sku+': needs '+r.qty+', only '+r.free+' free of '+r.onHand+' on hand'+held+(f.kind==='nobom'?' and there is no recipe to build more':'');
+  if(f.kind==='part')return sku+': '+r.free+' free of '+r.onHand+' on hand'+held+'; cannot build the rest - short on '+dispSku(f.pn)+' (needs '+f.need+', '+f.have+' free)';
+  if(f.kind==='nobom')return sku+': cannot build - sub-assembly '+dispSku(f.pn)+' has no free stock and no recipe';
+  return sku+': cannot be satisfied from current stock';
+}
+function ohBlockedHtml(blocked){
+  if(!blocked||!blocked.length)return '';
+  return '<details style="margin-top:12px"><summary style="cursor:pointer;font-size:var(--t-sm);font-weight:700;color:var(--text2)">Still on hold - cannot be released yet ('+blocked.length+')</summary>'
+  +'<div class="tbl-wrap" style="max-height:260px;overflow-y:auto;margin-top:8px"><table><thead><tr><th>Order</th><th>Customer</th><th>Date</th><th>What is stopping it</th></tr></thead><tbody>'
+  +blocked.map(function(b){return '<tr><td class="pn" style="min-width:86px;overflow-wrap:anywhere">'+escHtml(b.orderNum)+'</td><td style="font-size:var(--t-sm)">'+escHtml(b.customer||'')+'</td><td style="font-size:var(--t-sm);color:var(--text3)">'+escHtml(b.date||'')+'</td>'
+    +'<td style="font-size:var(--t-sm);white-space:normal;min-width:200px;line-height:1.45;word-break:break-word">'+b.reasons.map(function(r){return escHtml(ohReasonText(r));}).join('<br>')+'</td></tr>';}).join('')
+  +'</tbody></table></div></details>';
+}
+window.ohBlockedHtml=ohBlockedHtml;
 window.computeOnHoldFulfillable=computeOnHoldFulfillable;
 
 function showOnHoldFulfillable(){
   var r=computeOnHoldFulfillable();
-  if(!r.orders.length){toast('No on-hold orders can be fulfilled from current stock');return;}
+  if(!r.orders.length&&!(r.blocked&&r.blocked.length)){toast('No on-hold orders');return;}
   openModal('onHoldReady',r);
 }
 window.showOnHoldFulfillable=showOnHoldFulfillable;
