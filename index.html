@@ -473,7 +473,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.100</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.11</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -538,7 +538,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.100';
+const TGK_ERP_VERSION = 'v23.11';
 const TGK_ERP_BUILD_DATE = '2026-10-21';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -19740,7 +19740,7 @@ function _mmPrompt(chunk){
    +'4. Whole numbers only. safety must not exceed min. max must be at least min. When moq > 0, max must be a multiple of moq.\n'
    +'5. If the baseline already looks right, return the baseline values.\n'
    +'6. A lead time marked (assumed) is a 2-week default, not real data: stay close to the baseline for those parts.\n\n'
-   +'Return ONLY a JSON array with one object per part, in the same order, no markdown: [{"pn":"...","min":N,"max":N,"safety":N,"note":"max 8 words giving the main reason"}]\n\nPARTS:\n'+lines;
+   +'Return ONLY a JSON array with one object per part, in the same order, no markdown: [{"pn":"...","min":N,"max":N,"safety":N,"note":"max 6 words giving the main reason"}]\n\nPARTS:\n'+lines;
 }
 // One request to the model with retries for everything that is worth retrying (rate limits, overload, 5xx, network).
 var _mmNoTemp=false;   // set once the proxy/model rejects the temperature parameter
@@ -19748,10 +19748,15 @@ async function _mmCall(prompt){
   var lastErr='',noTemp=_mmNoTemp;
   for(var attempt=0;attempt<4;attempt++){
     try{
-      var body={model:'claude-sonnet-4-6',max_tokens:5000,messages:[{role:'user',content:prompt}]};
+      var body={model:'claude-sonnet-4-6',max_tokens:3500,messages:[{role:'user',content:prompt}]};
       if(!noTemp)body.temperature=0;
-      var res=await fetch(SUPA_URL+'/functions/v1/anthropic-proxy',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify(body)});
-      var data=null;try{data=await res.json();}catch(_e){data=null;}
+      var ctl=new AbortController(),tmo=setTimeout(function(){ctl.abort();},window._mmTimeoutMs||100000);   // a stalled request must not hang the run
+      var res,data=null;
+      try{
+        res=await fetch(SUPA_URL+'/functions/v1/anthropic-proxy',{method:'POST',signal:ctl.signal,headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify(body)});
+        try{data=await res.json();}catch(_e){data=null;}
+      }catch(fe){clearTimeout(tmo);lastErr=(fe&&fe.name==='AbortError')?'timed out waiting for the AI':String((fe&&fe.message)||fe);await new Promise(function(r){setTimeout(r,(attempt+1)*2500);});continue;}
+      clearTimeout(tmo);
       var errTxt=data&&data.error?String(data.error.type||data.error.message||'error')+(data.error.message?': '+data.error.message:''):'';
       if(res.ok&&data&&!data.error&&data.content){
         return {ok:true,text:(data.content||[]).map(function(c){return(c&&c.text)||'';}).join(''),stop:data.stop_reason||''};
@@ -19803,6 +19808,13 @@ function _mmFinalize(b,a){
   if(clamped)note+=(note?' ':'')+'[held to guardrail]';
   return {mn:mn,mx:mx,sf:sf,note:note,clamped:clamped,bad:bad};
 }
+function mmStop(){
+  if(!S.mmLoading)return;
+  S.mmCancel=true;
+  toast('Stopping: batches already running will finish, everything analyzed so far is kept');
+}
+window.mmStop=mmStop;
+function _mmFmt(ms){var s=Math.max(0,Math.round(ms/1000));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0');}
 async function aiSuggestMinMax(singlePn, pnList){
   if(S.mmLoading||S.mmApplying){toast('Already working - wait for it to finish');return;}
   var pool;
@@ -19815,7 +19827,7 @@ async function aiSuggestMinMax(singlePn, pnList){
     var st=statSuggest(p);
     var importedAvg=p.avg_sales_wk||0;
     var effectiveAvg=st.avg>0?st.avg:importedAvg;
-    var ser=weeklySeries(p.pn,12).slice().reverse();                 // oldest -> newest, 12 weeks
+    var ser=weeklySeries(p.pn,26).slice(0,12).reverse();            // oldest -> newest, last 12 weeks (sliced from the 26 weeks statSuggest already read: asking for a different week count would rebuild the whole sales cache for every part)
     var moq=p.moq||0;
     // With live sales, the statistical baseline is statSuggest(). With ONLY a spreadsheet average (no live sales) statSuggest just
     // hands back the stored min/max, and anchoring the guardrail to those would pin the answer to the very values under review.
@@ -19836,42 +19848,62 @@ async function aiSuggestMinMax(singlePn, pnList){
   var noDemand=base.length-withDemand.length;
   if(!withDemand.length){toast('None of the '+base.length+' parts has demand data - nothing to analyze, values left unchanged');return;}
 
-  S.mmLoading=true;S.mmProgress={done:0,total:withDemand.length};S.mmSuggest=null;S.mmApplyResult=null;
-  toast('Asking Claude to analyze '+withDemand.length+' parts'+(noDemand?' ('+noDemand+' with no demand data are left unchanged)':'')+'...');
+  var chunkSize=30,PARALLEL=4,queue=[];
+  for(var i=0;i<withDemand.length;i+=chunkSize)queue.push(withDemand.slice(i,i+chunkSize));
+  var t0=Date.now();
+  S.mmLoading=true;S.mmCancel=false;S.mmProgress={done:0,total:withDemand.length,batches:0,batchTotal:queue.length};S.mmSuggest=null;S.mmApplyResult=null;
+  toast('Asking Claude to analyze '+withDemand.length+' parts in '+queue.length+' batch'+(queue.length!==1?'es':'')+(noDemand?' ('+noDemand+' with no demand data are left unchanged)':'')+'...');
   render();
-  var aiMap={},why={},chunkSize=30,hard=0;
-  function bump(n){S.mmProgress.done=Math.min(S.mmProgress.total,S.mmProgress.done+n);var el=document.querySelector('[data-mm-all]');if(el)el.textContent='Analyzing '+S.mmProgress.done+'/'+S.mmProgress.total+'...';}
-  try{
-    for(var i=0;i<withDemand.length;i+=chunkSize){
-      var group=withDemand.slice(i,i+chunkSize);
-      var r=await _mmAsk(group);
-      Object.keys(r.got).forEach(function(k){aiMap[k]=r.got[k];});
-      var missing=group.filter(function(b){return !aiMap[b.pn];});
-      // The AI service itself is failing (every retry inside the call already failed): do not ask again part by part, and after
-      // two such batches stop calling it and say so, instead of stalling for minutes.
-      if(r.err&&!Object.keys(r.got).length&&r.err!=='reply was cut off'){
-        hard++;
-        missing.forEach(function(b){why[b.pn]='AI unavailable: '+r.err;});
-        if(hard>=2){
-          withDemand.slice(i+chunkSize).forEach(function(b){why[b.pn]='AI unavailable: '+r.err;});
-          bump(withDemand.length);break;
+  // live status: so the screen shows it is working, how far along, and roughly how long is left
+  var timer=setInterval(function(){
+    var el=document.getElementById('mm-ai-status'),P=S.mmProgress;if(!el||!P)return;
+    var ela=Date.now()-t0;
+    el.textContent=P.batches+' of '+P.batchTotal+' batch'+(P.batchTotal!==1?'es':'')+' done - '+_mmFmt(ela)+' elapsed'
+      +(P.batches>0&&P.batches<P.batchTotal?' - about '+_mmFmt((ela/P.batches)*(P.batchTotal-P.batches))+' left':(P.batches===0?' - estimating time left...':''))
+      +(S.mmCancel?' - stopping...':'');
+  },500);
+  function bump(n){var P=S.mmProgress;if(!P)return;P.done=Math.min(P.total,P.done+n);P.batches++;var el=document.querySelector('[data-mm-all]');if(el)el.textContent='Analyzing '+P.done+'/'+P.total+'...';}
+  var aiMap={},why={},cancelled={},qi=0,streak=0,aborted=false;
+  async function batchWorker(){
+    while(!aborted&&!S.mmCancel){
+      var idx=qi++;if(idx>=queue.length)break;
+      var group=queue[idx];
+      try{
+        var r=await _mmAsk(group);
+        Object.keys(r.got).forEach(function(k){aiMap[k]=r.got[k];});
+        var missing=group.filter(function(b){return !aiMap[b.pn];});
+        // The AI service itself is failing (every retry inside the call already failed): do not ask again part by part, and after
+        // two such batches in a row stop calling it and say so, instead of stalling for minutes.
+        if(r.err&&!Object.keys(r.got).length&&r.err!=='reply was cut off'){
+          streak++;
+          missing.forEach(function(b){why[b.pn]='AI unavailable: '+r.err;});
+          if(streak>=2){
+            aborted=true;
+            for(var k=qi;k<queue.length;k++)queue[k].forEach(function(b){why[b.pn]='AI unavailable: '+r.err;});
+            qi=queue.length;
+          }
+        }else{
+          streak=0;
+          // anything the model skipped or cut off is asked again in smaller groups before it is given up on
+          for(var j=0;j<missing.length&&!S.mmCancel;j+=10){
+            var sub=missing.slice(j,j+10);
+            var r2=await _mmAsk(sub);
+            Object.keys(r2.got).forEach(function(k){aiMap[k]=r2.got[k];});
+            sub.forEach(function(b){if(!aiMap[b.pn])why[b.pn]=r2.err||r.err||'the model did not return this part';});
+          }
+          group.forEach(function(b){if(!aiMap[b.pn]&&!why[b.pn])why[b.pn]=S.mmCancel?'stopped before it finished':'the model did not return this part';});
         }
-        bump(group.length);continue;
-      }
-      // anything the model skipped or cut off is asked again in smaller groups before it is given up on
-      for(var j=0;j<missing.length;j+=10){
-        var sub=missing.slice(j,j+10);
-        var r2=await _mmAsk(sub);
-        Object.keys(r2.got).forEach(function(k){aiMap[k]=r2.got[k];});
-        sub.forEach(function(b){if(!aiMap[b.pn])why[b.pn]=r2.err||r.err||'the model did not return this part';});
-      }
+      }catch(e){group.forEach(function(b){if(!aiMap[b.pn])why[b.pn]=String((e&&e.message)||e);});}
       bump(group.length);
     }
-  }catch(e){
-    withDemand.forEach(function(b){if(!aiMap[b.pn]&&!why[b.pn])why[b.pn]=String((e&&e.message)||e);});
   }
-  var results=[],stats={ai:0,fallback:0,clamped:0,noDemand:noDemand,assumedLead:0,reasons:{}};
+  try{await Promise.all(Array.from({length:Math.min(PARALLEL,queue.length)},batchWorker));}
+  finally{clearInterval(timer);}
+  var stopped=!!S.mmCancel&&!aborted;
+  if(stopped)for(var q=qi;q<queue.length;q++)queue[q].forEach(function(b){cancelled[b.pn]=true;});   // never started: left out, not guessed at
+  var results=[],stats={ai:0,fallback:0,clamped:0,noDemand:noDemand,cancelled:0,assumedLead:0,reasons:{}};
   withDemand.forEach(function(b){
+    if(cancelled[b.pn]){stats.cancelled++;return;}
     var a=aiMap[b.pn];
     if(a){
       var f=_mmFinalize(b,a);
@@ -19887,8 +19919,8 @@ async function aiSuggestMinMax(singlePn, pnList){
     results.push(Object.assign({},b,{ai:false,note:'Statistical baseline ('+rs+')'}));
   });
   results.forEach(function(s){s.changed=(s.min!==s.curMin||s.max!==s.curMax||s.safety!==s.curSafety);});
-  S.mmSuggest=results;S.mmStats=stats;S.mmLoading=false;S.mmProgress=null;
-  toast(results.length+' suggestions ready: '+stats.ai+' by AI'+(stats.fallback?', '+stats.fallback+' statistical (AI did not answer)':'')+(stats.noDemand?', '+stats.noDemand+' unchanged (no demand)':'')+' - review below');
+  S.mmSuggest=results.length?results:null;S.mmStats=stats;S.mmLoading=false;S.mmProgress=null;S.mmCancel=false;
+  toast((stopped?'Stopped: ':'')+results.length+' suggestions ready: '+stats.ai+' by AI'+(stats.fallback?', '+stats.fallback+' statistical (AI did not answer)':'')+(stats.cancelled?', '+stats.cancelled+' not analyzed':'')+(stats.noDemand?', '+stats.noDemand+' unchanged (no demand)':'')+' - '+_mmFmt(Date.now()-t0)+' total');
   render();
 }
 
@@ -19972,6 +20004,7 @@ function renderMMReview(){
     h+='<div style="padding:8px 14px;font-size:var(--t-sm);color:var(--text2);border-bottom:1px solid var(--border)">'
      +'<b style="color:var(--teal)">'+st.ai+' analyzed by AI</b>'
      +(st.fallback?' &middot; <b style="color:var(--orange)">'+st.fallback+' statistical baseline</b> (the AI did not answer: '+rs+')':'')
+     +(st.cancelled?' &middot; <b style="color:var(--orange)">'+st.cancelled+' not analyzed (stopped)</b>':'')
      +(st.clamped?' &middot; '+st.clamped+' held to the guardrail':'')
      +(st.noDemand?' &middot; '+st.noDemand+' with no demand data left unchanged':'')
      +(st.assumedLead?' &middot; '+st.assumedLead+' use an assumed 2-week lead time':'')+'</div>';
@@ -21869,6 +21902,7 @@ function renderMinMaxTab(parts){
       &#10024; AI Suggest Selected${selCount>0?' ('+selCount+')':''}
     </button>
     <span class="t3s" id="mm-sel-count">${selCount>0?selCount+' selected':''}</span>
+    ${S.mmLoading?'<button class="btn btn-sm" style="color:var(--red)" onclick="mmStop()">Stop</button><span class="t3s" id="mm-ai-status">Starting...</span>':''}
     ${selCount>0?`<button class="btn btn-sm" onclick="S.mmSelectedPns=new Set();render()">&#10005; Clear</button>`:''}
     <span style="flex:1"></span>
     <span class="t3s">${parts.length} parts &nbsp;&middot;&nbsp; Edit values inline or run AI Suggest to auto-fill</span>
