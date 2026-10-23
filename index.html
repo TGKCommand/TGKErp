@@ -473,7 +473,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.98</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.99</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -538,7 +538,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.98';
+const TGK_ERP_VERSION = 'v23.99';
 const TGK_ERP_BUILD_DATE = '2026-10-21';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -9794,10 +9794,11 @@ function centralDateOnly(d?: string): string {
 }
 
 async function buildOrderMap() {
-  const { data } = await db.from('sales')
-    .select('id,order_number,pn,fulfillment_status,qty')
+  const _bomSel = async (cols: string) =&gt; await db.from('sales').select(cols)
     .in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
     .limit(100000)
+  let { data, error: _omErr } = await _bomSel('id,order_number,pn,fulfillment_status,qty,shopify_line_item_id')
+  if (_omErr) ({ data } = await _bomSel('id,order_number,pn,fulfillment_status,qty')) // [v23.97] column missing: fall back to SKU-only matching
   const map: any = {}
   for (const line of (data || [])) {
     const key = stripHash(line.order_number || '')
@@ -9816,6 +9817,18 @@ async function buildOrderMap() {
 // ShipStation SKU has to be compared against an ERP sales line: the two sides frequently carry
 // DIFFERENT aliases of the same item, and a plain or substring string match then misses the real
 // match or grabs the wrong one. Anything with no assemblies/parts record resolves to itself.
+// [v23.97] buildCanonMap for a long list: a page of ShipStation shipments can carry hundreds of SKUs, too many for one request.
+async function buildCanonMapBig(skus: string[]): Promise&lt;(raw: string) =&gt; string&gt; {
+  const norm = (x: string) =&gt; String(x || '').trim().toUpperCase()
+  const list = [...new Set(skus.map((x) =&gt; String(x || '').trim()).filter(Boolean))]
+  const m: Record&lt;string, string&gt; = {}
+  for (let i = 0; i &lt; list.length; i += 150) {
+    const part = list.slice(i, i + 150)
+    const f = await buildCanonMap(part)
+    for (const s of part) m[norm(s)] = f(s)
+  }
+  return (raw: string) =&gt; { const n = norm(raw); return m[n] || n }
+}
 async function buildCanonMap(skus: string[]): Promise&lt;(raw: string) =&gt; string&gt; {
   const norm = (x: string) =&gt; String(x || '').trim().toUpperCase()
   const list = [...new Set(skus.map((x) =&gt; String(x || '').trim()).filter(Boolean))]
@@ -10341,7 +10354,7 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.96'
+const EDGE_BUILD = 'v23.97'
 const _gateLogged: Record&lt;string, number&gt; = {}
 async function authGate(req: Request, fn: string, action: string): Promise&lt;Response | null&gt; {
   const mode = (Deno.env.get('EDGE_AUTH_MODE') || 'log').toLowerCase()
@@ -10392,6 +10405,12 @@ Deno.serve(async (req) =&gt; {
       if (!res.ok) return json({ error: 'ShipStation error ' + res.status }, 502)
       const data = await res.json()
       totalPages = data.pages || 1
+      const _pageSkus: string[] = []
+      for (const _s of (data.shipments || [])) {
+        for (const i of (_s.shipmentItems || [])) { const v = String(i?.sku || i?.name || '').trim(); if (v) _pageSkus.push(v) }
+        for (const l of (orderMap[stripHash(_s.orderNumber || '')] || [])) if (l.pn) _pageSkus.push(l.pn)
+      }
+      const _bcanon = await buildCanonMapBig(_pageSkus)
       for (const ship of (data.shipments || [])) {
         if (ship.voided || !ship.trackingNumber) { skipped++; continue }
         const rawNum = stripHash(ship.orderNumber || '')
@@ -10402,10 +10421,14 @@ Deno.serve(async (req) =&gt; {
         // [AUDIT] Exact SKU match first. The substring test alone let a short SKU (TGK-0404-01) match a
         // longer one on the same order (TGK-0404-01-HW), marking an unshipped line Shipped and deducting it.
         // Substring stays only as a last resort when nothing matched exactly.
-        const _exact = allPns.filter(p =&gt; rawSkus.some((s: string) =&gt; norm(p) === norm(s)))
-        const matched = rawSkus.length &gt; 0
-          ? (_exact.length ? _exact : allPns.filter(p =&gt; rawSkus.some((s: string) =&gt; { const e=norm(p),k=norm(s); return e===k||e.includes(k)||k.includes(e) })))
-          : allPns
+        const _exact = allPns.filter(p =&gt; rawSkus.some((s: string) =&gt; norm(p) === norm(s) || _bcanon(p) === _bcanon(s)))
+        // [v23.97] same Shopify line-id match as the shipment webhook: survives a SKU edited in ShipStation
+        const _bsIds = new Set((ship.shipmentItems || []).map((i: any) =&gt; String(i?.lineItemKey ?? '').trim()).filter(Boolean))
+        const _bsIdPns = lines.filter((l: any) =&gt; l.shopify_line_item_id != null &amp;&amp; _bsIds.has(String(l.shopify_line_item_id).trim())).map((l: any) =&gt; l.pn as string)
+        const _bsByIdOrExact = [...new Set([..._bsIdPns, ..._exact])]
+        const matched = _bsByIdOrExact.length ? _bsByIdOrExact : (rawSkus.length &gt; 0
+          ? allPns.filter(p =&gt; rawSkus.some((s: string) =&gt; { const e=norm(p),k=norm(s); return e===k||e.includes(k)||k.includes(e) }))
+          : allPns)
         const tracking = ship.trackingNumber
         const carrier = (ship.carrierCode || '').toUpperCase()
         const shippedAt = ship.shipDate ? new Date(ship.shipDate).toISOString() : new Date().toISOString()
@@ -11274,7 +11297,8 @@ Deno.serve(async (req) =&gt; {
       }
       const resolvedOrderNum = resolvedOrderNumOrNull
       let { data: erpLinesRaw, error: _elErr } = await db.from('sales')
-        .select('id,pn,fulfillment_status,qty,deduct_pending').eq('order_number', resolvedOrderNum)
+        .select('id,pn,fulfillment_status,qty,deduct_pending,shopify_line_item_id').eq('order_number', resolvedOrderNum)
+      if (_elErr) ({ data: erpLinesRaw, error: _elErr } = await db.from('sales').select('id,pn,fulfillment_status,qty,deduct_pending').eq('order_number', resolvedOrderNum))
       if (_elErr) ({ data: erpLinesRaw } = await db.from('sales').select('id,pn,fulfillment_status,qty').eq('order_number', resolvedOrderNum))
       const erpLines = erpLinesRaw ?? []
       const allErpPns = erpLines.map((l: any) =&gt; l.pn as string)
@@ -11307,7 +11331,15 @@ Deno.serve(async (req) =&gt; {
       // [AUDIT] Exact (canonical) match first; substring only if nothing on the order matched exactly.
       // See bulk_sync - the substring test alone marks and deducts the wrong line on split shipments.
       const _exactPns = allErpPns.filter(erpPn =&gt; { const ce = canon(erpPn); return rawSkus.some((ssSku: string) =&gt; ce === canon(ssSku) || norm(erpPn) === norm(ssSku)) })
-      const matchedPns = _exactPns.length ? _exactPns : allErpPns.filter(erpPn =&gt; {
+      // [v23.97] Match on the Shopify LINE ITEM ID first. Every ERP line stores shopify_line_item_id and ShipStation carries the
+      // same value on each shipped item as lineItemKey. Matching only on SKU text meant that an item whose SKU had been EDITED in
+      // ShipStation (or that had no SKU, only a name) matched nothing, and because an unmatched On Hold line is deliberately never
+      // swept into Shipped, held orders that ShipStation had shipped stayed On Hold in the ERP, silently. The id is exact and
+      // survives any edit. SKU matching is unchanged and still applies to everything the id does not cover.
+      const _shipIds = new Set((ship.shipmentItems ?? []).map((i: any) =&gt; String(i?.lineItemKey ?? '').trim()).filter(Boolean))
+      const _idPns = erpLines.filter((l: any) =&gt; l.shopify_line_item_id != null &amp;&amp; _shipIds.has(String(l.shopify_line_item_id).trim())).map((l: any) =&gt; l.pn as string)
+      const _byIdOrExact = [...new Set([..._idPns, ..._exactPns])]
+      const matchedPns = _byIdOrExact.length ? _byIdOrExact : allErpPns.filter(erpPn =&gt; {
         const ce = canon(erpPn)
         return rawSkus.some((ssSku: string) =&gt; {
           if (ce === canon(ssSku)) return true
@@ -11316,6 +11348,12 @@ Deno.serve(async (req) =&gt; {
         })
       })
       console.log('[SS] matchedPns', JSON.stringify(matchedPns), 'of', JSON.stringify(allErpPns), viaSplit ? '(via split link)' : '')
+      if (!matchedPns.length) {
+        const _held = erpLines.filter((l: any) =&gt; l.fulfillment_status === 'On Hold').length
+        await logEdgeError('Shipment ' + tracking + ' for order ' + resolvedOrderNum + ' matched NO ERP line' + (_held ? ' - ' + _held + ' On Hold line(s) were left On Hold' : '')
+          + '. ERP lines: ' + allErpPns.join(', ') + ' | ShipStation items: ' + JSON.stringify((ship.shipmentItems ?? []).map((i: any) =&gt; ({ sku: i?.sku, name: i?.name, lineItemKey: i?.lineItemKey }))).slice(0, 500)
+          + ' - mark the line(s) Shipped in the ERP by hand.')
+      }
       const isSplit = matchedPns.length &gt; 0 &amp;&amp; matchedPns.length &lt; allErpPns.length
 
       // [AUDIT v23.65] Replaces the old whole-shipment skip ("this tracking number already has a deduction, so
@@ -26352,7 +26390,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.83','shipstation-ship':'v23.96'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.83','shipstation-ship':'v23.97'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
