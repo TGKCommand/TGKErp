@@ -473,7 +473,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.12</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.13</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -538,7 +538,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.12';
+const TGK_ERP_VERSION = 'v23.13';
 const TGK_ERP_BUILD_DATE = '2026-10-21';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -7799,8 +7799,9 @@ function renderIntegrations(){
     <div class="tab ${t==='shipstation'?'active':''}" onclick="S.intTab='shipstation';render()">ShipStation</div>
     <div class="tab ${t==='alerts'?'active':''}" onclick="S.intTab='alerts';render()"><span class="ic ic-bell"></span>Alerts</div>
     <div class="tab ${t==='setup'?'active':''}" onclick="S.intTab='setup';render()"><span class="ic ic-gear"></span>Setup Guide</div>
+  <div class="tab ${t==='jobs'?'active':''}" onclick="S.intTab='jobs';if(S.ops)S.ops.fullLoaded=false;render()"><span class="ic ic-clock"></span>Background Jobs${_opsTabDot()}</div>
   </div>
-  ${t==='shopify'?`<div class="int-card">
+  ${t==='jobs'?renderOpsPanel():t==='shopify'?`<div class="int-card">
     <div class="int-header">
       <div class="int-icon" style="background:#96bf48;font-size:var(--t-lg)">S</div>
       <div style="flex:1"><div class="int-title">Shopify</div><div class="int-sub">Order ingestion via webhook → Supabase</div></div>
@@ -8292,7 +8293,7 @@ async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.83'
+const EDGE_BUILD = 'v23.84'
 
 // [v23.82] The vehicle the shopper had saved on the website rides along as cart attribute "Vehicle" and arrives
 // here as an order note attribute. It is stored on each sales line (column added by fitment_7_insights.sql), so
@@ -8318,6 +8319,7 @@ async function authGate(req: Request, fn: string, action: string): Promise&lt;Re
   const mode = (Deno.env.get('EDGE_AUTH_MODE') || 'log').toLowerCase()
   if (mode === 'off') return null
   const tok = (req.headers.get('Authorization') || '').replace(/^Bearer\\s+/i, '')
+  if (tok &amp;&amp; tok === (Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || '')) return null // [v23.84] the server's own scheduled jobs (ops-cron)
   let ok = false
   if (tok) { try { const r = await db.auth.getUser(tok); ok = !!(r &amp;&amp; r.data &amp;&amp; r.data.user) } catch (_) { ok = false } }
   if (ok) return null
@@ -8331,7 +8333,7 @@ async function authGate(req: Request, fn: string, action: string): Promise&lt;Re
   return null
 }
 
-Deno.serve(async (req) =&gt; {
+async function handleRequest(req: Request): Promise&lt;Response&gt; {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
   if (req.method === 'GET') return new Response('pong', { headers: CORS })
   let body: any = {}
@@ -9687,8 +9689,65 @@ if (body.action === 'list_product_templates') {
   }
 } catch (err) {
     console.error('[shopify-orders] webhook error:', err)
+    _errByReq.set(req, String((err as any)?.message || err))
   }
   return new Response('ok', { headers: CORS })
+}
+
+// ===================================================================================================================
+// [v23.84] WEBHOOK LOG + DUPLICATE GUARD. Needs the tables from ops_setup.sql; until they exist this does nothing at all.
+//   * Every webhook is recorded (topic, order, ok / error, how long it took) so a missing or failing one is visible in the ERP
+//     (Integrations &gt; Background Jobs) and the nightly reconciliation can tell whether webhooks are still arriving.
+////   * Shopify re-sends a delivery with the SAME webhook id. One that already finished OK is acknowledged and skipped; one that
+//     failed is processed again exactly as before. (The handler was already safe to run twice; this saves the work.)
+//   * Logging never throws, never changes what the handler does, and costs two quick queries.
+// ===================================================================================================================
+const _errByReq = new WeakMap&lt;Request, string&gt;()
+let _whTable = true
+const _missingTable = (m: unknown) =&gt; /does not exist|schema cache|relation/i.test(String(m || ''))
+async function whAlreadyDone(source: string, extId: string | null): Promise&lt;boolean&gt; {
+  if (!_whTable || !extId) return false
+  try {
+    const { data, error } = await db.from('webhook_events').select('id,status,deliveries').eq('source', source).eq('external_id', extId).limit(1)
+    if (error) { if (_missingTable(error.message)) _whTable = false; return false }
+    if (data &amp;&amp; data.length &amp;&amp; data[0].status === 'ok') { await db.from('webhook_events').update({ deliveries: (data[0].deliveries || 1) + 1 }).eq('id', data[0].id); return true }
+  } catch (_) { /* never let logging break a webhook */ }
+  return false
+}
+async function whRecord(source: string, topic: string, extId: string | null, ref: string, via: string, err: string | null, ms: number): Promise&lt;void&gt; {
+  if (!_whTable) return
+  try {
+    const row = { status: err ? 'error' : 'ok', error: err ? String(err).slice(0, 500) : null, finished_at: new Date().toISOString(), duration_ms: ms }
+    if (extId) {
+      const { data } = await db.from('webhook_events').select('id,deliveries').eq('source', source).eq('external_id', extId).limit(1)
+      if (data &amp;&amp; data.length) { await db.from('webhook_events').update({ ...row, deliveries: (data[0].deliveries || 1) + 1 }).eq('id', data[0].id); return }
+    }
+    const { error } = await db.from('webhook_events').insert({ source, topic, external_id: extId, ref, via, ...row })
+    if (error &amp;&amp; _missingTable(error.message)) _whTable = false
+    else if (error &amp;&amp; extId &amp;&amp; /duplicate key|23505|unique/i.test(String(error.code || '') + ' ' + String(error.message || ''))) {
+      // two deliveries of the same webhook finished at the same instant and the other one logged first: count this one on its row
+      const { data } = await db.from('webhook_events').select('id,deliveries').eq('source', source).eq('external_id', extId).limit(1)
+      if (data &amp;&amp; data.length) await db.from('webhook_events').update({ ...row, deliveries: (data[0].deliveries || 1) + 1 }).eq('id', data[0].id)
+    }
+  } catch (_) { /* never let logging break a webhook */ }
+}
+
+Deno.serve(async (req) =&gt; {
+  const topic = req.headers.get('x-shopify-topic')
+  const isHook = req.method === 'POST' &amp;&amp; !!topic
+  let extId: string | null = null, ref = ''
+  if (isHook) {
+    extId = req.headers.get('x-shopify-webhook-id')
+    try { const b: any = JSON.parse(await req.clone().text()); ref = String(b?.name || b?.id || '').slice(0, 60) } catch (_) { /* not JSON: the handler deals with it */ }
+    if (await whAlreadyDone('shopify', extId)) { console.log('[shopify-orders] duplicate delivery skipped:', topic, extId); return new Response('ok', { headers: CORS }) }
+  }
+  const t0 = Date.now()
+  const via = req.headers.get('x-ops-replay') ? 'replay' : 'webhook'
+  let res: Response
+  try { res = await handleRequest(req) }
+  catch (e) { if (isHook) await whRecord('shopify', String(topic), extId, ref, via, String((e as any)?.message || e), Date.now() - t0); throw e }
+  if (isHook &amp;&amp; res.status !== 401) await whRecord('shopify', String(topic), extId, ref, via, _errByReq.get(req) || (res.status &gt;= 400 ? 'HTTP ' + res.status : null), Date.now() - t0) // 401 = failed signature: not a real webhook, not logged
+  return res
 })
 
 /* Migration needed before the risk-flagging feature works:
@@ -10354,12 +10413,13 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.97'
+const EDGE_BUILD = 'v23.98'
 const _gateLogged: Record&lt;string, number&gt; = {}
 async function authGate(req: Request, fn: string, action: string): Promise&lt;Response | null&gt; {
   const mode = (Deno.env.get('EDGE_AUTH_MODE') || 'log').toLowerCase()
   if (mode === 'off') return null
   const tok = (req.headers.get('Authorization') || '').replace(/^Bearer\\s+/i, '')
+  if (tok &amp;&amp; tok === (Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || '')) return null // [v23.98] the server's own scheduled jobs (ops-cron)
   let ok = false
   if (tok) { try { const r = await db.auth.getUser(tok); ok = !!(r &amp;&amp; r.data &amp;&amp; r.data.user) } catch (_) { ok = false } }
   if (ok) return null
@@ -10373,7 +10433,7 @@ async function authGate(req: Request, fn: string, action: string): Promise&lt;Re
   return null
 }
 
-Deno.serve(async (req) =&gt; {
+async function handleRequest(req: Request): Promise&lt;Response&gt; {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
   const body = await req.json().catch(() =&gt; ({})) as any
   if (req.method === 'GET' || body.ping) return new Response('pong', { headers: CORS })
@@ -11547,6 +11607,52 @@ Deno.serve(async (req) =&gt; {
     }
   }
   return ok('ok')
+}
+
+// ===================================================================================================================
+// [v23.98] WEBHOOK LOG. Needs the tables from ops_setup.sql; until they exist this does nothing at all.
+//   * Every webhook is recorded (topic, order, ok / error, how long it took) so a missing or failing one is visible in the ERP
+//     (Integrations &gt; Background Jobs) and the nightly reconciliation can tell whether webhooks are still arriving.
+//
+//   * Logging never throws, never changes what the handler does, and costs two quick queries.
+// ===================================================================================================================
+const _errByReq = new WeakMap&lt;Request, string&gt;()
+let _whTable = true
+const _missingTable = (m: unknown) =&gt; /does not exist|schema cache|relation/i.test(String(m || ''))
+
+async function whRecord(source: string, topic: string, extId: string | null, ref: string, via: string, err: string | null, ms: number): Promise&lt;void&gt; {
+  if (!_whTable) return
+  try {
+    const row = { status: err ? 'error' : 'ok', error: err ? String(err).slice(0, 500) : null, finished_at: new Date().toISOString(), duration_ms: ms }
+    if (extId) {
+      const { data } = await db.from('webhook_events').select('id,deliveries').eq('source', source).eq('external_id', extId).limit(1)
+      if (data &amp;&amp; data.length) { await db.from('webhook_events').update({ ...row, deliveries: (data[0].deliveries || 1) + 1 }).eq('id', data[0].id); return }
+    }
+    const { error } = await db.from('webhook_events').insert({ source, topic, external_id: extId, ref, via, ...row })
+    if (error &amp;&amp; _missingTable(error.message)) _whTable = false
+    else if (error &amp;&amp; extId &amp;&amp; /duplicate key|23505|unique/i.test(String(error.code || '') + ' ' + String(error.message || ''))) {
+      // two deliveries of the same webhook finished at the same instant and the other one logged first: count this one on its row
+      const { data } = await db.from('webhook_events').select('id,deliveries').eq('source', source).eq('external_id', extId).limit(1)
+      if (data &amp;&amp; data.length) await db.from('webhook_events').update({ ...row, deliveries: (data[0].deliveries || 1) + 1 }).eq('id', data[0].id)
+    }
+  } catch (_) { /* never let logging break a webhook */ }
+}
+
+Deno.serve(async (req) =&gt; {
+  let hook: { type: string; ref: string } | null = null
+  if (req.method === 'POST') {
+    try { const b: any = await req.clone().json(); if (b &amp;&amp; b.resource_type &amp;&amp; b.resource_url &amp;&amp; !b.action) hook = { type: String(b.resource_type), ref: String(b.resource_url).split('?').pop()!.slice(0, 80) } } catch (_) { /* not a ShipStation webhook */ }
+  }
+  const t0 = Date.now()
+  let res: Response
+  try { res = await handleRequest(req) }
+  catch (e) { if (hook) await whRecord('shipstation', hook.type, null, hook.ref, 'webhook', String((e as any)?.message || e), Date.now() - t0); throw e }
+  if (hook) {
+    let err: string | null = null
+    if (res.status &gt;= 400) { err = 'HTTP ' + res.status; try { err += ' ' + (await res.clone().text()).slice(0, 200) } catch (_) { /* keep the status only */ } }
+    await whRecord('shipstation', hook.type, null, hook.ref, 'webhook', err, Date.now() - t0)
+  }
+  return res
 })
 </pre>
 
@@ -18206,6 +18312,7 @@ async function startAutoBackup() {
 
 function startAutoRefresh(){
   if(S.autoRefreshTimer)clearInterval(S.autoRefreshTimer);
+  if(S.opsTimer)clearInterval(S.opsTimer);S.opsTimer=setInterval(opsQuietRefresh,3*60*1000);setTimeout(opsQuietRefresh,4000); // [v23.13] keeps the job-health alerts current
   if(S.autoHoldSyncTimer)clearInterval(S.autoHoldSyncTimer);
   // Auto hold sync — Integrations has always claimed this runs "every 5 min", but no timer ever
   // existed to actually do it; syncHoldsOnly()/runHoldSync() were click-only. Holds are time-
@@ -18213,9 +18320,10 @@ function startAutoRefresh(){
   if(S.autoDeductRetryTimer)clearInterval(S.autoDeductRetryTimer);
   // [AUDIT] Shipments whose stock deduction failed stay flagged on the sales line and are retried here,
   // as well as at the start of every ShipStation webhook. Silent unless something was fixed or still fails.
-  S.autoDeductRetryTimer=setInterval(function(){if(S.currentUserId)retryPendingDeductions(true);},5*60*1000);
+  S.autoDeductRetryTimer=setInterval(function(){if(S.currentUserId&&!_opsClientShouldSkip('deduct_retry'))retryPendingDeductions(true);},5*60*1000);
   S.autoHoldSyncTimer=setInterval(async()=>{
     if(!S.currentUserId)return;
+  if(_opsClientShouldSkip('hold_sync'))return; // [v23.13] the server runs this on a schedule now
     if(!(S.shopify?.store&&S.shopify?.key))return; // Shopify not configured — nothing to sync against
     try{
       const res=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
@@ -18245,6 +18353,7 @@ function startAutoRefresh(){
   // delivery status changes slowly and each run checks up to 2000 shipments against ShipStation.
   S.autoDeliverySyncTimer=setInterval(async()=>{
     if(!S.currentUserId)return;
+  if(_opsClientShouldSkip('delivery_sync'))return; // [v23.13] the server runs this on a schedule now
     if(!(S.shopify?.store&&S.shopify?.key))return;
     try{
       const res=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{
@@ -26610,15 +26719,15 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.83','shipstation-ship':'v23.97'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.84','shipstation-ship':'v23.98','ops-cron':'v1.0'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
-  await Promise.all(['shopify-orders','shipstation-ship'].map(async function(fn){
+  await Promise.all(['shopify-orders','shipstation-ship','ops-cron'].map(async function(fn){
     try{
       var r=await fetch(SUPA_URL+'/functions/v1/'+fn,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({action:'version'})});
       var t=await r.text(),j=null;try{j=JSON.parse(t);}catch(_){}
-      out[fn]=(j&&j.build)?{build:j.build}:{build:null,note:r.ok?'older than v23.77':'HTTP '+r.status};
+      out[fn]=(j&&j.build)?{build:j.build}:{build:null,note:r.status===404?'not deployed yet':(r.ok?'older than v23.77':'HTTP '+r.status)};
     }catch(e){out[fn]={build:null,note:'unreachable'};}
   }));
   S._edgeVers=out;render();
@@ -26629,12 +26738,752 @@ function renderEdgeVersionPanel(){
   if(!v){setTimeout(checkEdgeVersions,0);v={checking:true};S._edgeVers=v;}
   var row=function(fn){var x=v[fn];if(!x)return '<span class="t3xs" style="color:var(--text3)">checking...</span>';
     var ok=x.build===(EDGE_EXPECTED[fn]||EDGE_EXPECTED_BUILD);
-    return '<span style="font-weight:700;color:'+(ok?'var(--green)':'var(--orange)')+'">'+(x.build||'?')+'</span> '+(ok?'up to date':'<span class="t3xs" style="color:var(--orange)">'+escHtml(x.note||'')+' - redeploy (copy below, or push to GitHub)</span>');};
-  return '<div class="panel" style="padding:10px 14px;margin-bottom:12px;font-size:var(--t-sm)"><b>Deployed server functions</b> <span class="t3xs" style="color:var(--text3)">shopify-orders '+EDGE_EXPECTED['shopify-orders']+' &middot; shipstation-ship '+EDGE_EXPECTED['shipstation-ship']+'</span>'
+    return '<span style="font-weight:700;color:'+(ok?'var(--green)':'var(--orange)')+'">'+(x.build||'?')+'</span> '+(ok?'up to date':'<span class="t3xs" style="color:var(--orange)">'+escHtml(x.note||'')+(fn==='ops-cron'?' - see Background Jobs > Setup':' - redeploy (copy below, or push to GitHub)')+'</span>');};
+  return '<div class="panel" style="padding:10px 14px;margin-bottom:12px;font-size:var(--t-sm)"><b>Deployed server functions</b> <span class="t3xs" style="color:var(--text3)">shopify-orders '+EDGE_EXPECTED['shopify-orders']+' &middot; shipstation-ship '+EDGE_EXPECTED['shipstation-ship']+' &middot; ops-cron '+EDGE_EXPECTED['ops-cron']+'</span>'
     +' <button class="btn btn-sm" style="margin-left:8px" onclick="checkEdgeVersions()">Check again</button>'
-    +'<div style="margin-top:6px;display:flex;gap:24px;flex-wrap:wrap"><span>shopify-orders: '+row('shopify-orders')+'</span><span>shipstation-ship: '+row('shipstation-ship')+'</span></div></div>';
+    +'<div style="margin-top:6px;display:flex;gap:24px;flex-wrap:wrap"><span>shopify-orders: '+row('shopify-orders')+'</span><span>shipstation-ship: '+row('shipstation-ship')+'</span><span>ops-cron: '+row('ops-cron')+'</span></div></div>';
 }
 window.renderEdgeVersionPanel=renderEdgeVersionPanel;
+/* ===================================================================================================================
+   [v23.13] BACKGROUND JOBS, WEBHOOK LOG AND RECONCILIATION   (Integrations > Background Jobs)
+   The server (ops-cron) now runs the hold sync, deduction retry, delivery sync and a nightly Shopify-vs-ERP reconciliation,
+   so they no longer depend on someone having the ERP open. This screen shows whether they are healthy, lets staff run or pause
+   one, shows every webhook that arrived (and failed), and lists the differences the nightly check found.
+   =================================================================================================================== */
+var OPS_KIND={
+  missing_in_erp:{label:'Order never reached the ERP',hint:'Its Shopify webhook was lost. The nightly repair re-sends it; if it is still listed, look at the webhook settings (see the webhook table).'},
+  cancel_not_applied:{label:'Cancelled in Shopify, still open here',hint:'Cancel the lines here, or re-run the check: the repair re-sends the cancellation.'},
+  shopify_fulfilled_erp_open:{label:'Shipped per Shopify, still open here',hint:'If it really shipped, mark the lines shipped here. A ShipStation bulk sync was already tried and could not match it.'},
+  erp_shipped_shopify_open:{label:'Shipped here, but Shopify shows no fulfillment',hint:'The customer has no tracking. Fulfill it in Shopify with the tracking number, or check ShipStation\'s Shopify link.'},
+  fewer_units_in_erp:{label:'Fewer units here than in Shopify',hint:'An edited order, or two lines that share one SKU. Compare with the order in Shopify and fix the lines here.'},
+  webhooks_not_arriving:{label:'Shopify webhooks are not arriving',hint:'Shopify admin > Settings > Notifications > Webhooks: orders/create, orders/updated and orders/cancelled must be active and point at your shopify-orders function.'}
+};
+function _opsEnsure(){
+  if(!S.ops)S.ops={jobs:[],runs:[],events:[],reconRuns:[],issues:[],fixed:[],loadedAt:0,loading:false,fullLoaded:false,missing:false,err:'',running:{},retryAt:0};
+  return S.ops;
+}
+function _opsMissingErr(e){return !!e&&(e.code==='42P01'||/does not exist|schema cache|relation/i.test(String(e.message||'')));}
+async function opsLoad(full){
+  var O=_opsEnsure();if(O.loading)return;O.loading=true;
+  try{
+    var since24=new Date(Date.now()-24*3600*1000).toISOString(),since7=new Date(Date.now()-7*86400*1000).toISOString();
+    var qs=[db.from('ops_jobs').select('*').order('name'),
+            db.from('recon_issues').select('*').in('status',['open','ignored']).order('last_seen_at',{ascending:false}).limit(300)];
+    if(full)qs.push(
+      db.from('ops_job_runs').select('id,job,started_at,status,duration_ms,error,trigger').order('started_at',{ascending:false}).limit(15),
+      db.from('webhook_events').select('source,topic,status,via,deliveries,received_at,ref,error').gte('received_at',since24).order('received_at',{ascending:false}).limit(1500),
+      db.from('recon_runs').select('*').order('started_at',{ascending:false}).limit(5),
+      db.from('recon_issues').select('*').eq('status','auto_fixed').gte('resolved_at',since7).order('resolved_at',{ascending:false}).limit(100));
+    var rs=await Promise.all(qs);
+    var bad=rs.find(function(r){return r&&r.error;});
+    if(bad&&_opsMissingErr(bad.error)){O.missing=true;O.jobs=[];O.issues=[];O.retryAt=Date.now()+30*60000;}
+    else if(bad){O.err=String(bad.error.message||bad.error);}
+    else{
+      O.missing=false;O.err='';O.jobs=rs[0].data||[];O.issues=rs[1].data||[];
+      if(full){O.runs=rs[2].data||[];O.events=rs[3].data||[];O.reconRuns=rs[4].data||[];O.fixed=rs[5].data||[];}
+    }
+    O.loadedAt=Date.now();
+  }catch(e){O.err=String((e&&e.message)||e);}
+  if(full)O.fullLoaded=true;
+  O.loading=false;
+}
+function _opsLateMin(j){var iv=Number(j.interval_minutes)||5;return iv<=60?Math.max(iv*2.5,iv+10):iv*1.6;}
+function _opsJobHealth(j){
+  var now=Date.now();
+  if(j.enabled===false)return{state:'paused',label:'Paused',cls:'pill-muted'};
+  if(j.running_until&&new Date(j.running_until).getTime()>now&&j.last_started_at&&now-new Date(j.last_started_at).getTime()<30*60000)return{state:'running',label:'Running now',cls:'pill-teal'};
+  if(!j.last_ok_at&&!j.last_finished_at)return{state:'never',label:'Not run yet',cls:'pill-muted'};
+  if(j.last_status==='error')return{state:'failing',label:'Failing',cls:'pill-red'};
+  var ageMin=(now-new Date(j.last_ok_at).getTime())/60000;
+  if(ageMin>_opsLateMin(j))return{state:'late',label:'Late',cls:'pill-orange'};
+  return{state:'ok',label:'OK',cls:'pill-teal'};
+}
+// worth interrupting someone for: late, or failing for longer than two run intervals (one failed run that the next run fixes is not)
+function _opsNeedsAttention(j){
+  var h=_opsJobHealth(j);if(h.state==='late')return true;
+  if(h.state==='failing'){var iv=Number(j.interval_minutes)||5;var ref=j.last_ok_at?new Date(j.last_ok_at).getTime():(j.last_started_at?new Date(j.last_started_at).getTime():0);return !ref||(Date.now()-ref)/60000>iv*2;}
+  return false;
+}
+// the old browser timers step aside while the server is handling a job (or the job was paused on purpose)
+function _opsClientShouldSkip(name){
+  var O=S.ops;if(!O||O.missing||!O.jobs||!O.jobs.length)return false;
+  var j=O.jobs.find(function(x){return x.name===name;});if(!j)return false;
+  if(j.enabled===false)return true;
+  return !!j.last_ok_at&&(Date.now()-new Date(j.last_ok_at).getTime())/60000<=_opsLateMin(j);
+}
+function _opsSig(){var O=S.ops;if(!O)return '';return (O.jobs||[]).map(function(j){return j.name+':'+_opsJobHealth(j).state;}).join(',')+'|'+(O.issues||[]).filter(function(i){return i.status==='open';}).length;}
+async function opsQuietRefresh(){
+  var O=_opsEnsure();if(O.loading||!S.currentUserId)return;
+  if(O.missing&&Date.now()<O.retryAt)return;
+  var sig0=_opsSig();await opsLoad(false);
+  if(_opsSig()!==sig0&&(S.view==='dashboard'||S.view==='integrations')&&!(typeof isUserActivelyWorking==='function'&&isUserActivelyWorking()))render();
+}
+function _opsAlerts(alerts){
+  var O=S.ops;if(!O||O.missing||!O.jobs||!O.jobs.length)return;
+  var bad=O.jobs.filter(_opsNeedsAttention);
+  if(bad.length)alerts.push({level:'red',icon:'\u23f1',text:'Background job'+(bad.length>1?'s':'')+' not running: '+bad.map(function(j){return j.label||j.name;}).join(', ')+' - holds, deliveries and stock retries are not being kept up to date',nav:"S.intTab='jobs';nav('integrations')",lbl:'Check'});
+  var open=(O.issues||[]).filter(function(i){return i.status==='open';});
+  if(open.length){var hasErr=open.some(function(i){return i.severity==='error';});
+    alerts.push({level:hasErr?'red':'orange',icon:'\u2194',text:open.length+' Shopify/ERP difference'+(open.length>1?'s':'')+' found by the nightly check'+(hasErr?' (webhooks may be failing)':''),nav:"S.intTab='jobs';nav('integrations')",lbl:'Review'});}
+}
+function _opsSummaryText(job,sum){
+  if(!sum||typeof sum!=='object')return '';
+  if(job==='reconcile'&&typeof sum.examined==='number')return sum.examined+' orders checked, '+sum.issues_found+' difference'+(sum.issues_found!==1?'s':'')+', '+sum.auto_fixed+' repaired, '+sum.still_open+' need you'+(sum.dry_run?' (check only)':'');
+  if(job==='hold_sync'&&('markedHold' in sum||'markedOpen' in sum))return (sum.markedHold||0)+' put on hold, '+(sum.markedOpen||0)+' released';
+  if(job==='delivery_sync'&&'delivered' in sum)return (sum.delivered||0)+' marked Delivered';
+  var parts=[];Object.keys(sum).slice(0,5).forEach(function(k){var v=sum[k];
+    if(typeof v==='number'||typeof v==='string')parts.push(k.replace(/_/g,' ')+': '+v);else if(v&&typeof v==='object'&&'count' in v)parts.push(k.replace(/_/g,' ')+': '+v.count);});
+  return parts.join(', ');
+}
+async function opsRunNow(job,opts){
+  var O=_opsEnsure();if(O.running[job])return;O.running[job]=true;render();
+  var tok=SUPA_KEY;try{var ss=await db.auth.getSession();if(ss&&ss.data&&ss.data.session&&ss.data.session.access_token)tok=ss.data.session.access_token;}catch(_e){}
+  try{
+    var res=await fetch(SUPA_URL+'/functions/v1/ops-cron',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+tok},body:JSON.stringify(Object.assign({job:job},opts||{}))});
+    var j=await res.json().catch(function(){return {};});
+    if(res.status===404)toast('ops-cron is not deployed yet: see Setup at the bottom of this page',7000);
+    else if(res.status===401)toast('You are not signed in (or the session expired): sign out and in, then try again',7000);
+    else if(res.status===503)toast((j&&j.error)||'Not set up yet: run the setup SQL first',8000);
+    else if(!res.ok)toast('Could not run '+job+': '+((j&&j.error)||('HTTP '+res.status)),8000);
+    else if(j.status==='skipped')toast(job.replace(/_/g,' ')+': skipped ('+(j.reason||'')+')',4000);
+    else if(j.status==='error')toast(job.replace(/_/g,' ')+' failed: '+(j.error||''),9000);
+    else toast(job.replace(/_/g,' ')+' done: '+(_opsSummaryText(job,j.summary)||'ok'),6000);
+  }catch(e){toast('Could not reach ops-cron: '+((e&&e.message)||e),6000);}
+  O.running[job]=false;
+  await opsLoad(true);render();
+}
+async function opsToggle(name){
+  var O=_opsEnsure(),j=(O.jobs||[]).find(function(x){return x.name===name;});if(!j)return;
+  var r=await db.from('ops_jobs').update({enabled:j.enabled===false}).eq('name',name);
+  if(r&&r.error){toast('Could not change it: '+r.error.message,5000);return;}
+  await opsLoad(true);render();
+}
+async function opsIssue(id,status){
+  var by=(S.currentUser?String(S.currentUser):'staff');try{var ss=await db.auth.getSession();if(ss&&ss.data&&ss.data.session&&ss.data.session.user&&ss.data.session.user.email)by=ss.data.session.user.email;}catch(_e){}
+  var patch=status==='open'?{status:'open',resolved_at:null,resolved_by:null,fix_note:null}:{status:status,resolved_at:new Date().toISOString(),resolved_by:by,fix_note:status==='ignored'?'Ignored by staff':'Resolved by staff'};
+  var r=await db.from('recon_issues').update(patch).eq('id',id);
+  if(r&&r.error){toast('Could not update: '+r.error.message,5000);return;}
+  await opsLoad(true);render();
+}
+function _opsSetupPanel(open){
+  return '<details class="panel" style="padding:0;margin-top:12px"'+(open?' open':'')+'><summary style="cursor:pointer;padding:10px 14px;font-weight:700">Setup: database, schedule and functions</summary><div style="padding:0 14px 14px;font-size:var(--t-sm)">'
+   +'<ol style="margin:8px 0 10px 18px;line-height:1.6"><li><b>Database + schedule.</b> <button class="btn btn-sm" onclick="copyText(ERP_OPS_SQL,this)">Copy SQL</button> Open the Supabase SQL editor, paste it, put your <b>service_role</b> key on the line marked <code>PASTE HERE</code>, and Run. Safe to run again.</li>'
+   +'<li><b>Deploy three functions.</b> <b>ops-cron</b> is new (source below). <b>shopify-orders v23.84</b> and <b>shipstation-ship v23.98</b> add the webhook log: copy them from Integrations &rarr; Setup Guide, or push the files to GitHub.</li>'
+   +'<li><b>Come back here and press Refresh.</b> All four jobs should show OK within about five minutes.</li></ol>'
+   +'<div style="display:flex;align-items:center;gap:8px;margin:6px 0"><span class="pn">supabase/functions/ops-cron/index.ts</span><button class="btn btn-sm" style="margin-left:auto" onclick="copyText(ERP_OPS_CRON_SRC,this)">Copy</button></div>'
+   +'<pre style="background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:12px;font-size:var(--t-xs);max-height:260px;overflow:auto;white-space:pre-wrap">'+escHtml(ERP_OPS_CRON_SRC)+'</pre>'
+   +'<div class="t3xs" style="color:var(--text3);margin-top:6px">To stop everything later, run in the SQL editor: <code>select cron.unschedule(jobname) from cron.job where jobname like \'tgk-ops-%\';</code></div></div></details>';
+}
+function renderOpsPanel(){
+  var O=_opsEnsure();
+  if(!O.fullLoaded&&!O.loading){setTimeout(function(){opsLoad(true).then(function(){render();});},0);}
+  if(!O.loadedAt)return '<div class="panel" style="padding:14px">Loading background jobs&hellip;</div>'+_opsSetupPanel(false);
+  if(O.missing)return '<div class="panel" style="padding:12px 14px;border-left:3px solid var(--orange)"><b>Not set up yet.</b> <span style="color:var(--text2)">Until you do the steps below, holds, deliveries and stock retries still only run while someone has the ERP open in a browser. This takes about five minutes.</span></div>'+_opsSetupPanel(true);
+  var h='<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap"><div style="font-size:var(--t-sm);color:var(--text2);flex:1;min-width:220px">These run on the server on a schedule, whether or not anyone has the ERP open.</div>'
+   +'<span class="t3xs" style="color:var(--text3)">updated '+timeAgo(new Date(O.loadedAt).toISOString())+'</span><button class="btn btn-sm" '+(O.loading?'disabled':'')+' onclick="S.ops.fullLoaded=false;render()">Refresh</button></div>';
+  if(O.err)h+='<div class="panel" style="padding:8px 14px;border-left:3px solid var(--red);font-size:var(--t-sm)">Could not load some data: '+escHtml(O.err)+'</div>';
+  // ---- jobs
+  var rows=(O.jobs||[]).map(function(j){var hh=_opsJobHealth(j),every=(j.interval_minutes>=1440?'every night':'every '+j.interval_minutes+' min'),run=!!O.running[j.name];
+    return '<tr><td style="min-width:190px;white-space:normal"><b>'+escHtml(j.label||j.name)+'</b><div class="t3xs" style="color:var(--text3);white-space:normal">'+escHtml(j.description||'')+'</div></td><td class="t3xs">'+every+'</td>'
+     +'<td><span class="pill '+hh.cls+'">'+hh.label+'</span></td>'
+     +'<td>'+(j.last_ok_at?timeAgo(j.last_ok_at):'never')+(j.last_status==='error'&&j.last_error?'<div class="t3xs" style="color:var(--red);max-width:260px">'+escHtml(String(j.last_error).slice(0,160))+'</div>':'')+'</td>'
+     +'<td class="t3xs">'+escHtml(_opsSummaryText(j.name,j.last_summary))+'</td>'
+     +'<td style="white-space:nowrap"><button class="btn btn-sm" '+(run?'disabled':'')+' onclick="opsRunNow(\''+j.name+'\')">'+(run?'Running&hellip;':'Run now')+'</button> <button class="btn btn-sm" onclick="opsToggle(\''+j.name+'\')">'+(j.enabled===false?'Resume':'Pause')+'</button></td></tr>';}).join('');
+  h+='<div class="panel" style="padding:0"><div class="panel-title"><span>Scheduled jobs</span></div><div class="tbl-wrap"><table><thead><tr><th>Job</th><th>Runs</th><th>Status</th><th>Last success</th><th>Last result</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+  // ---- reconciliation
+  var lr=(O.reconRuns||[])[0],open=(O.issues||[]).filter(function(i){return i.status==='open';}),ign=(O.issues||[]).filter(function(i){return i.status==='ignored';});
+  var runR=!!O.running.reconcile;
+  h+='<div class="panel" style="padding:0;margin-top:12px"><div class="panel-title"><span>Shopify vs ERP: nightly check</span><div style="display:flex;gap:8px"><button class="btn btn-sm" '+(runR?'disabled':'')+' onclick="opsRunNow(\'reconcile\',{dry_run:true})" title="Look for differences but repair nothing">Check only</button><button class="btn btn-primary btn-sm" '+(runR?'disabled':'')+' onclick="opsRunNow(\'reconcile\')" title="Check the last 72 hours and repair what is safe to repair">'+(runR?'Running&hellip;':'Check &amp; repair now')+'</button></div></div>'
+   +'<div style="padding:8px 14px;font-size:var(--t-sm);color:var(--text2)">'+(lr?('Last check '+timeAgo(lr.started_at)+': '+escHtml(_opsSummaryText('reconcile',lr.summary)||lr.status)+'.'):'It has not run yet. It runs every night, or press the button.')+' It compares every Shopify order from the last 72 hours with the ERP, re-sends anything the ERP missed through the normal webhook path, and lists whatever is left.</div>';
+  if(open.length){
+    h+='<div class="tbl-wrap"><table><thead><tr><th>Problem</th><th>Order</th><th>Detail</th><th>First seen</th><th></th></tr></thead><tbody>'+open.map(function(i){var k=OPS_KIND[i.kind]||{label:i.kind,hint:''};
+      return '<tr><td><span style="color:'+(i.severity==='error'?'var(--red)':'var(--orange)')+'">&#9679;</span> <b>'+escHtml(k.label)+'</b></td>'
+       +'<td>'+(i.order_number?'<a href="#" data-o="'+escHtml(i.order_number)+'" onclick="goToOrder(this.dataset.o);return false">'+escHtml(i.order_number)+'</a>':'&mdash;')+'</td>'
+       +'<td style="max-width:420px">'+escHtml(i.detail||'')+'<div class="t3xs" style="color:var(--text3);margin-top:2px">'+escHtml(k.hint)+'</div></td><td class="t3xs">'+timeAgo(i.first_seen_at)+'</td>'
+       +'<td style="white-space:nowrap"><button class="btn btn-sm" onclick="opsIssue('+i.id+',\'resolved\')">Resolved</button> <button class="btn btn-sm" onclick="opsIssue('+i.id+',\'ignored\')">Ignore</button></td></tr>';}).join('')+'</tbody></table></div>';
+  }else if(lr){h+='<div style="padding:4px 14px 12px;font-size:var(--t-sm);color:var(--green)">&#10003; Nothing needs attention.</div>';}
+  if(ign.length)h+='<details style="padding:6px 14px 10px;font-size:var(--t-sm)"><summary style="cursor:pointer;color:var(--text3)">Ignored ('+ign.length+')</summary>'+ign.map(function(i){var k=OPS_KIND[i.kind]||{label:i.kind};return '<div style="margin:4px 0">'+escHtml(k.label)+' &middot; '+escHtml(i.order_number||'')+' <button class="btn btn-sm" onclick="opsIssue('+i.id+',\'open\')">Reopen</button></div>';}).join('')+'</details>';
+  if((O.fixed||[]).length)h+='<details style="padding:6px 14px 12px;font-size:var(--t-sm)"><summary style="cursor:pointer;color:var(--text3)">Repaired automatically in the last 7 days ('+O.fixed.length+')</summary>'+O.fixed.map(function(i){var k=OPS_KIND[i.kind]||{label:i.kind};return '<div class="t3xs" style="margin:3px 0">'+timeAgo(i.resolved_at)+' &middot; '+escHtml(i.order_number||'')+' &middot; '+escHtml(k.label)+' &rarr; '+escHtml(i.fix_note||'')+'</div>';}).join('')+'</details>';
+  h+='</div>';
+  // ---- webhooks
+  var ev=O.events||[],groups={},lastShop=0,errs=[];
+  ev.forEach(function(e){var key=e.source+'|'+e.topic,g=groups[key]||(groups[key]={source:e.source,topic:e.topic,n:0,ok:0,err:0,dup:0,rep:0,last:e.received_at});
+    g.n++;if(e.status==='ok')g.ok++;if(e.status==='error'){g.err++;if(errs.length<8)errs.push(e);}g.dup+=Math.max(0,(e.deliveries||1)-1);if(e.via==='replay')g.rep++;if(e.received_at>g.last)g.last=e.received_at;
+    if(e.source==='shopify'&&e.via!=='replay'){var t=new Date(e.received_at).getTime();if(t>lastShop)lastShop=t;}});
+  var gl=Object.keys(groups).sort().map(function(k){return groups[k];});
+  var d=new Date(),biz=d.getDay()>=1&&d.getDay()<=5&&d.getHours()>=9&&d.getHours()<19;
+  var warn='';
+  if(!ev.length)warn='Nothing has been logged yet. Once shopify-orders v23.84 and shipstation-ship v23.98 are deployed, every webhook shows up here.';
+  else if(biz&&lastShop&&Date.now()-lastShop>8*3600*1000)warn='Shopify has not sent an order webhook for '+Math.floor((Date.now()-lastShop)/3600000)+' hours during business hours. If orders have been coming in, check the webhook settings in Shopify.';
+  h+='<div class="panel" style="padding:0;margin-top:12px"><div class="panel-title"><span>Webhooks, last 24 hours</span></div>'+(warn?'<div style="padding:8px 14px;font-size:var(--t-sm);color:var(--orange)">'+escHtml(warn)+'</div>':'');
+  if(gl.length)h+='<div class="tbl-wrap"><table><thead><tr><th>From</th><th>Event</th><th>Received</th><th>OK</th><th>Failed</th><th>Re-deliveries skipped</th><th>Repair replays</th><th>Last</th></tr></thead><tbody>'+gl.map(function(g){
+    return '<tr><td>'+escHtml(g.source)+'</td><td><b>'+escHtml(g.topic)+'</b></td><td>'+g.n+'</td><td>'+g.ok+'</td><td style="color:'+(g.err?'var(--red)':'inherit')+';font-weight:'+(g.err?'700':'400')+'">'+g.err+'</td><td>'+g.dup+'</td><td>'+g.rep+'</td><td class="t3xs">'+timeAgo(g.last)+'</td></tr>';}).join('')+'</tbody></table></div>';
+  if(errs.length)h+='<div style="padding:8px 14px 12px;font-size:var(--t-sm)"><b>Recent failures</b>'+errs.map(function(e){return '<div class="t3xs" style="margin:3px 0;color:var(--red)">'+timeAgo(e.received_at)+' &middot; '+escHtml(e.source+' '+e.topic)+' &middot; '+escHtml(e.ref||'')+' &mdash; '+escHtml(String(e.error||'').slice(0,160))+'</div>';}).join('')+'<div class="t3xs" style="color:var(--text3);margin-top:4px">A failed Shopify webhook is retried by Shopify, and the nightly check re-sends anything still missing.</div></div>';
+  h+='</div>';
+  return h+_opsSetupPanel(false);
+}
+window.renderOpsPanel=renderOpsPanel;window.opsRunNow=opsRunNow;window.opsToggle=opsToggle;window.opsIssue=opsIssue;window.opsLoad=opsLoad;
+function _opsTabDot(){var O=S.ops;if(!O||O.missing||!O.jobs||!O.jobs.length)return '';var bad=O.jobs.some(_opsNeedsAttention)||(O.issues||[]).some(function(i){return i.status==='open';});return bad?' <span style="color:var(--red)">&#9679;</span>':'';}
+var ERP_OPS_SQL=`-- ============================================================================
+-- TGK ERP v23.13  -  BACKGROUND JOBS, WEBHOOK LOG, RECONCILIATION
+-- Run this ONCE in the Supabase SQL editor (safe to run again). Then deploy the three functions.
+--
+-- BEFORE YOU RUN IT: paste your service_role key between the quotes on the line marked  <<< PASTE HERE
+-- (Supabase dashboard > Project Settings > API > "service_role" key). It is stored in Supabase's encrypted
+-- Vault, never in the ERP, and the schedule uses it to call your ops-cron function.
+-- ============================================================================
+
+-- ---- 1. the service key, kept in the Vault --------------------------------------------------------
+do $$
+declare k text := 'PASTE_SERVICE_ROLE_KEY_HERE';   -- <<< PASTE HERE
+        sid uuid;
+begin
+  if k like 'PASTE%' then raise exception 'Paste your service_role key on the line marked PASTE HERE first, then run again.'; end if;
+  select id into sid from vault.secrets where name = 'ops_service_key';
+  if sid is null then perform vault.create_secret(k, 'ops_service_key', 'TGK ops-cron: lets the schedule call the ops-cron function');
+  else perform vault.update_secret(sid, k); end if;
+end $$;
+
+-- ---- 2. tables --------------------------------------------------------------------------------
+create table if not exists ops_jobs (
+  name              text primary key,
+  label             text not null,
+  description       text,
+  interval_minutes  int  not null,
+  enabled           boolean not null default true,
+  last_started_at   timestamptz,
+  last_finished_at  timestamptz,
+  last_ok_at        timestamptz,
+  last_status       text,
+  last_summary      jsonb,
+  last_error        text,
+  running_until     timestamptz,
+  run_count         bigint not null default 0,
+  fail_count        bigint not null default 0
+);
+create table if not exists ops_job_runs (
+  id           bigserial primary key,
+  job          text not null,
+  started_at   timestamptz not null default now(),
+  finished_at  timestamptz,
+  status       text,
+  duration_ms  int,
+  summary      jsonb,
+  error        text,
+  trigger      text
+);
+create index if not exists ops_job_runs_job_idx on ops_job_runs (job, started_at desc);
+
+create table if not exists webhook_events (
+  id           bigserial primary key,
+  source       text not null,                 -- shopify | shipstation
+  topic        text not null,
+  external_id  text,                          -- Shopify's webhook id (lets a re-delivery be recognised)
+  ref          text,                          -- order name / ShipStation resource id
+  status       text not null default 'received',   -- received | ok | error
+  error        text,
+  via          text not null default 'webhook',    -- webhook | replay (sent by the reconciliation repair)
+  deliveries   int  not null default 1,
+  received_at  timestamptz not null default now(),
+  finished_at  timestamptz,
+  duration_ms  int
+);
+create unique index if not exists webhook_events_ext_uq on webhook_events (source, external_id) where external_id is not null;
+create index if not exists webhook_events_recent_idx on webhook_events (received_at desc);
+create index if not exists webhook_events_ref_idx on webhook_events (source, topic, ref);
+
+create table if not exists recon_runs (
+  id            bigserial primary key,
+  started_at    timestamptz not null default now(),
+  finished_at   timestamptz,
+  window_hours  int,
+  trigger       text,
+  status        text,
+  summary       jsonb,
+  error         text
+);
+create table if not exists recon_issues (
+  id             bigserial primary key,
+  issue_key      text not null unique,          -- kind|order, so the same problem is one row, not one per night
+  kind           text not null,
+  order_number   text,
+  detail         text,
+  severity       text not null default 'warn',  -- warn | error
+  status         text not null default 'open',  -- open | auto_fixed | resolved | ignored
+  run_id         bigint,
+  first_seen_at  timestamptz not null default now(),
+  last_seen_at   timestamptz not null default now(),
+  resolved_at    timestamptz,
+  resolved_by    text,
+  fix_note       text
+);
+create index if not exists recon_issues_status_idx on recon_issues (status, last_seen_at desc);
+
+-- ---- 3. who can see and change what ---------------------------------------------------------------
+-- The server functions use the service key and bypass these rules. Signed-in ERP users can read everything, pause or resume a job,
+-- and mark a reconciliation issue resolved/ignored. Nothing else is writable from the browser.
+do $$
+declare t text;
+begin
+  foreach t in array array['ops_jobs','ops_job_runs','webhook_events','recon_runs','recon_issues'] loop
+    execute format('alter table %I enable row level security', t);
+    execute format('drop policy if exists "staff read" on %I', t);
+    execute format('create policy "staff read" on %I for select to authenticated using (true)', t);
+  end loop;
+end $$;
+drop policy if exists "staff pause jobs" on ops_jobs;
+create policy "staff pause jobs" on ops_jobs for update to authenticated using (true) with check (true);
+drop policy if exists "staff resolve issues" on recon_issues;
+create policy "staff resolve issues" on recon_issues for update to authenticated using (true) with check (true);
+
+-- ---- 4. the jobs --------------------------------------------------------------------------------
+insert into ops_jobs (name, label, description, interval_minutes) values
+  ('hold_sync',     'Hold sync',               'Mirrors ShipStation holds and releases into the ERP',                                         5),
+  ('deduct_retry',  'Stock-deduction retry',   'Retries shipments whose stock deduction failed',                                              5),
+  ('delivery_sync', 'Delivery sync',           'Marks shipped orders Delivered from carrier tracking',                                        30),
+  ('reconcile',     'Nightly reconciliation',  'Compares Shopify with the ERP for the last 72 hours, repairs what is safe and reports the rest', 1440)
+on conflict (name) do update set label = excluded.label, description = excluded.description, interval_minutes = excluded.interval_minutes;
+
+-- ---- 5. the schedule ----------------------------------------------------------------------------------
+create extension if not exists pg_cron;
+create extension if not exists pg_net;
+
+create or replace function public.ops_call(job text, extra jsonb default '{}'::jsonb) returns void
+language plpgsql security definer set search_path = public, extensions, vault as $$
+declare k text;
+begin
+  select decrypted_secret into k from vault.decrypted_secrets where name = 'ops_service_key' limit 1;
+  if k is null then raise exception 'ops_service_key is missing from the Vault: run section 1 of ops_setup.sql'; end if;
+  perform net.http_post(
+    url     := 'https://piamamighqiielfztgic.supabase.co/functions/v1/ops-cron',
+    headers := jsonb_build_object('Content-Type', 'application/json', 'Authorization', 'Bearer ' || k),
+    body    := jsonb_build_object('job', job) || extra,
+    timeout_milliseconds := 150000);
+end $$;
+revoke all on function public.ops_call(text, jsonb) from public, anon, authenticated;
+
+do $$
+declare j record;
+begin
+  for j in select * from (values
+      ('tgk-ops-hold-sync',     '*/5 * * * *',     'hold_sync'),
+      ('tgk-ops-deduct-retry',  '2-59/5 * * * *',  'deduct_retry'),
+      ('tgk-ops-delivery-sync', '7,37 * * * *',    'delivery_sync'),
+      ('tgk-ops-reconcile',     '15 9 * * *',      'reconcile')      -- 09:15 UTC = 3:15 am Central (4:15 am in summer)
+    ) as v(jobname, sched, job) loop
+    if exists (select 1 from cron.job where cron.job.jobname = j.jobname) then perform cron.unschedule(j.jobname); end if;
+    perform cron.schedule(j.jobname, j.sched, format('select public.ops_call(%L)', j.job));
+  end loop;
+end $$;
+
+-- To stop everything later:  select cron.unschedule(jobname) from cron.job where jobname like 'tgk-ops-%';
+-- To look at what the schedule is doing:  select * from cron.job_run_details order by start_time desc limit 20;
+`;
+var ERP_OPS_CRON_SRC=`// ============================================================================
+// SUPABASE EDGE FUNCTION: ops-cron          (function version v1.0)
+// ============================================================================
+// Runs the ERP's background jobs ON THE SERVER, so they no longer stop when nobody has the ERP open in a browser.
+//
+//   hold_sync      every 5 min    ShipStation holds and releases  -> ERP
+//   deduct_retry   every 5 min    retries shipments whose stock deduction failed
+//   delivery_sync  every 30 min   carrier tracking                -> orders marked Delivered
+//   reconcile      nightly        compares Shopify with the ERP for the last 72 hours, repairs what is safe, reports the rest
+//
+// The database schedule (pg_cron, set up by ops_setup.sql) calls it. Staff can also press "Run now" in the ERP
+// (Integrations > Background Jobs).
+//
+// POST JSON { job: "hold_sync" | "deduct_retry" | "delivery_sync" | "reconcile", hours?: 72, dry_run?: false }
+//   -> { ok, job, status: "ok" | "error" | "skipped", summary?, error?, reason? }
+// POST JSON { action: "version" } -> { fn: "ops-cron", build }       (no sign-in needed; the ERP's version panel uses it)
+//
+// WHAT RECONCILE CHECKS (each Shopify order changed in the window, against the ERP's order lines):
+//   missing_in_erp           Shopify has the order, the ERP has no lines for it          -> REPAIRED by replaying orders/create
+//   cancel_not_applied       cancelled in Shopify, still open in the ERP                 -> REPAIRED by replaying orders/cancelled
+//   shopify_fulfilled_erp_open  Shopify says fulfilled, the ERP still shows it unshipped -> REPAIRED by one ShipStation bulk sync
+//   erp_shipped_shopify_open ERP says shipped, Shopify never got the fulfillment/tracking -> REPORTED (the customer has no tracking)
+//   fewer_units_in_erp       the ERP has fewer units than Shopify (an edit, or two lines sharing a SKU) -> REPORTED
+//   webhooks_not_arriving    orders are being created but their webhooks are not reaching the ERP      -> REPORTED
+// "Replaying" means sending the order back through the SAME shopify-orders code path a live webhook uses, which skips
+// anything already recorded, so a repair can never double-count.
+//
+// SAFETY, in plain words:
+//   * Only the schedule (service key) or a signed-in ERP user can call it. Everything else is refused (401).
+//   * It never deletes orders or touches stock directly; repairs go through the existing, tested functions.
+//   * A lock stops two runs of the same job overlapping. Max 25 repairs per run. dry_run:true repairs nothing.
+//
+// SETUP: run ops_setup.sql in the Supabase SQL editor FIRST, then deploy this. Secrets it uses (all already set for your
+// other functions): SHOPIFY_STORE, SHOPIFY_KEY, optional SHOPIFY_WEBHOOK_SECRET. SUPABASE_URL and
+// SUPABASE_SERVICE_ROLE_KEY are provided by Supabase automatically.
+// ============================================================================
+import { createClient } from 'npm:@supabase/supabase-js@2'
+
+const FUNCTION_VERSION = 'v1.0'
+const JOBS = ['hold_sync', 'deduct_retry', 'delivery_sync', 'reconcile']
+const LOCK_MINUTES: Record<string, number> = { hold_sync: 8, deduct_retry: 8, delivery_sync: 12, reconcile: 25 }
+const API_VERSION = '2024-01'
+const MAX_REPLAYS = 25
+const MAX_SHOPIFY_PAGES = 20
+// what the ERP treats as "not shipped yet" / "can still be cancelled"
+const NOT_SHIPPED = ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order', 'Ordered']
+const CANCELLABLE = ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order']
+const SHIPPED = ['Shipped', 'Delivered']
+const INACTIVE = ['Cancelled', 'Refunded', 'Returned']
+
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+  'Content-Type': 'application/json',
+}
+const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: CORS })
+const orderKey = (n: unknown) => String(n ?? '').trim().replace(/^#+/, '').toUpperCase()
+const chunks = <T,>(a: T[], n: number): T[][] => { const o: T[][] = []; for (let i = 0; i < a.length; i += n) o.push(a.slice(i, i + n)); return o }
+function safeEqual(a: string, b: string): boolean {
+  if (!a || !b || a.length !== b.length) return false
+  let d = 0
+  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return d === 0
+}
+async function hmacB64(secret: string, text: string): Promise<string> {
+  const enc = new TextEncoder()
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(text)))
+  let bin = ''
+  for (let i = 0; i < mac.length; i++) bin += String.fromCharCode(mac[i])
+  return btoa(bin)
+}
+/** Keep a job's answer small and readable: numbers, short text, and the length of any list. */
+export function compact(v: any, depth = 0): any {
+  if (v === null || v === undefined) return v
+  if (Array.isArray(v)) return { count: v.length }
+  if (typeof v === 'object') {
+    if (depth > 1) return undefined
+    const o: any = {}
+    for (const k of Object.keys(v).slice(0, 24)) { const c = compact(v[k], depth + 1); if (c !== undefined) o[k] = c }
+    return o
+  }
+  if (typeof v === 'string') return v.slice(0, 160)
+  return v
+}
+
+export function createHandler(deps: { env: Record<string, string | undefined>; fetchFn: typeof fetch; db: any; now?: () => Date; log?: (...a: any[]) => void; callTimeoutMs?: number }) {
+  const { env, fetchFn, db } = deps
+  const now = deps.now || (() => new Date())
+  const log = deps.log || ((...a: any[]) => console.log('[ops-cron]', ...a))
+  const SUPA = String(env.SUPABASE_URL || '').replace(/\\/$/, '')
+  const SERVICE = String(env.SUPABASE_SERVICE_ROLE_KEY || '')
+
+  // ------------------------------------------------------------------ calling the other server functions
+  async function callFn(fn: string, payload: any, timeoutMs = deps.callTimeoutMs || 140000): Promise<any> {
+    const ctl = new AbortController()
+    const t = setTimeout(() => ctl.abort(), timeoutMs)
+    try {
+      const r = await fetchFn(SUPA + '/functions/v1/' + fn, {
+        method: 'POST', signal: ctl.signal,
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + SERVICE },
+        body: JSON.stringify(payload),
+      })
+      const text = await r.text()
+      let json: any = null
+      try { json = JSON.parse(text) } catch (_) { /* plain text answer */ }
+      if (!r.ok) throw new Error(fn + (payload.action ? ' ' + payload.action : '') + ': HTTP ' + r.status + ' ' + String((json && json.error) || text).slice(0, 200))
+      return json ?? { text: text.slice(0, 200) }
+    } catch (e: any) {
+      if (e && e.name === 'AbortError') throw new Error(fn + ': no answer within ' + Math.round(timeoutMs / 1000) + 's')
+      throw e
+    } finally { clearTimeout(t) }
+  }
+
+  // ------------------------------------------------------------------ Shopify (read) and webhook replay
+  function shopifyCreds() {
+    const store = String(env.SHOPIFY_STORE || '').replace(/^https?:\\/\\//, '').replace(/\\/.*$/, '')
+    let key = ''
+    for (const n of ['SHOPIFY_KEY', 'SHOPIFY_ADMIN_TOKEN', 'SHOPIFY_ADMIN_API_TOKEN', 'SHOPIFY_ACCESS_TOKEN', 'SHOPIFY_API_ACCESS_TOKEN', 'SHOPIFY_TOKEN']) { const v = String(env[n] || '').trim(); if (v) { key = v; break } }
+    if (!store || !key) throw new Error('Shopify is not set up for this function: set SHOPIFY_STORE and SHOPIFY_KEY in the edge function secrets')
+    return { store, key }
+  }
+  async function shopifyFetch(url: string, key: string): Promise<Response> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const r = await fetchFn(url, { headers: { 'X-Shopify-Access-Token': key } })
+      if (r.status === 429 && attempt < 2) { const ra = parseFloat(r.headers.get('retry-after') || ''); const wait = Math.min(8, isFinite(ra) ? ra : 2); await new Promise((res) => setTimeout(res, wait * 1000)); continue }
+      return r
+    }
+    throw new Error('Shopify kept answering 429 (too many requests)')
+  }
+  async function listShopifyOrders(sinceIso: string): Promise<any[]> {
+    const { store, key } = shopifyCreds()
+    const fields = 'id,name,created_at,updated_at,cancelled_at,financial_status,fulfillment_status,test,line_items,fulfillments'
+    let url: string | null = 'https://' + store + '/admin/api/' + API_VERSION + '/orders.json?status=any&limit=250&fields=' + fields + '&updated_at_min=' + encodeURIComponent(sinceIso)
+    const out: any[] = []
+    for (let page = 0; url && page < MAX_SHOPIFY_PAGES; page++) {
+      const r = await shopifyFetch(url, key)
+      if (r.status === 401 || r.status === 403) throw new Error('Shopify refused the token (HTTP ' + r.status + '): it needs read_orders')
+      if (!r.ok) throw new Error('Shopify answered HTTP ' + r.status)
+      const j: any = await r.json()
+      out.push(...(j.orders || []))
+      const m = /<([^>]+)>;\\s*rel="next"/.exec(r.headers.get('link') || '')
+      url = m ? m[1] : null
+    }
+    return out
+  }
+  async function getFullShopifyOrder(id: number | string): Promise<any | null> {
+    const { store, key } = shopifyCreds()
+    const r = await shopifyFetch('https://' + store + '/admin/api/' + API_VERSION + '/orders/' + id + '.json', key)
+    if (!r.ok) return null
+    const j: any = await r.json()
+    return j.order || null
+  }
+  /** Send an order back through shopify-orders exactly the way a live Shopify webhook arrives. */
+  async function replayWebhook(topic: string, order: any): Promise<boolean> {
+    const raw = JSON.stringify(order)
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json', Authorization: 'Bearer ' + SERVICE,
+      'x-shopify-topic': topic, 'x-shopify-webhook-id': 'recon-' + order.id + '-' + topic + '-' + now().getTime(), 'x-ops-replay': '1',
+    }
+    const secret = String(env.SHOPIFY_WEBHOOK_SECRET || '')
+    if (secret) headers['x-shopify-hmac-sha256'] = await hmacB64(secret, raw)
+    const r = await fetchFn(SUPA + '/functions/v1/shopify-orders', { method: 'POST', headers, body: raw })
+    return r.ok
+  }
+
+  // ------------------------------------------------------------------ job bookkeeping
+  async function getJob(name: string): Promise<{ row: any | null; missing: boolean }> {
+    const { data, error } = await db.from('ops_jobs').select('*').eq('name', name).limit(1)
+    if (error) return { row: null, missing: /does not exist|schema cache|relation/i.test(String(error.message || '')) }
+    return { row: (data && data[0]) || null, missing: false }
+  }
+  /** One UPDATE that only succeeds if nobody else holds the lock: that is the whole lock. */
+  async function acquire(name: string, minutes: number): Promise<any | null> {
+    const t = now()
+    const until = new Date(t.getTime() + minutes * 60000).toISOString()
+    const { data, error } = await db.from('ops_jobs')
+      .update({ running_until: until, last_started_at: t.toISOString() })
+      .eq('name', name).or('running_until.is.null,running_until.lt.' + t.toISOString()).select()
+    if (error || !data || !data.length) return null
+    return data[0]
+  }
+
+  async function runJob(name: string, trigger: string, opts: any): Promise<any> {
+    if (!JOBS.includes(name)) return { ok: false, status: 'error', error: 'Unknown job: ' + name, http: 400 }
+    const { row, missing } = await getJob(name)
+    if (missing) return { ok: false, status: 'error', error: 'The ops tables are not set up yet: run ops_setup.sql in the Supabase SQL editor first', http: 503 }
+    if (!row) return { ok: false, status: 'error', error: 'Job "' + name + '" is not in ops_jobs: re-run ops_setup.sql', http: 503 }
+    if (row.enabled === false && trigger === 'cron') return { ok: true, job: name, status: 'skipped', reason: 'paused' }
+    const locked = await acquire(name, LOCK_MINUTES[name])
+    if (!locked) return { ok: true, job: name, status: 'skipped', reason: 'already running' }
+    const t0 = now()
+    let runId: number | null = null
+    try {
+      const ins = await db.from('ops_job_runs').insert({ job: name, started_at: t0.toISOString(), status: 'running', trigger }).select('id')
+      runId = ins && ins.data && ins.data[0] ? ins.data[0].id : null
+    } catch (_) { /* the log is best-effort */ }
+    let status = 'ok', summary: any = null, error: string | null = null
+    try {
+      if (name === 'hold_sync') summary = compact(await callFn('shipstation-ship', { action: 'hold_sync' }))
+      else if (name === 'deduct_retry') summary = compact(await callFn('shipstation-ship', { action: 'retry_pending_deductions' }))
+      else if (name === 'delivery_sync') summary = compact(await callFn('shipstation-ship', { action: 'delivery_sync' }))
+      else summary = await reconcile(opts || {})
+    } catch (e: any) { status = 'error'; error = String((e && e.message) || e).slice(0, 400) }
+    const t1 = now()
+    const patch: any = { last_finished_at: t1.toISOString(), last_status: status, last_summary: summary, last_error: error, running_until: null,
+      run_count: (locked.run_count || 0) + 1, fail_count: (locked.fail_count || 0) + (status === 'error' ? 1 : 0) }
+    if (status === 'ok') patch.last_ok_at = t1.toISOString()
+    await db.from('ops_jobs').update(patch).eq('name', name)
+    if (runId !== null) await db.from('ops_job_runs').update({ finished_at: t1.toISOString(), status, duration_ms: t1.getTime() - t0.getTime(), summary, error }).eq('id', runId)
+    log(name, status, error || '')
+    return { ok: status === 'ok', job: name, status, summary, error }
+  }
+
+  // ------------------------------------------------------------------ nightly reconciliation
+  type Issue = { key: string; kind: string; order: string | null; detail: string; severity: string; fixed?: string }
+
+  async function erpRowsFor(names: string[]): Promise<Map<string, any[]>> {
+    const map = new Map<string, any[]>()
+    const wanted: string[] = []
+    for (const n of names) { const k = orderKey(n); wanted.push('#' + k, k) }
+    for (const part of chunks(Array.from(new Set(wanted)), 100)) {
+      const { data, error } = await db.from('sales').select('id,order_number,pn,qty,fulfillment_status,shipped_at,created_at').in('order_number', part)
+      if (error) throw new Error('Could not read the ERP order lines: ' + error.message)
+      for (const r of data || []) { const k = orderKey(r.order_number); const a = map.get(k) || []; a.push(r); map.set(k, a) }
+    }
+    return map
+  }
+
+  async function reconcile(opts: any): Promise<any> {
+    const hours = Math.min(336, Math.max(6, Number(opts.hours) || 72))
+    const dry = !!opts.dry_run
+    const t0 = now()
+    const since = new Date(t0.getTime() - hours * 3600000).toISOString()
+    let runId: number | null = null
+    try { const ins = await db.from('recon_runs').insert({ started_at: t0.toISOString(), window_hours: hours, trigger: opts.trigger || 'cron', status: 'running' }).select('id'); runId = ins && ins.data && ins.data[0] ? ins.data[0].id : null } catch (_) { /* best effort */ }
+
+    const orders = await listShopifyOrders(since)
+    const erp = await erpRowsFor(orders.map((o) => o.name))
+    const issues: Issue[] = []
+    const examined = new Set<string>()
+    const MIN = 60000
+    const add = (kind: string, o: any, detail: string, severity = 'warn') => { const k = orderKey(o.name); issues.push({ key: kind + '|' + k, kind, order: String(o.name), detail, severity }) }
+
+    for (const o of orders) {
+      if (o.test) continue
+      const k = orderKey(o.name)
+      examined.add(k)
+      const rows = erp.get(k) || []
+      const shopLines = (o.line_items || []).filter((li: any) => (li.sku || li.title) && Number(li.current_quantity ?? li.quantity ?? 1) > 0)
+      const shopQty = shopLines.reduce((a: number, li: any) => a + Number(li.current_quantity ?? li.quantity ?? 1), 0)
+      const ageMin = (t0.getTime() - new Date(o.created_at).getTime()) / MIN
+      if (o.cancelled_at) {
+        if (rows.some((r) => CANCELLABLE.includes(r.fulfillment_status))) add('cancel_not_applied', o, 'Cancelled in Shopify, but ' + rows.filter((r) => CANCELLABLE.includes(r.fulfillment_status)).length + ' line(s) are still open in the ERP')
+        continue
+      }
+      if (!rows.length) {
+        if (shopLines.length && ageMin >= 10) add('missing_in_erp', o, 'In Shopify (' + shopQty + ' unit' + (shopQty !== 1 ? 's' : '') + ') but the ERP has no lines for it: its webhook never arrived')
+        continue
+      }
+      const erpQty = rows.filter((r) => r.fulfillment_status !== 'Cancelled').reduce((a, r) => a + Number(r.qty || 0), 0)
+      if (erpQty < shopQty) add('fewer_units_in_erp', o, 'Shopify has ' + shopQty + ' unit(s), the ERP has ' + erpQty + ' (an edited order, or two lines sharing one SKU)')
+      const fulfs = (o.fulfillments || []).filter((f: any) => f.status !== 'cancelled')
+      const lastFulfil = fulfs.reduce((m: number, f: any) => Math.max(m, new Date(f.created_at).getTime()), 0)
+      if (o.fulfillment_status === 'fulfilled' && lastFulfil && (t0.getTime() - lastFulfil) / MIN >= 120 && rows.some((r) => NOT_SHIPPED.includes(r.fulfillment_status))) {
+        const trk = fulfs.map((f: any) => f.tracking_number).filter(Boolean)[0]
+        add('shopify_fulfilled_erp_open', o, 'Shopify shows it fulfilled' + (trk ? ' (tracking ' + trk + ')' : '') + ', but the ERP still has ' + rows.filter((r) => NOT_SHIPPED.includes(r.fulfillment_status)).length + ' line(s) unshipped')
+      }
+      const active = rows.filter((r) => !INACTIVE.includes(r.fulfillment_status))
+      if (active.length && active.every((r) => SHIPPED.includes(r.fulfillment_status)) && o.fulfillment_status !== 'fulfilled'
+          && active.every((r) => r.shipped_at && (t0.getTime() - new Date(r.shipped_at).getTime()) / MIN >= 180)) {
+        add('erp_shipped_shopify_open', o, 'The ERP shows it shipped, but Shopify shows it ' + (o.fulfillment_status || 'unfulfilled') + ': the customer has no tracking')
+      }
+    }
+
+    // ---- is Shopify still sending order webhooks? (only judged once the log has been running for 2+ days)
+    let webhookCheck: any = null
+    try {
+      const { data: oldest } = await db.from('webhook_events').select('received_at').eq('source', 'shopify').order('received_at', { ascending: true }).limit(1)
+      if (oldest && oldest.length && (t0.getTime() - new Date(oldest[0].received_at).getTime()) >= 48 * 3600000) {
+        const recent = orders.filter((o) => !o.test && !o.cancelled_at && (t0.getTime() - new Date(o.created_at).getTime()) >= 15 * MIN && (t0.getTime() - new Date(o.created_at).getTime()) <= 24 * 3600000)
+        if (recent.length) {
+          const { data: ev } = await db.from('webhook_events').select('ref').eq('source', 'shopify').eq('topic', 'orders/create').gte('received_at', new Date(t0.getTime() - 26 * 3600000).toISOString()).limit(5000)
+          const have = new Set((ev || []).map((e: any) => orderKey(e.ref)))
+          const missing = recent.filter((o) => !have.has(orderKey(o.name)))
+          webhookCheck = { checked: recent.length, missing: missing.length }
+          if (missing.length >= 3 || (missing.length >= 1 && missing.length / recent.length >= 0.25)) {
+            issues.push({ key: 'webhooks_not_arriving|ALL', kind: 'webhooks_not_arriving', order: null, severity: 'error',
+              detail: missing.length + ' of ' + recent.length + ' orders created in the last 24 hours never sent an orders/create webhook (e.g. ' + missing.slice(0, 3).map((o) => o.name).join(', ') + '). Check Shopify admin > Settings > Notifications > Webhooks.' })
+          }
+        }
+      }
+    } catch (_) { /* the log may not exist yet */ }
+
+    // ---- repairs: only through the same code paths live webhooks use
+    const fixed = new Map<string, string>()
+    const replayed: string[] = []
+    let bulk: any = null
+    if (!dry) {
+      const byOrder = new Map(orders.map((o) => [orderKey(o.name), o]))
+      const todo = issues.filter((i) => i.kind === 'cancel_not_applied' || i.kind === 'missing_in_erp').slice(0, MAX_REPLAYS)
+      for (const i of todo) {
+        try {
+          const brief = byOrder.get(orderKey(i.order))
+          const full = brief ? await getFullShopifyOrder(brief.id) : null
+          if (!full) continue
+          if (await replayWebhook(i.kind === 'missing_in_erp' ? 'orders/create' : 'orders/cancelled', full)) replayed.push(i.key)
+        } catch (e: any) { log('replay failed', i.key, e && e.message) }
+      }
+      const stuck = issues.filter((i) => i.kind === 'shopify_fulfilled_erp_open')
+      if (stuck.length) {
+        try {
+          const oldest = stuck.map((i) => byOrder.get(orderKey(i.order))).filter(Boolean).reduce((m: number, o: any) => Math.min(m, new Date(o.created_at).getTime()), t0.getTime())
+          bulk = compact(await callFn('shipstation-ship', { action: 'bulk_sync', since: new Date(oldest - 86400000).toISOString().slice(0, 10), until: new Date(t0.getTime() + 86400000).toISOString().slice(0, 10) }, 120000))
+          replayed.push('bulk_sync')
+        } catch (e: any) { bulk = { error: String((e && e.message) || e).slice(0, 200) } }
+      }
+      if (replayed.length) {
+        const again = await erpRowsFor(issues.filter((i) => i.order && ['cancel_not_applied', 'missing_in_erp', 'shopify_fulfilled_erp_open'].includes(i.kind)).map((i) => i.order as string))
+        for (const i of issues) {
+          if (!i.order || !['cancel_not_applied', 'missing_in_erp', 'shopify_fulfilled_erp_open'].includes(i.kind)) continue
+          const rows = again.get(orderKey(i.order)) || []
+          if (i.kind === 'missing_in_erp' && replayed.includes(i.key) && rows.length) fixed.set(i.key, 'Replayed orders/create: the ERP now has ' + rows.length + ' line(s)')
+          else if (i.kind === 'cancel_not_applied' && replayed.includes(i.key) && !rows.some((r) => CANCELLABLE.includes(r.fulfillment_status))) fixed.set(i.key, 'Replayed orders/cancelled')
+          else if (i.kind === 'shopify_fulfilled_erp_open' && replayed.includes('bulk_sync') && !rows.some((r) => NOT_SHIPPED.includes(r.fulfillment_status))) fixed.set(i.key, 'Applied by a ShipStation bulk sync')
+        }
+      }
+    }
+
+    // ---- record: open new issues, update known ones, close the ones that are gone
+    const nowIso = now().toISOString()
+    const existing = new Map<string, any>()
+    for (const part of chunks(issues.map((i) => i.key), 100)) {
+      const { data } = await db.from('recon_issues').select('*').in('issue_key', part)
+      for (const r of data || []) existing.set(r.issue_key, r)
+    }
+    const { data: openRows } = await db.from('recon_issues').select('*').eq('status', 'open').limit(2000)
+    for (const i of issues) {
+      const ex = existing.get(i.key), fx = fixed.get(i.key)
+      if (ex) {
+        const patch: any = { last_seen_at: nowIso, detail: i.detail, severity: i.severity, run_id: runId }
+        if (fx) Object.assign(patch, { status: 'auto_fixed', resolved_at: nowIso, resolved_by: 'system', fix_note: fx })
+        else if (ex.status !== 'ignored') Object.assign(patch, { status: 'open', resolved_at: null, resolved_by: null })
+        await db.from('recon_issues').update(patch).eq('id', ex.id)
+      } else {
+        await db.from('recon_issues').insert({ issue_key: i.key, kind: i.kind, order_number: i.order, detail: i.detail, severity: i.severity, run_id: runId,
+          status: fx ? 'auto_fixed' : 'open', first_seen_at: nowIso, last_seen_at: nowIso, resolved_at: fx ? nowIso : null, resolved_by: fx ? 'system' : null, fix_note: fx || null })
+      }
+    }
+    const foundKeys = new Set(issues.map((i) => i.key))
+    let closed = 0
+    for (const r of openRows || []) {
+      if (foundKeys.has(r.issue_key)) continue
+      const examinedIt = r.order_number ? examined.has(orderKey(r.order_number)) : r.kind === 'webhooks_not_arriving'
+      if (!examinedIt) continue
+      await db.from('recon_issues').update({ status: 'resolved', resolved_at: nowIso, resolved_by: 'system', fix_note: 'No longer detected' }).eq('id', r.id)
+      closed++
+    }
+    // ---- housekeeping
+    const old = (days: number) => new Date(t0.getTime() - days * 86400000).toISOString()
+    for (const [table, col, days, extra] of [['webhook_events', 'received_at', 45, null], ['ops_job_runs', 'started_at', 45, null], ['recon_runs', 'started_at', 90, null]] as any[]) {
+      try { await db.from(table).delete().lt(col, old(days)) } catch (_) { /* best effort */ }
+    }
+    try { await db.from('recon_issues').delete().in('status', ['resolved', 'auto_fixed', 'ignored']).lt('last_seen_at', old(90)) } catch (_) { /* best effort */ }
+
+    const open = issues.filter((i) => !fixed.has(i.key)).length
+    const summary = { window_hours: hours, shopify_orders: orders.length, examined: examined.size, issues_found: issues.length, auto_fixed: fixed.size, still_open: open, closed_as_gone: closed,
+      replayed: replayed.length, bulk_sync: bulk, webhooks: webhookCheck, dry_run: dry, by_kind: issues.reduce((m: any, i) => { m[i.kind] = (m[i.kind] || 0) + 1; return m }, {}), seconds: Math.round((now().getTime() - t0.getTime()) / 100) / 10 }
+    if (runId !== null) await db.from('recon_runs').update({ finished_at: nowIso, status: 'ok', summary }).eq('id', runId)
+    return summary
+  }
+
+  // ------------------------------------------------------------------ the HTTP entry point
+  async function authorize(req: Request): Promise<boolean> {
+    const tok = (req.headers.get('Authorization') || '').replace(/^Bearer\\s+/i, '')
+    if (!tok) return false
+    if (safeEqual(tok, SERVICE)) return true
+    try { const r = await db.auth.getUser(tok); return !!(r && r.data && r.data.user) } catch (_) { return false }
+  }
+  return async function handler(req: Request): Promise<Response> {
+    if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
+    if (req.method === 'GET') return reply({ pong: true })
+    let body: any = {}
+    try { body = await req.json() } catch (_) { /* empty body */ }
+    if (body.ping) return reply({ pong: true })
+    if (body.action === 'version') return reply({ fn: 'ops-cron', build: FUNCTION_VERSION })
+    if (!(await authorize(req))) return reply({ error: 'Not authorised: only the schedule or a signed-in ERP user can run jobs' }, 401)
+    const job = String(body.job || '')
+    if (!job) return reply({ error: 'Say which job: ' + JOBS.join(', ') }, 400)
+    const trigger = safeEqual((req.headers.get('Authorization') || '').replace(/^Bearer\\s+/i, ''), SERVICE) ? 'cron' : 'manual'
+    const out = await runJob(job, trigger, { hours: body.hours, dry_run: body.dry_run, trigger })
+    return reply(out, out.http || 200)
+  }
+}
+
+// The test harness sets globalThis.__TEST__ so importing this file does not start a server.
+if (!(globalThis as any).__TEST__) {
+  const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
+  const env: Record<string, string | undefined> = {}
+  for (const k of ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SHOPIFY_STORE', 'SHOPIFY_KEY', 'SHOPIFY_ADMIN_TOKEN', 'SHOPIFY_ADMIN_API_TOKEN', 'SHOPIFY_ACCESS_TOKEN', 'SHOPIFY_API_ACCESS_TOKEN', 'SHOPIFY_TOKEN', 'SHOPIFY_WEBHOOK_SECRET']) env[k] = Deno.env.get(k)
+  Deno.serve(createHandler({ env, fetchFn: fetch, db }))
+}
+`;
+
 
 function renderDataIntegrity(){
   if(!S._diResults)S._diResults=null;
@@ -32036,6 +32885,7 @@ window.showStaleOrders=showStaleOrders;
 function _buildWorkflowAlerts() {
   if (!S.purchases || !S.sales || !S.assemblies) return '';
   var alerts = [];
+  try { _opsAlerts(alerts); } catch (_e) { /* [v23.13] background-job and reconciliation alerts */ }
 
   var today = new Date().toISOString().slice(0, 10);
   // [v23.77 #3/#7] daily stock check + missing data
