@@ -474,7 +474,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.17</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.18</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -539,7 +539,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.17';
+const TGK_ERP_VERSION = 'v23.18';
 const TGK_ERP_BUILD_DATE = '2026-10-21';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -26721,7 +26721,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.84','shipstation-ship':'v23.98','ops-cron':'v1.1','customs-sync':'v1.0','customs-fill':'v1.1'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.84','shipstation-ship':'v23.98','ops-cron':'v1.1','customs-sync':'v1.0','customs-fill':'v1.2'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
@@ -27735,8 +27735,11 @@ var ERP_FILL_SRC=`// ===========================================================
 //   POST { action: "version" }                                              -> { fn, build }           (no sign-in needed)
 //   POST { action: "preview", order_numbers: ["10482", ...] }               -> exactly what it WOULD write; changes nothing
 //   POST { action: "fill",    order_numbers: [...], force?: true }          -> writes those orders now
-//   POST { action: "scan",    hours?: 72, limit?: 12, dry_run?: true }      -> what the schedule calls: finds international orders that still
-//                                                                              need customs lines and fills them
+//   POST { action: "scan",    hours?: 720, limit?: 12, dry_run?: true }     -> what the schedule calls: looks at international orders changed in
+//                                                                              the last 30 days (awaiting shipment AND on hold) and fills those that need it.
+//                                                                              "limit" caps WRITES per run (ShipStation's rate limit); orders that are
+//                                                                              blocked, edited by hand or unchanged never use that budget, so a backlog of
+//                                                                              them can never starve newer orders
 //   POST { action: "revert",  order_number: "10482" }                       -> puts back what ShipStation had before the fill
 //
 // SAFETY, in plain words:
@@ -27760,7 +27763,7 @@ var ERP_FILL_SRC=`// ===========================================================
 // ============================================================================
 import { createClient } from 'npm:@supabase/supabase-js@2'
 
-const FUNCTION_VERSION = 'v1.1'
+const FUNCTION_VERSION = 'v1.2'
 const SS_BASE = 'https://ssapi.shipstation.com'
 const API_VERSION = '2024-01'
 const FILLABLE = ['awaiting_shipment', 'on_hold']
@@ -27993,22 +27996,26 @@ export function createHandler(deps: { env: Record<string, string | undefined>; f
     const rules = await loadRules(allSkus)
     const results: any[] = [], counts: Record<string, number> = {}
     const bump = (k: string) => { counts[k] = (counts[k] || 0) + 1 }
-    let limit = mode === 'scan' ? (opts as any).limit : Infinity
+    let writes = mode === 'scan' ? (opts as any).limit : Infinity     // how many orders this run may WRITE to
+    let evals = mode === 'scan' ? 60 : Infinity                        // how many it may look at in detail (keeps a run short)
     for (const order of orders) {
       const rec = recs.get(String(order.orderNumber))
       try {
-        // quick path for the schedule: nothing changed since we last looked, so no price lookups and no writes
+        // nothing changed since we last looked, so no price lookups and no writes
         if (mode === 'scan' && rec && ['filled', 'unchanged'].includes(rec.status) && rec.inputs_canon === inputsCanon(order, cat, rules) && rec.written_canon === canonItems(order.internationalOptions?.customsItems)) { bump('skipped'); continue }
+        // a blocked or hand-edited order stays that way until its inputs change (an item fixed in the ERP, a decision made, the order edited)
+        if (mode === 'scan' && rec && ['blocked', 'edited_by_hand'].includes(rec.status) && rec.inputs_canon === inputsCanon(order, cat, rules)) { bump('skipped'); continue }
         // an order someone chose to UNDO is theirs to edit: the schedule never refills it (an explicit "fill" still can)
         if (mode === 'scan' && rec?.status === 'reverted') { bump('skipped'); continue }
-        if (mode === 'scan' && limit <= 0) { bump('deferred'); continue }
+        if (mode === 'scan' && evals <= 0) { bump('deferred'); continue }
+        if (mode === 'scan') evals--
         const ev = await evaluate(order, rec, cat, rules, { force: opts.force })
         if (mode === 'preview') { results.push(publicEv(ev)); continue }
         if (ev.decision === 'skip') { bump('skipped'); if (mode === 'fill') results.push(publicEv(ev)); continue }
-        if (mode === 'scan') limit--
         if (ev.decision === 'blocked') { bump('blocked'); if (!opts.dry) await saveRec(ev, 'blocked'); results.push(publicEv(ev)); continue }
         if (ev.decision === 'edited_by_hand') { bump('edited_by_hand'); if (!opts.dry) await saveRec(ev, 'edited_by_hand'); results.push(publicEv(ev)); continue }
         if (ev.decision === 'unchanged') { bump('unchanged'); if (!opts.dry) await saveRec(ev, 'unchanged', { fields: { written_canon: ev.canon_desired, filled_at: rec?.filled_at || now().toISOString() } }); results.push(publicEv(ev)); continue }
+        if (mode === 'scan') { if (writes <= 0) { bump('deferred'); continue } writes-- }
         if (opts.dry) { bump('would_fill'); results.push(publicEv(ev)); continue }
         const w = await applyFill(order, ev)
         if (w.ok) { bump('filled'); await saveRec(ev, 'filled', { note: 'Customs lines written to ShipStation', fields: { items: ev.desired.customsItems, previous: order.internationalOptions === undefined ? null : order.internationalOptions, written_canon: ev.canon_desired, filled_at: now().toISOString() } }); results.push({ ...publicEv(ev), decision: 'filled' }) }
@@ -28061,7 +28068,7 @@ export function createHandler(deps: { env: Record<string, string | undefined>; f
         return reply({ ok: true, ...out, not_found: notFound })
       }
       if (body.action === 'scan') {
-        const hours = Math.min(336, Math.max(1, Number(body.hours) || 72)), limit = Math.min(50, Math.max(1, Number(body.limit) || 12))
+        const hours = Math.min(2160, Math.max(1, Number(body.hours) || 720)), limit = Math.min(50, Math.max(1, Number(body.limit) || 12))
         const listed = await listOrders(FILLABLE, new Date(now().getTime() - hours * 3600000).toISOString())
         const intl = listed.filter(isIntl).sort((a, b) => String(a.modifyDate || '').localeCompare(String(b.modifyDate || '')))
         const out = await run('scan', intl, { dry: !!body.dry_run, limit } as any)
@@ -34605,7 +34612,7 @@ function _packingSlipWrapHtml(lines,pr){
   return '<div class="wrap">'
     +'<div style="position:relative;padding:18px 24px 16px;display:flex;align-items:flex-start;justify-content:space-between;border-bottom:1px solid var(--border)">'
     +'<div style="position:absolute;bottom:0;left:0;right:0;height:3px;background:'+GR+'"></div>'
-    +(LOGO?'<img src="'+LOGO+'" style="width:100px;height:auto;display:block">'
+    +(LOGO?'<img src="'+LOGO+'" style="width:230px;max-width:52%;height:auto;display:block">'
           :'<div style="font-size:var(--t-xl);font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--text)">TGK MOTORSPORT</div>')
     +'<div style="text-align:right">'
     +'<div style="font-size:var(--t-2xl);font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--text)">PACKING SLIP</div>'
