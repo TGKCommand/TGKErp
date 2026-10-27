@@ -474,7 +474,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.19</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.20</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -539,7 +539,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.19';
+const TGK_ERP_VERSION = 'v23.20';
 const TGK_ERP_BUILD_DATE = '2026-10-21';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -26721,7 +26721,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.84','shipstation-ship':'v23.98','ops-cron':'v1.1','customs-sync':'v1.0','customs-fill':'v1.2'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.84','shipstation-ship':'v23.98','ops-cron':'v1.1','customs-sync':'v1.0','customs-fill':'v1.3'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
@@ -27828,6 +27828,11 @@ var ERP_FILL_SRC=`// ===========================================================
 //   * After every write it re-reads the order and checks nothing but the customs lines changed. If anything else changed it puts the
 //     original back and reports an error. If ShipStation ever answers with a DIFFERENT order id (a duplicate instead of an update)
 //     it deletes that duplicate.
+//   * ORDERS WITH AN INCOMPLETE "BILL TO" SETTING (e.g. "my other account" with no account saved): ShipStation's API refuses ANY change to such an
+//     order. The function says so in plain words (and, for "my other account", does not even try), changes nothing, and tells you to complete the
+//     setting in ShipStation (Advanced options > Bill to) and press Retry. It never changes who is billed for shipping or duties.
+//   * An order whose last attempt ERRORED is not retried every run: the schedule tries again after 6 hours, or at once if the order or its ERP data
+//     changes. "Retry" in the ERP always tries immediately.
 //   * Every fill keeps the previous customs options, so "revert" can undo it. An order that was undone is NEVER refilled by the schedule
 //     (someone wants to edit it by hand); pressing Fill on it again does refill it.
 //   * Needs the customs_fills table (customs_fill_setup.sql). Without it, preview works but nothing is written.
@@ -27835,7 +27840,7 @@ var ERP_FILL_SRC=`// ===========================================================
 // ============================================================================
 import { createClient } from 'npm:@supabase/supabase-js@2'
 
-const FUNCTION_VERSION = 'v1.2'
+const FUNCTION_VERSION = 'v1.3'
 const SS_BASE = 'https://ssapi.shipstation.com'
 const API_VERSION = '2024-01'
 const FILLABLE = ['awaiting_shipment', 'on_hold']
@@ -28014,12 +28019,21 @@ export function createHandler(deps: { env: Record<string, string | undefined>; f
   }
 
   // ------------------------------------------------------------------ writing
+  const BILL_LABEL: Record<string, string> = { my_other_account: 'My other account', third_party: 'a third party', recipient: 'the recipient' }
+  const billToMessage = (order: any) => {
+    const party = String(order?.advancedOptions?.billToParty || '').toLowerCase()
+    return 'This order\\'s "Bill to" setting is ' + (BILL_LABEL[party] || party || 'set') + ', but ShipStation has no account saved for it, so ShipStation refuses ANY change to the order through its API. Nothing was changed. Fix it in ShipStation: open order ' + order.orderNumber + ' > Advanced options > Bill to, pick the account (or "My account"), save, then press Retry here. If many orders have this, look at the Automation Rule that sets it.'
+  }
+  /** ShipStation's raw validation text -> something a person can act on. */
+  const friendlyError = (raw: string, order: any) => (/billTo\\w*['"]?\\s+is required/i.test(raw) || /billToParty/i.test(raw)) ? billToMessage(order) : 'ShipStation refused the update: ' + raw.slice(0, 180)
   async function postOrder(body: any): Promise<any> { return ss('/orders/createorder', { method: 'POST', body: JSON.stringify(body) }) }
   async function applyFill(order: any, ev: Ev): Promise<{ ok: boolean; error?: string; reverted?: boolean }> {
+    // "Bill to: my other account" with no account saved can never be re-saved through the API: say so up front instead of making a call that will be refused
+    { const adv = order.advancedOptions || {}; if (String(adv.billToParty || '').toLowerCase() === 'my_other_account' && !adv.billToMyOtherAccount) return { ok: false, error: billToMessage(order) } }
     const before = clone(order), prevOptions = order.internationalOptions === undefined ? null : clone(order.internationalOptions)
     const body = clone(order); body.internationalOptions = ev.desired
     let res: any
-    try { res = await postOrder(body) } catch (e: any) { return { ok: false, error: 'ShipStation refused the update: ' + String(e && e.message || e).slice(0, 180) } }
+    try { res = await postOrder(body) } catch (e: any) { return { ok: false, error: friendlyError(String(e && e.message || e), order) } }
     if (res && res.orderId !== undefined && String(res.orderId) !== String(order.orderId)) {
       try { await ss('/orders/' + res.orderId, { method: 'DELETE' }) } catch (_) { /* reported below */ }
       return { ok: false, error: 'ShipStation created a NEW order (' + res.orderId + ') instead of updating this one; the duplicate was removed and nothing else was changed' }
@@ -28077,6 +28091,8 @@ export function createHandler(deps: { env: Record<string, string | undefined>; f
         if (mode === 'scan' && rec && ['filled', 'unchanged'].includes(rec.status) && rec.inputs_canon === inputsCanon(order, cat, rules) && rec.written_canon === canonItems(order.internationalOptions?.customsItems)) { bump('skipped'); continue }
         // a blocked or hand-edited order stays that way until its inputs change (an item fixed in the ERP, a decision made, the order edited)
         if (mode === 'scan' && rec && ['blocked', 'edited_by_hand'].includes(rec.status) && rec.inputs_canon === inputsCanon(order, cat, rules)) { bump('skipped'); continue }
+        // an order whose last attempt ERRORED is not hammered every run: the schedule tries again after 6 hours, or at once if its inputs change
+        if (mode === 'scan' && rec && rec.status === 'error' && rec.inputs_canon === inputsCanon(order, cat, rules) && (now().getTime() - new Date(rec.updated_at).getTime()) < 6 * 3600000) { bump('skipped'); continue }
         // an order someone chose to UNDO is theirs to edit: the schedule never refills it (an explicit "fill" still can)
         if (mode === 'scan' && rec?.status === 'reverted') { bump('skipped'); continue }
         if (mode === 'scan' && evals <= 0) { bump('deferred'); continue }
