@@ -474,7 +474,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.26</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.27</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -539,7 +539,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.26';
+const TGK_ERP_VERSION = 'v23.27';
 const TGK_ERP_BUILD_DATE = '2026-10-21';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -26733,7 +26733,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.84','shipstation-ship':'v23.99','ops-cron':'v1.1','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.3'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.84','shipstation-ship':'v23.99','ops-cron':'v1.2','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.3'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
@@ -28690,7 +28690,7 @@ var ERP_OPS_CRON_SRC=`// =======================================================
 // ============================================================================
 import { createClient } from 'npm:@supabase/supabase-js@2'
 
-const FUNCTION_VERSION = 'v1.1'
+const FUNCTION_VERSION = 'v1.2'
 const JOBS = ['hold_sync', 'deduct_retry', 'delivery_sync', 'reconcile', 'customs_fill']
 const LOCK_MINUTES: Record<string, number> = { hold_sync: 8, deduct_retry: 8, delivery_sync: 12, reconcile: 25, customs_fill: 10 }
 const API_VERSION = '2024-01'
@@ -28745,6 +28745,21 @@ export function createHandler(deps: { env: Record<string, string | undefined>; f
   const log = deps.log || ((...a: any[]) => console.log('[ops-cron]', ...a))
   const SUPA = String(env.SUPABASE_URL || '').replace(/\\/$/, '')
   const SERVICE = String(env.SUPABASE_SERVICE_ROLE_KEY || '')
+  // [v1.2] The schedule may ALSO identify itself with OPS_CRON_SECRET: a value YOU choose and set in two places (this function's secrets, and the Vault
+  // entry "ops_service_key"). That way the schedule never depends on which format Supabase's own service key is in, or whether it was rotated.
+  const SCHEDULE_SECRET = String(env.OPS_CRON_SECRET || '')
+  const isSchedule = (tok: string) => !!tok && (safeEqual(tok, SERVICE) || (SCHEDULE_SECRET.length >= 24 && safeEqual(tok, SCHEDULE_SECRET)))
+  /** what a key LOOKS like (never the key): its kind, length and a short fingerprint, so two keys can be compared without revealing either */
+  async function describeKey(k: string): Promise<string> {
+    if (!k) return 'none'
+    let kind = 'other'
+    if (k.startsWith('sb_secret_')) kind = 'sb_secret'
+    else if (k.startsWith('sb_publishable_')) kind = 'sb_publishable'
+    else if (k.startsWith('eyJ')) { try { kind = 'jwt:' + (JSON.parse(atob(k.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).role || '?') } catch (_) { kind = 'jwt:?' } }
+    const h = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(k)))).slice(0, 4).map((b) => b.toString(16).padStart(2, '0')).join('')
+    return kind + ', length ' + k.length + ', fingerprint ' + h
+  }
+  let lastRefusalLog = 0
 
   // ------------------------------------------------------------------ calling the other server functions
   async function callFn(fn: string, payload: any, timeoutMs = deps.callTimeoutMs || 140000): Promise<any> {
@@ -29030,8 +29045,14 @@ export function createHandler(deps: { env: Record<string, string | undefined>; f
   async function authorize(req: Request): Promise<boolean> {
     const tok = (req.headers.get('Authorization') || '').replace(/^Bearer\\s+/i, '')
     if (!tok) return false
-    if (safeEqual(tok, SERVICE)) return true
-    try { const r = await db.auth.getUser(tok); return !!(r && r.data && r.data.user) } catch (_) { return false }
+    if (isSchedule(tok)) return true
+    try { const r = await db.auth.getUser(tok); if (r && r.data && r.data.user) return true } catch (_) { /* fall through */ }
+    // refused: say so in the function log (at most once a minute), describing both keys without revealing either
+    if (now().getTime() - lastRefusalLog > 60000) {
+      lastRefusalLog = now().getTime()
+      log('REFUSED a call. It sent: ' + await describeKey(tok) + '. This function expects the service key (' + await describeKey(SERVICE) + ')' + (SCHEDULE_SECRET ? ' or OPS_CRON_SECRET (' + await describeKey(SCHEDULE_SECRET) + ')' : ', and OPS_CRON_SECRET is not set') + '. If the schedule is being refused, set OPS_CRON_SECRET (see OPS_SETUP.md).')
+    }
+    return false
   }
   return async function handler(req: Request): Promise<Response> {
     if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
@@ -29043,7 +29064,7 @@ export function createHandler(deps: { env: Record<string, string | undefined>; f
     if (!(await authorize(req))) return reply({ error: 'Not authorised: only the schedule or a signed-in ERP user can run jobs' }, 401)
     const job = String(body.job || '')
     if (!job) return reply({ error: 'Say which job: ' + JOBS.join(', ') }, 400)
-    const trigger = safeEqual((req.headers.get('Authorization') || '').replace(/^Bearer\\s+/i, ''), SERVICE) ? 'cron' : 'manual'
+    const trigger = isSchedule((req.headers.get('Authorization') || '').replace(/^Bearer\\s+/i, '')) ? 'cron' : 'manual'
     const out = await runJob(job, trigger, { hours: body.hours, dry_run: body.dry_run, trigger })
     return reply(out, out.http || 200)
   }
@@ -29053,7 +29074,7 @@ export function createHandler(deps: { env: Record<string, string | undefined>; f
 if (!(globalThis as any).__TEST__) {
   const db = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
   const env: Record<string, string | undefined> = {}
-  for (const k of ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SHOPIFY_STORE', 'SHOPIFY_KEY', 'SHOPIFY_ADMIN_TOKEN', 'SHOPIFY_ADMIN_API_TOKEN', 'SHOPIFY_ACCESS_TOKEN', 'SHOPIFY_API_ACCESS_TOKEN', 'SHOPIFY_TOKEN', 'SHOPIFY_WEBHOOK_SECRET']) env[k] = Deno.env.get(k)
+  for (const k of ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'OPS_CRON_SECRET', 'SHOPIFY_STORE', 'SHOPIFY_KEY', 'SHOPIFY_ADMIN_TOKEN', 'SHOPIFY_ADMIN_API_TOKEN', 'SHOPIFY_ACCESS_TOKEN', 'SHOPIFY_API_ACCESS_TOKEN', 'SHOPIFY_TOKEN', 'SHOPIFY_WEBHOOK_SECRET']) env[k] = Deno.env.get(k)
   Deno.serve(createHandler({ env, fetchFn: fetch, db }))
 }
 `;
