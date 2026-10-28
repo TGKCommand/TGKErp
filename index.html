@@ -474,7 +474,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.23</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.24</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -539,7 +539,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.23';
+const TGK_ERP_VERSION = 'v23.24';
 const TGK_ERP_BUILD_DATE = '2026-10-21';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -26733,7 +26733,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.84','shipstation-ship':'v23.99','ops-cron':'v1.1','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.0'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.84','shipstation-ship':'v23.99','ops-cron':'v1.1','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.1'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
@@ -36471,6 +36471,108 @@ async function poDeleteVendorUpdate(poId,id){
   if(S.poVendorUpd&&S.poVendorUpd[poId])S.poVendorUpd[poId]=S.poVendorUpd[poId].filter(function(t){return t.id!==id;});
   updateBadge();render();
 }
+// TGK purchase order PDF (design A: clean). Pure renderer: draws onto a jsPDF document from plain data, no ERP globals.
+//   d = { logo:{png:'data:image/png;base64,...', w, h} | null, company:{name, lines:[..], web},
+//         po:{ref, date, notes, currency}, buyer:{name,email}, vendor:{name, attn, lines:[..], email, phone}, shipTo:{name, lines:[..]},
+//         lines:[{pn, desc, qty, cost, ext, ship}] }       returns {pages, total, nLines}
+(function (root) {
+  function renderPOPdf(doc, d) {
+    var W = 612, H = 792, M = 42, CW = W - 2 * M;
+    var C = { ink: [28, 34, 41], gun: [43, 49, 56], teal: [13, 148, 136], mute: [107, 114, 128], line: [222, 226, 231], soft: [246, 247, 249], white: [255, 255, 255] };
+    var X = function (s) { return String(s == null ? '' : s).replace(/[\u2018\u2019]/g, "'").replace(/[\u201c\u201d]/g, '"').replace(/[\u2013\u2014]/g, '-').replace(/\u2026/g, '...').replace(/\u00a0/g, ' ').replace(/[^\x09\x0a\x0d\x20-\x7e\xa1-\xff]/g, '?'); };
+    var money2 = function (n) { n = Number(n) || 0; var s = Math.abs(n).toFixed(2).split('.'); s[0] = s[0].replace(/\B(?=(\d{3})+(?!\d))/g, ','); return (n < 0 ? '-' : '') + '$' + s.join('.'); };
+    var money = function (n) { n = Number(n) || 0; var s = Math.abs(n).toFixed(4).replace(/0{1,2}$/, ''); var p = s.split('.'); p[0] = p[0].replace(/\B(?=(\d{3})+(?!\d))/g, ','); return (n < 0 ? '-' : '') + '$' + p.join('.'); };
+    var MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+    var fmtDate = function (iso) { var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || '')); return m ? MONTHS[+m[2] - 1] + ' ' + (+m[3]) + ', ' + m[1] : String(iso || ''); };
+    var fill = function (c) { doc.setFillColor(c[0], c[1], c[2]); }, ink = function (c) { doc.setTextColor(c[0], c[1], c[2]); }, stroke = function (c) { doc.setDrawColor(c[0], c[1], c[2]); };
+    var font = function (bold, size) { doc.setFont('helvetica', bold ? 'bold' : 'normal'); doc.setFontSize(size); };
+    var ref = X(d.po.ref), buyer = d.buyer || {}, lg = d.logo;
+    var items = d.lines.filter(function (l) { return !l.ship; }), ship = d.lines.filter(function (l) { return l.ship; }), rows = items.concat(ship);
+    var sub = items.reduce(function (a, l) { return a + l.ext; }, 0), frt = ship.reduce(function (a, l) { return a + l.ext; }, 0), total = sub + frt;
+    function logoAt(x, y, w) {
+      if (lg && lg.png) { try { doc.addImage(lg.png, 'PNG', x, y, w, w * lg.h / lg.w, undefined, 'FAST'); return w * lg.h / lg.w; } catch (e) { /* fall through to text */ } }
+      font(true, w > 150 ? 18 : 12); ink(C.ink); doc.text('TGK MOTORSPORT', x, y + (w > 150 ? 18 : 12)); return w > 150 ? 24 : 16;
+    }
+    function headerFirst() {
+      var y = M, lh = logoAt(M, y, 190);
+      font(false, 8.5); ink(C.mute);
+      var cl = d.company.lines.concat(d.company.web ? [d.company.web] : []);
+      cl.forEach(function (t, i) { doc.text(X(t), M, y + lh + 14 + i * 11); });
+      font(true, 23); ink(C.ink); doc.text('PURCHASE ORDER', W - M, y + 22, { align: 'right' });
+      var meta = [['PO NUMBER', ref], ['DATE', fmtDate(d.po.date)], ['BUYER', X(buyer.name || '')]], my = y + 44;
+      meta.forEach(function (r, i) { font(true, 7.5); ink(C.mute); doc.text(r[0], W - M - 200, my + i * 15); font(true, 10); ink(C.ink); doc.text(r[1], W - M, my + i * 15, { align: 'right' }); });
+      var yEnd = y + lh + 14 + cl.length * 11 + 10;
+      fill(C.teal); doc.rect(M, yEnd, CW, 2.5, 'F');
+      return yEnd + 22;
+    }
+    function headerNext() {
+      logoAt(M, M - 6, 110); font(true, 11); ink(C.ink); doc.text('PURCHASE ORDER ' + ref + '  (continued)', W - M, M + 8, { align: 'right' });
+      fill(C.teal); doc.rect(M, M + 22, CW, 2, 'F'); return M + 42;
+    }
+    function cards(y) {
+      var gap = 14, w = (CW - gap) / 2;
+      var vl = [d.vendor.name].concat(d.vendor.attn ? ['Attn: ' + d.vendor.attn] : [], d.vendor.lines || [], d.vendor.email ? [d.vendor.email] : [], d.vendor.phone ? [d.vendor.phone] : []);
+      var sl = [d.shipTo.name].concat(d.shipTo.lines || []);
+      var n = Math.max(vl.length, sl.length), h = 30 + n * 12.5 + 10;
+      [['VENDOR', vl, M], ['SHIP TO', sl, M + w + gap]].forEach(function (c) {
+        var x = c[2];
+        fill(C.soft); doc.roundedRect(x, y, w, h, 2, 2, 'F');
+        font(true, 8); ink(C.teal); doc.text(c[0], x + 14, y + 20);
+        c[1].forEach(function (t, i) { if (i === 0) { font(true, 11); ink(C.ink); } else { font(false, 9.5); ink(c[0] === 'VENDOR' && /^Attn:/.test(t) ? C.ink : C.mute); } doc.text(doc.splitTextToSize(X(t), w - 28)[0], x + 14, y + 36 + i * 12.5); });
+      });
+      return y + h + 22;
+    }
+    var cx = { num: M + 10, pn: M + 34, desc: M + 142, qty: W - M - 168, cost: W - M - 92, amt: W - M - 10 };
+    function tableHead(y) {
+      fill(C.gun); doc.rect(M, y, CW, 22, 'F'); font(true, 7.5); ink(C.white);
+      doc.text('#', cx.num, y + 14); doc.text('PART #', cx.pn, y + 14); doc.text('DESCRIPTION', cx.desc, y + 14); doc.text('QTY', cx.qty, y + 14, { align: 'right' }); doc.text('UNIT COST', cx.cost, y + 14, { align: 'right' }); doc.text('AMOUNT', cx.amt, y + 14, { align: 'right' });
+      return y + 22;
+    }
+    function newPage() { doc.addPage(); return tableHead(headerNext()); }
+    var y = headerFirst();
+    y = cards(y);
+    y = tableHead(y);
+    rows.forEach(function (l, i) {
+      font(false, 9.5);
+      var dl = doc.splitTextToSize(X(l.desc), cx.qty - cx.desc - 40), pl = doc.splitTextToSize(X(l.pn), 100), n = Math.max(dl.length, pl.length, 1), rh = n * 12 + 12;
+      if (y + rh > H - 78) y = newPage();
+      if (i % 2 === 1) { fill(C.soft); doc.rect(M, y, CW, rh, 'F'); }
+      font(false, 8.5); ink(C.mute); doc.text(String(i + 1), cx.num, y + 14);
+      font(true, 9.5); ink(C.ink); doc.text(pl, cx.pn, y + 14);
+      font(false, 9.5); ink(C.ink); doc.text(dl, cx.desc, y + 14);
+      doc.text(String(l.qty), cx.qty, y + 14, { align: 'right' }); doc.text(money(l.cost), cx.cost, y + 14, { align: 'right' });
+      font(true, 9.5); doc.text(money2(l.ext), cx.amt, y + 14, { align: 'right' });
+      stroke(C.line); doc.setLineWidth(.5); doc.line(M, y + rh, W - M, y + rh); y += rh;
+    });
+    if (!rows.length) { font(false, 9.5); ink(C.mute); doc.text('No lines on this purchase order.', cx.desc, y + 18); y += 30; }
+    var rw = 214, rx = W - M - rw, lw2 = CW - rw - 24, notes = String(d.po.notes || '').trim();
+    var instr = ['Please confirm receipt of this order and your expected ship date by replying to this email.', 'Please reference ' + ref + ' on all packing slips, invoices and shipping labels.'];
+    font(false, 9); var nl = notes ? doc.splitTextToSize(X(notes), lw2 - 28) : [], il = []; instr.forEach(function (t) { il = il.concat(doc.splitTextToSize(X(t), lw2 - 28)); });
+    var leftH = (notes ? 30 + nl.length * 11.5 + 8 + 12 : 0) + 30 + il.length * 11.5 + 8, rightH = 22 + (ship.length ? 18 : 0) + 18 + 34 + 20, need = Math.max(leftH, rightH) + 20;
+    if (y + need > H - 78) y = newPage();
+    y += 20; var top = y;
+    font(false, 10); ink(C.mute); doc.text('Subtotal', rx + 12, y + 12); ink(C.ink); doc.text(money2(sub), rx + rw - 10, y + 12, { align: 'right' }); var ty = y + 12;
+    if (ship.length) { ty += 18; ink(C.mute); doc.text('Freight / shipping', rx + 12, ty); ink(C.ink); doc.text(money2(frt), rx + rw - 10, ty, { align: 'right' }); }
+    ty += 14; fill(C.gun); doc.roundedRect(rx, ty, rw, 34, 2, 2, 'F'); font(true, 9); ink(C.white); doc.text('ORDER TOTAL', rx + 12, ty + 21); font(true, 15); doc.text(money2(total), rx + rw - 10, ty + 22, { align: 'right' });
+    font(false, 7.5); ink(C.mute); doc.text('All amounts in ' + (d.po.currency || 'USD'), rx + rw, ty + 46, { align: 'right' });
+    var ly = top;
+    function box(label, lines, h) { fill(C.soft); doc.roundedRect(M, ly, lw2, h, 2, 2, 'F'); font(true, 8); ink(C.teal); doc.text(label, M + 14, ly + 18); font(false, 9); ink(C.ink); lines.forEach(function (t, i) { doc.text(t, M + 14, ly + 33 + i * 11.5); }); ly += h + 12; }
+    if (notes) box('NOTES', nl, 30 + nl.length * 11.5 + 8);
+    box('INSTRUCTIONS', il, 30 + il.length * 11.5 + 8);
+    var N = doc.getNumberOfPages();
+    for (var p = 1; p <= N; p++) {
+      doc.setPage(p); stroke(C.line); doc.setLineWidth(.6); doc.line(M, H - 50, W - M, H - 50);
+      font(false, 7.5); ink(C.mute);
+      doc.text(X(d.company.name + '  |  ' + d.company.lines.join(', ') + (d.company.web ? '  |  ' + d.company.web : '')), M, H - 38);
+      doc.text(X('Questions about this order: ' + (buyer.name || '') + (buyer.email ? '  |  ' + buyer.email : '')), M, H - 27);
+      font(true, 8); ink(C.ink); doc.text('Page ' + p + ' of ' + N, W - M, H - 38, { align: 'right' });
+    }
+    return { pages: N, total: total, nLines: rows.length };
+  }
+  if (typeof module !== 'undefined' && module.exports) module.exports = { renderPOPdf: renderPOPdf };
+  root.renderPOPdf = renderPOPdf;
+})(typeof window !== 'undefined' ? window : globalThis);
+
 // ===================== Email a PO to the vendor's contacts, sent as the signed-in user (v23.23) =====================
 // The sender is never chosen here: the po-email function works it out from the signed-in session token.
 var _POM={status:null,statusAt:0,busy:false,hist:{},histLoading:{},histMissing:false,pdfLib:null,draft:null};
@@ -36515,62 +36617,39 @@ function _poLoadPdfLib(){
 }
 function _pdfTxt(s){return String(s==null?'':s).replace(/[\u2018\u2019]/g,"'").replace(/[\u201c\u201d]/g,'"').replace(/[\u2013\u2014]/g,'-').replace(/\u2026/g,'...').replace(/\u00a0/g,' ').replace(/[^\x09\x0a\x0d\x20-\x7e\xa1-\xff]/g,'?');}
 function _poFileName(ref){var r=String(ref||'PO').replace(/[^A-Za-z0-9._-]+/g,'-').replace(/^-+|-+$/g,'')||'PO';return (/^po[-_]/i.test(r)?r:'PO-'+r)+'.pdf';}
+// the logo is stored as AVIF; a PDF needs PNG, so the browser converts it once (it can decode AVIF)
+var _POLOGO=null;
+function _poLogo(){
+  if(_POLOGO)return _POLOGO;
+  _POLOGO=new Promise(function(res){
+    try{
+      var u=(typeof PRINT_LOGO!=='undefined')?PRINT_LOGO:'';if(!u){res(null);return;}
+      var im=new Image();
+      im.onload=function(){try{var c=document.createElement('canvas');c.width=im.naturalWidth;c.height=im.naturalHeight;c.getContext('2d').drawImage(im,0,0);res({png:c.toDataURL('image/png'),w:c.width,h:c.height});}catch(e){res(null);}};
+      im.onerror=function(){res(null);};im.src=u;
+    }catch(e){res(null);}
+  });
+  return _POLOGO;
+}
+function _poPdfData(po,logo){
+  var v=poVendorRow(po),cons=poContactsOf(v),ref=poRefOf(po),me=S.currentFullName||S.currentUser||'',meEm=S.currentUser||'';
+  var ls=(S.poLines[po.id]||[]).map(function(l){var it=partByPn(l.pn)||asmByPn(l.pn);var q=Number(l.qty_ordered)||0,c=Number(l.unit_cost)||0;return {pn:it?dispPn(it):String(l.pn||''),desc:String(l.description||(it&&it.description)||''),qty:q,cost:c,ext:q*c,ship:(typeof isShippingLine==='function')?!!isShippingLine(l):false};});
+  var named=cons.filter(function(c){return c.po&&c.name;}),attn=named.slice(0,2).map(function(c){return c.name;}).join(', ');
+  if(!attn&&cons[0]&&cons[0].name)attn=cons[0].name;
+  var vl=[];
+  if(v){if(v.street1)vl.push(v.street1);if(v.street2)vl.push(v.street2);var cs=[v.city,[v.state,v.postal_code].filter(Boolean).join(' ')].filter(Boolean).join(', ');if(cs)vl.push(cs);var cn=String(v.country||'').toUpperCase();if(cn&&cn!=='US'&&cn!=='USA'&&cn!=='UNITED STATES')vl.push(v.country);}
+  var pc=cons.filter(function(c){return c.po;})[0]||cons[0];
+  return {logo:logo,company:{name:'TGK Motorsport',lines:['7406 Townline Rd.','West Bend, WI 53090','United States'],web:'tgkmotorsport.com'},
+    po:{ref:ref,date:po.order_date||'',notes:po.notes||'',currency:'USD'},buyer:{name:me,email:meEm},
+    vendor:{name:(v&&v.name)||po.vendor||'',attn:attn,lines:vl,email:(v&&v.email)||(pc?pc.email:''),phone:(v&&(v.phone||v.contact_phone))||''},
+    shipTo:{name:'TGK Motorsport',lines:['7406 Townline Rd.','West Bend, WI 53090','United States']},lines:ls};
+}
 function _poBuildPdf(po){
-  return _poLoadPdfLib().then(function(){
-    var J=window.jspdf.jsPDF,doc=new J({unit:'pt',format:'letter'}),W=612,H=792,M=44,X=_pdfTxt;
-    var v=poVendorRow(po),cons=poContactsOf(v),ref=poRefOf(po),me=S.currentFullName||S.currentUser||'',meEm=S.currentUser||'';
-    var ls=(S.poLines[po.id]||[]).map(function(l){var it=partByPn(l.pn)||asmByPn(l.pn);var q=Number(l.qty_ordered)||0,c=Number(l.unit_cost)||0;return {pn:it?dispPn(it):String(l.pn||''),desc:String(l.description||(it&&it.description)||''),qty:q,cost:c,ext:q*c,ship:(typeof isShippingLine==='function')?!!isShippingLine(l):false};});
-    var items=ls.filter(function(l){return !l.ship;}),ship=ls.filter(function(l){return l.ship;});
-    var sub=items.reduce(function(a,l){return a+l.ext;},0),frt=ship.reduce(function(a,l){return a+l.ext;},0);
-    var rows=items.concat(ship);
-    var cx={pn:M,desc:M+112,qty:W-M-170,cost:W-M-95,tot:W-M};   // column x positions (qty, cost and total are right-aligned)
-    function hdr(){
-      doc.setFont('helvetica','bold');doc.setFontSize(20);doc.setTextColor(20,20,20);doc.text('TGK MOTORSPORT',M,M+14);
-      doc.setFont('helvetica','normal');doc.setFontSize(8.5);doc.setTextColor(90,90,90);doc.text(['7406 Townline Rd.','West Bend, WI 53090','United States'],M,M+28);
-      doc.setFont('helvetica','bold');doc.setFontSize(17);doc.setTextColor(20,20,20);doc.text('PURCHASE ORDER',W-M,M+14,{align:'right'});
-      doc.setFont('helvetica','normal');doc.setFontSize(9.5);doc.setTextColor(60,60,60);doc.text(['PO: '+X(ref),'Date: '+X(po.order_date||'')],W-M,M+30,{align:'right'});
-      doc.setDrawColor(30,30,30);doc.setLineWidth(1.2);doc.line(M,M+66,W-M,M+66);
-    }
-    function colHdr(y){
-      doc.setFillColor(238,240,243);doc.rect(M,y,W-2*M,18,'F');doc.setFont('helvetica','bold');doc.setFontSize(8);doc.setTextColor(60,60,60);
-      doc.text('PART #',cx.pn+4,y+12);doc.text('DESCRIPTION',cx.desc,y+12);doc.text('QTY',cx.qty,y+12,{align:'right'});doc.text('UNIT COST',cx.cost,y+12,{align:'right'});doc.text('TOTAL',cx.tot-4,y+12,{align:'right'});
-      return y+18;
-    }
-    hdr();
-    var y=M+84;
-    doc.setFont('helvetica','bold');doc.setFontSize(8);doc.setTextColor(13,148,136);doc.text('VENDOR',M,y);doc.text('SHIP TO',W/2+10,y);
-    doc.setFont('helvetica','normal');doc.setFontSize(10);doc.setTextColor(20,20,20);
-    var vl=[(v&&v.name)||po.vendor||''];var pc=cons.filter(function(c){return c.po;})[0]||cons[0];if(pc&&pc.name)vl.push('Attn: '+pc.name);
-    if(v){if(v.street1)vl.push(v.street1);if(v.street2)vl.push(v.street2);var cs=[v.city,[v.state,v.postal_code].filter(Boolean).join(' ')].filter(Boolean).join(', ');if(cs)vl.push(cs);if(v.country&&v.country!=='US')vl.push(v.country);}
-    doc.text(vl.map(X),M,y+14);doc.text(['TGK Motorsport','7406 Townline Rd.','West Bend, WI 53090','United States'].map(X),W/2+10,y+14);
-    y+=14+Math.max(vl.length,4)*12+16;
-    y=colHdr(y);
-    function newPage(){doc.addPage();hdr();return colHdr(M+80);}
-    rows.forEach(function(l){
-      doc.setFont('helvetica','normal');doc.setFontSize(9.5);var dl=doc.splitTextToSize(X(l.desc),cx.qty-cx.desc-34),pl=doc.splitTextToSize(X(l.pn),104);
-      var n=Math.max(dl.length,pl.length,1),rh=n*12+8;
-      if(y+rh>H-120)y=newPage();
-      doc.setFont('helvetica','normal');doc.setFontSize(9.5);doc.setTextColor(20,20,20);
-      doc.text(pl,cx.pn+4,y+13);doc.text(dl,cx.desc,y+13);doc.text(String(l.qty),cx.qty,y+13,{align:'right'});doc.text(_poMoney(l.cost),cx.cost,y+13,{align:'right'});doc.text(_poMoney2(l.ext),cx.tot-4,y+13,{align:'right'});
-      doc.setDrawColor(225,228,232);doc.setLineWidth(.5);doc.line(M,y+rh,W-M,y+rh);y+=rh;
-    });
-    if(!rows.length){doc.setFontSize(9.5);doc.setTextColor(120,120,120);doc.text('No lines on this purchase order.',cx.desc,y+16);y+=26;}
-    if(y>H-170)y=newPage();
-    y+=12;doc.setFontSize(10);doc.setTextColor(60,60,60);doc.setFont('helvetica','normal');
-    doc.text('Subtotal',cx.cost,y,{align:'right'});doc.text(_poMoney2(sub),cx.tot-4,y,{align:'right'});
-    if(ship.length){y+=15;doc.text('Freight / shipping',cx.cost,y,{align:'right'});doc.text(_poMoney2(frt),cx.tot-4,y,{align:'right'});}
-    y+=18;doc.setFont('helvetica','bold');doc.setFontSize(12);doc.setTextColor(20,20,20);doc.text('Order total',cx.cost,y,{align:'right'});doc.text(_poMoney2(sub+frt),cx.tot-4,y,{align:'right'});
-    if(po.notes&&String(po.notes).trim()){
-      y+=30;doc.setFont('helvetica','bold');doc.setFontSize(8);doc.setTextColor(13,148,136);doc.text('NOTES',M,y);
-      doc.setFont('helvetica','normal');doc.setFontSize(9.5);doc.setTextColor(40,40,40);
-      var nl=doc.splitTextToSize(X(po.notes),W-2*M);nl.forEach(function(t){y+=12;if(y>H-60){doc.addPage();hdr();y=M+90;}doc.text(t,M,y);});
-    }
-    var N=doc.getNumberOfPages();
-    for(var p=1;p<=N;p++){doc.setPage(p);doc.setFont('helvetica','normal');doc.setFontSize(8);doc.setTextColor(110,110,110);
-      doc.text(X('Please confirm receipt of this order and your expected ship date. Questions: '+me+(meEm?' <'+meEm+'>':'')),M,H-34);
-      doc.text('Page '+p+' of '+N,W-M,H-34,{align:'right'});}
+  return Promise.all([_poLoadPdfLib(),_poLogo()]).then(function(r){
+    var J=window.jspdf.jsPDF,doc=new J({unit:'pt',format:'letter'});
+    var info=renderPOPdf(doc,_poPdfData(po,r[1]));
     var uri=doc.output('datauristring');
-    return {b64:uri.slice(uri.lastIndexOf(',')+1),pages:N,total:sub+frt,nLines:rows.length,name:_poFileName(ref),blobUrl:null,doc:doc};
+    return {b64:uri.slice(uri.lastIndexOf(',')+1),pages:info.pages,total:info.total,nLines:info.nLines,name:_poFileName(poRefOf(po)),blobUrl:null,doc:doc};
   });
 }
 // ---------- the dialog
@@ -36607,11 +36686,16 @@ function openSendPO(poId){
   window._poEsc=function(e){if(e.key==='Escape'&&document.getElementById('send-po-overlay'))closeSendPO();};document.addEventListener('keydown',window._poEsc);
   _poMailRefresh();
   _poStatus().then(function(st){
-    var el=document.getElementById('spo-from-note');if(!el)return;
+    var el=document.getElementById('spo-from-note');if(!el)return;var D=_POM.draft;
     if(!st||st.ok===false){el.style.color='var(--orange)';el.innerHTML='&middot; could not check the sender ('+escHtml(String((st&&st.error)||'unknown'))+')';return;}
-    if(st.own_address){el.style.color='var(--text3)';el.innerHTML='&middot; the signed-in user. Replies come back to this address.';}
-    else if(st.own_address_unknown){el.style.color='var(--text3)';el.innerHTML='&middot; the signed-in user. Replies come back to this address.';}
-    else{el.style.color='var(--orange)';el.innerHTML='&middot; <b>Note:</b> '+escHtml(String(st.email||me).split('@')[1]||'your domain')+' is not set up for sending yet, so this goes out from <b>'+escHtml(st.fallback_from||'a TGK address')+'</b> with your name. Replies still come to you.';}
+    var ws=st.will_send_as||(st.own_address||st.own_address_unknown?'self':'fallback');
+    if(ws==='blocked'){
+      if(D)D.blocked=true;
+      el.style.color='var(--red)';el.innerHTML='&middot; <b>Cannot be sent as you yet:</b> '+escHtml(st.blocked_reason||'your address cannot be used')+'. Ask an admin to finish the email setup (PO_EMAIL_SETUP.md). Nothing is sent from any other address.';
+      _poMailRefresh();
+    }else if(ws==='fallback'){
+      el.style.color='var(--orange)';el.innerHTML='&middot; <b>Note:</b> '+escHtml(String(st.email||me).split('@')[1]||'your domain')+' is not set up for sending yet, so this goes out from <b>'+escHtml(st.fallback_from||'a TGK address')+'</b> with your name. Replies still come to you.';
+    }else{el.style.color='var(--text3)';el.innerHTML='&middot; the signed-in user. Replies come back to this address.';}
   });
   _poBuildPdf(po).then(function(r){var D=_POM.draft;if(!D||D.poId!==po.id)return;D.pdf={status:'ready',b64:r.b64,name:r.name,pages:r.pages,total:r.total,nLines:r.nLines,doc:r.doc};_poMailRefresh();})
    .catch(function(e){var D=_POM.draft;if(!D||D.poId!==po.id)return;D.pdf={status:'failed',err:String((e&&e.message)||e)};_poMailRefresh();});
@@ -36644,8 +36728,8 @@ function _poMailRefresh(){
     else att.innerHTML='<span style="color:var(--text3)">Preparing the PDF...</span>';
   }
   var n=_poMailTo().length,b=document.getElementById('spo-send');
-  if(b){var building=P.status==='building';b.disabled=_POM.busy||building||n===0;
-    b.textContent=_POM.busy?'Sending...':(building?'Preparing the PDF...':(n===0?'Pick a recipient':('Send'+(P.status==='failed'?' without PDF':'')+' to '+n+' contact'+(n===1?'':'s'))));}
+  if(b){var building=P.status==='building',blocked=!!D.blocked;b.disabled=_POM.busy||building||n===0||blocked;
+    b.textContent=_POM.busy?'Sending...':(blocked?'Cannot be sent as you yet':(building?'Preparing the PDF...':(n===0?'Pick a recipient':('Send'+(P.status==='failed'?' without PDF':'')+' to '+n+' contact'+(n===1?'':'s')))));}
 }
 function poMailPreview(){var D=_POM.draft;if(!D||!D.pdf||!D.pdf.doc)return;try{window.open(D.pdf.doc.output('bloburl'),'_blank');}catch(e){toast('Could not open the preview: '+((e&&e.message)||e),5000);}}
 async function poMailSend(){
