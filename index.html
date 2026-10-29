@@ -7484,6 +7484,456 @@ async function sendDealerBlast(){
   }
 }
 
+/* ===== Dealer Notices: fitment updates, pre-order, out of stock, back in stock, stop sell (log + email + portal) ===== */
+var DN_TYPES={
+  fitment:{label:'Fitment Update',color:'#1d4ed8',bg:'#dbeafe',
+    intro:'We have updated vehicle fitment on the parts listed below.',
+    action:'Please update the fitment / compatibility on your website to match: add the vehicles under "Added", remove the vehicles under "Removed", and update any vehicle under "Changed". Fitment for any part not listed here has not changed.'},
+  preorder:{label:'Pre-Order',color:'#6d28d9',bg:'#ede9fe',dateLabel:'Expected ship date',
+    intro:'The parts listed below are available to pre-order.',
+    action:'Please list these as Pre-Order on your website and show the expected ship date. Ship dates are estimates and may move.'},
+  oos:{label:'Out of Stock',color:'#b91c1c',bg:'#fee2e2',dateLabel:'Restock date (est.)',
+    intro:'The parts listed below are currently out of stock.',
+    action:'Please mark these as out of stock / backordered on your website. If you accept backorders, show the restock date as an estimate.'},
+  instock:{label:'Back in Stock',color:'#15803d',bg:'#dcfce7',dateLabel:'Available from',
+    intro:'The parts listed below are back in stock.',
+    action:'Please return these to in-stock / available to order on your website.'},
+  stopsell:{label:'Stop Sell',color:'#c2410c',bg:'#ffedd5',dateLabel:'Effective date',
+    intro:'The parts listed below should no longer be sold.',
+    action:'Please stop selling these parts on your website as of the effective date shown. Where a replacement SKU is listed, please use it instead.'}
+};
+var DN_FIT_FIELDS=['make','model','year_from','year_to','engine','chassis','variant_sku','transmission','drivetrain','notes'];
+var DN_FIT_LABEL={make:'Make',model:'Model',year_from:'Year from',year_to:'Year to',engine:'Engine',chassis:'Chassis',variant_sku:'Variant SKU',transmission:'Transmission',drivetrain:'Drivetrain',notes:'Notes'};
+var DN={tab:'compose',type:'fitment',items:[],notices:null,noTable:false,err:null,changes:null,chgErr:null,desel:{},since:'',showSent:false,detCache:{},warn:'',usedChangeIds:[],
+  intro:'',action:'',note:'',subject:'',subjEdited:false,pub:true,saveTpl:false,building:false,recipOff:{},openLog:null,_bt:0};
+
+function dnToday(){var d=new Date();return d.getFullYear()+'-'+('0'+(d.getMonth()+1)).slice(-2)+'-'+('0'+d.getDate()).slice(-2);}
+function dnFmtDate(iso){if(!iso)return '';var m=/^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso));if(!m)return String(iso);
+  var mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];return mo[+m[2]-1]+' '+(+m[3])+', '+m[1];}
+function dnTpl(type){
+  var t=DN_TYPES[type],saved=null,raw=(S.settings||{})['dealer_notice_tpl_'+type];
+  try{saved=(raw&&typeof raw==='object')?raw:(raw?JSON.parse(raw):null);}catch(e){saved=null;}
+  return {intro:(saved&&saved.intro)||t.intro,action:(saved&&saved.action)||t.action};
+}
+function dnDefaultSubject(type){return 'TGK Motorsport - '+DN_TYPES[type].label+' ('+dnFmtDate(dnToday())+')';}
+function dnYears(r){var a=r.year_from,b=r.year_to;if(!a&&!b)return '';if(!b||a===b)return String(a||b);return a+'-'+b;}
+function dnVeh(r){return [r.make,r.model,dnYears(r),r.engine,r.chassis,r.transmission,r.drivetrain].filter(Boolean).join(' ');}
+
+/* ---- netting: turn a series of logged edits into the real before/after per part ---- */
+function dnSig(r){return DN_FIT_FIELDS.map(function(k){return String(r[k]==null?'':r[k]).trim().toLowerCase();}).join('|');}
+function dnNetFitments(changes){
+  var state={},trunc=false;
+  changes.forEach(function(c){
+    var undo=/^Undo: /.test(c.label||''),got=0;
+    (c.details||[]).forEach(function(d){
+      if(d.t!=='fitments')return;
+      var add=undo?d.removed:d.added,del=undo?d.added:d.removed;
+      (add||[]).forEach(function(r){got++;var s=state[r.id];if(!s)state[r.id]={pn:r.pn,before:null,after:r};else{s.after=r;}});
+      (del||[]).forEach(function(r){got++;var s=state[r.id];if(!s)state[r.id]={pn:r.pn,before:r,after:null};else{s.after=null;}});
+      (d.changed||[]).forEach(function(ch){got++;
+        var rowB=Object.assign({},ch.row),rowA=Object.assign({},ch.row);
+        Object.keys(ch.diff||{}).forEach(function(f){
+          var o=ch.diff[f][0],n=ch.diff[f][1];
+          if(o==null)delete rowB[f];else rowB[f]=o;
+          if(n==null)delete rowA[f];else rowA[f]=n;
+        });
+        var B=undo?rowA:rowB,A=undo?rowB:rowA,s=state[ch.key];
+        if(!s)state[ch.key]={pn:ch.row.pn,before:B,after:A};else{s.after=A;}
+      });
+    });
+    var f=(c.summary&&c.summary.fitments)||{},want=(f.added||0)+(f.removed||0)+(f.changed||0);
+    if(got<want)trunc=true;
+  });
+  // a part that was removed and re-added with identical vehicle data (delete + re-insert) is not a change
+  var byPn={};
+  Object.keys(state).forEach(function(k){var s=state[k],pn=s.pn||(s.after&&s.after.pn)||(s.before&&s.before.pn)||'';(byPn[pn]=byPn[pn]||[]).push(s);});
+  var items=[];
+  Object.keys(byPn).forEach(function(pn){
+    var list=byPn[pn],adds=[],rems=[],chs=[];
+    list.forEach(function(s){
+      if(!s.before&&s.after)adds.push(s.after);
+      else if(s.before&&!s.after)rems.push(s.before);
+      else if(s.before&&s.after&&dnSig(s.before)!==dnSig(s.after)){
+        var diff={};DN_FIT_FIELDS.forEach(function(f){var o=s.before[f]==null?'':s.before[f],n=s.after[f]==null?'':s.after[f];if(String(o)!==String(n))diff[f]=[o,n];});
+        chs.push({row:s.after,diff:diff});
+      }
+    });
+    var remSig={};rems.forEach(function(r,i){(remSig[dnSig(r)]=remSig[dnSig(r)]||[]).push(i);});
+    var drop={};
+    adds=adds.filter(function(a){var arr=remSig[dnSig(a)];if(arr&&arr.length){drop[arr.shift()]=1;return false;}return true;});
+    rems=rems.filter(function(r,i){return !drop[i];});
+    // same vehicle removed and re-added with only variant SKU / notes different = one "changed" line, not add + remove
+    var idk=function(r){return ['make','model','year_from','year_to','engine','chassis','transmission','drivetrain'].map(function(k){return String(r[k]==null?'':r[k]).trim().toLowerCase();}).join('|');};
+    var remIdx={};rems.forEach(function(r,i){(remIdx[idk(r)]=remIdx[idk(r)]||[]).push(i);});
+    var drop2={};
+    adds=adds.filter(function(a){var arr=remIdx[idk(a)];if(arr&&arr.length){var ri=arr.shift();drop2[ri]=1;var b=rems[ri],diff={};
+      DN_FIT_FIELDS.forEach(function(f){var o=b[f]==null?'':b[f],nv=a[f]==null?'':a[f];if(String(o)!==String(nv))diff[f]=[o,nv];});
+      chs.push({row:a,diff:diff});return false;}return true;});
+    rems=rems.filter(function(r,i){return !drop2[i];});
+    if(!adds.length&&!rems.length&&!chs.length)return;
+    var asm=(typeof findAsm==='function')?findAsm(pn):null;
+    var clean=function(r){var o={};DN_FIT_FIELDS.forEach(function(k){if(r[k]!=null&&r[k]!=='')o[k]=r[k];});return o;};
+    items.push({pn:pn,sku:(typeof dispSku==='function'?dispSku(pn):pn),desc:(asm&&asm.description)||'',
+      added:adds.map(clean),removed:rems.map(clean),changed:chs.map(function(c){return {row:clean(c.row),diff:c.diff};})});
+  });
+  items.sort(function(a,b){return String(a.sku).localeCompare(String(b.sku));});
+  return {items:items,trunc:trunc};
+}
+
+/* ---- rendering of a notice (used for the email, the ERP preview/log and the dealer portal) ---- */
+function dnCols(rows){
+  var cols=[['make','Make'],['model','Model'],['years','Years'],['engine','Engine'],['chassis','Chassis'],['transmission','Trans'],['drivetrain','Drive'],['variant_sku','Variant SKU'],['notes','Notes']];
+  return cols.filter(function(c){return rows.some(function(r){return c[0]==='years'?!!dnYears(r):!!r[c[0]];});});
+}
+function dnTbl(heads,rowsHtml){
+  var th='font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#6b7280;text-align:left;padding:5px 8px;border-bottom:1px solid #e5e7eb;background:#f9fafb;white-space:nowrap';
+  return '<table style="border-collapse:collapse;width:100%;font-size:13px;margin:4px 0 10px"><thead><tr>'+heads.map(function(h){return '<th style="'+th+'">'+escHtml(h)+'</th>';}).join('')+'</tr></thead><tbody>'+rowsHtml+'</tbody></table>';
+}
+function dnTd(v,extra){return '<td style="padding:5px 8px;border-bottom:1px solid #f0f0f0;vertical-align:top;'+(extra||'')+'">'+v+'</td>';}
+function dnItemsHtml(type,items){
+  items=items||[];
+  if(!items.length)return '<div style="color:#6b7280;font-size:13px">No items.</div>';
+  if(type==='fitment'){
+    return items.map(function(it){
+      var h='<div style="margin:14px 0 4px;padding:8px 10px;background:#f3f4f6;border-radius:6px"><b style="font-family:Consolas,Menlo,monospace">'+escHtml(it.sku)+'</b>'+(it.desc?' <span style="color:#374151">- '+escHtml(it.desc)+'</span>':'')+'</div>';
+      function vt(rows,tag,color){
+        var cols=dnCols(rows);
+        var body=rows.map(function(r){return '<tr>'+cols.map(function(c){return dnTd(escHtml(c[0]==='years'?dnYears(r):(r[c[0]]==null?'':r[c[0]])));}).join('')+'</tr>';}).join('');
+        return '<div style="font-size:12px;font-weight:700;color:'+color+';margin-top:6px">'+tag+' ('+rows.length+')</div>'+dnTbl(cols.map(function(c){return c[1];}),body);
+      }
+      if(it.added&&it.added.length)h+=vt(it.added,'ADDED - add these vehicles','#15803d');
+      if(it.removed&&it.removed.length)h+=vt(it.removed,'REMOVED - remove these vehicles','#b91c1c');
+      if(it.changed&&it.changed.length){
+        h+='<div style="font-size:12px;font-weight:700;color:#b45309;margin-top:6px">CHANGED ('+it.changed.length+')</div>'
+          +dnTbl(['Vehicle','What changed'],it.changed.map(function(c){
+            return '<tr>'+dnTd(escHtml(dnVeh(c.row)))+dnTd(Object.keys(c.diff).map(function(f){return escHtml(DN_FIT_LABEL[f]||f)+': <s style="color:#9ca3af">'+escHtml(c.diff[f][0]===''?'(blank)':c.diff[f][0])+'</s> &rarr; <b>'+escHtml(c.diff[f][1]===''?'(blank)':c.diff[f][1])+'</b>';}).join('<br>'))+'</tr>';
+          }).join(''));
+      }
+      return h;
+    }).join('');
+  }
+  var t=DN_TYPES[type]||{},showRep=(type==='stopsell');
+  var heads=['SKU','Description',t.dateLabel||'Date'].concat(showRep?['Replacement SKU']:[]).concat(['Note']);
+  return dnTbl(heads,items.map(function(it){
+    return '<tr>'+dnTd('<b style="font-family:Consolas,Menlo,monospace">'+escHtml(it.sku||it.pn)+'</b>','white-space:nowrap')+dnTd(escHtml(it.desc||''))
+      +dnTd(escHtml(it.date?dnFmtDate(it.date):(type==='oos'?'TBD':'')),'white-space:nowrap')+(showRep?dnTd(escHtml(it.replacement||''),'font-family:Consolas,Menlo,monospace'):'')+dnTd(escHtml(it.note||''))+'</tr>';
+  }).join(''));
+}
+function dnItemsText(type,items){
+  var out=[];
+  (items||[]).forEach(function(it){
+    if(type==='fitment'){
+      out.push('',it.sku+(it.desc?' - '+it.desc:''));
+      (it.added||[]).forEach(function(r){out.push('  ADD:     '+dnVeh(r)+(r.variant_sku?' ['+r.variant_sku+']':'')+(r.notes?' ('+r.notes+')':''));});
+      (it.removed||[]).forEach(function(r){out.push('  REMOVE:  '+dnVeh(r)+(r.variant_sku?' ['+r.variant_sku+']':'')+(r.notes?' ('+r.notes+')':''));});
+      (it.changed||[]).forEach(function(c){out.push('  CHANGE:  '+dnVeh(c.row)+' -> '+Object.keys(c.diff).map(function(f){return (DN_FIT_LABEL[f]||f)+' '+(c.diff[f][0]===''?'(blank)':c.diff[f][0])+' => '+(c.diff[f][1]===''?'(blank)':c.diff[f][1]);}).join(', '));});
+    }else{
+      var t=DN_TYPES[type]||{};
+      out.push('- '+(it.sku||it.pn)+(it.desc?' - '+it.desc:'')+(it.date?' | '+(t.dateLabel||'Date')+': '+dnFmtDate(it.date):(type==='oos'?' | '+(t.dateLabel||'Date')+': TBD':''))+(it.replacement?' | Replacement: '+it.replacement:'')+(it.note?' | '+it.note:''));
+    }
+  });
+  return out.join('\n');
+}
+function dnBuildEmail(n,withSig){
+  var t=DN_TYPES[n.type]||DN_TYPES.fitment,s=S.settings||{};
+  var logo=s.dealer_blast_logo||TGK_DEALER_LOGO,sig=s.dealer_blast_signature||'Thank you,\nThe TGK Motorsport Team\nSupport@TGKMotorsport.com';
+  var nl=function(x){return escHtml(x).replace(/\n/g,'<br>');};
+  var sigHtml=withSig?('<div style="margin-top:22px;padding-top:14px;border-top:1px solid #e2e2e2;color:#555;font-size:13px">'
+    +(logo?'<img src="'+escHtml(logo.replace('width=150','width=600'))+'" alt="TGK Motorsport" width="170" style="width:170px;height:auto;display:block;margin-bottom:12px;border:0">':'')+nl(sig)+'</div>'):'';
+  var html='<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222;line-height:1.55;max-width:760px">'
+    +'<div style="display:inline-block;background:'+t.bg+';color:'+t.color+';font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;padding:3px 10px;border-radius:999px">'+escHtml(t.label)+'</div>'
+    +'<div style="font-size:12px;color:#6b7280;margin:6px 0 10px">Notice date: '+escHtml(dnFmtDate(n.notice_date||dnToday()))+'</div>'
+    +(n.intro?'<p style="margin:0 0 10px">'+nl(n.intro)+'</p>':'')
+    +(n.action?'<div style="background:#f0fdfa;border-left:4px solid #0d9488;padding:9px 12px;margin:0 0 12px"><b>What to do:</b> '+nl(n.action)+'</div>':'')
+    +dnItemsHtml(n.type,n.items)
+    +(n.note?'<p style="margin:12px 0 0">'+nl(n.note)+'</p>':'')
+    +sigHtml+'</div>';
+  var text=(n.intro?n.intro+'\n\n':'')+(n.action?'WHAT TO DO: '+n.action+'\n':'')+dnItemsText(n.type,n.items)+(n.note?'\n\n'+n.note:'')+(withSig?'\n\n'+sig:'');
+  return {html:html,text:text};
+}
+
+/* ---- CSV (dealer-friendly, one row per vehicle / per part) ---- */
+function dnCsvCell(v){v=v==null?'':String(v);return /[",\n\r]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;}
+function dnCsv(n){
+  var rows=[],d=dnFmtDate(n.notice_date||n.created_at),t=(DN_TYPES[n.type]||{}).label||n.type;
+  if(n.type==='fitment'){
+    rows.push(['Notice Date','SKU','Description','Change','Make','Model','Year From','Year To','Engine','Chassis','Transmission','Drivetrain','Variant SKU','Notes','What Changed']);
+    (n.items||[]).forEach(function(it){
+      var line=function(chg,r,what){rows.push([d,it.sku,it.desc,chg,r.make,r.model,r.year_from,r.year_to,r.engine,r.chassis,r.transmission,r.drivetrain,r.variant_sku,r.notes,what||'']);};
+      (it.added||[]).forEach(function(r){line('ADDED',r);});
+      (it.removed||[]).forEach(function(r){line('REMOVED',r);});
+      (it.changed||[]).forEach(function(c){line('CHANGED',c.row,Object.keys(c.diff).map(function(f){return (DN_FIT_LABEL[f]||f)+': '+(c.diff[f][0]===''?'(blank)':c.diff[f][0])+' -> '+(c.diff[f][1]===''?'(blank)':c.diff[f][1]);}).join('; '));});
+    });
+  }else{
+    rows.push(['Notice Date','Type','SKU','Description',(DN_TYPES[n.type]||{}).dateLabel||'Date','Replacement SKU','Note']);
+    (n.items||[]).forEach(function(it){rows.push([d,t,it.sku||it.pn,it.desc,it.date?dnFmtDate(it.date):'',it.replacement||'',it.note||'']);});
+  }
+  return rows.map(function(r){return r.map(dnCsvCell).join(',');}).join('\r\n');
+}
+function dnDownload(name,text){
+  var b=new Blob(['\ufeff'+text],{type:'text/csv;charset=utf-8'}),a=document.createElement('a');
+  a.href=URL.createObjectURL(b);a.download=name;document.body.appendChild(a);a.click();
+  setTimeout(function(){URL.revokeObjectURL(a.href);a.remove();},500);
+}
+function dnNoticeById(id){
+  var pool=[].concat(DN.notices||[],window._dpNotices||[]);
+  for(var i=0;i<pool.length;i++){if(String(pool[i].id)===String(id))return pool[i];}return null;
+}
+function dnCsvById(id){var n=dnNoticeById(id);if(!n)return;
+  dnDownload('TGK_'+n.type+'_notice_'+String(n.notice_date||n.created_at||'').slice(0,10)+'.csv',dnCsv(n));}
+async function dnCopyTextById(id){var n=dnNoticeById(id);if(!n)return;
+  var e=dnBuildEmail(n,false);
+  try{await navigator.clipboard.writeText((n.subject||'')+'\n\n'+e.text);toast('Copied');}catch(x){toast('Copy failed - use the CSV instead');}}
+
+/* ---- data ---- */
+async function dnLoadNotices(force){
+  if(DN.notices&&!force)return;
+  var r=await db.from('dealer_notices').select('*').order('created_at',{ascending:false}).limit(300);
+  if(r.error){DN.noTable=/dealer_notices|does not exist|schema cache|relation/i.test(r.error.message||'')||r.error.code==='42P01';DN.err=r.error.message;DN.notices=[];}
+  else{DN.noTable=false;DN.err=null;DN.notices=r.data||[];}
+}
+async function dnLoadChanges(){
+  var r=await db.from('fitment_changes').select('id,at,user_email,label,summary').order('at',{ascending:false}).limit(500);
+  if(r.error){DN.chgErr=r.error.message;DN.changes=[];return;}
+  DN.chgErr=null;DN.changes=r.data||[];
+}
+function dnSentIds(){var set={};(DN.notices||[]).forEach(function(n){(n.change_ids||[]).forEach(function(id){set[id]=1;});});return set;}
+function dnVisibleChanges(){
+  var sent=dnSentIds();
+  return (DN.changes||[]).filter(function(c){
+    var f=c.summary&&c.summary.fitments;if(!f||!(f.added||f.removed||f.changed))return false;
+    if(DN.since&&String(c.at||'').slice(0,10)<DN.since)return false;
+    if(!DN.showSent&&sent[c.id])return false;
+    return true;
+  });
+}
+async function dnBuildFitment(){
+  var tok=++DN._bt,sel=dnVisibleChanges().filter(function(c){return !DN.desel[c.id];});
+  DN.usedChangeIds=sel.map(function(c){return c.id;});
+  var need=sel.filter(function(c){return !DN.detCache[c.id];}).map(function(c){return c.id;});
+  DN.building=true;dnRenderCompose();
+  try{
+    for(var i=0;i<need.length;i+=15){
+      var r=await db.from('fitment_changes').select('id,details').in('id',need.slice(i,i+15));
+      if(r.error)throw r.error;
+      (r.data||[]).forEach(function(x){DN.detCache[x.id]=x.details||[];});
+    }
+  }catch(e){DN.building=false;DN.warn='Could not load change details: '+(e.message||e);dnRenderCompose();return;}
+  if(tok!==DN._bt)return;
+  var list=sel.map(function(c){return {id:c.id,at:c.at,label:c.label,summary:c.summary,details:DN.detCache[c.id]||[]};}).sort(function(a,b){return String(a.at).localeCompare(String(b.at));});
+  var res=dnNetFitments(list);
+  DN.items=res.items;
+  DN.warn=res.trunc?'One or more of the selected changes was large and the Command Center only keeps the first 150 rows of each kind in its history, so this list may be incomplete. Check the Fitment tool before sending.':'';
+  DN.building=false;dnRenderCompose();
+}
+
+/* ---- UI ---- */
+function dnOpen(){
+  var ex=document.getElementById('dn-ov');if(ex)ex.remove();
+  var ov=document.createElement('div');ov.id='dn-ov';
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:16px';
+  ov.innerHTML='<div style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(1240px,98vw);height:min(94vh,940px);display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.25)">'
+    +'<div style="padding:12px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">'
+      +'<div style="font-size:var(--t-lg);font-weight:700;color:var(--text)">Dealer Notices</div>'
+      +'<div style="display:flex;gap:4px;margin-left:14px" id="dn-tabs"></div>'
+      +'<div style="flex:1"></div><button class="btn btn-sm" onclick="dnClose()">Close</button></div>'
+    +'<div id="dn-body" style="flex:1;min-height:0;display:flex"></div></div>';
+  document.body.appendChild(ov);
+  DN.tab='compose';DN.type='fitment';DN.items=[];DN.desel={};DN.warn='';DN.note='';DN.saveTpl=false;DN.openLog=null;DN.subjEdited=false;DN.recipOff={};
+  var tp=dnTpl('fitment');DN.intro=tp.intro;DN.action=tp.action;DN.subject=dnDefaultSubject('fitment');
+  var d=new Date();d.setDate(d.getDate()-14);DN.since=d.getFullYear()+'-'+('0'+(d.getMonth()+1)).slice(-2)+'-'+('0'+d.getDate()).slice(-2);
+  DN.pub=true;DN.notices=null;DN.changes=null;
+  dnRenderTabs();dnBody();
+  dnLoadNotices(true).then(function(){
+    var last=(DN.notices||[]).filter(function(n){return n.type==='fitment'&&n.emailed;})[0];
+    if(last&&last.created_at){DN.since=String(last.created_at).slice(0,10);}
+    dnRenderTabs();
+    return dnLoadChanges();
+  }).then(function(){if(DN.tab==='compose'&&DN.type==='fitment')dnBuildFitment();else dnBody();});
+}
+function dnClose(){var ov=document.getElementById('dn-ov');if(ov)ov.remove();}
+function dnRenderTabs(){
+  var el=document.getElementById('dn-tabs');if(!el)return;
+  var tab=function(id,l){return '<button class="filter-chip'+(DN.tab===id?' on-teal':'')+'" onclick="dnTab(\''+id+'\')">'+l+'</button>';};
+  el.innerHTML=tab('compose','New notice')+tab('log','Sent log'+(DN.notices?' ('+DN.notices.length+')':''));
+}
+function dnTab(t){DN.tab=t;dnRenderTabs();dnBody();}
+function dnBody(){if(DN.tab==='log')dnRenderLog();else dnRenderCompose();}
+function dnSetType(t){
+  DN.type=t;DN.items=[];DN.warn='';
+  var tp=dnTpl(t);DN.intro=tp.intro;DN.action=tp.action;
+  if(!DN.subjEdited)DN.subject=dnDefaultSubject(t);
+  if(t==='fitment'){if(DN.changes)dnBuildFitment();else dnRenderCompose();}else dnRenderCompose();
+}
+function dnSetSince(v){DN.since=v;dnBuildFitment();}
+function dnToggleSent(on){DN.showSent=!!on;dnBuildFitment();}
+function dnToggleChg(id,on){if(on)delete DN.desel[id];else DN.desel[id]=1;dnBuildFitment();}
+function dnField(k,v){DN[k]=v;if(k==='subject')DN.subjEdited=true;dnPrev();}
+function dnItemField(i,k,v){if(DN.items[i]){DN.items[i][k]=v;dnPrev();}}
+function dnRemoveItem(i){DN.items.splice(i,1);dnRenderCompose();}
+function dnAddAsm(pn){
+  var a=(typeof findAsm==='function')?findAsm(pn):null;if(!a)return;
+  if(DN.items.some(function(x){return x.pn===a.pn;})){toast('Already in the list');return;}
+  var bo=(S.currentBackorders||{})[String(a.pn).toUpperCase()]||(a.new_sku&&(S.currentBackorders||{})[String(a.new_sku).toUpperCase()])||null;
+  DN.items.push({pn:a.pn,sku:dispPn(a),desc:a.description||'',date:DN.type==='oos'?((bo&&bo.restock_date)||''):(DN.type==='stopsell'||DN.type==='instock'?dnToday():''),replacement:'',note:''});
+  dnRenderCompose();
+}
+function dnQuickAdd(kind){
+  var added=0,add=function(a){if(a&&!DN.items.some(function(x){return x.pn===a.pn;})){var bo=(S.currentBackorders||{})[String(a.pn).toUpperCase()]||(a.new_sku&&(S.currentBackorders||{})[String(a.new_sku).toUpperCase()])||null;
+    DN.items.push({pn:a.pn,sku:dispPn(a),desc:a.description||'',date:kind==='oos'?((bo&&bo.restock_date)||''):'',replacement:'',note:''});added++;}};
+  if(kind==='oos'){Object.keys(S.currentBackorders||{}).forEach(function(k){add(findAsm(k));});}
+  if(kind==='preorder'){(S.assemblies||[]).filter(function(a){return (a.category||'')==='Pre-Order'&&!a.discontinued&&!a.is_subassembly;}).forEach(add);}
+  toast(added?('Added '+added+' item'+(added===1?'':'s')):'Nothing to add');
+  dnRenderCompose();
+}
+function dnSearch(q){
+  var el=document.getElementById('dn-res');if(!el)return;q=String(q||'').trim().toLowerCase();
+  if(q.length<2){el.innerHTML='';return;}
+  var res=(S.assemblies||[]).filter(function(a){return !a.is_subassembly&&((a.pn||'').toLowerCase().indexOf(q)>=0||(a.new_sku||'').toLowerCase().indexOf(q)>=0||(a.description||'').toLowerCase().indexOf(q)>=0);}).slice(0,8);
+  el.innerHTML=res.length?res.map(function(a){return '<div style="padding:6px 10px;cursor:pointer;border-bottom:1px solid var(--border);font-size:var(--t-md)" onmousedown="dnAddAsm(\''+String(a.pn).replace(/'/g,"\\'")+'\')"><b style="font-family:var(--mono)">'+escHtml(dispPn(a))+'</b> <span style="color:var(--text3)">'+escHtml(a.description||'')+'</span></div>';}).join(''):'<div style="padding:8px 10px;color:var(--text3);font-size:var(--t-md)">No matching SKU</div>';
+}
+function dnPrev(){
+  var el=document.getElementById('dn-prev');if(!el)return;
+  var n={type:DN.type,intro:DN.intro,action:DN.action,note:DN.note,items:DN.items,notice_date:dnToday()};
+  el.innerHTML=DN.building?'<div style="padding:30px;text-align:center;color:#6b7280">Reading the change history...</div>':dnBuildEmail(n,true).html;
+}
+function dnRecipCount(){var n=document.querySelectorAll('.dn-recip:checked').length;
+  var c=document.getElementById('dn-rcount');if(c)c.textContent=n;
+  var b=document.getElementById('dn-send');if(b){b.textContent='Email '+n+' dealer'+(n===1?'':'s');b.removeAttribute('data-armed');b.style.background='';b.style.borderColor='';}
+  return n;}
+function dnRecipToggle(cb){var id=cb.getAttribute('data-id');if(cb.checked)delete DN.recipOff[id];else DN.recipOff[id]=1;dnRecipCount();}
+function dnRecipAll(cb){document.querySelectorAll('.dn-recip').forEach(function(x){x.checked=cb.checked;var id=x.getAttribute('data-id');if(cb.checked)delete DN.recipOff[id];else DN.recipOff[id]=1;});dnRecipCount();}
+
+function dnRenderCompose(){
+  var body=document.getElementById('dn-body');if(!body)return;
+  var T=DN_TYPES[DN.type],dealers=_dealerBlastActive();
+  var h='<div style="width:48%;min-width:420px;border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0"><div style="flex:1;overflow-y:auto;padding:16px 18px">';
+  if(DN.noTable)h+='<div style="background:var(--red-dim);border:1px solid var(--red);color:var(--red);border-radius:var(--r-md);padding:10px 12px;margin-bottom:12px;font-size:var(--t-md)">The <b>dealer_notices</b> table does not exist yet. Run <b>dealer_notices.sql</b> in the Supabase SQL editor, then reopen this window. Sending is disabled until then so nothing is emailed without being logged.</div>';
+  h+='<div class="form-label" style="margin-bottom:6px">Notice type</div><div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px">'
+    +Object.keys(DN_TYPES).map(function(k){return '<button class="filter-chip'+(DN.type===k?' on-teal':'')+'" onclick="dnSetType(\''+k+'\')">'+DN_TYPES[k].label+'</button>';}).join('')+'</div>';
+  if(DN.type==='fitment'){
+    var vis=dnVisibleChanges(),sent=dnSentIds();
+    h+='<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px"><div class="form-label" style="margin:0">Fitment changes since</div>'
+      +'<input type="date" class="form-input" style="width:150px" value="'+escHtml(DN.since)+'" onchange="dnSetSince(this.value)">'
+      +'<label style="font-size:var(--t-sm);color:var(--text3);display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" '+(DN.showSent?'checked':'')+' onchange="dnToggleSent(this.checked)"> show ones already sent</label></div>';
+    if(DN.chgErr)h+='<div class="fm-bad" style="color:var(--red);font-size:var(--t-md);margin-bottom:8px">Could not read the fitment change history: '+escHtml(DN.chgErr)+'</div>';
+    else if(!DN.changes)h+='<div style="color:var(--text3);padding:10px">Loading...</div>';
+    else if(!vis.length)h+='<div style="color:var(--text3);padding:10px;border:1px dashed var(--border2);border-radius:var(--r-md);font-size:var(--t-md)">No unsent fitment changes in this date range.</div>';
+    else h+='<div style="border:1px solid var(--border);border-radius:var(--r-md);max-height:210px;overflow-y:auto;background:var(--bg)">'
+      +vis.map(function(c){var f=c.summary.fitments,b=[];if(f.added)b.push(f.added+' added');if(f.changed)b.push(f.changed+' changed');if(f.removed)b.push(f.removed+' removed');
+        return '<label style="display:flex;gap:8px;padding:6px 10px;border-bottom:1px solid var(--border);cursor:pointer;font-size:var(--t-md);align-items:flex-start"><input type="checkbox" style="margin-top:3px" '+(DN.desel[c.id]?'':'checked')+' onchange="dnToggleChg('+JSON.stringify(c.id).replace(/"/g,'&quot;')+',this.checked)">'
+          +'<span style="flex:1"><b>'+escHtml(c.label||'')+'</b>'+(sent[c.id]?' <span class="pill pill-muted">sent before</span>':'')+'<br><span style="color:var(--text3);font-size:var(--t-sm)">'+escHtml(new Date(c.at).toLocaleString())+' &middot; '+escHtml(c.user_email||'')+' &middot; '+b.join(', ')+'</span></span></label>';}).join('')+'</div>';
+    if(DN.warn)h+='<div style="background:var(--yellow-dim);border:1px solid var(--yellow);color:var(--text);border-radius:var(--r-md);padding:8px 10px;margin-top:8px;font-size:var(--t-sm)">'+escHtml(DN.warn)+'</div>';
+    h+='<div style="font-size:var(--t-sm);color:var(--text3);margin:8px 0 14px">'+(DN.building?'Working...':(DN.items.length?DN.items.length+' part'+(DN.items.length===1?'':'s')+' with real changes. Edits that were undone or re-saved with identical data are netted out.':'Nothing to report from the selected changes.'))+'</div>';
+  }else{
+    h+='<div class="form-label" style="margin-bottom:6px">Parts in this notice ('+DN.items.length+')</div>';
+    h+='<div style="position:relative;margin-bottom:8px"><input class="form-input" placeholder="Search SKU or description to add..." oninput="dnSearch(this.value)" onblur="setTimeout(function(){var e=document.getElementById(\'dn-res\');if(e)e.innerHTML=\'\';},150)">'
+      +'<div id="dn-res" style="position:absolute;left:0;right:0;top:100%;background:var(--bg);border:1px solid var(--border2);border-radius:var(--r-md);z-index:5;box-shadow:0 8px 20px rgba(0,0,0,.15)"></div></div>';
+    h+='<div style="display:flex;gap:6px;margin-bottom:8px">'+(DN.type==='oos'?'<button class="btn btn-sm" onclick="dnQuickAdd(\'oos\')">+ All currently backordered</button>':'')+(DN.type==='preorder'?'<button class="btn btn-sm" onclick="dnQuickAdd(\'preorder\')">+ All Pre-Order SKUs</button>':'')+'</div>';
+    h+=DN.items.length?DN.items.map(function(it,i){
+      return '<div style="border:1px solid var(--border);border-radius:var(--r-md);padding:8px 10px;margin-bottom:6px;background:var(--bg)">'
+        +'<div style="display:flex;align-items:center;gap:8px"><b style="font-family:var(--mono)">'+escHtml(it.sku)+'</b><span style="flex:1;color:var(--text3);font-size:var(--t-sm)" class="ellip">'+escHtml(it.desc)+'</span><button class="action-btn del" onclick="dnRemoveItem('+i+')">Remove</button></div>'
+        +'<div style="display:grid;grid-template-columns:150px '+(DN.type==='stopsell'?'140px ':'')+'1fr;gap:8px;margin-top:6px">'
+        +'<div><div class="form-label">'+escHtml(T.dateLabel)+'</div><input type="date" class="form-input" value="'+escHtml(it.date||'')+'" oninput="dnItemField('+i+',\'date\',this.value)"></div>'
+        +(DN.type==='stopsell'?'<div><div class="form-label">Replacement SKU</div><input class="form-input" value="'+escHtml(it.replacement||'')+'" oninput="dnItemField('+i+',\'replacement\',this.value)"></div>':'')
+        +'<div><div class="form-label">Note (optional)</div><input class="form-input" value="'+escHtml(it.note||'')+'" oninput="dnItemField('+i+',\'note\',this.value)"></div></div></div>';
+    }).join(''):'<div style="color:var(--text3);padding:10px;border:1px dashed var(--border2);border-radius:var(--r-md);font-size:var(--t-md)">Search above to add parts.</div>';
+    h+='<div style="height:12px"></div>';
+  }
+  h+='<div class="form-group" style="margin-bottom:10px"><label class="form-label">Subject</label><input class="form-input" value="'+escHtml(DN.subject)+'" oninput="dnField(\'subject\',this.value)"></div>'
+    +'<div class="form-group" style="margin-bottom:10px"><label class="form-label">Intro</label><textarea class="form-input" rows="2" oninput="dnField(\'intro\',this.value)">'+escHtml(DN.intro)+'</textarea></div>'
+    +'<div class="form-group" style="margin-bottom:6px"><label class="form-label">What dealers should do</label><textarea class="form-input" rows="3" oninput="dnField(\'action\',this.value)">'+escHtml(DN.action)+'</textarea></div>'
+    +'<label style="font-size:var(--t-sm);color:var(--text3);display:flex;align-items:center;gap:5px;cursor:pointer;margin-bottom:10px"><input type="checkbox" '+(DN.saveTpl?'checked':'')+' onchange="DN.saveTpl=this.checked"> Save this intro + instructions as the default for '+escHtml(T.label)+'</label>'
+    +'<div class="form-group" style="margin-bottom:14px"><label class="form-label">Extra note (optional, shown at the bottom)</label><textarea class="form-input" rows="2" oninput="dnField(\'note\',this.value)">'+escHtml(DN.note)+'</textarea></div>';
+  var nOn=dealers.filter(function(d){return !DN.recipOff[d.id];}).length;
+  h+='<div class="form-group"><label class="form-label" style="display:flex;align-items:center;justify-content:space-between">Recipients (<span id="dn-rcount">'+nOn+'</span> selected)'
+    +'<label style="font-size:var(--t-sm);font-weight:500;text-transform:none;letter-spacing:0;color:var(--text3);display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" '+(nOn===dealers.length?'checked':'')+' onchange="dnRecipAll(this)"> Select all</label></label>'
+    +'<div style="border:1px solid var(--border);border-radius:var(--r-md);max-height:170px;overflow-y:auto;padding:4px;background:var(--bg)">'
+    +(dealers.length?dealers.map(function(d){var em=String(d.email).trim();
+      return '<label style="display:flex;align-items:center;gap:8px;padding:4px 8px;cursor:pointer;font-size:var(--t-md)"><input type="checkbox" class="dn-recip" data-id="'+escHtml(d.id)+'" value="'+escHtml(em)+'" '+(DN.recipOff[d.id]?'':'checked')+' onchange="dnRecipToggle(this)"><span style="font-weight:600">'+escHtml(d.name||'')+'</span><span style="color:var(--text3);font-family:var(--mono);font-size:var(--t-sm)">'+escHtml(em)+'</span></label>';}).join(''):'<div style="padding:12px;color:var(--text3);text-align:center">No active dealers with an email address.</div>')
+    +'</div></div>';
+  h+='</div>'
+    +'<div style="padding:12px 18px;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+    +'<label style="font-size:var(--t-sm);color:var(--text3);display:flex;align-items:center;gap:5px;cursor:pointer;flex:1;min-width:200px"><input type="checkbox" '+(DN.pub?'checked':'')+' onchange="DN.pub=this.checked"> Show on every dealer\'s portal (Updates tab)</label>'
+    +'<button class="btn btn-sm" onclick="dnSubmit(false)" title="Save to the log (and portal) without emailing anyone">Log only</button>'
+    +'<button class="btn btn-sm" onclick="dnCsvDraft()">CSV</button>'
+    +'<button class="btn btn-primary" id="dn-send" onclick="dnSubmit(true)" '+(DN.noTable?'disabled':'')+'>Email '+nOn+' dealer'+(nOn===1?'':'s')+'</button></div></div>'
+    +'<div style="flex:1;min-width:0;display:flex;flex-direction:column;background:var(--bg3)"><div style="padding:10px 16px;font-size:var(--t-xs);font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text3)">Email preview</div>'
+    +'<div style="flex:1;overflow-y:auto;padding:0 16px 16px"><div id="dn-prev" style="background:#fff;border:1px solid var(--border2);border-radius:var(--r-md);padding:20px 22px;color:#222"></div></div></div>';
+  body.innerHTML=h;dnPrev();
+}
+function dnCsvDraft(){
+  if(!DN.items.length){toast('Nothing to export yet');return;}
+  dnDownload('TGK_'+DN.type+'_notice_'+dnToday()+'.csv',dnCsv({type:DN.type,notice_date:dnToday(),items:DN.items}));
+}
+async function dnSubmit(emailIt){
+  try{
+    if(!DN.items.length){toast('Add at least one part (or one fitment change) first');return;}
+    var subject=(DN.subject||'').trim();if(!subject){toast('Subject required');return;}
+    var boxes=[].slice.call(document.querySelectorAll('.dn-recip:checked'));
+    var emails=[...new Set(boxes.map(function(x){return x.value;}).filter(Boolean))],ids=boxes.map(function(x){return x.getAttribute('data-id');});
+    if(emailIt&&!emails.length){toast('Select at least one dealer');return;}
+    if(emailIt&&DN.noTable){toast('Run dealer_notices.sql first');return;}
+    var btn=document.getElementById('dn-send');
+    if(emailIt&&btn&&btn.getAttribute('data-armed')!=='1'){
+      btn.setAttribute('data-armed','1');btn.textContent='Click again to email '+emails.length+' dealer'+(emails.length===1?'':'s');btn.style.background='var(--red)';btn.style.borderColor='var(--red)';return;
+    }
+    if(btn){btn.disabled=true;btn.textContent='Sending...';}
+    var n={type:DN.type,intro:DN.intro,action:DN.action,note:DN.note,items:DN.items,notice_date:dnToday()};
+    if(emailIt){
+      var s=S.settings||{},from=s.dealer_blast_from||'TGK Motorsport <sales@mail.tgkmotorsport.com>',replyTo=s.dealer_blast_replyto||'support@tgkmotorsport.com';
+      var em=dnBuildEmail(n,true),payload={subject:subject,html:em.html,text:em.text,bcc:emails,from:from};
+      if(replyTo)payload.replyTo=replyTo;
+      var resp=await fetch(SUPA_URL+'/functions/v1/send-dealer-blast',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      var data=await resp.json().catch(function(){return{};});
+      if(!resp.ok||data.error){toast('Send failed: '+(data.error||('HTTP '+resp.status))+' - nothing was logged',9000);if(btn){btn.disabled=false;btn.removeAttribute('data-armed');btn.style.background='';btn.style.borderColor='';btn.textContent='Email '+emails.length+' dealers';}return;}
+    }
+    var row={type:DN.type,subject:subject,notice_date:dnToday(),intro:DN.intro,action:DN.action,note:DN.note,items:DN.items,
+      change_ids:DN.type==='fitment'?DN.usedChangeIds:[],emailed:!!emailIt,recipient_ids:emailIt?ids:[],recipient_count:emailIt?emails.length:0,published:!!DN.pub,sent_by:S.currentUser||null};
+    var ins=await db.from('dealer_notices').insert(row).select().single();
+    if(ins.error){toast((emailIt?'Email was sent, but the log entry failed: ':'Log failed: ')+ins.error.message+' - run dealer_notices.sql',10000);if(btn)btn.disabled=false;return;}
+    if(DN.saveTpl){var key='dealer_notice_tpl_'+DN.type,val=JSON.stringify({intro:DN.intro,action:DN.action});S.settings=S.settings||{};S.settings[key]=val;db.from('settings').upsert({key:key,value:val},{onConflict:'key'});}
+    DN.notices=[ins.data].concat(DN.notices||[]);
+    toast(emailIt?('Emailed '+emails.length+' dealer'+(emails.length===1?'':'s')+' and logged'):'Logged');
+    DN.items=[];DN.note='';DN.tab='log';DN.openLog=ins.data.id;dnRenderTabs();dnBody();
+  }catch(e){toast('Error: '+((e&&e.message)||e),9000);var b=document.getElementById('dn-send');if(b){b.disabled=false;b.removeAttribute('data-armed');b.style.background='';b.style.borderColor='';}}
+}
+function dnRenderLog(){
+  var body=document.getElementById('dn-body');if(!body)return;
+  var h='<div style="flex:1;overflow-y:auto;padding:16px 20px">';
+  if(DN.noTable)h+='<div style="color:var(--red);padding:10px">Run <b>dealer_notices.sql</b> in Supabase to turn on the log.</div>';
+  else if(!DN.notices)h+='<div style="color:var(--text3);padding:20px">Loading...</div>';
+  else if(!DN.notices.length)h+='<div style="color:var(--text3);padding:20px;text-align:center">No notices logged yet.</div>';
+  else{
+    h+='<table><thead><tr><th>Date</th><th>Type</th><th>Subject</th><th>Parts</th><th>Sent to</th><th>By</th><th>Portal</th></tr></thead><tbody>';
+    DN.notices.forEach(function(n){
+      var t=DN_TYPES[n.type]||{label:n.type,color:'#374151',bg:'#e5e7eb'},open=String(DN.openLog)===String(n.id);
+      h+='<tr style="cursor:pointer" onclick="dnOpenLog(\''+n.id+'\')"><td class="wnw">'+escHtml(dnFmtDate(n.notice_date||n.created_at))+'</td>'
+        +'<td><span style="background:'+t.bg+';color:'+t.color+';font-size:var(--t-xs);font-weight:700;padding:2px 8px;border-radius:999px;white-space:nowrap">'+escHtml(t.label)+'</span></td>'
+        +'<td class="main-col">'+escHtml(n.subject||'')+'</td><td>'+((n.items||[]).length)+'</td>'
+        +'<td>'+(n.emailed?n.recipient_count+' dealer'+(n.recipient_count===1?'':'s'):'<span class="pill pill-muted">log only</span>')+'</td>'
+        +'<td class="t3s">'+escHtml(n.sent_by||'')+'</td><td>'+(n.published?'<span class="pill pill-green">visible</span>':'<span class="pill pill-muted">hidden</span>')+'</td></tr>';
+      if(open){
+        var names=(n.recipient_ids||[]).map(function(id){var d=(S.dealers||[]).find(function(x){return String(x.id)===String(id);});return d?d.name:null;}).filter(Boolean);
+        h+='<tr><td colspan="7" style="background:var(--bg);padding:14px 18px"><div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap"><button class="btn btn-sm btn-teal" onclick="dnCsvById(\''+n.id+'\')">Download CSV</button>'
+          +'<button class="btn btn-sm" onclick="dnCopyTextById(\''+n.id+'\')">Copy as text</button>'
+          +'<button class="btn btn-sm" onclick="dnTogglePub(\''+n.id+'\')">'+(n.published?'Hide from portal':'Show on portal')+'</button></div>'
+          +(names.length?'<div class="t3s" style="margin-bottom:8px">Emailed to: '+escHtml(names.join(', '))+'</div>':'')
+          +'<div style="background:#fff;border:1px solid var(--border2);border-radius:var(--r-md);padding:16px 18px;color:#222">'+dnBuildEmail(n,false).html+'</div></td></tr>';
+      }
+    });
+    h+='</tbody></table>';
+  }
+  h+='</div>';body.innerHTML=h;
+}
+function dnOpenLog(id){DN.openLog=(String(DN.openLog)===String(id))?null:id;dnRenderLog();}
+async function dnTogglePub(id){
+  var n=dnNoticeById(id);if(!n)return;
+  var r=await db.from('dealer_notices').update({published:!n.published}).eq('id',id);
+  if(r.error){toast('Error: '+r.error.message);return;}
+  n.published=!n.published;dnRenderLog();
+}
+
 function renderDealers(){
   let list=S.dealers;
   const q=(S.searchQ||'').toLowerCase();
@@ -7499,7 +7949,7 @@ function renderDealers(){
   <div class="panel" style="padding:0">
     <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
       <div class="panel-title" style="margin:0;padding:0;border:none">Dealers <span style="color:var(--text);font-size:var(--t-md);font-weight:400;margin-left:6px;text-transform:none;letter-spacing:0">(${list.length})</span></div>
-      <div style="display:flex;gap:8px;align-items:center"><button class="btn btn-sm btn-teal" onclick="openDealerBlast()" title="Email all active dealers (BCC)">&#9993; Email Dealers</button>${totalVisits>0?`<button class="btn btn-sm" onclick="showAllVisitLog()" title="View all dealer visits"><span class="ic ic-chart"></span>All Visits (${totalVisits})</button>`:''}</div>
+      <div style="display:flex;gap:8px;align-items:center"><button class="btn btn-sm btn-teal" onclick="openDealerBlast()" title="Email all active dealers (BCC)">&#9993; Email Dealers</button><button class="btn btn-sm btn-primary" onclick="dnOpen()" title="Fitment updates, pre-order, out of stock, stop sell - templates, send and log">&#128227; Dealer Notices</button>${totalVisits>0?`<button class="btn btn-sm" onclick="showAllVisitLog()" title="View all dealer visits"><span class="ic ic-chart"></span>All Visits (${totalVisits})</button>`:''}</div>
     </div>
     <table><thead><tr><th>Dealer</th><th>Contact</th><th>Discount</th><th>Status</th><th style="text-align:right">Actions</th></tr></thead><tbody>
     ${list.map(d=>{
@@ -14089,15 +14539,17 @@ async function startDealerPortal(dealerId){
     if(dErr||!dealer){wrap.innerHTML=dealerPortalError('This price list link is invalid or has been removed.');return;}
     if(dealer.status!=='Active'){wrap.innerHTML=dealerPortalError('This price list is not currently active. Contact TGK Motorsport.');return;}
 
-    const[prodResult,storeResult,fitResult,syncLogResult]=await Promise.all([
+    const[prodResult,storeResult,fitResult,syncLogResult,noticeResult]=await Promise.all([
       db.from('assemblies')
         .select('pn,new_sku,use_new_sku,description,category,msrp,image_url,ship_us,ship_ca,ship_intl,sales_price,pl_notes,product_url')
         .eq('is_subassembly',false).eq('discontinued',false).gt('msrp',0).neq('pl_active',false)
         .order('category').order('pn'),
       db.from('settings').select('value').eq('key','portal_store_url').maybeSingle(),
       fetchAll((f,t)=>db.from('fitments').select('*').order('make').order('model').order('year_from').range(f,t)).then(data=>({data,error:null}),e=>{console.warn('[TGK] Dealer portal: fitments fetch failed —',e?.message||e);return{data:[],error:e};}),
-      db.from('shopify_sync_log').select('pn,action,restock_date,created_at').order('created_at',{ascending:false}).limit(3000).then(r=>r,e=>({data:[],error:e}))
+      db.from('shopify_sync_log').select('pn,action,restock_date,created_at').order('created_at',{ascending:false}).limit(3000).then(r=>r,e=>({data:[],error:e})),
+      db.from('dealer_notices').select('id,type,subject,notice_date,created_at,intro,action,note,items,published,recipient_ids').or('published.eq.true,recipient_ids.cs.{'+dealerId+'}').order('created_at',{ascending:false}).limit(100).then(r=>r,e=>({data:[],error:e}))
     ]);
+    window._dpNotices=(noticeResult&&!noticeResult.error&&noticeResult.data)||[];
     const products=prodResult.data||[];
     const storeUrl=(storeResult.data?.value||'https://tgkmotorsport.com').replace(/\/$/,'');
     const portalFitments=fitResult?.data||[];
@@ -14114,7 +14566,7 @@ async function startDealerPortal(dealerId){
     }
 
     try{var _nhD=await db.from('settings').select('value').eq('key','note_highlights').maybeSingle();if(_nhD&&_nhD.data&&_nhD.data.value)S.noteHL=_nhD.data.value;}catch(_e){}
-    const _dph=buildDealerPortalHTML(dealer,products,storeUrl,portalFitments,!!fitResult.error,dpSyncMap);
+    const _dph=buildDealerPortalHTML(dealer,products,storeUrl,portalFitments,!!fitResult.error,dpSyncMap,window._dpNotices);
     window._dealerPortalHTML=_dph;
     wrap.innerHTML=_dph;
     document.title='TGK Dealer Pricing';
@@ -14176,8 +14628,9 @@ window.exportDealerXLS=function(type){
   toast('\u2713 Excel file downloaded');
 };
 
-function buildDealerPortalHTML(dealer,products,storeUrl,fitments,fitError,dpSyncMap){
+function buildDealerPortalHTML(dealer,products,storeUrl,fitments,fitError,dpSyncMap,dpNotices){
   dpSyncMap=dpSyncMap||{};
+  dpNotices=dpNotices||[];
   // Read-only reference badge for dealers -- they order by phone/email, not through this
   // portal, so this is purely informational: same badge + ETA staff already trust in-app,
   // shown here without any Shopify round-trip since the portal is ERP-data-driven.
@@ -14309,6 +14762,7 @@ function buildDealerPortalHTML(dealer,products,storeUrl,fitments,fitError,dpSync
     +'<div class="no-print" style="display:flex;gap:0;border-bottom:2px solid #e5e7eb;margin-bottom:20px">'
     +'<button class="dp-tab-btn active" id="dp-tab-price-btn" onclick="dpTab(this)" data-tab="price">&#128230; Price List</button>'
     +((fitProducts.length>0||fitError)?'<button class="dp-tab-btn" id="dp-tab-fit-btn" onclick="dpTab(this)" data-tab="fit">&#128268; Fitment Guide '+(fitError?'\u26a0':'('+fitProducts.length+')')+'</button>':'')
+    +(dpNotices.length?'<button class="dp-tab-btn" id="dp-tab-updates-btn" onclick="dpTab(this)" data-tab="updates">&#128227; Updates ('+dpNotices.length+')</button>':'')
     +'</div>'
     +'<div id="dp-price-section">'
     +'<div class="no-print" style="display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap">'
@@ -14346,6 +14800,19 @@ function buildDealerPortalHTML(dealer,products,storeUrl,fitments,fitError,dpSync
         +'<div style="font-size:32px;margin-bottom:10px">&#9888;</div><div style="font-size:var(--t-lg);font-weight:600;margin-bottom:4px;color:var(--text2)">Fitment guide couldn\'t load</div>'
         +'<div style="font-size:var(--t-md)">Please try refreshing this page. If the problem continues, contact TGK Motorsport.</div></div>'
         :'')
+    +(dpNotices.length?'<div id="dp-updates-section" style="display:none">'
+      +'<div class="no-print" style="font-size:var(--t-md);color:#6b7280;margin-bottom:14px">Fitment changes, pre-orders, stock status and stop-sell notices from TGK Motorsport, newest first. Open a notice to see exactly what to change on your site, or download it as a CSV.</div>'
+      +dpNotices.map(function(n){
+        var t=DN_TYPES[n.type]||{label:n.type,color:'#374151',bg:'#e5e7eb'};
+        return '<details style="border:1px solid #e5e7eb;border-radius:8px;margin-bottom:8px;background:#fff"><summary style="cursor:pointer;padding:10px 14px;display:flex;align-items:center;gap:10px;list-style:none">'
+          +'<span style="background:'+t.bg+';color:'+t.color+';font-size:11px;font-weight:700;padding:2px 9px;border-radius:999px;white-space:nowrap">'+escHtml(t.label)+'</span>'
+          +'<span style="font-size:13px;color:#6b7280;white-space:nowrap">'+escHtml(dnFmtDate(n.notice_date||n.created_at))+'</span>'
+          +'<span style="flex:1;font-weight:600;color:#111">'+escHtml(n.subject||'')+'</span>'
+          +'<span style="font-size:12px;color:#9ca3af">'+((n.items||[]).length)+' part'+((n.items||[]).length===1?'':'s')+'</span></summary>'
+          +'<div style="padding:4px 18px 16px;border-top:1px solid #f0f0f0">'
+          +'<div class="no-print" style="margin:10px 0"><button class="export-btn" onclick="dnCsvById(\''+escHtml(n.id)+'\')">&#128202; Download CSV</button></div>'
+          +dnBuildEmail(n,false).html+'</div></details>';
+      }).join('')+'</div>':'')
     +'<div style="margin-top:32px;padding-top:14px;border-top:1px solid #e5e7eb;font-size:var(--t-xs);color:#9ca3af;text-align:center">'
     +'Confidential &mdash; '+escHtml(dname)+' only &mdash; Prices subject to change &mdash; &copy; TGK Motorsport '+new Date().getFullYear()
     +'</div></div></body></html>';
@@ -14394,7 +14861,7 @@ function attachDealerPortalSearch(){
   };
   window.dpTab=function(btn){
     const t=btn.dataset.tab;
-    ['dp-price-section','dp-fit-section'].forEach(id=>{const el=document.getElementById(id);if(el)el.style.display='none';});
+    ['dp-price-section','dp-fit-section','dp-updates-section'].forEach(id=>{const el=document.getElementById(id);if(el)el.style.display='none';});
     const target=document.getElementById('dp-'+t+'-section');if(target)target.style.display='';
     ['dp-prices-section','dp-fitments-section'].forEach(id=>{const el=document.getElementById(id);if(el)el.style.display='none';});
     if(t==='price'||t==='prices'){const el=document.getElementById('dp-prices-section');if(el)el.style.display='';}
