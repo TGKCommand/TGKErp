@@ -35225,6 +35225,52 @@ function _slipShow(w,html){
   setTimeout(function(){try{w.print();}catch(e){}},500);
 }
 
+// [FEATURE] SPLIT ORDERS ON THE PACKING SLIP. An order split in ShipStation ends up as lines with different statuses
+// (some Shipped, some Open, some On Hold). The slip used to print every line the same way, so there was no telling what
+// goes in this box. When an order has lines in 2+ of the groups below the slip now shows a banner, groups the lines by what
+// to do with them, and adds an "In stock" column (on hand, short by how many, and whether the shortfall is buildable).
+// Stock and buildable use the same numbers as the order page: assembly total_on_hand / part total_unpckgd, and the shared
+// buildability() engine. A one-group order prints exactly as before.
+function _slipLineInfo(l){
+  var fs=l.fulfillment_status||'Open',need=l.qty||1;
+  var a=findAsm(l.pn)||findAsm(String(l.pn||'').toUpperCase()),p=a?null:_findPart(l.pn);
+  var stock=a?(a.total_on_hand||0):(p?(p.total_unpckgd||0):null);
+  var group=(fs==='Shipped'||fs==='Delivered')?'shipped':fs==='On Hold'?'hold':null;
+  var canFill=stock===null||stock>=need,short=stock===null?0:Math.max(0,need-Math.max(0,stock)),build=null,hasBOM=false;
+  if(stock!==null&&!canFill&&a){
+    try{var b=buildability(a.pn);if(b&&b.hasBOM){hasBOM=true;var mx=(b.maxBuild===Infinity)?short:(b.maxBuild||0);if(mx>0)build={max:mx,covers:mx>=short};}}catch(e){}
+  }
+  if(!group)group=canFill?'ready':'short';
+  return {fs:fs,stock:stock,need:need,drop:stock===null,canFill:canFill,short:short,build:build,hasBOM:hasBOM,group:group};
+}
+var _SLIP_GROUPS={
+  ready:{label:'Ready to ship',color:'#15803d',bg:'#f0fdf4'},
+  short:{label:'Open - not enough stock',color:'#b91c1c',bg:'#fef2f2'},
+  hold:{label:'On hold - do not ship',color:'#c2410c',bg:'#fff7ed'},
+  shipped:{label:'Already shipped',color:'#4b5563',bg:'#f3f4f6'}
+};
+function _slipStockPref(){try{return localStorage.getItem('tgk_slip_stock')!=='0';}catch(e){return true;}}
+function _slipStockCell(i){
+  var st='padding:9px 10px;font-size:var(--t-md);text-align:center;border-bottom:1px solid var(--bg3);white-space:nowrap;vertical-align:top',h;
+  if(i.group==='shipped')h='<span style="color:var(--text3)">&mdash;</span>';
+  else if(i.drop)h='<span style="color:var(--purple);font-weight:700;font-size:var(--t-xs)">Drop-ship</span>';
+  else{
+    h='<b style="font-size:var(--t-lg);color:'+(i.canFill?'var(--green)':'var(--red)')+'">'+i.stock+'</b>';
+    if(!i.canFill)h+='<div style="font-size:var(--t-xs);color:var(--red);font-weight:700">short '+i.short+'</div>';
+    if(i.build)h+='<div style="margin-top:3px;font-size:var(--t-xs);font-weight:700;color:var(--orange);border:1px solid var(--orange);border-radius:3px;padding:0 5px;display:inline-block">'+(i.build.covers?'Buildable now':'Can build '+i.build.max)+'</div>';
+    else if(!i.canFill)h+='<div style="margin-top:3px;font-size:var(--t-xs);color:var(--text3)">Not buildable</div>';
+  }
+  return '<td class="ix" style="'+st+'">'+h+'</td>';
+}
+function _slipSplitBannerHtml(by){
+  var parts=['ready','short','hold','shipped'].filter(function(k){return by[k].length;}).map(function(k){
+    var g=_SLIP_GROUPS[k];return '<span><b style="color:'+g.color+'">'+by[k].length+'</b> '+({ready:'ready to ship',short:'short on stock',hold:'on hold',shipped:'already shipped'})[k]+'</span>';
+  });
+  return '<div class="slip-split" style="display:flex;flex-wrap:wrap;align-items:center;gap:6px 18px;padding:10px 24px 10px 18px;border-bottom:1px solid var(--border);border-left:6px solid #e8731c;background:#fff4e8;font-size:var(--t-md);color:var(--text)">'
+    +'<span style="display:inline-block;border:2px solid #9a3412;background:#fff;color:#9a3412;font-weight:800;font-size:var(--t-sm);letter-spacing:.1em;text-transform:uppercase;padding:2px 10px;border-radius:4px">Split order</span>'
+    +parts.join('<span style="color:var(--text3)">&middot;</span>')+'</div>';
+}
+
 function _packingSlipWrapHtml(lines,pr){
   if(!lines||!lines.length)return '';
   var esc=_packingSlipEsc;
@@ -35246,15 +35292,31 @@ function _packingSlipWrapHtml(lines,pr){
     (lead.shipping_country&&lead.shipping_country!=='US')?lead.shipping_country:''
   ].filter(Boolean);
 
-  var rows=valid.map(function(l){
-    var a=asmMap[l.pn];var p=prtMap[l.pn];
-    var desc=_descForPn(l.pn);if(!desc&&pr){var _sl=_slipShopifyLine(l,pr);if(_sl&&_sl.title)desc=_sl.title;}
+  var infos=valid.map(function(l){return {l:l,i:_slipLineInfo(l)};});
+  var by={ready:[],short:[],hold:[],shipped:[]};
+  infos.forEach(function(x){by[x.i.group].push(x);});
+  var isSplit=['ready','short','hold','shipped'].filter(function(k){return by[k].length;}).length>=2;
+  var nCols=3+(isSplit?1:0)+(pr?2:0);
+  // On a split order the tracking of an already-shipped package prints on its own row, not in the header (this slip is for what is still to go).
+  if(isSplit)trackLine=valid.filter(function(l){return l.fulfillment_status!=='Shipped'&&l.fulfillment_status!=='Delivered';}).find(function(l){return l.tracking_number;})||{};
+  function rowFor(x){
+    var l=x.l,i=x.i,desc=_descForPn(l.pn);if(!desc&&pr){var _sl=_slipShopifyLine(l,pr);if(_sl&&_sl.title)desc=_sl.title;}
+    var dim=isSplit&&i.group==='shipped',tc=dim?'var(--text3)':'var(--text)';
+    var trk=(isSplit&&i.group==='shipped'&&l.tracking_number)?'<div style="font-size:var(--t-xs);color:var(--text3);font-family:monospace;margin-top:2px">'+esc((l.carrier?l.carrier+' ':'')+l.tracking_number)+'</div>':'';
     return '<tr>'
-      +'<td style="padding:9px 14px;font-family:monospace;font-size:var(--t-sm);font-weight:700;color:var(--teal);white-space:nowrap;border-bottom:1px solid var(--bg3)">'+esc(l.pn)+'</td>'
-      +'<td style="padding:9px 14px;font-size:var(--t-md);color:var(--text);border-bottom:1px solid var(--bg3)">'+esc(desc||l.pn)+'</td>'
-      +'<td style="padding:9px 14px;font-size:var(--t-lg);font-weight:800;color:var(--text);text-align:center;border-bottom:1px solid var(--bg3)">'+(l.qty||1)+'</td>'
+      +'<td style="padding:9px 14px;font-family:monospace;font-size:var(--t-sm);font-weight:700;color:'+(dim?'var(--text3)':'var(--teal)')+';white-space:nowrap;border-bottom:1px solid var(--bg3)">'+esc(l.pn)+'</td>'
+      +'<td style="padding:9px 14px;font-size:var(--t-md);color:'+tc+';border-bottom:1px solid var(--bg3)">'+esc(desc||l.pn)+trk+'</td>'
+      +'<td style="padding:9px 14px;font-size:var(--t-lg);font-weight:800;color:'+tc+';text-align:center;border-bottom:1px solid var(--bg3)">'+(l.qty||1)+'</td>'
+      +(isSplit?_slipStockCell(i):'')
       +_slipPriceCells(l,pr)
       +'</tr>';
+  }
+  var rows;
+  if(!isSplit)rows=infos.map(rowFor).join('');
+  else rows=['ready','short','hold','shipped'].filter(function(k){return by[k].length;}).map(function(k){
+    var g=_SLIP_GROUPS[k];
+    return '<tr><td colspan="'+nCols+'" style="padding:6px 14px;background:'+g.bg+';color:'+g.color+';font-size:var(--t-xs);font-weight:800;letter-spacing:.1em;text-transform:uppercase;border-top:1px solid var(--border);border-bottom:1px solid var(--border)">'+g.label+' ('+by[k].length+')</td></tr>'
+      +by[k].map(rowFor).join('');
   }).join('');
 
   return '<div class="wrap">'
@@ -35268,6 +35330,7 @@ function _packingSlipWrapHtml(lines,pr){
     +(trackLine.tracking_number?'<div style="font-size:var(--t-sm);color:var(--teal);margin-top:2px;font-weight:600">'+(trackLine.carrier?esc(trackLine.carrier)+' &nbsp;&middot;&nbsp; ':'')+esc(trackLine.tracking_number)+'</div>':'')
     +'</div></div>'
  +_slipOrderNotesHtml(lines,pr)
+ +(isSplit?_slipSplitBannerHtml(by):'')
     +'<div style="display:grid;grid-template-columns:1fr 1fr;border-bottom:1px solid var(--border)">'
     +'<div style="padding:14px 24px;border-right:1px solid var(--border)">'
     +'<div style="font-size:var(--t-xs);font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--teal);margin-bottom:8px">Ship To</div>'
@@ -35285,12 +35348,14 @@ function _packingSlipWrapHtml(lines,pr){
     +'<th style="padding:8px 14px;font-size:var(--t-xs);font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text3);text-align:left;border-bottom:2px solid var(--border)">SKU</th>'
     +'<th style="padding:8px 14px;font-size:var(--t-xs);font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text3);text-align:left;border-bottom:2px solid var(--border)">Description</th>'
     +'<th style="padding:8px 14px;font-size:var(--t-xs);font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text3);text-align:center;border-bottom:2px solid var(--border)">Qty</th>'
+ +(isSplit?'<th class="ix" data-ix="1" style="padding:8px 10px;font-size:var(--t-xs);font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text3);text-align:center;border-bottom:2px solid var(--border)">In stock</th>':'')
  +(pr?'<th class="px" style="padding:8px 14px;font-size:var(--t-xs);font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text3);text-align:right;border-bottom:2px solid var(--border)">Price</th><th class="px" style="padding:8px 14px;font-size:var(--t-xs);font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text3);text-align:right;border-bottom:2px solid var(--border)">Total</th>':'')
     +'</tr></thead>'
     +'<tbody>'+rows+'</tbody>'
     +'<tfoot><tr style="background:#f8f9fa">'
     +'<td colspan="2" style="padding:10px 14px;font-size:var(--t-sm);font-weight:700;color:var(--text3);border-top:2px solid var(--border)">Total Items</td>'
     +'<td style="padding:10px 14px;font-size:var(--t-lg);font-weight:800;color:var(--teal);text-align:center;border-top:2px solid var(--border)">'+totalQty+'</td>'
+ +(isSplit?'<td class="ix" style="background:#f8f9fa;border-top:2px solid var(--border)"></td>':'')
  +(pr?'<td class="px" colspan="2" style="background:#f8f9fa;border-top:2px solid var(--border)"></td>':'')
     +'</tr></tfoot>'
     +'</table>'
@@ -35309,11 +35374,12 @@ function _packingSlipDocument(wraps,title,hasPrices,note){
   return '<!DOCTYPE html><html><head><meta charset="UTF-8">'
     +'<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;700&display=swap" rel="stylesheet">'
     +'<title>'+_packingSlipEsc(title)+'</title>'
-    +'<style>'+PRINT_TOKENS+'*{box-sizing:border-box;margin:0;padding:0}body{font-family:"DM Sans",sans-serif;background:var(--bg3);padding:20px}.wrap{background:#fff;max-width:680px;margin:0 auto;border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden}.slip{page-break-after:always;break-after:page}.slip:last-child{page-break-after:auto;break-after:auto}.slip+.slip{margin-top:20px}@page{margin:12mm 10mm;size:letter portrait}@media print{body{background:#fff;padding:0}.no-print{display:none!important}.wrap{border:none;border-radius:0;max-width:100%}.slip+.slip{margin-top:0}*{-webkit-print-color-adjust:exact;print-color-adjust:exact}}body.noprice .px{display:none!important}</style>'
-    +'</head><body'+(hasPrices&&!_slipPricePref()?' class="noprice"':'')+'>'
+    +'<style>'+PRINT_TOKENS+'*{box-sizing:border-box;margin:0;padding:0}body{font-family:"DM Sans",sans-serif;background:var(--bg3);padding:20px}.wrap{background:#fff;max-width:680px;margin:0 auto;border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden}.slip{page-break-after:always;break-after:page}.slip:last-child{page-break-after:auto;break-after:auto}.slip+.slip{margin-top:20px}@page{margin:12mm 10mm;size:letter portrait}@media print{body{background:#fff;padding:0}.no-print{display:none!important}.wrap{border:none;border-radius:0;max-width:100%}.slip+.slip{margin-top:0}*{-webkit-print-color-adjust:exact;print-color-adjust:exact}}body.noprice .px{display:none!important}body.nostock .ix{display:none!important}</style>'
+    +'</head><body'+(function(){var c=[];if(hasPrices&&!_slipPricePref())c.push('noprice');if(wraps.some(function(w){return w.indexOf('data-ix="1"')>=0;})&&!_slipStockPref())c.push('nostock');return c.length?' class="'+c.join(' ')+'"':'';})()+'>'
     +'<div class="no-print" style="display:flex;gap:8px;align-items:center;margin-bottom:14px">'
     +'<button onclick="window.print()" style="padding:8px 20px;background:var(--teal);color:#fff;border:none;border-radius:var(--r-md);font-size:var(--t-md);font-weight:600;cursor:pointer;font-family:inherit">&#128247; Print / Save PDF</button>'
     +'<button onclick="window.close()" style="padding:8px 14px;background:transparent;border:1px solid var(--border);border-radius:var(--r-md);font-size:var(--t-md);cursor:pointer;font-family:inherit">Close</button>'
+    +(wraps.some(function(w){return w.indexOf('data-ix="1"')>=0;})?'<label style="display:flex;align-items:center;gap:6px;margin-left:8px;font-size:var(--t-md);cursor:pointer" title="Hide this before printing if the slip goes in the box to the customer"><input type="checkbox" id="stk-toggle"'+(_slipStockPref()?' checked':'')+' onchange="document.body.classList.toggle(\'nostock\',!this.checked);try{window.opener.localStorage.setItem(\'tgk_slip_stock\',this.checked?\'1\':\'0\');}catch(e){}"> Show stock + buildable</label>':'')
     +(hasPrices?'<label style="display:flex;align-items:center;gap:6px;margin-left:8px;font-size:var(--t-md);cursor:pointer"><input type="checkbox" id="px-toggle"'+(_slipPricePref()?' checked':'')+' onchange="document.body.classList.toggle(\'noprice\',!this.checked);try{window.opener.localStorage.setItem(\'tgk_slip_prices\',this.checked?\'1\':\'0\');}catch(e){}"> Show prices</label>':'')
  +'</div>'
     +(note?'<div class="no-print slip-note" style="background:#fff7e6;border:1px solid #f5c26b;color:#7a4b00;padding:10px 14px;border-radius:var(--r-md);font-size:var(--t-md);line-height:1.5;margin-bottom:14px"><b>Prices are not on this slip.</b> '+_packingSlipEsc(note)+'</div>':'')
