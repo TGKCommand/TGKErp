@@ -474,7 +474,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.36</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.37</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -539,7 +539,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.36';
+const TGK_ERP_VERSION = 'v23.37';
 const TGK_ERP_BUILD_DATE = '2026-11-02';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -738,6 +738,7 @@ function computeDemand(){
   const asmCalc={},partCalc={};
   const devPnSet=new Set(S.assemblies.filter(a=>isDev(a)).map(a=>a.pn));
   S.assemblies.forEach(a=>{asmCalc[a.pn]={wk4:(wk4[a.pn]||0)/4,wk12:(wk12[a.pn]||0)/12};});
+  S.assemblies.forEach(a=>{var _r=forecastRate(a.pn);if(_r)asmCalc[a.pn]={wk4:_r.f,wk12:_r.f,fc:1};}); // [v23.37] forecast replaces the plain averages
   const asmByPn={};S.assemblies.forEach(a=>{asmByPn[a.pn]=a;});
   function _productionUrgency(pn){
     // How urgently does THIS assembly need to be built again, based on its own buffer stock vs its
@@ -786,6 +787,7 @@ function computeDemand(){
     });
   });
   S.parts.forEach(p=>{partCalc[p.pn]={wk4:(wk4[p.pn]||0)/4,wk12:(wk12[p.pn]||0)/12};});
+  S.parts.forEach(p=>{var _r=forecastRate(p.pn);if(_r)partCalc[p.pn]={wk4:_r.f,wk12:_r.f,fc:1};}); // [v23.37]
   Object.entries(S.boms).forEach(([parent,items])=>{
     if(devPnSet.has(parent))return;
     const ad=asmCalc[parent];if(!ad)return;
@@ -830,7 +832,7 @@ function computeDemand(){
     if(s.sale_date>=fCutStr){var _fk=(_canonItem(s.pn)||{}).pn||s.pn;fCounts[_fk]=(fCounts[_fk]||0)+(s.qty||1);} // [CANON]
   });
   const forecastMap={};
-  S.parts.forEach(function(p){forecastMap[p.pn]=(fCounts[p.pn]||0)/fwks;});
+  S.parts.forEach(function(p){forecastMap[p.pn]=(fCounts[p.pn]||0)/fwks;var _fr=forecastRate(p.pn);if(_fr)forecastMap[p.pn]=_fr.f;}); // [v23.37]
   S.calc={asm:asmCalc,part:partCalc,boReservedPart,boBacklog,
     salesLen:S.sales.length,bomLen:Object.keys(S.boms).length,
     d7:_dAgo(7),d30:_dAgo(30),d60:_dAgo(60),d90:_dAgo(90),
@@ -945,6 +947,156 @@ function eventChipHtml(){
     +'<button class="filter-chip" title="Set one multiple for every SKU (blank = learned per SKU)" onclick="setEventMult()">\u00d7</button>';
 }
 // [/v23.36 EVENT UPLIFT]
+
+// ===================================================================================================
+// [v23.37] FORECAST ENGINE. Every build target, reorder suggestion and status in the ERP came from a plain 12-week average
+// (or the 4-week one when higher). That lags a rising item, over-reacts to one big order, and cannot see an event. This engine
+// forecasts weekly demand per item from up to two years of sales, using several methods and CHECKING them on weeks it has not
+// seen: for each item it replays history, forecasts the next 4 weeks at many past dates with every method, and keeps the one that
+// would have been closest (the blend of methods unless another is clearly better). The last 12 weeks are held back from that
+// choice and used only to score it, so the accuracy it reports is honest. Event weeks (Black Friday) are smoothed out of the
+// baseline and added back by the event uplift. Items with too little history keep the old 12-week average.
+// ===================================================================================================
+var FC_H=4;
+function _fcMonday(d){var x=new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate()));return new Date(x.getTime()-((x.getUTCDay()+6)%7)*86400000);}
+function fcMean(a){var s=0;for(var i=0;i<a.length;i++)s+=a[i];return a.length?s/a.length:0;}
+function fcQuantile(a,q){if(!a.length)return 0;var b=a.slice().sort(function(x,y){return x-y;}),p=(b.length-1)*q,lo=Math.floor(p),hi=Math.ceil(p);return b[lo]+(b[hi]-b[lo])*(p-lo);}
+function fcEwma(y,al){if(!y.length)return 0;var l=y[0];for(var i=1;i<y.length;i++)l=al*y[i]+(1-al)*l;return l;}
+function fcHolt(y,H){ // damped trend: average weekly rate over the next H weeks
+  if(y.length<4)return fcMean(y);
+  var al=0.3,be=0.1,ph=0.8,l=fcMean(y.slice(0,4)),b=0;
+  for(var i=4;i<y.length;i++){var pl=l;l=al*y[i]+(1-al)*(pl+ph*b);b=be*(l-pl)+(1-be)*ph*b;}
+  var s=0,d=0;for(var h=1;h<=H;h++){d+=Math.pow(ph,h);s+=Math.max(0,l+d*b);}
+  return Math.max(0,s/H);
+}
+function fcSba(y){ // Croston with the Syntetos-Boylan correction, for items that sell in occasional weeks
+  var a=0.1,z=0,p=0,q=1,init=false;
+  for(var i=0;i<y.length;i++){
+    if(y[i]>0){if(!init){z=y[i];p=q;init=true;}else{z=a*y[i]+(1-a)*z;p=a*q+(1-a)*p;}q=1;}else q++;
+  }
+  return init?(1-a/2)*z/p:0;
+}
+function fcWins12(y){var w=y.slice(-12),cap=Math.max(2,fcQuantile(y.slice(-26),0.8)),s=0;for(var i=0;i<w.length;i++)s+=Math.min(w[i],cap);return w.length?s/w.length:0;}
+var FC_METHODS={
+  avg12:function(y){return fcMean(y.slice(-12));},
+  avg26:function(y){return fcMean(y.slice(-26));},
+  ewma15:function(y){return fcEwma(y,0.15);},
+  ewma30:function(y){return fcEwma(y,0.30);},
+  wins12:function(y){return fcWins12(y);},
+  holt:function(y,H){return fcHolt(y,H);},
+  sba:function(y){return fcSba(y);}
+};
+FC_METHODS.combo=function(y,H){return(FC_METHODS.avg12(y)+FC_METHODS.ewma30(y)+FC_METHODS.wins12(y)+FC_METHODS.holt(y,H)+FC_METHODS.avg26(y))/5;};
+var FC_NAMES={combo:'Blend',avg12:'12-wk average',avg26:'26-wk average',ewma15:'Smoothed (slow)',ewma30:'Smoothed (fast)',wins12:'12-wk, spikes capped',holt:'Trend',sba:'Occasional-demand'};
+function fcBuildSeries(rows,now,weeks){
+  weeks=weeks||104;var W=7*86400000,end=_fcMonday(now||new Date()).getTime(),start=end-weeks*W,ser={};
+  (rows||[]).forEach(function(s){
+    if(!s.pn||s.fulfillment_status==='Cancelled')return;
+    var q=Number(s.qty)||0;if(q<=0)return;                       // returns / reversals are not demand
+    var t=Date.parse(String(s.sale_date).slice(0,10)+'T00:00:00Z');if(!(t>=start&&t<end))return; // the current, unfinished week is left out
+    var it=_canonItem(s.pn);if(!it)return;                        // only catalog items are forecast; old and new SKU numbers merge here
+    var a=ser[it.pn]||(ser[it.pn]=new Array(weeks).fill(0));a[Math.floor((t-start)/W)]+=q;
+  });
+  return {ser:ser,start:start,weeks:weeks};
+}
+function fcEventFlags(start,weeks){
+  var f=new Array(weeks).fill(false),y0=new Date(start).getUTCFullYear();
+  for(var y=y0;y<=y0+2;y++){var w=_evBF(y),i=Math.round((w.start.getTime()-start)/(7*86400000));if(i>=0&&i<weeks)f[i]=true;}
+  return f;
+}
+function fcClean(y,ev){ // an event week is replaced by the median of its nearest ordinary weeks, so it cannot inflate a baseline
+  var c=y.slice();
+  for(var i=0;i<c.length;i++){
+    if(!ev[i])continue;var nb=[],j;
+    for(j=i-1;j>=0&&nb.length<3;j--)if(!ev[j])nb.push(y[j]);
+    for(j=i+1;j<c.length&&nb.length<6;j++)if(!ev[j])nb.push(y[j]);
+    c[i]=nb.length?fcQuantile(nb,0.5):0;
+  }
+  return c;
+}
+function fcBacktest(yRaw,yClean,ev,H,o0,o1){
+  var names=Object.keys(FC_METHODS),out={act:0,n:0,m:{}};
+  names.forEach(function(k){out.m[k]={abs:0,res:[]};});
+  for(var t=o0;t<=o1;t++){
+    var act=0,skip=false;
+    for(var h=0;h<H;h++){if(ev[t+h]){skip=true;break;}act+=yRaw[t+h];}
+    if(skip)continue;                                              // event weeks are judged by the event uplift, not here
+    var base=yClean.slice(0,t);out.act+=act;out.n++;
+    names.forEach(function(k){var f=FC_METHODS[k](base,H),r=act-H*f;out.m[k].abs+=Math.abs(r);out.m[k].res.push(r);});
+  }
+  return out;
+}
+function fcFit(yRaw,yClean,ev,H){
+  H=H||FC_H;var n=yClean.length,last=n-H,r={n:n,H:H,avg12:FC_METHODS.avg12(yClean)};
+  if(n<40||last<38){r.method='combo';r.conf='low';r.f=FC_METHODS.combo(yClean,H);r.q10=null;r.q90=null;r.hold=null;return r;}
+  var sel=fcBacktest(yRaw,yClean,ev,H,last-37,last-12),hold=fcBacktest(yRaw,yClean,ev,H,last-11,last);
+  var best='combo',bs=sel.m.combo.abs;
+  Object.keys(sel.m).forEach(function(k){if(k!=='combo'&&sel.m[k].abs<0.92*sel.m.combo.abs&&sel.m[k].abs<bs){best=k;bs=sel.m[k].abs;}});
+  r.method=best;r.f=FC_METHODS[best](yClean,H);r.conf=sel.n>=18?'ok':'low';
+  r.hold=hold.n>=6?{act:hold.act,n:hold.n,chosen:hold.m[best].abs,avg12:hold.m.avg12.abs,combo:hold.m.combo.abs}:null;
+  var res=sel.m[best].res.concat(hold.m[best].res);
+  r.q10=res.length>=12?fcQuantile(res,0.1):null;r.q90=res.length>=12?fcQuantile(res,0.9):null;
+  return r;
+}
+function fcRunAll(rows,now,weeks){
+  var b=fcBuildSeries(rows,now,weeks),ev=fcEventFlags(b.start,b.weeks),by={},agg={hAct:0,hChosen:0,hAvg12:0,hCombo:0,skus:0,tested:0,methods:{}};
+  Object.keys(b.ser).forEach(function(k){
+    var y=b.ser[k],first=-1,i;for(i=0;i<y.length;i++)if(y[i]>0){first=i;break;}
+    if(first<0)return;
+    var yr=y.slice(first),e=ev.slice(first),yc=fcClean(yr,e),tot=0;for(i=0;i<yr.length;i++)tot+=yr[i];
+    if(tot<4)return;                                               // a few units in two years cannot be forecast
+    var r=fcFit(yr,yc,e,FC_H);r.units=tot;by[k]=r;agg.skus++;agg.methods[r.method]=(agg.methods[r.method]||0)+1;
+    if(r.hold){agg.tested++;agg.hAct+=r.hold.act;agg.hChosen+=r.hold.chosen;agg.hAvg12+=r.hold.avg12;agg.hCombo+=r.hold.combo;}
+  });
+  return {by:by,agg:agg,built:(now||new Date()).toISOString()};
+}
+function forecastRate(pn){var fc=S._fc;if(!fc||fc.on===false)return null;var r=fc.by[pn];return(r&&r.n>=12)?r:null;}
+async function buildForecasts(force){
+  try{
+    if(S._fcBusy)return;
+    var day=new Date().toISOString().slice(0,10);
+    if(S._fc&&!force&&S._fc.day===day)return;
+    S._fcBusy=true;if(force)render();
+    var now=new Date(),weeks=104,from=new Date(_fcMonday(now).getTime()-weeks*7*86400000).toISOString().slice(0,10);
+    var rows=await fetchAll(function(a,b){return db.from('sales').select('pn,qty,sale_date,fulfillment_status').gte('sale_date',from).order('sale_date',{ascending:true}).range(a,b);});
+    if(!S._asmIdx||!S._partIdx)buildLookupMaps();
+    var res=fcRunAll(rows,now,weeks);
+    res.day=day;res.on=!(S.settings&&S.settings.forecast_engine==='off');
+    S._fc=res;S.calc=null;S._seriesBump=(S._seriesBump||0)+1;
+  }catch(e){console.warn('[forecast] build failed',e);}
+  finally{S._fcBusy=false;if(!(typeof isUserActivelyWorking==='function'&&isUserActivelyWorking()))render();}
+}
+async function toggleForecast(){
+  S.settings=S.settings||{};var turningOn=S.settings.forecast_engine==='off';
+  S.settings.forecast_engine=turningOn?'on':'off';
+  if(S._fc)S._fc.on=turningOn;S.calc=null;S._seriesBump=(S._seriesBump||0)+1;
+  try{await db.from('settings').upsert({key:'forecast_engine',value:S.settings.forecast_engine},{onConflict:'key'});}catch(e){console.warn('[forecast] save failed',e);}
+  if(turningOn&&!S._fc)buildForecasts(true);
+  render();
+}
+function fcChipHtml(){
+  if(S.settings&&S.settings.forecast_engine==='off')return '<button class="filter-chip" title="The forecast engine is OFF: targets use the plain 12-week average. Click to turn it on." onclick="toggleForecast()">Forecast: off</button>';
+  var fc=S._fc;if(!fc)return '<span class="t3xs" style="color:var(--text3)">Forecast: learning...</span>';
+  var a=fc.agg;if(!(a.hAct>0))return '<button class="filter-chip on-teal" title="Click to turn off" onclick="toggleForecast()">Forecast on</button>';
+  var pc=function(x){return Math.round(100*x/a.hAct)+'%';};
+  return '<button class="filter-chip on-teal" title="Forecast engine on. Scored on the last 12 weeks it had not seen, 4 weeks ahead: units off by '+pc(a.hChosen)+' (the plain 12-week average: '+pc(a.hAvg12)+'). Click to turn off." onclick="toggleForecast()">Forecast: '+pc(a.hChosen)+' error vs '+pc(a.hAvg12)+'</button>';
+}
+function renderForecastPanel(){
+  var fc=S._fc,esc=escHtml,on=!(S.settings&&S.settings.forecast_engine==='off');
+  var head='<div class="section-header" style="display:flex;justify-content:space-between;align-items:center"><span>Demand forecast accuracy</span><span style="text-transform:none;letter-spacing:0;font-weight:400;display:flex;gap:8px;align-items:center">'
+    +'<button class="btn btn-sm" onclick="toggleForecast()">'+(on?'Turn off':'Turn on')+'</button>'
+    +'<button class="btn btn-sm" onclick="buildForecasts(true)"'+(S._fcBusy?' disabled':'')+'>'+(S._fcBusy?'Learning...':'Recompute')+'</button></span></div>';
+  if(!fc)return '<div class="panel" style="padding:0;margin-bottom:12px">'+head+'<div class="section-empty">'+(S._fcBusy?'Reading two years of sales...':'Learns from your sales history shortly after the app loads, or press Recompute.')+'</div></div>';
+  var a=fc.agg,pct=function(x,y){return y>0?Math.round(100*x/y)+'%':'-';};
+  var sum='<div style="padding:10px 14px;font-size:var(--t-sm)"><b>'+a.skus+'</b> items forecast from up to two years of sales ('+a.tested+' had enough history to be scored). Each was scored on its last 12 weeks, which the engine had not been allowed to learn from, forecasting 4 weeks ahead: <b>units off by '+pct(a.hChosen,a.hAct)+'</b>, against <b>'+pct(a.hAvg12,a.hAct)+'</b> for the plain 12-week average the ERP used before'+(a.hCombo>0?' and '+pct(a.hCombo,a.hAct)+' for the blended method':'')+'. Lower is better. Event weeks are left out of this score.</div>';
+  var rows=Object.keys(fc.by).map(function(k){return{k:k,r:fc.by[k]};}).sort(function(x,y){return y.r.units-x.r.units;}).slice(0,40);
+  var tbl='<div class="tbl-wrap"><table><thead><tr><th>Item</th><th>2-yr units</th><th>Forecast / wk</th><th>12-wk avg / wk</th><th>Method</th><th>Next 4 wks (80% range)</th><th>Error</th><th>12-wk avg error</th></tr></thead><tbody>'
+   +rows.map(function(x){var r=x.r,rng=(r.q10!=null)?(Math.max(0,Math.round(r.H*r.f+r.q10))+' to '+Math.round(r.H*r.f+r.q90)):'-';
+     return '<tr><td class="pn">'+esc(x.k)+'</td><td>'+x.r.units+'</td><td><b>'+r.f.toFixed(1)+'</b></td><td>'+r.avg12.toFixed(1)+'</td><td class="t3xs">'+esc(FC_NAMES[r.method]||r.method)+(r.conf==='low'?' (short history)':'')+'</td><td>'+rng+'</td><td>'+(r.hold?pct(r.hold.chosen,r.hold.act):'-')+'</td><td>'+(r.hold?pct(r.hold.avg12,r.hold.act):'-')+'</td></tr>';}).join('')
+   +'</tbody></table></div>';
+  return '<div class="panel" style="padding:0;margin-bottom:12px;border-left:3px solid var(--teal)">'+head+sum+tbl+'<div class="t3xs" style="padding:6px 14px 10px;color:var(--text3)">Top 40 by units sold. Items with under about 10 months of history use the blended method and are marked short history.</div></div>';
+}
+// [/v23.37 FORECAST ENGINE]
 function ltWeeks(p){return(p&&p.lead_time_weeks>0)?p.lead_time_weeks:2;} // default 2wk; manual entry always wins
 function effectiveWkDemand(p){
   const c=S.calc&&S.calc.part&&S.calc.part[p.pn];
@@ -24764,7 +24916,7 @@ function renderPackQueue(){
       <button class="filter-chip ${sf.status==='partial'?'on-teal':''}" style="${sf.status==='partial'?'':'color:var(--yellow)'}" onclick="setFilter('production','status',${sf.status==='partial'?"''":"'partial'"})"><span class="ic ic-alert"></span>Partial (${counts.partial})</button>
       <button class="filter-chip ${sf.status==='blocked'?'on-teal':''}" style="${sf.status==='blocked'?'':'color:var(--red)'}" onclick="setFilter('production','status',${sf.status==='blocked'?"''":"'blocked'"})"><span class="ic ic-x"></span>Blocked (${counts.blocked})</button>
       <button class="filter-chip ${sf.status==='covered'?'on-teal':''}" onclick="setFilter('production','status',${sf.status==='covered'?"''":"'covered'"})">Covered (${counts.covered})</button>
-      ${eventChipHtml()}<span style="font-size:var(--t-xs);color:var(--text3);margin-left:auto">Target:</span>
+      ${eventChipHtml()}${fcChipHtml()}<span style="font-size:var(--t-xs);color:var(--text3);margin-left:auto">Target:</span>
       ${[2,4,8,12].map(w=>`<button class="filter-chip ${cov===w?'on-teal':''}" onclick="S.buildCoverage=${w};render()">${w}w</button>`).join('')}
       <button class="btn btn-primary btn-sm" onclick="startWorkOrder()" title="Select assemblies to build today — see combined pick list and print shop floor sheet"><span class="ic ic-clipboard"></span>Work Order</button>
       ${(function(){
@@ -30415,7 +30567,7 @@ if (!(globalThis as any).__TEST__) {
 function renderDataIntegrity(){
   if(!S._diResults)S._diResults=null;
   if(!S._diLoading)S._diLoading=false;
-  return renderStockCheckPanel()+renderDataGapsPanel()+_diStockPanel()+`
+  return renderStockCheckPanel()+renderForecastPanel()+renderDataGapsPanel()+_diStockPanel()+`
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
     <div>
       <div style="font-size:var(--t-md);color:var(--text2);margin-bottom:4px">Automated checks for the specific failure patterns found in this system historically — not a general health check, a targeted one. Run any time you want to verify nothing has silently drifted.</div>
@@ -35088,6 +35240,7 @@ function printPriceList(){
         try{startAutoRefresh();}catch(e){console.error('startAutoRefresh:',e);}
         try{maybeDailyStockCheck();}catch(e){console.warn('stock check:',e);}
         try{setTimeout(function(){loadEventHistory();},4000);}catch(e){}
+        try{setTimeout(function(){buildForecasts();},9000);}catch(e){}
         try{
   const _rh=(window.location.hash||'').replace(/^#/,'').split('?')[0].toLowerCase();
   const _validViews=Object.keys(PAGE_TITLES);
