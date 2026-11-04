@@ -474,7 +474,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.35</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.36</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -539,7 +539,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.35';
+const TGK_ERP_VERSION = 'v23.36';
 const TGK_ERP_BUILD_DATE = '2026-11-02';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -846,6 +846,105 @@ function avgWk4(p){
   const c=S.calc&&S.calc.part&&S.calc.part[p.pn];
   return c?c.wk4:0;
 }
+// ===================================================================================================
+// [v23.36] EVENT UPLIFT. Build targets and reorder suggestions came from 12-week / 4-week averages, which cannot see a
+// spike that is known to be coming: last Black Friday week sold roughly 3 to 11 times a normal week. The ERP now learns each
+// SKU's own multiple from last year's same event (the 8 weeks before it are the baseline), pulls it toward the shop-wide median
+// for SKUs with little history, and adds the extra units to any target whose coverage window overlaps the event.
+// The app only keeps 180 days of sales in memory, so the one week it needs is fetched on its own (loadEventHistory).
+// Off switch / manual multiple: the chip on the Production page (settings key demand_events).
+// ===================================================================================================
+function _evThanksgiving(y){var d=new Date(Date.UTC(y,10,1)),dow=d.getUTCDay(),first=1+((4-dow+7)%7);return new Date(Date.UTC(y,10,first+21));} // 4th Thursday of November
+function _evBF(y){var th=_evThanksgiving(y),s=new Date(th.getTime()-3*86400000);return {start:s,end:new Date(s.getTime()+6*86400000)};} // Monday..Sunday of Black Friday week
+function demandEvents(now){
+  now=now||new Date();
+  var raw=S.settings&&S.settings.demand_events;
+  var list=(Array.isArray(raw)&&raw.length)?raw:[{kind:'bf',name:'Black Friday',on:true,mult:null}];
+  var out=[];
+  list.forEach(function(e){
+    if(!e||e.on===false)return;
+    if(e.kind==='bf'){
+      var w=_evBF(now.getUTCFullYear());
+      if(w.end<now)w=_evBF(now.getUTCFullYear()+1); // this year's is over: plan for the next one
+      out.push({key:'bf',name:e.name||'Black Friday',start:w.start,end:w.end,last:_evBF(w.start.getUTCFullYear()-1),mult:Number(e.mult)>0?Number(e.mult):null});
+    }
+  });
+  return out;
+}
+async function loadEventHistory(force){
+  try{
+    if(S._evLoading)return;
+    if(S._evStats&&!force)return;
+    var ev=demandEvents()[0];
+    if(!ev){S._evStats={key:'',gm:1,cap:8,by:{},skus:0};return;}
+    S._evLoading=true;
+    var l=ev.last,baseStart=new Date(l.start.getTime()-56*86400000);
+    var f=baseStart.toISOString().slice(0,10),t=l.end.toISOString().slice(0,10),ls=l.start.toISOString().slice(0,10);
+    var rows=await fetchAll(function(a,b){return db.from('sales').select('pn,qty,sale_date,fulfillment_status').gte('sale_date',f).lte('sale_date',t).order('sale_date',{ascending:true}).range(a,b);});
+    if(!S._asmIdx||!S._partIdx)buildLookupMaps();
+    var by={};
+    (rows||[]).forEach(function(s){
+      if(!s.pn||s.fulfillment_status==='Cancelled')return;
+      var q=Number(s.qty)||0; if(q<=0)return; // returns / reversals would only blur the multiple
+      var sd=String(s.sale_date).slice(0,10); if(sd<f||sd>t)return; // belt and braces: only the baseline weeks and the event week
+      var k=(_canonItem(s.pn)||{}).pn||s.pn,o=by[k]||(by[k]={base:0,ev:0});
+      if(String(s.sale_date).slice(0,10)<ls)o.base+=q; else o.ev+=q;
+    });
+    var ratios=[]; Object.keys(by).forEach(function(k){var o=by[k]; if(o.base>=8)ratios.push(o.ev/(o.base/8));}); // SKUs that sold at least a unit a week
+    ratios.sort(function(a,b){return a-b;});
+    var cap=Number(S.settings&&S.settings.event_uplift_cap)>0?Number(S.settings.event_uplift_cap):8;
+    var gm=ratios.length?ratios[Math.floor(ratios.length/2)]:1; gm=Math.max(1,Math.min(gm,Math.min(cap,6)));
+    S._evStats={key:ev.key+l.start.getUTCFullYear(),gm:gm,cap:cap,by:by,skus:ratios.length};
+    S._seriesBump=(S._seriesBump||0)+1;
+    if(!(typeof isUserActivelyWorking==='function'&&isUserActivelyWorking()))render();
+  }catch(e){console.warn('[event uplift] history load failed',e);}
+  finally{S._evLoading=false;}
+}
+function eventMult(pn,ev){
+  if(ev&&ev.mult)return Math.max(1,ev.mult);
+  var st=S._evStats; if(!st)return 1; // history not loaded yet: no uplift rather than a guess
+  var k=(_canonItem(pn)||{}).pn||pn,o=st.by[k],gm=st.gm;
+  if(!o||!(o.base>0))return gm;
+  var r=o.ev/(o.base/8),n=o.base,K=12; // few units of history -> lean on the shop-wide median
+  return Math.max(1,Math.min((n*r+K*gm)/(n+K),st.cap||8));
+}
+function eventExtra(pn,baseWk,horizonWeeks,from){
+  if(!(baseWk>0)||!(horizonWeeks>0))return 0;
+  var evs=demandEvents(from); if(!evs.length)return 0;
+  var t0=(from||new Date()).getTime(),t1=t0+horizonWeeks*7*86400000,extra=0;
+  evs.forEach(function(ev){
+    var a=Math.max(t0,ev.start.getTime()),b=Math.min(t1,ev.end.getTime()+86400000);
+    if(b<=a)return;
+    extra+=baseWk*(eventMult(pn,ev)-1)*((b-a)/(7*86400000));
+  });
+  return extra;
+}
+function _covUnitsWk(pn,wk,cov){return Math.ceil(wk*cov+eventExtra(pn,wk,cov));}
+function _covUnits(a,cov){var wk=asmAvgWk(a);return Math.ceil(wk*cov+eventExtra(a.pn,wk,cov));}
+function _evSettings(){var raw=S.settings&&S.settings.demand_events;return(Array.isArray(raw)&&raw.length)?raw.map(function(e){return Object.assign({},e);}):[{kind:'bf',name:'Black Friday',on:true,mult:null}];}
+async function _saveEvSettings(list){
+  S.settings=S.settings||{};S.settings.demand_events=list;S._seriesBump=(S._seriesBump||0)+1;
+  try{await db.from('settings').upsert({key:'demand_events',value:list},{onConflict:'key'});}catch(e){console.warn('[event uplift] save failed',e);}
+  if(list[0]&&list[0].on!==false&&!S._evStats)loadEventHistory(true);
+  render();
+}
+function toggleEventUplift(){var l=_evSettings();l[0].on=(l[0].on===false);_saveEvSettings(l);}
+function setEventMult(){
+  var l=_evSettings();
+  var v=prompt('Black Friday multiple for EVERY SKU (5 = five times a normal week).\nLeave blank to use each SKU\'s own multiple learned from last year.',l[0].mult||'');
+  if(v===null)return;
+  var n=parseFloat(v);l[0].mult=(n>0)?n:null;_saveEvSettings(l);
+}
+function eventChipHtml(){
+  var l=_evSettings();
+  if(l[0].on===false)return '<button class="filter-chip" title="Event uplift is OFF: targets ignore Black Friday. Click to turn on." onclick="toggleEventUplift()">Event uplift: off</button>';
+  var ev=demandEvents()[0]; if(!ev)return '';
+  var st=S._evStats,d=function(x){return x.toISOString().slice(5,10);};
+  var txt=ev.name+' '+d(ev.start)+' to '+d(ev.end)+(st?(' \u00d7'+(ev.mult||st.gm).toFixed(1)+(ev.mult?' (set)':' typical')):' (learning...)');
+  return '<button class="filter-chip on-teal" title="Build targets and reorder suggestions add the extra units a typical week like this needs, for any coverage window that reaches it. Learned from last year per SKU. Click to turn off." onclick="toggleEventUplift()">'+txt+'</button>'
+    +'<button class="filter-chip" title="Set one multiple for every SKU (blank = learned per SKU)" onclick="setEventMult()">\u00d7</button>';
+}
+// [/v23.36 EVENT UPLIFT]
 function ltWeeks(p){return(p&&p.lead_time_weeks>0)?p.lead_time_weeks:2;} // default 2wk; manual entry always wins
 function effectiveWkDemand(p){
   const c=S.calc&&S.calc.part&&S.calc.part[p.pn];
@@ -21791,7 +21890,7 @@ function btoPullNeed(p){
     const st=liveStatus(fg);
     if(st!=='low'&&st!=='critical')continue;      // finished good is fine -> component not needed yet
     const wk=asmAvgWk(fg);
-    const target=Math.max(1,Math.ceil(wk*cov));    // build back up to coverage weeks
+    const target=Math.max(1,_covUnitsWk(fg.pn,wk,cov));    // build back up to coverage weeks
     const short=Math.max(0, target-(fg.total_on_hand||0)-(openOrderedQty(fg.pn)||0));
     if(short<=0)continue;
     need += short*(line.qty||1);
@@ -21822,7 +21921,7 @@ function calcSuggestedQty(p) {
     // [HORIZON] The selected horizon defines target coverage. max_qty must NOT cap this branch:
     // max is an order-up-to level computed for one default cycle, so capping here froze the
     // suggestion at the same number across 4w..52w (the "horizon doesn't adapt" bug).
-    const needed = Math.ceil(wkDemand * (fw + lt));
+    const needed = Math.ceil(wkDemand * (fw + lt) + eventExtra(p.pn, wkDemand, fw + lt)); // [v23.36] + event uplift
     sq = Math.max(0, needed - available - onOrder);
   } else {
     if(max > 0) return Math.max(0, Math.ceil(max - available - onOrder));
@@ -24594,7 +24693,7 @@ function renderPackQueue(){
     // good needs them) should never carry a speculative "keep N weeks on the shelf" target — that's
     // exactly the shelf-stock buffer they're not supposed to have. Their fcDemand is zeroed so
     // `suggested` reflects only real, currently-placed demand, not a forecast.
-    const fcDemand=a.build_to_order?0:Math.ceil(asmAvgWk(a)*cov);
+    const fcDemand=a.build_to_order?0:_covUnits(a,cov);
     const suggested=Math.max(0,Math.max(demand,fcDemand)-(a.total_on_hand||0));
     const type=isHWPack(a.pn)?'hwp':a.is_subassembly?'sub':'fg';
     let st,stCls;
@@ -24665,7 +24764,7 @@ function renderPackQueue(){
       <button class="filter-chip ${sf.status==='partial'?'on-teal':''}" style="${sf.status==='partial'?'':'color:var(--yellow)'}" onclick="setFilter('production','status',${sf.status==='partial'?"''":"'partial'"})"><span class="ic ic-alert"></span>Partial (${counts.partial})</button>
       <button class="filter-chip ${sf.status==='blocked'?'on-teal':''}" style="${sf.status==='blocked'?'':'color:var(--red)'}" onclick="setFilter('production','status',${sf.status==='blocked'?"''":"'blocked'"})"><span class="ic ic-x"></span>Blocked (${counts.blocked})</button>
       <button class="filter-chip ${sf.status==='covered'?'on-teal':''}" onclick="setFilter('production','status',${sf.status==='covered'?"''":"'covered'"})">Covered (${counts.covered})</button>
-      <span style="font-size:var(--t-xs);color:var(--text3);margin-left:auto">Target:</span>
+      ${eventChipHtml()}<span style="font-size:var(--t-xs);color:var(--text3);margin-left:auto">Target:</span>
       ${[2,4,8,12].map(w=>`<button class="filter-chip ${cov===w?'on-teal':''}" onclick="S.buildCoverage=${w};render()">${w}w</button>`).join('')}
       <button class="btn btn-primary btn-sm" onclick="startWorkOrder()" title="Select assemblies to build today — see combined pick list and print shop floor sheet"><span class="ic ic-clipboard"></span>Work Order</button>
       ${(function(){
@@ -25039,7 +25138,7 @@ window.derivedAvgWk=derivedAvgWk;
 function subTarget(pn){
   const a=(S._asmIdx&&S._asmIdx[pn])||null;
   if(!a)return 0;
-  const byCover=Math.ceil(derivedAvgWk(pn)*(S.buildCoverage||4));
+  const _dw=derivedAvgWk(pn),_cv=S.buildCoverage||4;const byCover=Math.ceil(_dw*_cv+eventExtra(pn,_dw,_cv));
   return Math.max(byCover, Number(a.min_qty)||0);
 }
 window.subTarget=subTarget;
@@ -25110,7 +25209,7 @@ function startWorkOrder(){
   const cands=[];
   S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&!a.is_subassembly&&!isHWPack(a.pn)).forEach(a=>{
     const demand=openOrderDemand(a.pn);
-    const fcDemand=a.build_to_order?0:Math.ceil(asmAvgWk(a)*cov);
+    const fcDemand=a.build_to_order?0:_covUnits(a,cov);
     const suggested=Math.max(0,Math.max(demand,fcDemand)-(a.total_on_hand||0));
     if(suggested<=0)return;
     const b=buildability(a.pn);
@@ -25487,7 +25586,7 @@ function renderBuildPlanner(asm){
   const b=buildability(asm.pn);
   const demand=openOrderDemand(asm.pn);
   const cov=S.buildCoverage||4;
-  const want=S.buildQty||Math.max(1,Math.max(demand,asm.build_to_order?0:Math.ceil(asmAvgWk(asm)*cov))-(asm.total_on_hand||0))||1;
+  const want=S.buildQty||Math.max(1,Math.max(demand,asm.build_to_order?0:_covUnits(asm,cov))-(asm.total_on_hand||0))||1;
   const feasible=b.maxBuild===Infinity?want:Math.min(want,b.maxBuild);
   return `
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
@@ -34988,6 +35087,7 @@ function printPriceList(){
         try{startAutoBackup();}catch(e){console.error('startAutoBackup:',e);}
         try{startAutoRefresh();}catch(e){console.error('startAutoRefresh:',e);}
         try{maybeDailyStockCheck();}catch(e){console.warn('stock check:',e);}
+        try{setTimeout(function(){loadEventHistory();},4000);}catch(e){}
         try{
   const _rh=(window.location.hash||'').replace(/^#/,'').split('?')[0].toLowerCase();
   const _validViews=Object.keys(PAGE_TITLES);
