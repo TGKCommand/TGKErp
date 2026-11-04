@@ -474,7 +474,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.37</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.38</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -539,7 +539,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.37';
+const TGK_ERP_VERSION = 'v23.38';
 const TGK_ERP_BUILD_DATE = '2026-11-02';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -849,102 +849,151 @@ function avgWk4(p){
   return c?c.wk4:0;
 }
 // ===================================================================================================
-// [v23.36] EVENT UPLIFT. Build targets and reorder suggestions came from 12-week / 4-week averages, which cannot see a
-// spike that is known to be coming: last Black Friday week sold roughly 3 to 11 times a normal week. The ERP now learns each
-// SKU's own multiple from last year's same event (the 8 weeks before it are the baseline), pulls it toward the shop-wide median
-// for SKUs with little history, and adds the extra units to any target whose coverage window overlaps the event.
-// The app only keeps 180 days of sales in memory, so the one week it needs is fetched on its own (loadEventHistory).
-// Off switch / manual multiple: the chip on the Production page (settings key demand_events).
+// [v23.38] EVENTS: Black Friday and your own. Saved in settings key demand_events as a list of
+//   {id, kind:'bf'|'custom', name, on, start, end, mult, items, cap}
+//   kind 'bf' = Black Friday week, dates found automatically unless start/end are set.
+//   mult = null: every item learns its own multiple from the same dates last year (the 8 weeks before are the baseline,
+//          items with little history lean on the shop-wide typical value); a number: use that for every item.
+//   items = null: all items, or a list of SKUs.   cap = the most any one item may be raised (default 8).
+// The app keeps only 180 days of sales in memory, so each event fetches the one week it needs (loadEventHistory).
 // ===================================================================================================
 function _evThanksgiving(y){var d=new Date(Date.UTC(y,10,1)),dow=d.getUTCDay(),first=1+((4-dow+7)%7);return new Date(Date.UTC(y,10,first+21));} // 4th Thursday of November
 function _evBF(y){var th=_evThanksgiving(y),s=new Date(th.getTime()-3*86400000);return {start:s,end:new Date(s.getTime()+6*86400000)};} // Monday..Sunday of Black Friday week
-function demandEvents(now){
+function _evISO(d){return d.toISOString().slice(0,10);}
+function _evDate(s){var t=Date.parse(String(s||'').slice(0,10)+'T00:00:00Z');return isNaN(t)?null:new Date(t);}
+function _evDefault(){return [{id:'bf',kind:'bf',name:'Black Friday',on:true,mult:null,items:null}];}
+function evList(){
+  var raw=S.settings&&S.settings.demand_events,l=Array.isArray(raw)?raw:_evDefault(); // an empty saved list means "none", not "default"
+  return l.map(function(e,i){var c=Object.assign({},e);if(!c.kind)c.kind='custom';if(!c.id)c.id=(c.kind==='bf'?'bf':'ev'+i);return c;});
+}
+function _evNorm(e,now){
+  now=now||new Date();var start,end,last;
+  if(e.kind==='bf'){
+    var os=_evDate(e.start),oe=_evDate(e.end),w;
+    if(os&&oe&&oe.getTime()>=now.getTime()-60*86400000){start=os;end=oe;}
+    else{w=_evBF(now.getUTCFullYear());if(w.end<now)w=_evBF(now.getUTCFullYear()+1);start=w.start;end=w.end;}
+    last=_evBF(start.getUTCFullYear()-1);
+  }else{
+    start=_evDate(e.start);end=_evDate(e.end);if(!start||!end)return null;
+    last={start:new Date(start.getTime()-364*86400000),end:new Date(end.getTime()-364*86400000)};
+  }
+  var list=Array.isArray(e.items)&&e.items.length?e.items:null;
+  var set=list?new Set(list.map(function(x){return String((_canonItem(x)||{}).pn||x).toUpperCase();})):null;
+  return {id:e.id,kind:e.kind,name:e.name||'Event',on:e.on!==false,start:start,end:end,last:last,
+    mult:Number(e.mult)>0?Number(e.mult):null,items:set,itemList:list,cap:Number(e.cap)>0?Number(e.cap):null,
+    statKey:e.id+'|'+_evISO(last.start)+'|'+_evISO(last.end)};
+}
+function evAll(now){var out=[];evList().forEach(function(e){var n=_evNorm(e,now);if(n)out.push(n);});return out;}
+function demandEvents(now){ // the events that can still affect a target: switched on, and not over yet
   now=now||new Date();
-  var raw=S.settings&&S.settings.demand_events;
-  var list=(Array.isArray(raw)&&raw.length)?raw:[{kind:'bf',name:'Black Friday',on:true,mult:null}];
-  var out=[];
-  list.forEach(function(e){
-    if(!e||e.on===false)return;
-    if(e.kind==='bf'){
-      var w=_evBF(now.getUTCFullYear());
-      if(w.end<now)w=_evBF(now.getUTCFullYear()+1); // this year's is over: plan for the next one
-      out.push({key:'bf',name:e.name||'Black Friday',start:w.start,end:w.end,last:_evBF(w.start.getUTCFullYear()-1),mult:Number(e.mult)>0?Number(e.mult):null});
-    }
-  });
-  return out;
+  return evAll(now).filter(function(n){return n.on&&n.end.getTime()+86400000>=now.getTime();});
 }
 async function loadEventHistory(force){
   try{
     if(S._evLoading)return;
-    if(S._evStats&&!force)return;
-    var ev=demandEvents()[0];
-    if(!ev){S._evStats={key:'',gm:1,cap:8,by:{},skus:0};return;}
+    S._evStats=S._evStats||{};
+    var todo=demandEvents().filter(function(ev){return !ev.mult&&(force||!S._evStats[ev.statKey]);});
+    if(!todo.length)return;
     S._evLoading=true;
-    var l=ev.last,baseStart=new Date(l.start.getTime()-56*86400000);
-    var f=baseStart.toISOString().slice(0,10),t=l.end.toISOString().slice(0,10),ls=l.start.toISOString().slice(0,10);
-    var rows=await fetchAll(function(a,b){return db.from('sales').select('pn,qty,sale_date,fulfillment_status').gte('sale_date',f).lte('sale_date',t).order('sale_date',{ascending:true}).range(a,b);});
     if(!S._asmIdx||!S._partIdx)buildLookupMaps();
-    var by={};
-    (rows||[]).forEach(function(s){
-      if(!s.pn||s.fulfillment_status==='Cancelled')return;
-      var q=Number(s.qty)||0; if(q<=0)return; // returns / reversals would only blur the multiple
-      var sd=String(s.sale_date).slice(0,10); if(sd<f||sd>t)return; // belt and braces: only the baseline weeks and the event week
-      var k=(_canonItem(s.pn)||{}).pn||s.pn,o=by[k]||(by[k]={base:0,ev:0});
-      if(String(s.sale_date).slice(0,10)<ls)o.base+=q; else o.ev+=q;
-    });
-    var ratios=[]; Object.keys(by).forEach(function(k){var o=by[k]; if(o.base>=8)ratios.push(o.ev/(o.base/8));}); // SKUs that sold at least a unit a week
-    ratios.sort(function(a,b){return a-b;});
     var cap=Number(S.settings&&S.settings.event_uplift_cap)>0?Number(S.settings.event_uplift_cap):8;
-    var gm=ratios.length?ratios[Math.floor(ratios.length/2)]:1; gm=Math.max(1,Math.min(gm,Math.min(cap,6)));
-    S._evStats={key:ev.key+l.start.getUTCFullYear(),gm:gm,cap:cap,by:by,skus:ratios.length};
-    S._seriesBump=(S._seriesBump||0)+1;
+    for(var i=0;i<todo.length;i++){
+      var ev=todo[i],l=ev.last,baseStart=new Date(l.start.getTime()-56*86400000);
+      var f=_evISO(baseStart),t=_evISO(l.end),ls=_evISO(l.start);
+      var rows=await fetchAll(function(a,b){return db.from('sales').select('pn,qty,sale_date,fulfillment_status').gte('sale_date',f).lte('sale_date',t).order('sale_date',{ascending:true}).range(a,b);});
+      var by={};
+      (rows||[]).forEach(function(s){
+        if(!s.pn||s.fulfillment_status==='Cancelled')return;
+        var q=Number(s.qty)||0;if(q<=0)return; // returns / reversals would only blur the multiple
+        var sd=String(s.sale_date).slice(0,10);if(sd<f||sd>t)return;
+        var k=(_canonItem(s.pn)||{}).pn||s.pn,o=by[k]||(by[k]={base:0,ev:0});
+        if(sd<ls)o.base+=q;else o.ev+=q;
+      });
+      var ratios=[];Object.keys(by).forEach(function(k){var o=by[k];if(o.base>=8)ratios.push(o.ev/(o.base/8));}); // items that sold at least a unit a week
+      ratios.sort(function(a,b){return a-b;});
+      var gm=ratios.length?ratios[Math.floor(ratios.length/2)]:1;gm=Math.max(1,Math.min(gm,Math.min(cap,6)));
+      S._evStats[ev.statKey]={gm:gm,cap:cap,by:by,skus:ratios.length};
+    }
+    S._seriesBump=(S._seriesBump||0)+1;S.calc=null;
     if(!(typeof isUserActivelyWorking==='function'&&isUserActivelyWorking()))render();
-  }catch(e){console.warn('[event uplift] history load failed',e);}
+    if(typeof document!=='undefined'&&document.getElementById('plan-overlay'))openPlanning();
+  }catch(e){console.warn('[events] history load failed',e);}
   finally{S._evLoading=false;}
 }
 function eventMult(pn,ev){
   if(ev&&ev.mult)return Math.max(1,ev.mult);
-  var st=S._evStats; if(!st)return 1; // history not loaded yet: no uplift rather than a guess
-  var k=(_canonItem(pn)||{}).pn||pn,o=st.by[k],gm=st.gm;
-  if(!o||!(o.base>0))return gm;
-  var r=o.ev/(o.base/8),n=o.base,K=12; // few units of history -> lean on the shop-wide median
-  return Math.max(1,Math.min((n*r+K*gm)/(n+K),st.cap||8));
+  var st=S._evStats&&ev&&S._evStats[ev.statKey];if(!st)return 1; // history not loaded yet: no uplift rather than a guess
+  var k=(_canonItem(pn)||{}).pn||pn,o=st.by[k],gm=st.gm,cap=ev.cap||st.cap||8;
+  if(!o||!(o.base>0))return Math.min(gm,cap);
+  var r=o.ev/(o.base/8),n=o.base,K=12; // few units of history -> lean on the shop-wide typical value
+  return Math.max(1,Math.min((n*r+K*gm)/(n+K),cap));
+}
+function _evExtraOne(ev,pn,baseWk,t0,t1){
+  if(ev.items){var k=String((_canonItem(pn)||{}).pn||pn).toUpperCase();if(!ev.items.has(k))return 0;}
+  var a=Math.max(t0,ev.start.getTime()),b=Math.min(t1,ev.end.getTime()+86400000);if(b<=a)return 0;
+  return baseWk*(eventMult(pn,ev)-1)*((b-a)/(7*86400000));
 }
 function eventExtra(pn,baseWk,horizonWeeks,from){
   if(!(baseWk>0)||!(horizonWeeks>0))return 0;
-  var evs=demandEvents(from); if(!evs.length)return 0;
-  var t0=(from||new Date()).getTime(),t1=t0+horizonWeeks*7*86400000,extra=0;
-  evs.forEach(function(ev){
-    var a=Math.max(t0,ev.start.getTime()),b=Math.min(t1,ev.end.getTime()+86400000);
-    if(b<=a)return;
-    extra+=baseWk*(eventMult(pn,ev)-1)*((b-a)/(7*86400000));
-  });
-  return extra;
+  var evs=demandEvents(from);if(!evs.length)return 0;
+  var t0=(from||new Date()).getTime(),t1=t0+horizonWeeks*7*86400000,x=0;
+  evs.forEach(function(ev){x+=_evExtraOne(ev,pn,baseWk,t0,t1);});
+  return x;
 }
 function _covUnitsWk(pn,wk,cov){return Math.ceil(wk*cov+eventExtra(pn,wk,cov));}
 function _covUnits(a,cov){var wk=asmAvgWk(a);return Math.ceil(wk*cov+eventExtra(a.pn,wk,cov));}
-function _evSettings(){var raw=S.settings&&S.settings.demand_events;return(Array.isArray(raw)&&raw.length)?raw.map(function(e){return Object.assign({},e);}):[{kind:'bf',name:'Black Friday',on:true,mult:null}];}
-async function _saveEvSettings(list){
-  S.settings=S.settings||{};S.settings.demand_events=list;S._seriesBump=(S._seriesBump||0)+1;
-  try{await db.from('settings').upsert({key:'demand_events',value:list},{onConflict:'key'});}catch(e){console.warn('[event uplift] save failed',e);}
-  if(list[0]&&list[0].on!==false&&!S._evStats)loadEventHistory(true);
-  render();
+function evImpact(ev){ // what this event does to build targets at the current plan window; null while still learning
+  if(!ev.mult&&!(S._evStats&&S._evStats[ev.statKey]))return null;
+  var cov=S.buildCoverage||4,t0=Date.now(),t1=t0+cov*7*86400000,n=0,sum=0,top=[];
+  (S.assemblies||[]).forEach(function(a){
+    if(a.discontinued||a.build_to_order||(typeof isDev==='function'&&isDev(a)))return;
+    var x=_evExtraOne(ev,a.pn,asmAvgWk(a),t0,t1);if(x>=0.5){n++;sum+=x;top.push({pn:a.pn,x:x});}
+  });
+  top.sort(function(p,q){return q.x-p.x;});
+  return {items:n,units:Math.round(sum),top:top.slice(0,3)};
 }
-function toggleEventUplift(){var l=_evSettings();l[0].on=(l[0].on===false);_saveEvSettings(l);}
-function setEventMult(){
-  var l=_evSettings();
-  var v=prompt('Black Friday multiple for EVERY SKU (5 = five times a normal week).\nLeave blank to use each SKU\'s own multiple learned from last year.',l[0].mult||'');
-  if(v===null)return;
-  var n=parseFloat(v);l[0].mult=(n>0)?n:null;_saveEvSettings(l);
+async function evSave(list){
+  S.settings=S.settings||{};S.settings.demand_events=list;S._seriesBump=(S._seriesBump||0)+1;S.calc=null;
+  try{await db.from('settings').upsert({key:'demand_events',value:list},{onConflict:'key'});}
+  catch(e){console.warn('[events] save failed',e);if(typeof toast==='function')toast('<span class="ic ic-alert"></span>Could not save the events. Check your connection and try again.',6000);}
+  loadEventHistory();render();
+  if(typeof document!=='undefined'&&document.getElementById('plan-overlay'))openPlanning();
 }
-function eventChipHtml(){
-  var l=_evSettings();
-  if(l[0].on===false)return '<button class="filter-chip" title="Event uplift is OFF: targets ignore Black Friday. Click to turn on." onclick="toggleEventUplift()">Event uplift: off</button>';
-  var ev=demandEvents()[0]; if(!ev)return '';
-  var st=S._evStats,d=function(x){return x.toISOString().slice(5,10);};
-  var txt=ev.name+' '+d(ev.start)+' to '+d(ev.end)+(st?(' \u00d7'+(ev.mult||st.gm).toFixed(1)+(ev.mult?' (set)':' typical')):' (learning...)');
-  return '<button class="filter-chip on-teal" title="Build targets and reorder suggestions add the extra units a typical week like this needs, for any coverage window that reaches it. Learned from last year per SKU. Click to turn off." onclick="toggleEventUplift()">'+txt+'</button>'
-    +'<button class="filter-chip" title="Set one multiple for every SKU (blank = learned per SKU)" onclick="setEventMult()">\u00d7</button>';
+function evToggle(id){
+  var l=evList(),e=l.find(function(x){return x.id===id;});
+  if(!e){if(id==='bf'){l.push(_evDefault()[0]);}else return;}else e.on=(e.on===false);
+  evSave(l);
+}
+function evDelete(id){
+  var e=evList().find(function(x){return x.id===id;});if(!e)return;
+  if(typeof confirm==='function'&&!confirm('Delete "'+(e.name||'this event')+'"? Targets will stop including it. Your sales history is not touched, and you can add the event again.'))return;
+  evSave(evList().filter(function(x){return x.id!==id;}));
+}
+function evEdit(id){
+  var e=id?evList().find(function(x){return x.id===id;}):null,n=e?_evNorm(e):null;
+  S._evEdit={id:e?e.id:null,kind:e?e.kind:'custom',d:{
+    name:e?(e.name||''):'',start:n?_evISO(n.start):'',end:n?_evISO(n.end):'',
+    how:(e&&Number(e.mult)>0)?'own':'learn',mult:(e&&Number(e.mult)>0)?String(e.mult):'',
+    scope:(e&&Array.isArray(e.items)&&e.items.length)?'only':'all',items:(e&&Array.isArray(e.items))?e.items.join(', '):'',cap:(e&&Number(e.cap)>0)?String(e.cap):''}};
+  openPlanning();
+}
+function evEditSet(k,v,redraw){if(!S._evEdit)return;S._evEdit.d[k]=v;if(redraw)openPlanning();}
+function evEditCancel(){S._evEdit=null;openPlanning();}
+function evEditSave(){
+  var ed=S._evEdit;if(!ed)return;var d=ed.d,err='';
+  var name=String(d.name||'').trim();if(!name)err='Give the event a name.';
+  var s=_evDate(d.start),e=_evDate(d.end);
+  if(!err&&(!s||!e))err='Pick a start and an end date.';
+  if(!err&&e<s)err='The end date is before the start date.';
+  var mult=null;if(!err&&d.how==='own'){mult=parseFloat(d.mult);if(!(mult>=1))err='Enter a multiple of 1 or more, for example 5.';}
+  var items=null;if(!err&&d.scope==='only'){items=String(d.items||'').split(/[\s,;]+/).map(function(x){return x.trim();}).filter(Boolean);if(!items.length)err='List at least one SKU, or choose All items.';}
+  var cap=null;if(!err&&String(d.cap||'').trim()!==''){cap=parseFloat(d.cap);if(!(cap>=1))err='The cap must be 1 or more.';}
+  if(err){if(typeof toast==='function')toast('<span class="ic ic-alert"></span>'+err,6000);return;}
+  var l=evList(),ex=ed.id?l.find(function(x){return x.id===ed.id;}):null;
+  var rec={id:ed.id||('ev'+Date.now().toString(36)),kind:ex?ex.kind:'custom',name:name,on:ex?ex.on!==false:true,mult:mult,items:items,cap:cap,start:_evISO(s),end:_evISO(e)};
+  if(rec.kind==='bf'){var w=_evNorm({kind:'bf'});if(rec.start===_evISO(w.start)&&rec.end===_evISO(w.end)){rec.start=null;rec.end=null;}} // unchanged dates stay automatic
+  l=ex?l.map(function(x){return x.id===ed.id?rec:x;}):l.concat([rec]);
+  S._evEdit=null;evSave(l);
 }
 // [/v23.36 EVENT UPLIFT]
 
@@ -1002,6 +1051,11 @@ function fcBuildSeries(rows,now,weeks){
 function fcEventFlags(start,weeks){
   var f=new Array(weeks).fill(false),y0=new Date(start).getUTCFullYear();
   for(var y=y0;y<=y0+2;y++){var w=_evBF(y),i=Math.round((w.start.getTime()-start)/(7*86400000));if(i>=0&&i<weeks)f[i]=true;}
+  evList().forEach(function(e){ // your own events: the same dates a year and two years back are event weeks too
+    if(e.kind!=='custom'||e.on===false)return;var s0=_evDate(e.start),e0=_evDate(e.end);if(!s0||!e0)return;
+    for(var k=0;k<=2;k++){var a=s0.getTime()-k*364*86400000,b=e0.getTime()-k*364*86400000,i0=Math.floor((a-start)/(7*86400000)),i1=Math.floor((b-start)/(7*86400000));
+      for(var j=i0;j<=i1;j++)if(j>=0&&j<weeks)f[j]=true;}
+  });
   return f;
 }
 function fcClean(y,ev){ // an event week is replaced by the median of its nearest ordinary weeks, so it cannot inflate a baseline
@@ -1050,7 +1104,12 @@ function fcRunAll(rows,now,weeks){
   });
   return {by:by,agg:agg,built:(now||new Date()).toISOString()};
 }
-function forecastRate(pn){var fc=S._fc;if(!fc||fc.on===false)return null;var r=fc.by[pn];return(r&&r.n>=12)?r:null;}
+function forecastMode(){var m=S.settings&&S.settings.forecast_mode;if(m==='off'||m==='smart'||m==='all')return m;return(S.settings&&S.settings.forecast_engine==='off')?'off':'smart';}
+function forecastUses(r){ // does the forecast apply to this item in the current mode?
+  var m=forecastMode();if(m==='off')return false;if(m==='all')return true;
+  return !!(r.hold&&r.conf==='ok'&&r.hold.chosen<r.hold.avg12); // smart: only where it beat the plain 12-week average on the held-out weeks
+}
+function forecastRate(pn){var fc=S._fc;if(!fc)return null;var r=fc.by[pn];if(!(r&&r.n>=12))return null;return forecastUses(r)?r:null;}
 async function buildForecasts(force){
   try{
     if(S._fcBusy)return;
@@ -1066,14 +1125,13 @@ async function buildForecasts(force){
   }catch(e){console.warn('[forecast] build failed',e);}
   finally{S._fcBusy=false;if(!(typeof isUserActivelyWorking==='function'&&isUserActivelyWorking()))render();}
 }
-async function toggleForecast(){
-  S.settings=S.settings||{};var turningOn=S.settings.forecast_engine==='off';
-  S.settings.forecast_engine=turningOn?'on':'off';
-  if(S._fc)S._fc.on=turningOn;S.calc=null;S._seriesBump=(S._seriesBump||0)+1;
-  try{await db.from('settings').upsert({key:'forecast_engine',value:S.settings.forecast_engine},{onConflict:'key'});}catch(e){console.warn('[forecast] save failed',e);}
-  if(turningOn&&!S._fc)buildForecasts(true);
-  render();
+async function setForecastMode(m){
+  S.settings=S.settings||{};S.settings.forecast_mode=m;S.calc=null;S._seriesBump=(S._seriesBump||0)+1;
+  try{await db.from('settings').upsert({key:'forecast_mode',value:m},{onConflict:'key'});}catch(e){console.warn('[forecast] save failed',e);}
+  if(m!=='off'&&!S._fc)buildForecasts(true);
+  render();if(typeof document!=='undefined'&&document.getElementById('plan-overlay'))openPlanning();
 }
+function toggleForecast(){setForecastMode(forecastMode()==='off'?'smart':'off');}
 function fcChipHtml(){
   if(S.settings&&S.settings.forecast_engine==='off')return '<button class="filter-chip" title="The forecast engine is OFF: targets use the plain 12-week average. Click to turn it on." onclick="toggleForecast()">Forecast: off</button>';
   var fc=S._fc;if(!fc)return '<span class="t3xs" style="color:var(--text3)">Forecast: learning...</span>';
@@ -1082,9 +1140,9 @@ function fcChipHtml(){
   return '<button class="filter-chip on-teal" title="Forecast engine on. Scored on the last 12 weeks it had not seen, 4 weeks ahead: units off by '+pc(a.hChosen)+' (the plain 12-week average: '+pc(a.hAvg12)+'). Click to turn off." onclick="toggleForecast()">Forecast: '+pc(a.hChosen)+' error vs '+pc(a.hAvg12)+'</button>';
 }
 function renderForecastPanel(){
-  var fc=S._fc,esc=escHtml,on=!(S.settings&&S.settings.forecast_engine==='off');
+  var fc=S._fc,esc=escHtml,on=forecastMode()!=='off';
   var head='<div class="section-header" style="display:flex;justify-content:space-between;align-items:center"><span>Demand forecast accuracy</span><span style="text-transform:none;letter-spacing:0;font-weight:400;display:flex;gap:8px;align-items:center">'
-    +'<button class="btn btn-sm" onclick="toggleForecast()">'+(on?'Turn off':'Turn on')+'</button>'
+    +'<button class="btn btn-sm" onclick="openPlanning()">Planning options</button><button class="btn btn-sm" onclick="toggleForecast()">'+(on?'Turn off':'Turn on')+'</button>'
     +'<button class="btn btn-sm" onclick="buildForecasts(true)"'+(S._fcBusy?' disabled':'')+'>'+(S._fcBusy?'Learning...':'Recompute')+'</button></span></div>';
   if(!fc)return '<div class="panel" style="padding:0;margin-bottom:12px">'+head+'<div class="section-empty">'+(S._fcBusy?'Reading two years of sales...':'Learns from your sales history shortly after the app loads, or press Recompute.')+'</div></div>';
   var a=fc.agg,pct=function(x,y){return y>0?Math.round(100*x/y)+'%':'-';};
@@ -1097,6 +1155,129 @@ function renderForecastPanel(){
   return '<div class="panel" style="padding:0;margin-bottom:12px;border-left:3px solid var(--teal)">'+head+sum+tbl+'<div class="t3xs" style="padding:6px 14px 10px;color:var(--text3)">Top 40 by units sold. Items with under about 10 months of history use the blended method and are marked short history.</div></div>';
 }
 // [/v23.37 FORECAST ENGINE]
+
+// ===================================================================================================
+// [v23.38] PLANNING PANEL and the compact controls on the Production page.
+// ===================================================================================================
+function _sw(on,label,onclick,title){var tr=on?'var(--teal)':'#8A939B',kx=on?'20px':'2px';
+  return '<button type="button" role="switch" aria-checked="'+(on?'true':'false')+'" aria-label="'+label+'"'+(title?' title="'+title+'"':'')+' onclick="'+onclick+'" style="min-height:32px;min-width:44px;background:transparent;border:none;padding:0;cursor:pointer;display:inline-flex;align-items:center"><span style="position:relative;display:inline-block;width:40px;height:22px;border-radius:999px;background:'+tr+'"><span style="position:absolute;top:2px;left:'+kx+';width:18px;height:18px;border-radius:50%;background:#fff"></span></span></button>';}
+function _fcCounts(){var fc=S._fc,n=0,t=0;if(!fc)return null;Object.keys(fc.by).forEach(function(k){var r=fc.by[k];if(r.n>=12){t++;if(forecastUses(r))n++;}});return {used:n,total:t};}
+function _fcStatusText(){
+  var m=forecastMode();if(m==='off')return 'off';
+  var fc=S._fc;if(!fc)return S._fcBusy?'learning...':'not learned yet';
+  var a=fc.agg;
+  if(m==='smart'){var c=_fcCounts();return 'used for '+c.used+' of '+c.total+' items';}
+  if(!(a.hAct>0)||!(a.hAvg12>0))return 'on';
+  var d=(a.hChosen-a.hAvg12)/a.hAvg12;
+  return Math.abs(d)<0.05?'same as 12-wk avg':(d<0?Math.round(-d*100)+'% better than 12-wk avg':Math.round(d*100)+'% worse than 12-wk avg');
+}
+function prodControls(c){
+  var sf=c.sf,esc=escHtml,cov=c.cov,chip=function(on,label,click,title){return '<button type="button" class="filter-chip '+(on?'on-teal':'')+'" aria-pressed="'+(on?'true':'false')+'"'+(title?' title="'+title+'"':'')+' onclick="'+click+'">'+label+'</button>';};
+  var tog=function(v){return "setFilter('production','status',"+(sf.status===v?"''":"'"+v+"'")+")";};
+  var any=!!(sf.status||sf.type||sf.search||sf.openOnly||sf.unpackOnly);
+  var evs=evList(),bf=evs.find(function(e){return e.kind==='bf';}),others=evs.filter(function(e){return e.kind!=='bf'&&e.on!==false;}).length;
+  var bfOn=!!(bf&&bf.on!==false);
+  var fcm=forecastMode(),fcTip='';
+  if(S._fc&&S._fc.agg&&S._fc.agg.hAct>0){var ag=S._fc.agg;fcTip='On the last 12 weeks it had not seen, the forecast was off by '+Math.round(100*ag.hChosen/ag.hAct)+'% and the plain 12-week average by '+Math.round(100*ag.hAvg12/ag.hAct)+'%.';}
+  var who=packedByUser()||'',me=S.currentUser||'',alt=(who&&who!==me);
+  var tcs={fg:0,sub:0,hwp:0};(c.all||[]).forEach(function(r){tcs[r.type]=(tcs[r.type]||0)+1;});
+  var row1='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 14px;border-bottom:1px solid var(--border)">'
+   +'<div class="search-wrap" style="flex:0 1 240px;min-width:160px"><span class="search-icon"><span class="ic ic-search"></span></span><input aria-label="Search SKU or description" placeholder="Search SKU or description…" value="'+esc(sf.search||'')+'" oninput="setFilter(\'production\',\'search\',this.value)"></div>'
+   +'<select aria-label="Type" class="input" style="max-width:190px" onchange="setFilter(\'production\',\'type\',this.value)">'
+     +'<option value=""'+(!sf.type?' selected':'')+'>All types ('+c.total+')</option><option value="fg"'+(sf.type==='fg'?' selected':'')+'>Finished goods ('+tcs.fg+')</option><option value="sub"'+(sf.type==='sub'?' selected':'')+'>Subassemblies ('+tcs.sub+')</option><option value="hwp"'+(sf.type==='hwp'?' selected':'')+'>Hardware packs ('+tcs.hwp+')</option></select>'
+   +'<span class="t3s">Show</span>'
+   +chip(!sf.status,'All '+c.total,"setFilter('production','status','')")
+   +chip(sf.status==='build','Build now '+c.nBuild,tog('build'),'Enough parts on the shelf to build everything the target asks for')
+   +chip(sf.status==='wait','Waiting on parts '+c.nWait,tog('wait'),c.nPart+' partial (can build some) and '+c.nBlk+' blocked (can build none)')
+   +chip(sf.status==='covered','Covered '+c.nCov,tog('covered'),'Stock already meets the target')
+   +'<label style="display:flex;align-items:center;gap:6px;font-size:var(--t-sm);cursor:pointer;margin-left:6px" title="Only items that have an open order"><input type="checkbox" '+(sf.openOnly?'checked':'')+' onchange="setFilter(\'production\',\'openOnly\',this.checked)">Has open orders <span class="t3s">('+c.nOpen+')</span></label>'
+   +'<label style="display:flex;align-items:center;gap:6px;font-size:var(--t-sm);cursor:pointer" title="Short on raw parts, but you can cover the orders by unpacking assemblies already in stock"><input type="checkbox" '+(sf.unpackOnly?'checked':'')+' onchange="setFilter(\'production\',\'unpackOnly\',this.checked)">Can unpack to cover <span class="t3s">('+c.nUnp+')</span></label>'
+   +(any?'<button type="button" class="btn btn-sm" onclick="(function(){var f=S.filters.production||(S.filters.production={});f.status=\'\';f.type=\'\';f.search=\'\';f.openOnly=false;f.unpackOnly=false;render();})()"><span class="ic ic-x"></span>Clear</button>':'')
+   +'<span style="flex:1"></span>'
+   +'<button type="button" class="btn btn-primary btn-sm" onclick="startWorkOrder()" title="Select assemblies to build today — see combined pick list and print shop floor sheet"><span class="ic ic-clipboard"></span>Work Order</button>'
+   +'<button type="button" class="btn btn-sm" onclick="S.customPackMode=true;S.customPackLines=[];render()" title="Manually record packed units for any SKU"><span class="ic ic-box"></span>Custom Pack</button></div>';
+  var grp=function(inner){return '<div style="display:flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:var(--r-md);padding:0 10px 0 12px;min-height:34px;background:var(--bg1)">'+inner+'</div>';};
+  var pill=function(t,c2){return '<span style="font-size:11px;font-weight:700;padding:1px 8px;border-radius:999px;color:'+c2+';border:1px solid '+c2+'">'+t+'</span>';};
+  var row2='<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 14px;background:var(--bg3)">'
+   +'<span class="t3s" style="font-weight:700">Plan next</span>'+[2,4,8,12].map(function(w){return chip(cov===w,w+' wk','S.buildCoverage='+w+';render()','Build and order enough for the next '+w+' weeks of sales');}).join('')
+   +grp('<span style="font-size:var(--t-sm);font-weight:700">Forecast</span>'+_sw(fcm!=='off','Forecast on or off','toggleForecast()')+'<span class="t3s" title="'+fcTip+'">'+_fcStatusText()+'</span>')
+   +grp('<span style="font-size:var(--t-sm);font-weight:700">Black Friday</span>'+_sw(bfOn,'Black Friday uplift on or off',"evToggle('bf')")+(bf?pill(bfOn?'ON':'OFF',bfOn?'var(--teal)':'var(--orange)'):pill('REMOVED','var(--orange)'))+(others?'<span class="t3s">+'+others+' more</span>':''))
+   +'<button type="button" class="btn btn-sm" onclick="openPlanning()" title="What the forecast and events do, and how to change or remove them">Explain &amp; edit</button>'
+   +'<span style="flex:1"></span>'
+   +'<button type="button" class="btn btn-sm" style="'+(alt?'color:var(--orange);border-color:rgba(234,88,12,.45);font-weight:700':'')+'" onclick="openPackAsPicker()" title="Who is recorded as packing. Resets to the signed-in user on reload."><span class="ic ic-user"></span>'+(alt?('Packing as '+esc(who.split('@')[0])):'Packing as me')+'</button>'
+   +'<span style="display:flex;align-items:center;gap:2px" title="'+(c.packTip||'')+'">'+_sw(!!S.packSkipMissing,'Pack even if short','S.packSkipMissing=!S.packSkipMissing;render()')+'<span style="font-size:var(--t-sm);font-weight:700;'+(S.packSkipMissing?'color:var(--orange)':'')+'">Pack even if short</span></span></div>';
+  return '<div class="panel" style="padding:0;overflow:hidden">'+row1+row2+'</div>';
+}
+function _plBox(h,b){return '<div style="border:1px solid var(--border);border-radius:var(--r-md);padding:12px 14px;background:var(--bg3)"><div style="font-weight:800;font-size:var(--t-sm);margin-bottom:4px">'+h+'</div><div style="font-size:var(--t-sm);line-height:1.5;color:var(--text2)">'+b+'</div></div>';}
+function _plBar(label,pct,color,txt){return '<div style="display:grid;grid-template-columns:118px 1fr 44px;gap:8px;align-items:center;margin:5px 0"><div style="font-size:var(--t-xs);font-weight:700">'+label+'</div><div style="height:12px;background:var(--bg1);border-radius:6px;border:1px solid var(--border)"><div style="width:'+Math.max(2,Math.min(100,pct))+'%;height:100%;border-radius:6px;background:'+color+'"></div></div><div style="font-family:var(--mono);font-size:var(--t-xs);font-weight:700">'+txt+'</div></div>';}
+function _evFmt(d){return d.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',timeZone:'UTC'}).replace(',','');}
+function _plForecast(){
+  var m=forecastMode(),fc=S._fc,a=fc&&fc.agg,esc=escHtml;
+  var modeBtn=function(v,l){return '<button type="button" class="filter-chip '+(m===v?'on-teal':'')+'" aria-pressed="'+(m===v?'true':'false')+'" onclick="setForecastMode(\''+v+'\')">'+l+'</button>';};
+  var how;
+  if(!fc)how=S._fcBusy?'Reading two years of sales...':'Not learned yet. It learns a few seconds after the app loads, or press Recompute.';
+  else if(!(a.hAct>0))how='Not enough history yet to score it.';
+  else{var pc=Math.round(100*a.hChosen/a.hAct),pa=Math.round(100*a.hAvg12/a.hAct);
+    how='Tested on the last 12 weeks it had not been allowed to learn from, predicting 4 weeks ahead.'+_plBar('Forecast',pc,'var(--teal)',pc+'%')+_plBar('Plain 12-wk avg',pa,'#8A939B',pa+'%')+'<span class="t3s">&ldquo;Off by&rdquo; is how many units it missed, as a share of units sold. Lower is better. '+(Math.abs(pc-pa)<=3?'Today they are about the same.':(pc<pa?'The forecast is doing better.':'The plain average is doing better.'))+'</span>';}
+  var c=_fcCounts(),smartNote=(m==='smart'&&c)?' Right now it is used for <b>'+c.used+' of '+c.total+'</b> items.':'';
+  return '<div class="panel" style="padding:0;overflow:hidden;margin-bottom:14px"><div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 18px;border-bottom:1px solid var(--border)"><div style="display:flex;align-items:center;gap:10px"><h2 style="margin:0;font-size:var(--t-lg,18px)">Forecast</h2><span class="t3s">'+_fcStatusText()+'</span></div>'+_sw(m!=='off','Forecast on or off','toggleForecast()')+'</div>'
+   +'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:14px 18px">'
+   +_plBox('What it does','Normally the ERP plans from the last 12 weeks of sales. The forecast studies up to two years for each item, tries several ways of predicting demand, and uses whichever would have been the most accurate for that item. One-off spikes cannot distort the number.')
+   +_plBox('How well does it work?',how)
+   +_plBox('If I turn it off','Build targets and reorder suggestions go back to the plain 12-week average. No sales or stock data is changed or deleted, and you can turn it back on whenever you like.')
+   +'</div><div style="padding:0 18px 16px"><div class="t3s" style="font-weight:700;margin-bottom:6px">Where to use the forecast</div><div style="display:flex;gap:6px;flex-wrap:wrap">'+modeBtn('off','Nowhere')+modeBtn('smart','Only where it was more accurate')+modeBtn('all','Everywhere')+'</div>'
+   +'<div class="t3s" style="margin-top:8px;max-width:760px"><b>Only where it was more accurate</b> uses the forecast for an item only if it beat the 12-week average on those 12 weeks. Items without enough history keep the 12-week average.'+smartNote+' Twelve weeks is a short test, so treat this as a sensible default and not a guarantee.</div>'
+   +'<div style="display:flex;gap:8px;margin-top:12px"><button type="button" class="btn btn-sm" onclick="buildForecasts(true)"'+(S._fcBusy?' disabled':'')+'>'+(S._fcBusy?'Learning...':'Recompute now')+'</button><span class="t3s" style="align-self:center">Each item&#8217;s forecast is on the Data Integrity page.</span></div></div></div>';
+}
+function _plEvents(){
+  var esc=escHtml,all=evAll(),cov=S.buildCoverage||4,now=Date.now();
+  var rows=all.map(function(ev){
+    var big=ev.mult?('&times;'+ev.mult+' for every item'):('Learned from last year'+((S._evStats&&S._evStats[ev.statKey])?', typical &times;'+S._evStats[ev.statKey].gm.toFixed(1):''));
+    var eff='';
+    if(!ev.on)eff='<span class="t3s">Off</span>';
+    else if(ev.end.getTime()+86400000<now)eff='<span class="t3s">Over</span>';
+    else{var im=evImpact(ev);
+      if(!im)eff='<span class="t3s">Learning from last year...</span>';
+      else if(im.items===0&&ev.start.getTime()>now+cov*7*86400000)eff='<span class="t3s">Starts in '+Math.ceil((ev.start.getTime()-now)/86400000)+' days, so not inside your '+cov+'-week plan yet</span>';
+      else eff='<b>'+im.items+'</b> items raised, about <b>+'+im.units+'</b> units'+(im.top.length?'<div class="t3s">Most: '+im.top.map(function(x){return esc(x.pn)+' +'+Math.round(x.x);}).join(', ')+'</div>':'');}
+    return '<tr><td>'+_sw(ev.on,esc(ev.name)+' on or off',"evToggle('"+esc(ev.id)+"')")+'</td><td><b>'+esc(ev.name)+'</b>'+(ev.itemList?'<div class="t3s">'+ev.itemList.length+' chosen items</div>':'')+'</td><td>'+_evFmt(ev.start)+' to '+_evFmt(ev.end)+', '+ev.end.getUTCFullYear()+'</td><td>'+big+'</td><td>'+eff+'</td><td style="white-space:nowrap"><button type="button" class="btn btn-sm" onclick="evEdit(\''+esc(ev.id)+'\')">Edit</button> <button type="button" class="btn btn-sm" style="color:var(--red)" onclick="evDelete(\''+esc(ev.id)+'\')">Delete</button></td></tr>';
+  }).join('');
+  var hasBF=evList().some(function(e){return e.kind==='bf';});
+  var table=rows?'<div class="tbl-wrap"><table><thead><tr><th>On</th><th>Event</th><th>Dates</th><th>How big</th><th>Effect now</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>':'<div class="t3s" style="padding:12px 0">No events. Add one, or put Black Friday back.</div>';
+  var form='';
+  if(S._evEdit){
+    var ed=S._evEdit,d=ed.d,inp='class="input" style="width:100%"';
+    var lastTxt='';var sD=_evDate(d.start),eD=_evDate(d.end);
+    if(sD&&eD){var ln=ed.kind==='bf'?_evBF(sD.getUTCFullYear()-1):{start:new Date(sD.getTime()-364*86400000),end:new Date(eD.getTime()-364*86400000)};lastTxt='The matching week last year is found automatically ('+_evFmt(ln.start)+' to '+_evFmt(ln.end)+', '+ln.end.getUTCFullYear()+').';}
+    form='<div style="margin-top:14px;border:2px solid var(--teal);border-radius:var(--r-md);padding:16px 18px;background:var(--bg1)"><div style="font-weight:800;margin-bottom:10px">'+(ed.id?'Edit: '+esc(d.name||'event'):'Add an event')+'</div>'
+     +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px"><div style="display:flex;flex-direction:column;gap:10px">'
+     +'<label class="t3s" style="font-weight:700">Name<input '+inp+' value="'+esc(d.name)+'" oninput="evEditSet(\'name\',this.value)"></label>'
+     +'<div style="display:flex;gap:10px"><label class="t3s" style="font-weight:700;flex:1">Starts<input type="date" '+inp+' value="'+esc(d.start)+'" onchange="evEditSet(\'start\',this.value,true)"></label><label class="t3s" style="font-weight:700;flex:1">Ends<input type="date" '+inp+' value="'+esc(d.end)+'" onchange="evEditSet(\'end\',this.value,true)"></label></div>'
+     +'<div class="t3s">'+lastTxt+'</div></div><div>'
+     +'<div class="t3s" style="font-weight:700">How big is the spike?</div>'
+     +'<label style="display:flex;gap:8px;align-items:flex-start;padding:6px 0;cursor:pointer"><input type="radio" name="evhow" '+(d.how==='learn'?'checked':'')+' onchange="evEditSet(\'how\',\'learn\',true)"><span><b>Learn it from last year</b> (suggested)<br><span class="t3s">Each item gets its own multiple from how much it sold that week last year, compared with the 8 weeks before.</span></span></label>'
+     +'<label style="display:flex;gap:8px;align-items:center;padding:6px 0;cursor:pointer"><input type="radio" name="evhow" '+(d.how==='own'?'checked':'')+' onchange="evEditSet(\'how\',\'own\',true)"><span><b>Set my own</b></span><input aria-label="Your own multiple" class="input" style="width:64px" value="'+esc(d.mult)+'" '+(d.how==='own'?'':'disabled')+' oninput="evEditSet(\'mult\',this.value)"><span class="t3s">times a normal week, for every item</span></label>'
+     +'<div class="t3s" style="font-weight:700;margin-top:6px">Applies to</div><div style="display:flex;gap:16px;padding-top:4px"><label style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="radio" name="evwho" '+(d.scope==='all'?'checked':'')+' onchange="evEditSet(\'scope\',\'all\',true)">All items</label><label style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="radio" name="evwho" '+(d.scope==='only'?'checked':'')+' onchange="evEditSet(\'scope\',\'only\',true)">Only these SKUs</label></div>'
+     +(d.scope==='only'?'<textarea class="input" rows="2" style="width:100%;margin-top:6px" placeholder="SKUs separated by commas or spaces" oninput="evEditSet(\'items\',this.value)">'+esc(d.items)+'</textarea>':'')
+     +'<label class="t3s" style="font-weight:700;display:flex;gap:8px;align-items:center;margin-top:8px">No item raised by more than <input aria-label="Cap" class="input" style="width:64px" placeholder="8" value="'+esc(d.cap)+'" oninput="evEditSet(\'cap\',this.value)"> times</label></div></div>'
+     +'<div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px"><div style="display:flex;gap:8px"><button type="button" class="btn btn-primary btn-sm" onclick="evEditSave()">Save changes</button><button type="button" class="btn btn-sm" onclick="evEditCancel()">Cancel</button></div>'+(ed.id?'<button type="button" class="btn btn-sm" style="color:var(--red)" onclick="evDelete(\''+esc(ed.id)+'\')">Delete event</button>':'')+'</div></div>';
+  }
+  var explain='<div style="margin-top:12px;font-size:var(--t-sm);line-height:1.5;color:var(--text2);border:1px solid var(--border);border-radius:var(--r-md);padding:12px 14px;background:var(--bg3)"><b>How &ldquo;learned from last year&rdquo; works.</b> For each item, the ERP compares the matching week last year with the 8 weeks before it. For example, TGK-INT-01 sold about 3 a week before Black Friday last year and 21 in Black Friday week, roughly 7 times a normal week. Items with little history use the shop&#8217;s typical value instead, and no item is raised by more than 8 times unless you change the cap. The extra units are added to a target only when its planning window reaches the event.</div>';
+  return '<div class="panel" style="padding:0;overflow:hidden"><div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 18px;border-bottom:1px solid var(--border)"><div><h2 style="margin:0;font-size:var(--t-lg,18px)">Events, like Black Friday</h2><div class="t3s" style="margin-top:2px;max-width:640px">Some weeks sell far more than normal. Tell the ERP about them and it adds extra stock to any build or reorder target whose planning window reaches that week.</div></div><div style="display:flex;gap:6px">'+(hasBF?'':'<button type="button" class="btn btn-sm" onclick="evToggle(\'bf\')">+ Black Friday</button>')+'<button type="button" class="btn btn-primary btn-sm" onclick="evEdit(null)">+ Add event</button></div></div><div style="padding:14px 18px 18px">'+table+form+explain+'<div class="t3s" style="margin-top:10px">Examples to add: a spring sale, a product launch, a dealer order you know is coming.</div></div></div>';
+}
+function openPlanning(){
+  if(typeof document==='undefined')return;
+  var ov=document.getElementById('plan-overlay');
+  if(!ov){ov=document.createElement('div');ov.id='plan-overlay';ov.setAttribute('role','dialog');ov.setAttribute('aria-label','Planning');
+    ov.style.cssText='position:fixed;inset:0;z-index:9000;background:rgba(10,14,18,.55);overflow:auto;padding:28px 16px';
+    ov.onclick=function(e){if(e.target===ov)closePlanning();};document.body.appendChild(ov);}
+  var st=ov.firstChild&&ov.firstChild.scrollTop;
+  ov.innerHTML='<div style="max-width:1060px;margin:0 auto;background:var(--bg);border:1px solid var(--border);border-radius:var(--r-lg,14px);padding:18px 20px 22px;box-shadow:0 20px 60px rgba(0,0,0,.35)">'
+    +'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:12px"><div><div class="t3s" style="letter-spacing:.12em;font-weight:700">PRODUCTION &amp; PACKING</div><h1 style="margin:2px 0 4px;font-size:var(--t-xl,24px)">Planning</h1><div class="t3s" style="max-width:720px">By default the ERP plans from the last 12 weeks of sales. These two optional helpers adjust that. Each has an on/off switch, and nothing here deletes sales or stock data.</div></div><button type="button" class="btn btn-sm" onclick="closePlanning()">Close</button></div>'
+    +_plForecast()+_plEvents()+'</div>';
+}
+function closePlanning(){S._evEdit=null;var ov=typeof document!=='undefined'&&document.getElementById('plan-overlay');if(ov&&ov.remove)ov.remove();}
+// [/v23.38 PLANNING]
 function ltWeeks(p){return(p&&p.lead_time_weeks>0)?p.lead_time_weeks:2;} // default 2wk; manual entry always wins
 function effectiveWkDemand(p){
   const c=S.calc&&S.calc.part&&S.calc.part[p.pn];
@@ -24854,11 +25035,11 @@ function renderPackQueue(){
     else if(b.maxBuild>=suggested){st='build';stCls='pill-green';}
     else if(b.maxBuild>0){st='partial';stCls='pill-yellow';}
     else{st='blocked';stCls='pill-red';}
-    if(demand>0&&suggested>0) st='orders';
+    const stBase=st; if(demand>0&&suggested>0) st='orders';
     // [UNPACK-BUILD] On-order assemblies that raw stock can't cover: could unpacking in-stock assemblies do it?
     let up=null;
     if(demand>0&&b.hasBOM){const _need=demand-(a.total_on_hand||0);if(_need>0&&b.maxBuild<_need)up=buildabilityUnpack(a.pn,_need);}
-    return{...a,b,demand,fcDemand,suggested,st,stCls,type,up,canCover:(b.maxBuild===Infinity||b.maxBuild>=suggested)};
+    return{...a,b,demand,fcDemand,suggested,st,stBase,stCls,type,up,canCover:(b.maxBuild===Infinity||b.maxBuild>=suggested)};
   });
 
   const _pqSort=sf.sort, _pqDir=sf.dir||'desc';
@@ -24886,7 +25067,12 @@ function renderPackQueue(){
 
   let rows=allRows;
   if(qSearch) rows=rows.filter(r=>r.pn.toLowerCase().includes(qSearch)||(r.new_sku||'').toLowerCase().includes(qSearch)||(r.description||'').toLowerCase().includes(qSearch));
-  if(sf.status) rows=rows.filter(r=>sf.status==='unpack'?!!(r.up&&r.up.ok&&r.up.steps.length):r.st===sf.status);
+  if(sf.status==='build') rows=rows.filter(r=>r.stBase==='build');
+  else if(sf.status==='wait') rows=rows.filter(r=>r.stBase==='partial'||r.stBase==='blocked');
+  else if(sf.status==='covered') rows=rows.filter(r=>r.stBase==='covered');
+  else if(sf.status) rows=rows.filter(r=>sf.status==='unpack'?!!(r.up&&r.up.ok&&r.up.steps.length):r.st===sf.status);
+  if(sf.openOnly) rows=rows.filter(r=>r.demand>0);
+  if(sf.unpackOnly) rows=rows.filter(r=>!!(r.up&&r.up.ok&&r.up.steps.length));
   const typeCounts={fg:rows.filter(r=>r.type==='fg').length,sub:rows.filter(r=>r.type==='sub').length,hwp:rows.filter(r=>r.type==='hwp').length};
   if(sf.type) rows=rows.filter(r=>r.type===sf.type);
 
@@ -24895,54 +25081,20 @@ function renderPackQueue(){
   const ready=needBuild.filter(r=>!r.b.hasBOM||r.b.maxBuild>=r.suggested);
   const withOrders=allRows.filter(r=>r.demand>0);
   const counts={orders:allRows.filter(r=>r.st==='orders').length,build:allRows.filter(r=>r.st==='build').length,partial:allRows.filter(r=>r.st==='partial').length,blocked:allRows.filter(r=>r.st==='blocked').length,covered:allRows.filter(r=>r.st==='covered').length,unpack:allRows.filter(r=>r.up&&r.up.ok&&r.up.steps.length).length};
+  // [v23.38] one set of counts for the tiles AND the Show buttons: every item is exactly one of build / wait / covered
+  const _nBuild=ready.length,_nWait=needBuild.length-ready.length,_nCov=allRows.length-needBuild.length;
+  const _nBlk=blocked.length,_nPart=_nWait-_nBlk,_nOpen=withOrders.length,_nUnp=allRows.filter(r=>r.up&&r.up.ok&&r.up.steps.length).length;
   const typeBadge=t=>t==='hwp'?`<span style="font-size:8px;background:var(--purple-dim);color:var(--purple);border:1px solid rgba(124,58,237,.2);border-radius:var(--r-sm);padding:1px 4px;font-weight:700;margin-left:4px">HWP</span>`:t==='sub'?`<span style="font-size:8px;background:var(--orange-dim);color:var(--orange);border:1px solid rgba(234,88,12,.2);border-radius:var(--r-sm);padding:1px 4px;font-weight:700;margin-left:4px">SUB</span>`:`<span style="font-size:8px;background:var(--teal-dim);color:var(--teal);border:1px solid rgba(13,148,136,.2);border-radius:var(--r-sm);padding:1px 4px;font-weight:700;margin-left:4px">FG</span>`;
 
 
   return `
   <div class="kpi-grid kpi-grid-4" style="cursor:pointer">
-    <div class="kpi kpi-red" onclick="setFilter('production','status',${sf.status==='orders'?"''":"'orders'"})"><div class="kpi-label">Open Order Demand</div><div class="kpi-value">${withOrders.length}</div><div class="kpi-sub">${allRows.reduce((t,r)=>t+r.demand,0)} units</div></div>
-    <div class="kpi kpi-orange" onclick="setFilter('production','status',${sf.status==='build'?"''":"'build'"})"><div class="kpi-label">Buildable Now</div><div class="kpi-value">${ready.length}</div><div class="kpi-sub">click to filter</div></div>
-    <div class="kpi kpi-yellow" onclick="setFilter('production','status',${sf.status==='partial'?"''":"'partial'"})"><div class="kpi-label">Partial / Blocked</div><div class="kpi-value">${allRows.filter(r=>r.st==='partial').length+blocked.length}</div></div>
-    <div class="kpi kpi-teal" onclick="setFilter('production','status',${sf.status==='covered'?"''":"'covered'"})"><div class="kpi-label">Covered</div><div class="kpi-value">${counts.covered}</div></div>
+    <div class="kpi kpi-red" onclick="setFilter('production','openOnly',${sf.openOnly?'false':'true'})"><div class="kpi-label">Open Order Demand</div><div class="kpi-value">${withOrders.length}</div><div class="kpi-sub">${allRows.reduce((t,r)=>t+r.demand,0)} units · click to filter</div></div>
+    <div class="kpi kpi-orange" onclick="setFilter('production','status',${sf.status==='build'?"''":"'build'"})"><div class="kpi-label">Build Now</div><div class="kpi-value">${_nBuild}</div><div class="kpi-sub">enough parts on the shelf</div></div>
+    <div class="kpi kpi-yellow" onclick="setFilter('production','status',${sf.status==='wait'?"''":"'wait'"})"><div class="kpi-label">Waiting on Parts</div><div class="kpi-value">${_nWait}</div><div class="kpi-sub">${_nPart} partial · ${_nBlk} blocked</div></div>
+    <div class="kpi kpi-teal" onclick="setFilter('production','status',${sf.status==='covered'?"''":"'covered'"})"><div class="kpi-label">Covered</div><div class="kpi-value">${_nCov}</div><div class="kpi-sub">stock meets the target</div></div>
   </div>
-  <div class="panel" style="padding:10px 16px">
-    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-      <div class="search-wrap" style="flex:1;min-width:160px"><span class="search-icon"><span class="ic ic-search"></span></span><input placeholder="Search SKU or description…" value="${sf.search||''}" oninput="setFilter('production','search',this.value)"></div>
-      <span class="t3s">Status:</span>
-      <button class="filter-chip ${!sf.status?'on-teal':''}" onclick="setFilter('production','status','')">All (${allRows.length})</button>
-      <button class="filter-chip ${sf.status==='orders'?'on-teal':''}" style="${sf.status==='orders'?'':'color:var(--red)'}" onclick="setFilter('production','status',${sf.status==='orders'?"''":"'orders'"})"><span class="ic ic-flame"></span>Open Orders (${counts.orders})</button>
-      <button class="filter-chip ${sf.status==='build'?'on-teal':''}" style="${sf.status==='build'?'':'color:var(--green)'}" onclick="setFilter('production','status',${sf.status==='build'?"''":"'build'"})"><span class="ic ic-check"></span>Build Now (${counts.build})</button>
-      <button class="filter-chip ${sf.status==='unpack'?'on-teal':''}" style="${sf.status==='unpack'?'':'color:var(--orange)'}" title="On-order assemblies that raw stock can't cover, but can be built by unpacking assemblies already in stock" onclick="setFilter('production','status',${sf.status==='unpack'?"''":"'unpack'"})"><span class="ic ic-wrench"></span>Via Unpack (${counts.unpack})</button>
-      <button class="filter-chip ${sf.status==='partial'?'on-teal':''}" style="${sf.status==='partial'?'':'color:var(--yellow)'}" onclick="setFilter('production','status',${sf.status==='partial'?"''":"'partial'"})"><span class="ic ic-alert"></span>Partial (${counts.partial})</button>
-      <button class="filter-chip ${sf.status==='blocked'?'on-teal':''}" style="${sf.status==='blocked'?'':'color:var(--red)'}" onclick="setFilter('production','status',${sf.status==='blocked'?"''":"'blocked'"})"><span class="ic ic-x"></span>Blocked (${counts.blocked})</button>
-      <button class="filter-chip ${sf.status==='covered'?'on-teal':''}" onclick="setFilter('production','status',${sf.status==='covered'?"''":"'covered'"})">Covered (${counts.covered})</button>
-      ${eventChipHtml()}${fcChipHtml()}<span style="font-size:var(--t-xs);color:var(--text3);margin-left:auto">Target:</span>
-      ${[2,4,8,12].map(w=>`<button class="filter-chip ${cov===w?'on-teal':''}" onclick="S.buildCoverage=${w};render()">${w}w</button>`).join('')}
-      <button class="btn btn-primary btn-sm" onclick="startWorkOrder()" title="Select assemblies to build today — see combined pick list and print shop floor sheet"><span class="ic ic-clipboard"></span>Work Order</button>
-      ${(function(){
-        var who=packedByUser()||'', me=S.currentUser||'';
-        var alt=(who&&who!==me);
-        // Visible at all times, not buried in a menu: if the wrong name is being recorded the
-        // only way anyone notices is by seeing it.
-        return '<button class="btn btn-sm" style="'+(alt?'color:var(--orange);border-color:rgba(234,88,12,.45);font-weight:700':'')+'" '
-          +'onclick="openPackAsPicker()" title="Who is recorded as packing. Resets to the signed-in user on reload.">'
-          +'<span class="ic ic-user"></span>'+(alt?('Packing as '+who.split('@')[0]):'Packing as me')+'</button>';
-      })()}
-      <button class="btn btn-sm" onclick="S.customPackMode=true;S.customPackLines=[];render()" title="Manually record packed units for any SKU"><span class="ic ic-box"></span>Custom Pack</button>
-      <label style="display:flex;align-items:center;gap:6px;font-size:var(--t-sm);color:var(--text2);cursor:pointer;padding:4px 10px;border-radius:var(--r-md);background:${S.packSkipMissing?'var(--orange-dim)':'var(--bg3)'};border:1px solid ${S.packSkipMissing?'rgba(234,88,12,.3)':'var(--border)'}" title="When on, packing proceeds even if a component is out of stock — that component simply isn't deducted, instead of blocking the whole pack">
-        <input type="checkbox" ${S.packSkipMissing?'checked':''} onchange="S.packSkipMissing=this.checked;render()" style="margin:0">
-        <span style="${S.packSkipMissing?'color:var(--orange);font-weight:700':''}">Pack even if short</span>
-      </label>
-    </div>
-    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-top:8px;border-top:1px solid var(--border)">
-      <span class="t3s">Type:</span>
-      <button class="filter-chip ${!sf.type?'on-teal':''}" onclick="setFilter('production','type','')">All Types</button>
-      <button class="filter-chip ${sf.type==='fg'?'on-teal':''}" style="${sf.type==='fg'?'':'color:var(--teal)'}" onclick="setFilter('production','type',${sf.type==='fg'?"''":"'fg'"})"><span class="ic ic-box"></span>Finished Goods (${typeCounts.fg})</button>
-      <button class="filter-chip ${sf.type==='sub'?'on-teal':''}" style="${sf.type==='sub'?'':'color:var(--orange)'}" onclick="setFilter('production','type',${sf.type==='sub'?"''":"'sub'"})"><span class="ic ic-alert"></span>Subassemblies (${typeCounts.sub})</button>
-      <button class="filter-chip ${sf.type==='hwp'?'on-teal':''}" style="${sf.type==='hwp'?'':'color:var(--purple)'}" onclick="setFilter('production','type',${sf.type==='hwp'?"''":"'hwp'"})"><span class="ic ic-box"></span>Hardware Packs (${typeCounts.hwp})</button>
-      ${sf.type||sf.status?`<button class="btn btn-sm" style="margin-left:auto;font-size:var(--t-xs)" onclick="setFilter('production','type','');setFilter('production','status','')"><span class="ic ic-x"></span>Clear filters</button>`:''}
-    </div>
-  </div>
+  ${prodControls({sf,cov,all:allRows,total:allRows.length,nBuild:_nBuild,nWait:_nWait,nCov:_nCov,nPart:_nPart,nBlk:_nBlk,nOpen:_nOpen,nUnp:_nUnp,packTip:'When on, packing proceeds even if a component is out of stock — that component simply isn&#39;t deducted, instead of blocking the whole pack'})}
   <div class="tbl-wrap prod-desktop-tbl">
   <table><thead class="sticky-header"><tr><th style="cursor:pointer;user-select:none" onclick="(()=>{var _s=(S.filters.production||{});var d=_s.sort==='pn'&&_s.dir==='asc'?'desc':'asc';setFilter('production','sort','pn');setFilter('production','dir',d)})()">SKU${sf.sort==='pn'?(sf.dir==='asc'?' \u2191':' \u2193'):''}</th><th style="cursor:pointer;user-select:none" onclick="(()=>{var _s=(S.filters.production||{});var d=_s.sort==='desc'&&_s.dir==='asc'?'desc':'asc';setFilter('production','sort','desc');setFilter('production','dir',d)})()">Description${sf.sort==='desc'?(sf.dir==='asc'?' \u2191':' \u2193'):''}</th><th>Bin</th><th style="cursor:pointer;user-select:none" onclick="(()=>{var _s=(S.filters.production||{});var d=_s.sort==='oh'&&_s.dir==='asc'?'desc':'asc';setFilter('production','sort','oh');setFilter('production','dir',d)})()">On Hand${sf.sort==='oh'?(sf.dir==='asc'?' \u2191':' \u2193'):''}</th><th style="cursor:pointer;user-select:none" onclick="(()=>{var _s=(S.filters.production||{});var d=_s.sort==='demand'&&_s.dir==='asc'?'desc':'asc';setFilter('production','sort','demand');setFilter('production','dir',d)})()">Open Orders${sf.sort==='demand'?(sf.dir==='asc'?' \u2191':' \u2193'):''}</th><th style="cursor:pointer;user-select:none" onclick="(()=>{var _s=(S.filters.production||{});var d=_s.sort==='fcst'&&_s.dir==='asc'?'desc':'asc';setFilter('production','sort','fcst');setFilter('production','dir',d)})()">${cov}-Wk Fcst${sf.sort==='fcst'?(sf.dir==='asc'?' \u2191':' \u2193'):''}</th><th style="cursor:pointer;user-select:none" onclick="(()=>{var _s=(S.filters.production||{});var d=_s.sort==='suggested'&&_s.dir==='asc'?'desc':'asc';setFilter('production','sort','suggested');setFilter('production','dir',d)})()">Suggested${sf.sort==='suggested'?(sf.dir==='asc'?' \u2191':' \u2193'):''}</th><th style="cursor:pointer;user-select:none" onclick="(()=>{var _s=(S.filters.production||{});var d=_s.sort==='max'&&_s.dir==='asc'?'desc':'asc';setFilter('production','sort','max');setFilter('production','dir',d)})()">Max Buildable${sf.sort==='max'?(sf.dir==='asc'?' \u2191':' \u2193'):''}</th><th style="cursor:pointer;user-select:none" onclick="(()=>{var _s=(S.filters.production||{});var d=_s.sort==='status'&&_s.dir==='asc'?'desc':'asc';setFilter('production','sort','status');setFilter('production','dir',d)})()">Status${sf.sort==='status'?(sf.dir==='asc'?' \u2191':' \u2193'):''}</th><th>Quick Pack</th></tr></thead><tbody>
   ${rows.map(r=>{
