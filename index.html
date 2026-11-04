@@ -474,7 +474,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.32</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.33</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -539,7 +539,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.32';
+const TGK_ERP_VERSION = 'v23.33';
 const TGK_ERP_BUILD_DATE = '2026-11-02';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -902,6 +902,11 @@ function poStatusBadge(p){
 window.poStatusBadge=poStatusBadge;
 /* Status a PO moves to when its last line is received: a PO that was ever lost closes as Recovered. */
 function poDoneStatus(po){return (po&&(po.status==='Lost'||po.status==='Recovered'||po.lost_at))?'Recovered':'Received';}
+// [v23.33] A line the vendor will not finish is 'Closed Short': it stops counting as on order and counts as done for the PO.
+function poLineClosed(l){return !!l&&String(l.status||'')==='Closed Short';}
+function poLineRem(l){return poLineClosed(l)?0:Math.max(0,(l.qty_ordered||0)-(l.qty_received||0));}
+function poLineDone(l){return poLineClosed(l)||(l.qty_received||0)>=(l.qty_ordered||0);}
+window.poLineClosed=poLineClosed;window.poLineRem=poLineRem;window.poLineDone=poLineDone;
 window.poDoneStatus=poDoneStatus;
 /* A Lost PO is never incoming: the replacement shipment lives on a new PO. */
 function poIsLostId(poId){const _p=(S.purchases||[]).find(x=>String(x.id)===String(poId));return !!(_p&&_p.status==='Lost');}
@@ -930,7 +935,7 @@ function poOutstanding(p){
   const _itemLs=_allLs.filter(l=>!isShippingLine(l));
   const ls=_itemLs.length?_itemLs:_allLs;
   const hd=(p.description||'').trim();
-  const rem=l=>Math.max(0,(l.qty_ordered||0)-(l.qty_received||0));
+  const rem=poLineRem;
   if(ls.length===1){
     const l=ls[0],d=(l.description||'').trim();
     if(_stubRe.test(d)||_stubRe.test(hd))return rem(l)>0?(l.unit_cost||0):0;
@@ -2195,7 +2200,7 @@ function cascadeShopifySync(childPn,_seen){
       // a genuine finished good: re-check it once, if it has no stock of its own
       if(!seen['S:'+parentPn]){
         seen['S:'+parentPn]=1;
-        if((parent.total_on_hand||0)<=0)syncShopifyTemplate(parentPn,parent.total_on_hand||0);
+        if(_netAvail(parentPn,parent.total_on_hand||0)<=0)syncShopifyTemplate(parentPn,parent.total_on_hand||0);
       }
     }
     cascadeShopifySync(parentPn,seen); // keep climbing: sub-assemblies and hardware packs are not products, and bundles may contain this finished good
@@ -2223,17 +2228,17 @@ function syncShopifyTemplate(pn,newOh){
   // variant for every new_sku item and the flag never lands. This matches what the bulk sync already does.
   var canonPn=_item?_item.pn:pn;
   var shopSku=_item?dispPn(_item):pn;
-  var isBackorder=false;
+  var isBackorder=false,_av=newOh;
   // Manual override wins over everything below. Set on the assembly's edit form, it holds the
   // item on backorder no matter what stock or buildability say.
   if(_item&&_item.force_backorder){
     isBackorder=true;
     console.log('[Shopify backorder] '+pn+' FORCED on backorder by manual override');
   }
-  else if(newOh<=0){
+  else if((_av=_netAvail(canonPn,newOh))<=0){
     var b=buildabilityForBackorder(canonPn);
     if(b.hasBOM){
-      isBackorder=(b.maxBuild<=0);
+      isBackorder=(b.maxBuild<(1-_av));
     }else{
       isBackorder=true;
       console.warn('[Shopify backorder] '+pn+' has no BOM -- flagging as backorder (cannot verify buildability)');
@@ -6673,6 +6678,7 @@ async function submitShipment(saleId,pn,qty){
   // The Ship button is UI-gated to open lines, but the ShipStation edge function may have shipped this
   // line first; without this guard a manual Ship here would deduct the same shipment a second time.
   const _shipChk=S.sales.find(s=>s.id===saleId);
+  if(_shipChk&&Number(_shipChk.qty_shipped)>0&&String(_shipChk.fulfillment_status||'').toLowerCase()==='partial'){qty=Math.max(0,(Number(_shipChk.qty)||qty)-Number(_shipChk.qty_shipped));} // [v23.33] only what has not already shipped
   if(_shipChk&&['Shipped','Delivered','Cancelled','Refunded'].includes(_shipChk.fulfillment_status||'Open')){toast(pn+' is already '+_shipChk.fulfillment_status+' — not shipping/deducting again');return;}
   try{
     const _fr=await db.from('sales').select('fulfillment_status').eq('id',saleId).maybeSingle();
@@ -8247,7 +8253,7 @@ async function checkEdgeFunctions(){
 function renderIntegrations(){
   const t=S.intTab;
   const edgeUrl=SUPA_URL.replace('.supabase.co','')+'.supabase.co/functions/v1';
-  return renderEdgeVersionPanel()+`<details class="panel" style="padding:0;margin-bottom:12px"><summary style="cursor:pointer;padding:10px 14px;font-weight:700">Database migration v23.77 <span style="font-weight:400;font-size:var(--t-sm);color:var(--text3)">all-or-nothing ship/receive/pack + daily stock check - run once in the Supabase SQL editor</span></summary>
+  return renderEdgeVersionPanel()+`<details class="panel" style="padding:0;margin-bottom:12px"><summary style="cursor:pointer;padding:10px 14px;font-weight:700">Database migration v23.33 <span style="font-weight:400;font-size:var(--t-sm);color:var(--text3)">shipped quantities, one row per Shopify line, stock-check upgrades, void + backorder jobs - run once in the Supabase SQL editor</span></summary><div style="padding:0 14px 12px"><div style="margin:6px 0"><button class="btn btn-sm" onclick="copyText(ERP_MIGRATION_V2333,this)">Copy SQL</button> <span class="t3xs" style="color:var(--text3)">safe to run more than once; run ops_setup.sql first if the Background Jobs are not set up yet</span></div><pre style="background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:12px;font-size:var(--t-xs);max-height:300px;overflow:auto;white-space:pre-wrap">${escHtml(ERP_MIGRATION_V2333)}</pre></div></details>`+`<details class="panel" style="padding:0;margin-bottom:12px"><summary style="cursor:pointer;padding:10px 14px;font-weight:700">Database migration v23.77 <span style="font-weight:400;font-size:var(--t-sm);color:var(--text3)">all-or-nothing ship/receive/pack + daily stock check - run once in the Supabase SQL editor</span></summary>
     <div style="padding:0 14px 12px"><div style="margin:6px 0"><button class="btn btn-sm" onclick="copyText(ERP_MIGRATION_V2377,this)">Copy SQL</button> <span class="t3xs" style="color:var(--text3)">safe to run more than once; until it runs, the ERP uses its previous step-by-step path</span></div>
     <pre style="background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:12px;font-size:var(--t-xs);max-height:300px;overflow:auto;white-space:pre-wrap">${escHtml(ERP_MIGRATION_V2377)}</pre></div></details>`+`
   <div class="tabs-row">
@@ -8542,23 +8548,19 @@ async function _canonicalPnFor(pn: string): Promise&lt;string&gt; {
   if (p?.length) return p[0].pn
   return n
 }
-async function dedupeSalesLine(orderName: string, pn: string): Promise&lt;void&gt; {
+// [v23.85] Race guard keyed on the Shopify LINE ITEM id, not the SKU. It used to collapse every row on the order that shared a
+// SKU, which silently deleted a genuine second line for the same SKU. Now only rows carrying the SAME line item id count as
+// duplicates (oldest kept). Once sales_shopify_line_uq exists (v23.33 migration) the database refuses the second insert
+// itself and this never has anything to do.
+async function dedupeSalesLine(orderName: string, lineItemId: string | null | undefined): Promise&lt;void&gt; {
   try {
-    const canon = await _canonicalPnFor(pn)
-    const { data: rows } = await db.from('sales').select('id,pn,created_at').eq('order_number', orderName)
+    if (!lineItemId) return
+    const { data: rows } = await db.from('sales').select('id,created_at').eq('shopify_line_item_id', String(lineItemId))
     if (!rows || rows.length &lt; 2) return
-    const matching: any[] = []
-    for (const r of rows) {
-      if (!r.pn) continue
-      const rc = await _canonicalPnFor(r.pn)
-      if (rc === canon) matching.push(r)
-    }
-    if (matching.length &lt; 2) return
-    matching.sort((x: any, y: any) =&gt; String(x.created_at || x.id).localeCompare(String(y.created_at || y.id)))
-    const dupes = matching.slice(1)
-    for (const d of dupes) {
+    rows.sort((x: any, y: any) =&gt; String(x.created_at || x.id).localeCompare(String(y.created_at || y.id)))
+    for (const d of rows.slice(1)) {
       await db.from('sales').delete().eq('id', d.id)
-      console.warn('[shopify-orders] dedupe: removed race-duplicate sales row', d.id, 'for', orderName, pn, '- kept', matching[0].id)
+      console.warn('[shopify-orders] dedupe: removed race-duplicate sales row', d.id, 'for', orderName, 'line item', lineItemId, '- kept', rows[0].id)
     }
   } catch (e) { console.warn('[shopify-orders] dedupeSalesLine failed:', e) }
 }
@@ -8749,7 +8751,7 @@ async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.84'
+const EDGE_BUILD = 'v23.85'
 
 // [v23.82] The vehicle the shopper had saved on the website rides along as cart attribute "Vehicle" and arrives
 // here as an order note attribute. It is stored on each sales line (column added by fitment_7_insights.sql), so
@@ -8768,6 +8770,45 @@ async function insertSaleLine(db: any, row: any) {
     res = await db.from('sales').insert(r2)
   }
   return res
+}
+
+// [v23.85] Background work. Supabase's EdgeRuntime.waitUntil lets a task finish after the reply has gone out; without it
+// (older runtimes) the task is simply awaited, exactly as before.
+async function bgOrWait(p: Promise&lt;any&gt;): Promise&lt;void&gt; {
+  const rt: any = (globalThis as any).EdgeRuntime
+  if (rt &amp;&amp; typeof rt.waitUntil === 'function') { rt.waitUntil(p.catch((e: any) =&gt; console.warn('[shopify-orders] background task failed:', e))); return }
+  await p
+}
+// [v23.85] A new / cancelled / edited order changes how much of a SKU is spoken for, so the storefront's backorder state is
+// re-checked by shipstation-ship (which owns that logic). Fire-and-forget: the backorder_audit job is the safety net.
+function queueBackorderRecheck(pns: Iterable&lt;string&gt;): void {
+  const list = [...new Set([...pns].map((p) =&gt; String(p || '').trim()).filter(Boolean))].slice(0, 20)
+  if (!list.length) return
+  const url = (Deno.env.get('SUPABASE_URL') || '').replace(/\\/$/, '') + '/functions/v1/shipstation-ship'
+  const svc = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || ''
+  if (!url.startsWith('http') || !svc) return
+  const p = fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + svc }, body: JSON.stringify({ action: 'resync_backorder', pns: list }) })
+    .then((r) =&gt; { if (!r.ok) console.warn('[shopify-orders] backorder recheck answered HTTP', r.status) }, (e) =&gt; console.warn('[shopify-orders] backorder recheck failed:', e))
+  const rt: any = (globalThis as any).EdgeRuntime
+  if (rt &amp;&amp; typeof rt.waitUntil === 'function') rt.waitUntil(p)
+}
+// [v23.85] Zero an inventory item at EVERY location it is stocked at. This used to use locations(first: 1) only, which is
+// right for a one-location store and leaves stock showing at any other location. Returns Shopify's userErrors.
+async function zeroAllLocations(gq: (q: string) =&gt; Promise&lt;any&gt;, invId: string): Promise&lt;string[]&gt; {
+  let locIds: string[] = []
+  try {
+    const r = await gq('{ inventoryItem(id: "' + invId + '") { inventoryLevels(first: 20) { edges { node { location { id } } } } } }')
+    locIds = (r?.data?.inventoryItem?.inventoryLevels?.edges || []).map((e: any) =&gt; e?.node?.location?.id).filter(Boolean)
+  } catch (_) { /* fall back to the first location below */ }
+  if (!locIds.length) {
+    const loc = await gq('{ locations(first: 1) { edges { node { id } } } }')
+    const l1 = loc?.data?.locations?.edges?.[0]?.node?.id
+    if (l1) locIds = [l1]
+  }
+  if (!locIds.length) return []
+  const sets = locIds.map((l) =&gt; '{inventoryItemId: "' + invId + '", locationId: "' + l + '", quantity: 0}').join(', ')
+  const z = await gq('mutation { inventorySetOnHandQuantities(input: {reason: "correction", setQuantities: [' + sets + ']}) { userErrors { message } } }')
+  return (z?.data?.inventorySetOnHandQuantities?.userErrors || []).map((u: any) =&gt; String(u?.message || u))
 }
 
 const _gateLogged: Record&lt;string, number&gt; = {}
@@ -9123,9 +9164,7 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
     if (hold) {
       if (invId) {
         await gq('mutation { inventoryItemUpdate(id: "' + invId + '", input: {tracked: true}) { userErrors { message } } }')
-        const loc = await gq('{ locations(first: 1) { edges { node { id } } } }')
-        const lId = loc?.data?.locations?.edges?.[0]?.node?.id
-        if (lId) await gq('mutation { inventorySetOnHandQuantities(input: {reason: "correction", setQuantities: [{inventoryItemId: "' + invId + '", locationId: "' + lId + '", quantity: 0}]}) { userErrors { message } } }')
+        await zeroAllLocations(gq, invId)
       }
       const p = await gq('mutation { productVariantsBulkUpdate(productId: "' + prodId + '", variants: [{id: "' + variantId + '", inventoryPolicy: DENY}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
       const pol = p?.data?.productVariantsBulkUpdate?.productVariants?.[0]?.inventoryPolicy
@@ -9252,12 +9291,7 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
           const t = await gql('mutation { inventoryItemUpdate(id: "' + invItemId + '", input: {tracked: true}) { inventoryItem { tracked } userErrors { message } } }')
           ;(t?.data?.inventoryItemUpdate?.userErrors || []).forEach((u:any)=&gt;errs.push(u.message))
           actual_tracked = t?.data?.inventoryItemUpdate?.inventoryItem?.tracked ?? actual_tracked
-          const loc = await gql('{ locations(first: 1) { edges { node { id } } } }')
-          const locId = loc?.data?.locations?.edges?.[0]?.node?.id
-          if (locId) {
-            const z = await gql('mutation { inventorySetOnHandQuantities(input: {reason: "correction", setQuantities: [{inventoryItemId: "' + invItemId + '", locationId: "' + locId + '", quantity: 0}]}) { userErrors { message } } }')
-            ;(z?.data?.inventorySetOnHandQuantities?.userErrors || []).forEach((u:any)=&gt;errs.push(u.message))
-          }
+          ;(await zeroAllLocations(gql, invItemId)).forEach((m: string) =&gt; errs.push(m))
         }
         const p = await gql('mutation { productVariantsBulkUpdate(productId: "' + prodId + '", variants: [{id: "' + variantId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
         ;(p?.data?.productVariantsBulkUpdate?.userErrors || []).forEach((u:any)=&gt;errs.push(u.message))
@@ -9816,6 +9850,7 @@ if (body.action === 'list_product_templates') {
   try {
     const order = body
     const fin = (order.financial_status || '').toLowerCase()
+    const _recheck = new Set&lt;string&gt;() // SKUs whose open-order demand this event changed
     if (topic === 'orders/create') {
       const custName = (order.shipping_address?.name || order.billing_address?.name || (order.customer ? (order.customer.first_name||'')+' '+(order.customer.last_name||'') : '')).trim()
       const custEmail = order.email || order.customer?.email || ''
@@ -9828,8 +9863,27 @@ if (body.action === 'list_product_templates') {
           ? Number(li.current_quantity)
           : ((li.quantity === undefined || li.quantity === null) ? 1 : Number(li.quantity))
         if (_createQty &lt;= 0) { console.log('[shopify-orders] orders/create: skipping zero-quantity line', order.name, pn); continue }
-        const { data: existing } = await db.from('sales').select('id').eq('order_number', order.name).eq('pn', pn).limit(1)
-        if (existing?.length) { console.log('[shopify-orders] skipping duplicate', order.name, pn); continue }
+        // [v23.85] Duplicate check is per Shopify LINE ITEM, so two lines that share a SKU are both recorded (the second used
+        // to be skipped as a "duplicate", leaving the ERP a unit short). A legacy row for this SKU that never stored a line
+        // item id is the same line: it is adopted rather than added to.
+        const liId = li.id != null ? String(li.id) : ''
+        _recheck.add(pn)
+        if (liId) {
+          const { data: byId } = await db.from('sales').select('id').eq('shopify_line_item_id', liId).limit(1)
+          if (byId?.length) { console.log('[shopify-orders] skipping duplicate line item', order.name, pn, liId); continue }
+        }
+        const lg = await db.from('sales').select('id,shopify_line_item_id').eq('order_number', order.name).eq('pn', pn)
+        if (lg.error) {
+          const ex = await db.from('sales').select('id').eq('order_number', order.name).eq('pn', pn).limit(1) // column not migrated yet: old rule
+          if (ex.data?.length) { console.log('[shopify-orders] skipping duplicate', order.name, pn); continue }
+        } else {
+          const free = (lg.data || []).filter((r: any) =&gt; !r.shopify_line_item_id)
+          if (free.length) {
+            if (liId) await db.from('sales').update({ shopify_line_item_id: liId }).eq('id', free[0].id)
+            console.log('[shopify-orders] orders/create: existing row adopted for', order.name, pn)
+            continue
+          }
+        }
         const shipAddr = order.shipping_address || {}
         const { error: insErr } = await insertSaleLine(db, {
           vehicle: orderVehicle(order),
@@ -9853,11 +9907,13 @@ if (body.action === 'list_product_templates') {
           shopify_order_id: String(order.id),
           shopify_line_item_id: String(li.id),
         })
-        if (insErr) console.error('[shopify-orders] insert error:', insErr.message, insErr.details)
-        else await dedupeSalesLine(order.name, pn)
+        if (insErr) {
+          if ((insErr as any).code === '23505') console.log('[shopify-orders] line item already recorded (database refused the duplicate):', order.name, pn)
+          else console.error('[shopify-orders] insert error:', insErr.message, insErr.details)
+        } else await dedupeSalesLine(order.name, liId)
       }
-      // Runs after the insert loop so it flags rows that already exist, rather than racing them.
-      await checkOrderRisk(order.id, order.name)
+      // Runs after the insert loop so it flags rows that already exist, rather than racing them. [v23.85] In the background.
+      await bgOrWait(checkOrderRisk(order.id, order.name))
 
       // [FIX] Closes the Support Center &lt;-&gt; Shopify loop: if this order came from a Support
       // Center draft, create-draft-order attached email_id as a custom attribute on the draft,
@@ -9879,10 +9935,12 @@ if (body.action === 'list_product_templates') {
     } else if (topic === 'orders/cancelled') {
       // Only cancel lines that have NOT shipped. Flipping a shipped line to Cancelled leaves its
       // stock deducted while erasing the sale that explains it, and drops real revenue.
-      await db.from('sales')
+      const { data: _cancelled } = await db.from('sales')
         .update({ fulfillment_status: 'Cancelled', cancelled_at: order.cancelled_at })
         .eq('order_number', order.name)
         .in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
+        .select('pn')
+      ;(_cancelled || []).forEach((r: any) =&gt; { if (r?.pn) _recheck.add(String(r.pn)) }) // [v23.85] those units are no longer spoken for
     } else if (topic === 'orders/updated') {
       const updFields: Record&lt;string, any&gt; = {}
       // [AUDIT] A PARTIAL refund (one returned item, a shipping refund, a goodwill credit - including the
@@ -9952,7 +10010,8 @@ if (body.action === 'list_product_templates') {
       // now used in shipstation-ship.ts's hold_sync - closes this for good.
       const _aliasCandidates = new Set&lt;string&gt;()
       for (const li of currentLineItems) { const pn = li.sku ? li.sku.trim() : (li.title || '').trim(); if (pn) _aliasCandidates.add(pn) }
-      const { data: existingLineRows } = await db.from('sales').select('id,pn,qty,fulfillment_status').eq('order_number', order.name)
+      let { data: existingLineRows, error: _elrErr } = await db.from('sales').select('id,pn,qty,fulfillment_status,shopify_line_item_id').eq('order_number', order.name)
+      if (_elrErr) ({ data: existingLineRows } = await db.from('sales').select('id,pn,qty,fulfillment_status').eq('order_number', order.name)) // column not migrated yet
       for (const row of (existingLineRows || [])) if (row.pn) _aliasCandidates.add(row.pn)
       const _aliasList = [..._aliasCandidates]
       const _canonMap: Record&lt;string, string&gt; = {}
@@ -9991,42 +10050,51 @@ if (body.action === 'list_product_templates') {
         if (li.current_quantity !== undefined &amp;&amp; li.current_quantity !== null) return Number(li.current_quantity)
         return (li.quantity === undefined || li.quantity === null) ? 1 : Number(li.quantity)
       }
-      const currentPnQty: Record&lt;string, number&gt; = {}
+      // [v23.85] Reconcile by Shopify LINE ITEM id instead of by SKU. Matching on SKU collapsed two real lines that share a SKU into
+      // one (the later qty overwrote the earlier), and could not tell an edited line from a new one. Each Shopify line is matched
+      // to the ERP row carrying its line item id; a legacy row with no id is adopted by canonical SKU; anything unmatched is
+      // either removed (cancelled, if it has not shipped) or new (inserted).
+      const curLines: { li: any, pn: string, canon: string, q: number, id: string }[] = []
       for (const li of currentLineItems) {
         const pn = li.sku ? li.sku.trim().toUpperCase() : (li.title || '').trim()
         if (!pn) continue
         const q = _liQty(li)
         if (q &lt;= 0) { console.log('[shopify-orders] orders/updated: line zeroed out in Shopify -&gt;', order.name, pn, '- treating as removed'); continue }
-        currentPnQty[_canon(pn)] = q
+        curLines.push({ li, pn, canon: _canon(pn), q, id: li.id != null ? String(li.id) : '' })
       }
-      for (const row of (existingLineRows || [])) {
-        const rowPn = _canon(row.pn || '')
+      const rowsNow: any[] = existingLineRows || []
+      const claimed = new Set&lt;string&gt;()
+      const toInsert: typeof curLines = []
+      for (const cl of curLines) {
+        _recheck.add(cl.pn)
+        let row = cl.id ? rowsNow.find((r: any) =&gt; !claimed.has(r.id) &amp;&amp; r.shopify_line_item_id != null &amp;&amp; String(r.shopify_line_item_id) === cl.id) : undefined
+        if (!row) row = rowsNow.find((r: any) =&gt; !claimed.has(r.id) &amp;&amp; !r.shopify_line_item_id &amp;&amp; _canon(r.pn || '') === cl.canon)
+        if (!row) { toInsert.push(cl); continue }
+        claimed.add(row.id)
+        if (!row.shopify_line_item_id &amp;&amp; cl.id) await db.from('sales').update({ shopify_line_item_id: cl.id }).eq('id', row.id)
         const isTerminal = _TERMINAL_LINE_STATUSES.includes(String(row.fulfillment_status || '').toLowerCase())
-        if (isTerminal) continue
-        if (!(rowPn in currentPnQty)) {
-          await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('id', row.id)
-          console.log('[shopify-orders] orders/updated: line removed from order -&gt;', order.name, rowPn, '- cancelled')
-        } else if ((row.qty || 1) !== currentPnQty[rowPn]) {
-          await db.from('sales').update({ qty: currentPnQty[rowPn] }).eq('id', row.id)
-          console.log('[shopify-orders] orders/updated: qty changed -&gt;', order.name, rowPn, row.qty, '-&gt;', currentPnQty[rowPn])
+        if (!isTerminal &amp;&amp; (row.qty || 1) !== cl.q) {
+          await db.from('sales').update({ qty: cl.q }).eq('id', row.id)
+          console.log('[shopify-orders] orders/updated: qty changed -&gt;', order.name, cl.canon, row.qty, '-&gt;', cl.q)
         }
       }
-      const existingPnSet = new Set((existingLineRows || []).map((r: any) =&gt; _canon(r.pn || '')))
-      const newLineItems = currentLineItems.filter((li: any) =&gt; {
-        const pn = li.sku ? li.sku.trim().toUpperCase() : (li.title || '').trim()
-        return pn &amp;&amp; _liQty(li) &gt; 0 &amp;&amp; !existingPnSet.has(_canon(pn))
-      })
-      if (newLineItems.length) {
+      for (const row of rowsNow) {
+        if (claimed.has(row.id)) continue
+        if (_TERMINAL_LINE_STATUSES.includes(String(row.fulfillment_status || '').toLowerCase())) continue
+        await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('id', row.id)
+        if (row.pn) _recheck.add(String(row.pn))
+        console.log('[shopify-orders] orders/updated: line removed from order -&gt;', order.name, _canon(row.pn || ''), '- cancelled')
+      }
+      if (toInsert.length) {
         const shipAddr = order.shipping_address || {}
         const custName = (order.shipping_address?.name || order.billing_address?.name || (order.customer ? (order.customer.first_name||'')+' '+(order.customer.last_name||'') : '')).trim()
         const custEmail = order.email || order.customer?.email || ''
-        for (const li of newLineItems) {
-          const pn = li.sku ? li.sku.trim().toUpperCase() : (li.title || '').trim()
+        for (const cl of toInsert) {
           const { error: insErr } = await insertSaleLine(db, {
-          vehicle: orderVehicle(order),
+            vehicle: orderVehicle(order),
             order_number: order.name,
-            pn,
-            qty: _liQty(li),
+            pn: cl.pn,
+            qty: cl.q,
             source: 'Shopify',
             fulfillment_status: 'Open',
             financial_status: order.financial_status || 'pending',
@@ -10042,17 +10110,19 @@ if (body.action === 'list_product_templates') {
             shipping_country: shipAddr.country_code || shipAddr.country || null,
             discount_code: (order.discount_codes &amp;&amp; order.discount_codes.length ? order.discount_codes[0].code : null),
             shopify_order_id: String(order.id),
-            shopify_line_item_id: String(li.id),
+            shopify_line_item_id: String(cl.li.id),
           })
-          if (insErr) console.error('[shopify-orders] orders/updated: insert new line error:', insErr.message)
-          else { console.log('[shopify-orders] orders/updated: new line added to existing order -&gt;', order.name, pn); await dedupeSalesLine(order.name, pn) }
+          if (insErr) {
+            if ((insErr as any).code === '23505') console.log('[shopify-orders] orders/updated: line item already recorded (database refused the duplicate):', order.name, cl.pn)
+            else console.error('[shopify-orders] orders/updated: insert new line error:', insErr.message)
+          } else { console.log('[shopify-orders] orders/updated: new line added to existing order -&gt;', order.name, cl.pn); await dedupeSalesLine(order.name, String(cl.li.id)) }
         }
       }
 
       // Some fraud apps finish their risk assessment a moment after order creation - checking
       // again here (idempotent, see checkOrderRisk) catches those without needing a dedicated
       // webhook topic.
-      await checkOrderRisk(order.id, order.name)
+      await bgOrWait(checkOrderRisk(order.id, order.name))
       // [FEATURE] Some drop-ship vendors fulfill directly in Shopify (their own app or a manual
       // fulfillment) rather than ever passing through ShipStation. Those lines would otherwise
       // sit in Open/Ordered forever, since nothing ShipStation-side ever sees them ship.
@@ -10094,6 +10164,7 @@ if (body.action === 'list_product_templates') {
         }
       }
     }
+    if (_recheck.size) queueBackorderRecheck(_recheck)
     if (body.action === 'create_refund') {
     // [AUDIT] This URL is public (Shopify must reach it), so a refund requires a signed-in ERP user's token.
     const _tok = (req.headers.get('Authorization') || '').replace('Bearer ', '')
@@ -10146,6 +10217,11 @@ if (body.action === 'list_product_templates') {
 } catch (err) {
     console.error('[shopify-orders] webhook error:', err)
     _errByReq.set(req, String((err as any)?.message || err))
+    // [v23.85] A webhook that FAILED used to answer 200 anyway, so Shopify never retried it and the order was lost until the
+    // nightly reconcile noticed. Now it answers 500 so Shopify redelivers (the duplicate guard makes a retry safe). After 3
+    // failed deliveries of the same webhook it answers 200 again, so one bad payload cannot keep a subscription failing; the
+    // reconcile job still repairs it.
+    if (topic &amp;&amp; !body.action &amp;&amp; (_deliveriesByReq.get(req) || 0) &lt; 3) return new Response('error', { status: 500, headers: CORS })
   }
   return new Response('ok', { headers: CORS })
 }
@@ -10159,6 +10235,8 @@ if (body.action === 'list_product_templates') {
 //   * Logging never throws, never changes what the handler does, and costs two quick queries.
 // ===================================================================================================================
 const _errByReq = new WeakMap&lt;Request, string&gt;()
+const _deliveriesByReq = new WeakMap&lt;Request, number&gt;() // [v23.85] how many times this webhook id had already been delivered
+const _deliveriesSeen = new Map&lt;string, number&gt;()
 let _whTable = true
 const _missingTable = (m: unknown) =&gt; /does not exist|schema cache|relation/i.test(String(m || ''))
 async function whAlreadyDone(source: string, extId: string | null): Promise&lt;boolean&gt; {
@@ -10167,6 +10245,7 @@ async function whAlreadyDone(source: string, extId: string | null): Promise&lt;b
     const { data, error } = await db.from('webhook_events').select('id,status,deliveries').eq('source', source).eq('external_id', extId).limit(1)
     if (error) { if (_missingTable(error.message)) _whTable = false; return false }
     if (data &amp;&amp; data.length &amp;&amp; data[0].status === 'ok') { await db.from('webhook_events').update({ deliveries: (data[0].deliveries || 1) + 1 }).eq('id', data[0].id); return true }
+    if (data &amp;&amp; data.length) _deliveriesSeen.set(extId, Number(data[0].deliveries) || 1)
   } catch (_) { /* never let logging break a webhook */ }
   return false
 }
@@ -10196,6 +10275,7 @@ Deno.serve(async (req) =&gt; {
     extId = req.headers.get('x-shopify-webhook-id')
     try { const b: any = JSON.parse(await req.clone().text()); ref = String(b?.name || b?.id || '').slice(0, 60) } catch (_) { /* not JSON: the handler deals with it */ }
     if (await whAlreadyDone('shopify', extId)) { console.log('[shopify-orders] duplicate delivery skipped:', topic, extId); return new Response('ok', { headers: CORS }) }
+    _deliveriesByReq.set(req, extId ? (_deliveriesSeen.get(extId) || 0) : 0)
   }
   const t0 = Date.now()
   const via = req.headers.get('x-ops-replay') ? 'replay' : 'webhook'
@@ -10237,19 +10317,22 @@ async function logEdgeError(message: string): Promise&lt;void&gt; {
 // Deduct one sales line and settle its pending flag. Returns false only when it must be retried.
 async function deductLine(line: any, tracking: string, orderRef: string): Promise&lt;boolean&gt; {
   _lastDeduct = 'failed'
-  try { await deductForShipment(line.pn, Number(line.qty) || 1, tracking, orderRef) } catch (e) { _lastDeduct = 'failed'; console.error('[SS] deduction threw for', line.pn, e) }
+  const _owed = Number(line.deduct_qty) &gt; 0 ? Number(line.deduct_qty) : (Number(line.qty) || 1) // [v23.102] what was actually shipped, not the whole line
+  try { await deductForShipment(line.pn, _owed, tracking, orderRef, line.id) } catch (e) { _lastDeduct = 'failed'; console.error('[SS] deduction threw for', line.pn, e) }
   if (_lastDeduct === 'failed') {
     await logEdgeError('Stock deduction failed for ' + line.pn + ' on ' + orderRef + ' (tracking ' + tracking + ') - left pending, retried automatically')
     return false
   }
   if (_lastDeduct === 'notfound') await logEdgeError(line.pn + ' on ' + orderRef + ' shipped but is not in Parts or Assemblies - no stock deducted')
   await markDeductPending([line.id], false)
+  await setLineQtyCols(line.id, { deduct_qty: null })
   return true
 }
 async function retryPendingDeductions(limit: number): Promise&lt;{ tried: number, done: number, failed: number, remaining: number | null }&gt; {
   const out = { tried: 0, done: 0, failed: 0, remaining: null as number | null }
   if (!_pendingColumnOk) return out
-  const { data: rows, error } = await db.from('sales').select('id,pn,qty,order_number,tracking_number').eq('deduct_pending', true).limit(limit)
+  let { data: rows, error } = await db.from('sales').select('id,pn,qty,order_number,tracking_number,deduct_qty').eq('deduct_pending', true).limit(limit)
+  if (error &amp;&amp; /deduct_qty/i.test(error.message || '') &amp;&amp; !/deduct_pending/i.test(error.message || '')) { _qtyColsOk = false; ({ data: rows, error } = await db.from('sales').select('id,pn,qty,order_number,tracking_number').eq('deduct_pending', true).limit(limit)) }
   if (error) { if (/deduct_pending|column/i.test(error.message || '')) _pendingColumnOk = false; return out }
   for (const l of (rows || [])) {
     // Never retry without a tracking number: it is the duplicate guard that makes a retry safe.
@@ -10286,6 +10369,124 @@ const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
+// ===================================================================================================================
+// [v23.102] SHIPPED QUANTITY, VOIDED LABELS, STOREFRONT AVAILABILITY
+//  * The quantity ShipStation actually shipped is what gets deducted. Before, a line was marked fully Shipped and its whole
+//    ERP quantity deducted on the first label even if only part of it went out. sales.qty_shipped records the running total
+//    and sales.deduct_qty the amount still owed to a retry (both added by the v23.33 migration; without it the old
+//    whole-line behaviour is kept).
+//  * Items are matched by Shopify line item id, then by exact canonical SKU. The substring guess is gone.
+//  * A voided label puts the order and its stock back (void_sweep).
+//  * Shopify availability = on hand minus open orders (setting backorder_net_open_orders = false turns this off).
+// ===================================================================================================================
+let _qtyColsOk = true
+async function setLineQtyCols(id: string, patch: { qty_shipped?: number, deduct_qty?: number | null }): Promise&lt;void&gt; {
+  if (!_qtyColsOk || !id) return
+  const { error } = await db.from('sales').update(patch).eq('id', id)
+  if (error) {
+    if (/qty_shipped|deduct_qty|column/i.test(error.message || '')) { _qtyColsOk = false; console.warn('[SS] sales.qty_shipped / deduct_qty not migrated - shipping whole lines until the v23.33 migration runs') }
+    else console.warn('[SS] could not update line quantities:', error.message)
+  }
+}
+const _NOT_SHIPPABLE = ['cancelled', 'canceled', 'refunded', 'returned']
+function lineShippedSoFar(l: any): number {
+  const st = String(l?.fulfillment_status || '').toLowerCase()
+  if (st === 'shipped' || st === 'delivered' || st === 'fulfilled') return Number(l?.qty) || 1 // terminal = the whole line went out
+  const q = Number(l?.qty_shipped)
+  return isFinite(q) &amp;&amp; q &gt; 0 ? q : 0
+}
+function lineRemaining(l: any): number { return Math.max(0, (Number(l?.qty) || 1) - lineShippedSoFar(l)) }
+// Works out how many units of each ERP line one shipment covers. Pure: no database, no network.
+//   1. an item whose lineItemKey is a line's Shopify line item id belongs to that line, whatever its SKU says
+//   2. otherwise by exact canonical SKU (never substring); several lines with the same SKU are filled in turn, largest remainder first
+// Lines already fully shipped stay in the result with 0 (so a re-label still refreshes their tracking).
+function allocateShipment(lines: any[], items: any[], canon: (s: string) =&gt; string): { got: Map&lt;string, number&gt;, unmatched: any[] } {
+  const norm = (s: any) =&gt; String(s || '').trim().toUpperCase()
+  const eligible = lines.filter((l) =&gt; !_NOT_SHIPPABLE.includes(String(l?.fulfillment_status || '').toLowerCase()))
+  const got = new Map&lt;string, number&gt;()
+  const left = new Map&lt;string, number&gt;()
+  eligible.forEach((l) =&gt; left.set(l.id, lineRemaining(l)))
+  const unmatched: any[] = []
+  for (const it of items || []) {
+    let q = ssItemQty(it)
+    if (!(q &gt; 0)) continue
+    const key = String(it?.lineItemKey ?? '').trim()
+    let cands: any[] = []
+    if (key) cands = eligible.filter((l) =&gt; l.shopify_line_item_id != null &amp;&amp; String(l.shopify_line_item_id).trim() === key)
+    if (!cands.length) {
+      const sku = norm(it?.sku), name = norm(it?.name)
+      const cs = sku ? canon(sku) : '', cn = !sku &amp;&amp; name ? canon(name) : ''
+      cands = eligible.filter((l) =&gt; { const cl = canon(l.pn); return (cs &amp;&amp; (cl === cs || norm(l.pn) === sku)) || (cn &amp;&amp; (cl === cn || norm(l.pn) === name)) })
+    }
+    if (!cands.length) { unmatched.push(it); continue }
+    cands = cands.map((c, i) =&gt; ({ c, i })).sort((a, b) =&gt; ((left.get(b.c.id) || 0) - (left.get(a.c.id) || 0)) || (a.i - b.i)).map((x) =&gt; x.c)
+    for (const l of cands) {
+      if (q &lt;= 0) break
+      const cap = left.get(l.id) || 0
+      const take = Math.min(q, cap)
+      if (take &gt; 0) { got.set(l.id, (got.get(l.id) || 0) + take); left.set(l.id, cap - take); q -= take }
+    }
+    if (!got.has(cands[0].id)) got.set(cands[0].id, 0) // matched, but already fully shipped
+  }
+  return { got, unmatched }
+}
+
+// ---- storefront availability = on hand - open orders -------------------------------------------------------------------
+let _lastSync = '' // how the last syncShopifyBackorder call ended: skipped | unchanged | changed
+let _netCache: { v: boolean, t: number } | null = null
+async function netBackorderEnabled(): Promise&lt;boolean&gt; {
+  if (_netCache &amp;&amp; Date.now() - _netCache.t &lt; 60000) return _netCache.v
+  let v = true
+  try {
+    const { data } = await db.from('settings').select('value').eq('key', 'backorder_net_open_orders').limit(1)
+    const x = data?.[0]?.value
+    if (x === false || x === 'false') v = false
+  } catch (_) { /* default on */ }
+  _netCache = { v, t: Date.now() }
+  return v
+}
+// Units on open (not yet shipped) orders for one item, counting a partly shipped line at what is still to ship.
+async function openDemandFor(canonPn: string, newSku?: string | null): Promise&lt;number&gt; {
+  if (!(await netBackorderEnabled())) return 0
+  const keys = [...new Set([canonPn, newSku || ''].map((x) =&gt; String(x || '').trim()).filter(Boolean))]
+  if (!keys.length) return 0
+  const st = 'fulfillment_status.is.null,fulfillment_status.in.(Open,Packed,Partial,partial,"On Hold")'
+  let { data, error } = await db.from('sales').select('qty,qty_shipped,fulfillment_status').in('pn', keys).or(st).limit(20000)
+  if (error) ({ data, error } = await db.from('sales').select('qty,fulfillment_status').in('pn', keys).or(st).limit(20000))
+  if (error) return 0
+  let n = 0
+  for (const r of (data || []) as any[]) {
+    const q = Number(r.qty) || 1
+    const partial = String(r.fulfillment_status || '').toLowerCase() === 'partial'
+    n += Math.max(0, q - (partial ? (Number(r.qty_shipped) || 0) : 0))
+  }
+  return n
+}
+async function onHandOf(pn: string): Promise&lt;{ kind: 'assembly' | 'part', id: string, oh: number, row: any } | null&gt; {
+  const { data: a } = await db.from('assemblies').select('id,pn,new_sku,total_on_hand').eq('pn', pn).limit(1)
+  if (a?.length) return { kind: 'assembly', id: String(a[0].id), oh: Number(a[0].total_on_hand) || 0, row: a[0] }
+  const { data: p } = await db.from('parts').select('id,pn,new_sku,total_unpckgd').eq('pn', pn).limit(1)
+  if (p?.length) return { kind: 'part', id: String(p[0].id), oh: Number(p[0].total_unpckgd) || 0, row: p[0] }
+  return null
+}
+// Zero an inventory item at EVERY location it is stocked at (locations(first: 1) only covered a one-location store).
+async function zeroAllLocations(gq: (q: string) =&gt; Promise&lt;any&gt;, invId: string): Promise&lt;string[]&gt; {
+  let locIds: string[] = []
+  try {
+    const r = await gq('{ inventoryItem(id: "' + invId + '") { inventoryLevels(first: 20) { edges { node { location { id } } } } } }')
+    locIds = (r?.data?.inventoryItem?.inventoryLevels?.edges || []).map((e: any) =&gt; e?.node?.location?.id).filter(Boolean)
+  } catch (_) { /* fall back to the first location below */ }
+  if (!locIds.length) {
+    const loc = await gq('{ locations(first: 1) { edges { node { id } } } }')
+    const l1 = loc?.data?.locations?.edges?.[0]?.node?.id
+    if (l1) locIds = [l1]
+  }
+  if (!locIds.length) return []
+  const sets = locIds.map((l) =&gt; '{inventoryItemId: "' + invId + '", locationId: "' + l + '", quantity: 0}').join(', ')
+  const z = await gq('mutation { inventorySetOnHandQuantities(input: {reason: "correction", setQuantities: [' + sets + ']}) { userErrors { message } } }')
+  return (z?.data?.inventorySetOnHandQuantities?.userErrors || []).map((u: any) =&gt; String(u?.message || u))
+}
+
 function ok(body: string) { return new Response(body, { headers: CORS }) }
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { ...CORS, 'Content-Type': 'application/json' } })
@@ -10312,7 +10513,8 @@ async function buildOrderMap() {
   const _bomSel = async (cols: string) =&gt; await db.from('sales').select(cols)
     .in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
     .limit(100000)
-  let { data, error: _omErr } = await _bomSel('id,order_number,pn,fulfillment_status,qty,shopify_line_item_id')
+  let { data, error: _omErr } = await _bomSel('id,order_number,pn,fulfillment_status,qty,shopify_line_item_id,qty_shipped')
+  if (_omErr) ({ data, error: _omErr } = await _bomSel('id,order_number,pn,fulfillment_status,qty,shopify_line_item_id'))
   if (_omErr) ({ data } = await _bomSel('id,order_number,pn,fulfillment_status,qty')) // [v23.97] column missing: fall back to SKU-only matching
   const map: any = {}
   for (const line of (data || [])) {
@@ -10661,7 +10863,8 @@ function isManagedBackorderTemplate(templateSuffix: string | null | undefined): 
   return cur === boTpl
 }
 
-async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&gt; {
+async function syncShopifyBackorder(pn: string, newOh: number, trigger: string = 'shipstation_webhook', opts: { onlyIfChanged?: boolean } = {}): Promise&lt;void&gt; {
+  _lastSync = 'skipped'
   const { data: toggleRow } = await db.from('settings').select('value').eq('key', 'shopify_backorder_sync_enabled').limit(1)
   const syncEnabled = toggleRow?.[0]?.value
   if (syncEnabled === false || syncEnabled === 'false') {
@@ -10693,19 +10896,22 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
   let template = ''
   let ssRestock = ''
   const forcedBO = !!(eligItem &amp;&amp; eligItem.force_backorder)
+  let _demand = 0
   if (forcedBO) {
     template = Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder'
     console.log('[SS-&gt;Shopify]', pn, 'FORCED on backorder by manual override')
-  } else if (newOh &lt;= 0) {
+  } else if (newOh - (_demand = await openDemandFor(canonPn, eligItem?.new_sku)) &lt;= 0) {
+    // [v23.102] "out" now means on hand minus open orders is zero or less. Short by N means N more units must be buildable.
+    const avail = newOh - _demand
     const { hasBOM, maxBuild } = await bomMaxBuild(canonPn)
-    const isBackorder = !hasBOM || maxBuild &lt;= 0
+    const isBackorder = !hasBOM || maxBuild &lt; (1 - avail)
     if (isBackorder) {
       template = Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder'
       const { data: rdRow } = await db.from('settings').select('value').eq('key', 'shopify_restock_days').limit(1)
       const rdDays = Number(rdRow?.[0]?.value) || 30
       ssRestock = new Date(Date.now() + rdDays * 86400000).toISOString().slice(0, 10)
     }
-    console.log('[SS-&gt;Shopify]', pn, 'newOh='+newOh, 'hasBOM='+hasBOM, 'maxBuild='+maxBuild, '-&gt;', template || '(revert)', ssRestock ? 'restock:'+ssRestock : '')
+    console.log('[SS-&gt;Shopify]', pn, 'newOh='+newOh, 'openOrders='+_demand, 'hasBOM='+hasBOM, 'maxBuild='+maxBuild, '-&gt;', template || '(revert)', ssRestock ? 'restock:'+ssRestock : '')
   }
   try {
     const isBO = template !== ''
@@ -10716,7 +10922,7 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
       return r
     }
     const safeBO = shopSkuBO.replace(/"/g, '')
-    const findBO = await gqlBO('{ productVariants(first: 10, query: "sku:' + safeBO + '") { edges { node { id sku inventoryItem { id } product { id templateSuffix } metafield(namespace: "custom", key: "estimated_arrival_date") { value } } } } }')
+    const findBO = await gqlBO('{ productVariants(first: 10, query: "sku:' + safeBO + '") { edges { node { id sku inventoryQuantity inventoryPolicy inventoryItem { id tracked } product { id templateSuffix } metafield(namespace: "custom", key: "estimated_arrival_date") { value } } } } }')
     const edgesBO = findBO?.data?.productVariants?.edges || []
     const mBO = edgesBO.find((e:any) =&gt; (e.node.sku || '').trim().toUpperCase() === shopSkuBO.toUpperCase())
     if (!mBO) { console.warn('[SS-&gt;Shopify] no variant for SKU', shopSkuBO, '(from canonical ' + pn + ')'); return }
@@ -10728,14 +10934,19 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
     const vId = mBO.node.id
     const iId = mBO.node.inventoryItem?.id
     const pId = mBO.node.product?.id
+    if (opts.onlyIfChanged) {
+      // repair-only mode (order events and the audit job): leave Shopify and the sync log alone when it already matches
+      const _bo = template !== ''
+      const _actualBO = !!mBO.node.inventoryItem?.tracked &amp;&amp; (Number(mBO.node.inventoryQuantity) || 0) &lt;= 0
+      if (_actualBO === _bo &amp;&amp; (!_bo || mBO.node.inventoryPolicy === 'CONTINUE')) { _lastSync = 'unchanged'; return }
+    }
+    _lastSync = 'changed'
     const existingEtaBO = String(mBO.node.metafield?.value || '').trim()
     if (isBO &amp;&amp; existingEtaBO) ssRestock = existingEtaBO
     if (isBO) {
       if (iId) {
         await gqlBO('mutation { inventoryItemUpdate(id: "' + iId + '", input: {tracked: true}) { userErrors { message } } }')
-        const locBO = await gqlBO('{ locations(first: 1) { edges { node { id } } } }')
-        const lId = locBO?.data?.locations?.edges?.[0]?.node?.id
-        if (lId) await gqlBO('mutation { inventorySetOnHandQuantities(input: {reason: "correction", setQuantities: [{inventoryItemId: "' + iId + '", locationId: "' + lId + '", quantity: 0}]}) { userErrors { message } } }')
+        await zeroAllLocations(gqlBO, iId)
       }
       const pBO = await gqlBO('mutation { productVariantsBulkUpdate(productId: "' + pId + '", variants: [{id: "' + vId + '", inventoryPolicy: CONTINUE}]) { productVariants { id inventoryPolicy } userErrors { field message } } }')
       const polBO = pBO?.data?.productVariantsBulkUpdate?.productVariants?.[0]?.inventoryPolicy || null
@@ -10760,7 +10971,7 @@ async function syncShopifyBackorder(pn: string, newOh: number): Promise&lt;void&
     const ssRestockDate = ssRestock || ''
     try {
       const { maxBuild: logMaxBuild } = await bomMaxBuild(canonPn)
-      await db.from('shopify_sync_log').insert({ pn: canonPn, action: isBO ? 'backorder' : 'reverted', trigger_source: 'shipstation_webhook', new_oh: newOh, max_build: logMaxBuild || null, restock_date: ssRestockDate || null })
+      await db.from('shopify_sync_log').insert({ pn: canonPn, action: isBO ? 'backorder' : 'reverted', trigger_source: trigger, new_oh: newOh, max_build: logMaxBuild || null, restock_date: ssRestockDate || null })
     } catch (e) { console.warn('[SS-&gt;Shopify] log insert failed:', e) }
   } catch (e) {
     console.warn('[SS-&gt;Shopify] error for', pn, e)
@@ -10786,14 +10997,18 @@ async function cascadeShopifyBackorder(childPn: string, seen: Set&lt;string&gt; 
   for (const parent of (parents || [])) {
     if (isEligibleForBackorderSync(parent) &amp;&amp; !seen.has('S:' + parent.pn)) {
       seen.add('S:' + parent.pn)
-      if ((parent.total_on_hand || 0) &lt;= 0) await syncShopifyBackorder(parent.pn, parent.total_on_hand || 0)
+      if ((parent.total_on_hand || 0) - (await openDemandFor(parent.pn, parent.new_sku)) &lt;= 0) await syncShopifyBackorder(parent.pn, parent.total_on_hand || 0)
     }
     await cascadeShopifyBackorder(parent.pn, seen)
   }
 }
 
-async function deductForShipment(pn: string, qty: number, tracking: string, orderRef: string): Promise&lt;boolean&gt; {
-  const reason = 'Shipped via ShipStation ' + orderRef + ' ' + tracking
+async function deductForShipment(pn: string, qty: number, tracking: string, orderRef: string, lineId?: string): Promise&lt;boolean&gt; {
+  // [v23.102] The duplicate guard used to be pn + tracking only, so two orders combined in one box (same SKU, one tracking number)
+  // looked like one deduction delivered twice and the second was skipped. It now includes the sales line (or the order when there
+  // is no line), and the history reason carries a short line marker so each line's deduction is recognisable on its own.
+  const baseReason = 'Shipped via ShipStation ' + orderRef + ' ' + tracking
+  const reason = baseReason + (lineId ? ' [line ' + String(lineId).slice(0, 8) + ']' : '')
   // [AUDIT] Manual ERP orders created before ERP v23.62 had stock taken at creation. Don't take it twice.
   try {
     const { data: mc } = await db.from('inv_corrections').select('id').eq('source', 'manual').eq('pn', pn).eq('reason', 'Manual ERP order ' + orderRef).limit(1)
@@ -10803,7 +11018,12 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
     }
   } catch (e) { console.warn('[SS] manual-order check failed', e) }
   if (tracking) {
-    const dedupKey = 'shipment|' + pn + '|' + tracking
+    // Deductions made before v23.102 used the old key and the plain reason: recognise them so a retry can never take stock twice.
+    try {
+      const { data: priorSame } = await db.from('inv_corrections').select('id').eq('source', 'shipment').eq('pn', pn).in('reason', lineId ? [baseReason, reason] : [reason]).limit(1)
+      if (priorSame?.length) { console.log('[SS] Already deducted', pn, 'for', orderRef, tracking, '- skipping (idempotent)'); _lastDeduct = 'duplicate'; return false }
+    } catch (e) { console.warn('[SS] prior-deduction check failed', e) }
+    const dedupKey = 'shipment|' + pn + '|' + tracking + '|' + (lineId || orderRef)
     try {
       const { data: rpcRes, error: rpcErr } = await db.rpc('apply_shipment_deduction', {
         p_pn: pn, p_qty: qty, p_dedup_key: dedupKey, p_reason: reason, p_source: 'shipment'
@@ -10818,6 +11038,7 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
         if (row &amp;&amp; row.applied === true) {
           console.log('[SS] Deducted', qty, 'of', pn, 'on', orderRef, '| atomic |', row.kind, 'on_hand:', row.prev_qty, '-&gt;', row.new_qty)
           _lastDeduct = 'deducted' // stock is down - a Shopify sync error below must not mark this as a failed deduction
+          if (Number(row.prev_qty) &lt; qty) await logEdgeError('Shipment of ' + qty + ' x ' + pn + ' (' + orderRef + ') was more than the ' + row.prev_qty + ' on hand: stock floored at 0 and ' + (qty - Number(row.prev_qty)) + ' went to backorder. Count this item - it usually means a count error or a build that was never recorded.')
           try { await syncShopifyBackorder(pn, Number(row.new_qty)); if (row.kind === 'part') await cascadeShopifyBackorder(pn) } catch (e) { console.warn('[SS] Shopify sync after deduction failed', e) }
           return true
         }
@@ -10831,7 +11052,7 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
   if (tracking) {
     const { data: dup } = await db.from('inv_corrections')
       .select('id').eq('source', 'shipment').eq('pn', pn)
-      .ilike('reason', '%' + tracking + '%').limit(1)
+      .in('reason', lineId ? [baseReason, reason] : [reason]).limit(1)
     if (dup?.length) {
       console.log('[SS] Already deducted', pn, 'for tracking', tracking, '- skipping (idempotent)')
       _lastDeduct = 'duplicate'
@@ -10861,15 +11082,169 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
   }
   await db.from('inv_corrections').insert({ pn, previous_qty: res.prev, new_qty: res.next, adjustment: -qty, reason, source: 'shipment' })
   console.log('[SS] Deducted', qty, 'of', pn, '(' + kind + ') on', orderRef, '| on_hand:', res.prev, '-&gt;', res.next)
+  if (res.prev &lt; qty) await logEdgeError('Shipment of ' + qty + ' x ' + pn + ' (' + orderRef + ') was more than the ' + res.prev + ' on hand: stock floored at 0 and the shortfall went to backorder. Count this item.')
   _lastDeduct = 'deducted' // stock is down - a Shopify sync error below must not mark this as a failed deduction
   try { await syncShopifyBackorder(pn, res.next); if (kind === 'part') await cascadeShopifyBackorder(pn) } catch (e) { console.warn('[SS] Shopify sync after deduction failed', e) }
   return true
 }
 
+
+// ---- scheduled job: compare Shopify availability with the ERP and repair drift --------------------------------------------
+// Looks at the items most likely to be wrong: everything the sync log last put on backorder, and everything whose open orders
+// are at or above its stock. A cursor (settings.backorder_audit_cursor) walks the list a few at a time, so one run stays short.
+async function backorderAudit(limit: number): Promise&lt;any&gt; {
+  const out: any = { candidates: 0, examined: 0, repaired: 0, unchanged: 0, skipped: 0, errors: 0, cursor: 0 }
+  const cand = new Set&lt;string&gt;()
+  const { data: logRows } = await db.from('shopify_sync_log').select('pn,action,created_at').order('created_at', { ascending: false }).limit(4000)
+  const seen = new Set&lt;string&gt;()
+  for (const r of (logRows || []) as any[]) {
+    if (!r.pn || seen.has(r.pn)) continue
+    seen.add(r.pn)
+    if (r.action === 'backorder' || r.action === 'partial') cand.add(r.pn)
+  }
+  if (await netBackorderEnabled()) {
+    const st = 'fulfillment_status.is.null,fulfillment_status.in.(Open,Packed,Partial,partial,"On Hold")'
+    let { data: open, error: oe } = await db.from('sales').select('pn,qty,qty_shipped,fulfillment_status').or(st).limit(50000)
+    if (oe) ({ data: open, error: oe } = await db.from('sales').select('pn,qty,fulfillment_status').or(st).limit(50000))
+    if (!oe) {
+      const raw: Record&lt;string, number&gt; = {}
+      for (const r of (open || []) as any[]) {
+        if (!r.pn) continue
+        const partial = String(r.fulfillment_status || '').toLowerCase() === 'partial'
+        raw[r.pn] = (raw[r.pn] || 0) + Math.max(0, (Number(r.qty) || 1) - (partial ? (Number(r.qty_shipped) || 0) : 0))
+      }
+      const canon = await buildCanonMapBig(Object.keys(raw))
+      const demand: Record&lt;string, number&gt; = {}
+      for (const [k, q] of Object.entries(raw)) { const c = canon(k); demand[c] = (demand[c] || 0) + q }
+      const keys = Object.keys(demand)
+      for (let i = 0; i &lt; keys.length; i += 150) {
+        const chunk = keys.slice(i, i + 150)
+        const { data: a } = await db.from('assemblies').select('pn,total_on_hand').in('pn', chunk)
+        ;(a || []).forEach((r: any) =&gt; { if ((Number(r.total_on_hand) || 0) - (demand[r.pn] || 0) &lt;= 0) cand.add(r.pn) })
+        const { data: p } = await db.from('parts').select('pn,total_unpckgd').in('pn', chunk)
+        ;(p || []).forEach((r: any) =&gt; { if ((Number(r.total_unpckgd) || 0) - (demand[r.pn] || 0) &lt;= 0) cand.add(r.pn) })
+      }
+    }
+  }
+  const list = [...cand].sort()
+  out.candidates = list.length
+  let cursor = 0
+  try { const { data } = await db.from('settings').select('value').eq('key', 'backorder_audit_cursor').limit(1); cursor = Number(data?.[0]?.value) || 0 } catch (_) { /* start at 0 */ }
+  if (cursor &gt;= list.length) cursor = 0
+  const slice = list.slice(cursor, cursor + limit)
+  for (const pn of slice) {
+    try {
+      const it = await onHandOf(pn)
+      if (!it) { out.skipped++; continue }
+      _lastSync = ''
+      await syncShopifyBackorder(pn, it.oh, 'backorder_audit', { onlyIfChanged: true })
+      out.examined++
+      if (_lastSync === 'changed') out.repaired++
+      else if (_lastSync === 'unchanged') out.unchanged++
+      else out.skipped++
+    } catch (e) { out.errors++; console.warn('[SS] backorder_audit failed for', pn, e) }
+    await new Promise((r) =&gt; setTimeout(r, 350)) // stay well inside Shopify's request limits
+  }
+  out.cursor = cursor + slice.length &gt;= list.length ? 0 : cursor + slice.length
+  try { await db.from('settings').upsert({ key: 'backorder_audit_cursor', value: out.cursor }, { onConflict: 'key' }) } catch (_) { /* best effort */ }
+  if (out.repaired) await logEdgeError('backorder_audit repaired ' + out.repaired + ' Shopify availability setting(s) that had drifted from the ERP')
+  return out
+}
+
+// ---- scheduled job: voided labels --------------------------------------------------------------------------------------
+// SHIP_NOTIFY fires when a label is CREATED, so an order is marked Shipped and its stock taken at that moment. Voiding the label
+// (wrong address, rate shopping, cancelled order) sends no webhook, so nothing used to put either back.
+// For every recently voided label: if an ERP line still points at it and no other live label covers that line, the line goes
+// back to Open and exactly what was deducted under that label is returned to stock. A re-label that already replaced the
+// tracking number is left alone (the goods did ship, under the new label). Split-order children and lines where only part
+// of the quantity was voided are reported for a human instead of guessed at.
+async function deductionTakenFor(line: any, tracking: string): Promise&lt;{ qty: number, keys: string[] }&gt; {
+  const it = await resolveItem(line.pn)
+  const keys = [...new Set([line.pn, it?.pn, it?.new_sku].filter(Boolean) as string[])]
+  const { data } = await db.from('inv_corrections').select('adjustment,reason').eq('source', 'shipment').in('pn', keys).ilike('reason', '%' + tracking + '%')
+  const marker = '[line ' + String(line.id).slice(0, 8) + ']'
+  let qty = 0
+  for (const r of (data || []) as any[]) {
+    const why = String(r.reason || '')
+    if (why.includes('[line ') &amp;&amp; !why.includes(marker)) continue // another line's deduction under the same label
+    qty += Math.max(0, -(Number(r.adjustment) || 0))
+  }
+  return { qty, keys }
+}
+async function voidSweep(): Promise&lt;any&gt; {
+  const out: any = { shipments_checked: 0, voided_found: 0, unshipped: 0, repointed: 0, stock_restored_lines: 0, needs_a_human: 0, errors: 0 }
+  if (!Deno.env.get('SS_KEY')) return { error: 'SS_KEY or SS_SECRET not set' }
+  const auth = ssAuth()
+  const norm = (s: any) =&gt; String(s || '').trim().toUpperCase()
+  const since = new Date(Date.now() - 4 * 86400000).toISOString().slice(0, 10)
+  const voids: any[] = []
+  for (let page = 1; page &lt;= 4; page++) {
+    const r = await fetch('https://ssapi.shipstation.com/shipments?shipDateStart=' + since + '&amp;pageSize=500&amp;page=' + page + '&amp;includeShipmentItems=true', { headers: { Authorization: 'Basic ' + auth } })
+    if (!r.ok) return { error: 'ShipStation error ' + r.status }
+    const d = await r.json()
+    for (const sh of (d.shipments || [])) { out.shipments_checked++; if (sh.voided &amp;&amp; sh.trackingNumber) voids.push(sh) }
+    if (page &gt;= (d.pages || 1)) break
+  }
+  out.voided_found = voids.length
+  for (const v of voids.slice(0, 40)) {
+    try {
+      const rawNum = stripHash(v.orderNumber || '')
+      if (!rawNum || rawNum.startsWith('SHERROR-') || rawNum.startsWith('WARRANTY-')) continue
+      const tracking = String(v.trackingNumber)
+      const { num, viaSplit } = await resolveShipmentOrder(rawNum, v)
+      if (!num) continue
+      const { data: pointing } = await db.from('sales').select('id,pn,qty,fulfillment_status,tracking_number,qty_shipped,shopify_line_item_id')
+        .eq('order_number', num).eq('tracking_number', tracking).in('fulfillment_status', ['Shipped', 'Partial'])
+      if (!pointing || !pointing.length) continue // nothing points at the voided label any more
+      if (viaSplit) { await logEdgeError('Label ' + tracking + ' on split-order child ' + rawNum + ' (ERP order ' + num + ') was voided - put the order back by hand'); out.needs_a_human++; continue }
+      // live (non-voided) labels for the same order
+      const lr = await fetch('https://ssapi.shipstation.com/shipments?orderNumber=' + encodeURIComponent(rawNum) + '&amp;pageSize=100&amp;includeShipmentItems=true', { headers: { Authorization: 'Basic ' + auth } })
+      const live: any[] = lr.ok ? ((await lr.json()).shipments || []).filter((s: any) =&gt; !s.voided &amp;&amp; s.trackingNumber &amp;&amp; s.trackingNumber !== tracking) : []
+      const aliasPns = [...new Set([...(pointing as any[]).map((l) =&gt; l.pn), ...live.flatMap((s: any) =&gt; (s.shipmentItems || []).map((i: any) =&gt; i.sku))].filter(Boolean))] as string[]
+      const canon = await buildCanonMap(aliasPns)
+      for (const line of pointing as any[]) {
+        const covers = (s: any) =&gt; (s.shipmentItems || []).filter((i: any) =&gt; {
+          const k = String(i?.lineItemKey ?? '').trim()
+          return (k &amp;&amp; line.shopify_line_item_id != null &amp;&amp; k === String(line.shopify_line_item_id).trim()) || (i?.sku &amp;&amp; canon(i.sku) === canon(line.pn))
+        })
+        const coverShip = live.find((s) =&gt; covers(s).length)
+        if (coverShip) {
+          const liveQty = live.reduce((n, s) =&gt; n + covers(s).reduce((m: number, i: any) =&gt; m + ssItemQty(i), 0), 0)
+          const needed = Number(line.qty_shipped) &gt; 0 ? Number(line.qty_shipped) : (Number(line.qty) || 1)
+          if (liveQty &lt; needed) { await logEdgeError('Order ' + num + ' ' + line.pn + ': label ' + tracking + ' was voided but other labels cover only ' + liveQty + ' of ' + needed + ' shipped - correct stock and the line by hand'); out.needs_a_human++; continue }
+          await db.from('sales').update({ tracking_number: coverShip.trackingNumber, carrier: (coverShip.carrierCode || '').toUpperCase() }).eq('id', line.id).eq('tracking_number', tracking)
+          out.repointed++
+          continue
+        }
+        // nothing live covers it: claim the line first (the tracking guard makes this safe against a second sweep), then put the stock back
+        const claim = await db.from('sales').update({ fulfillment_status: 'Open', tracking_number: null, carrier: null, shipped_at: null, deduct_pending: false, is_split_shipment: false })
+          .eq('id', line.id).eq('tracking_number', tracking).select('id')
+        if (!claim.data || !claim.data.length) continue
+        await setLineQtyCols(line.id, { qty_shipped: 0, deduct_qty: null })
+        out.unshipped++
+        const { qty, keys } = await deductionTakenFor(line, tracking)
+        if (qty &lt;= 0) continue // never deducted (still pending, or shipped from stock the ERP never counted)
+        const { data: already } = await db.from('inv_corrections').select('id').eq('source', 'unship').in('pn', keys).ilike('reason', '%voided%' + tracking + '%').limit(1)
+        if (already &amp;&amp; already.length) continue
+        const item = await resolveItem(line.pn)
+        const target = item ? await onHandOf(item.pn) : null
+        if (!target) { await logEdgeError('Voided label ' + tracking + ': ' + line.pn + ' put back to Open but stock could not be restored (item not found) - add ' + qty + ' back by hand'); out.needs_a_human++; continue }
+        const res = await stockDelta(target.kind, target.id, qty)
+        if (!res) { await logEdgeError('Voided label ' + tracking + ': ' + line.pn + ' put back to Open but the stock restore FAILED - add ' + qty + ' back by hand'); out.errors++; continue }
+        await db.from('inv_corrections').insert({ pn: target.row.pn, previous_qty: res.prev, new_qty: res.next, adjustment: qty, reason: 'Label voided - order ' + num + ' reverted (tracking ' + tracking + ')', source: 'unship' })
+        out.stock_restored_lines++
+        try { await syncShopifyBackorder(target.row.pn, res.next, 'void_sweep'); if (target.kind === 'part') await cascadeShopifyBackorder(target.row.pn) } catch (e) { console.warn('[SS] Shopify sync after void restore failed', e) }
+      }
+    } catch (e) { out.errors++; console.warn('[SS] void_sweep failed on', v?.orderNumber, e) }
+  }
+  if (out.unshipped || out.needs_a_human) await logEdgeError('void_sweep: ' + out.unshipped + ' line(s) put back to Open after a voided label, ' + out.stock_restored_lines + ' stock restore(s), ' + out.needs_a_human + ' needing a human')
+  return out
+}
+
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.101'
+const EDGE_BUILD = 'v23.102'
 const _gateLogged: Record&lt;string, number&gt; = {}
 async function authGate(req: Request, fn: string, action: string): Promise&lt;Response | null&gt; {
   const mode = (Deno.env.get('EDGE_AUTH_MODE') || 'log').toLowerCase()
@@ -10905,6 +11280,23 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
   if (body.action === 'retry_pending_deductions') {
     return json(await retryPendingDeductions(200))
   }
+  if (body.action === 'resync_backorder') {
+    // [v23.102] shopify-orders calls this when an order is placed, cancelled or edited: open demand changed, so availability may have.
+    const pns: string[] = Array.isArray(body.pns) ? body.pns.map((x: any) =&gt; String(x).trim()).filter(Boolean).slice(0, 20) : []
+    const done: string[] = []
+    for (const raw of pns) {
+      try {
+        const it = await resolveItem(raw)
+        const target = it ? await onHandOf(it.pn) : null
+        if (!target) continue
+        await syncShopifyBackorder(target.row.pn, target.oh, 'order_event', { onlyIfChanged: true })
+        done.push(target.row.pn)
+      } catch (e) { console.warn('[SS] resync_backorder failed for', raw, e) }
+    }
+    return json({ ok: true, rechecked: done.length, pns: done })
+  }
+  if (body.action === 'backorder_audit') return json(await backorderAudit(Math.min(Math.max(parseInt(body.limit) || 25, 1), 40)))
+  if (body.action === 'void_sweep') return json(await voidSweep())
   if (body.action === 'bulk_sync') {
     const auth = ssAuth()
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
@@ -10932,53 +11324,52 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
         const rawNum = stripHash(ship.orderNumber || '')
         const lines = orderMap[rawNum] || []
         if (!lines.length) { notFound++; continue }
-        const rawSkus = (ship.shipmentItems || []).flatMap((i: any) =&gt; [i.sku, i.name].filter(Boolean))
-        const allPns = lines.map((l: any) =&gt; l.pn as string)
-        // [AUDIT] Exact SKU match first. The substring test alone let a short SKU (TGK-0404-01) match a
-        // longer one on the same order (TGK-0404-01-HW), marking an unshipped line Shipped and deducting it.
-        // Substring stays only as a last resort when nothing matched exactly.
-        const _exact = allPns.filter(p =&gt; rawSkus.some((s: string) =&gt; norm(p) === norm(s) || _bcanon(p) === _bcanon(s)))
-        // [v23.97] same Shopify line-id match as the shipment webhook: survives a SKU edited in ShipStation
-        const _bsIds = new Set((ship.shipmentItems || []).map((i: any) =&gt; String(i?.lineItemKey ?? '').trim()).filter(Boolean))
-        const _bsIdPns = lines.filter((l: any) =&gt; l.shopify_line_item_id != null &amp;&amp; _bsIds.has(String(l.shopify_line_item_id).trim())).map((l: any) =&gt; l.pn as string)
-        const _bsByIdOrExact = [...new Set([..._bsIdPns, ..._exact])]
-        const matched = _bsByIdOrExact.length ? _bsByIdOrExact : (rawSkus.length &gt; 0
-          ? allPns.filter(p =&gt; rawSkus.some((s: string) =&gt; { const e=norm(p),k=norm(s); return e===k||e.includes(k)||k.includes(e) }))
-          : allPns)
         const tracking = ship.trackingNumber
         const carrier = (ship.carrierCode || '').toUpperCase()
         const shippedAt = ship.shipDate ? new Date(ship.shipDate).toISOString() : new Date().toISOString()
-        const gKey = tracking + '|' + carrier + '|' + shippedAt.slice(0,10)
-        if (!updateGroups[gKey]) updateGroups[gKey] = { ids: [], tracking, carrier, shippedAt }
-        for (const pn of matched) {
-          const line = lines.find((l: any) =&gt; l.pn === pn)
-          if (line) {
-            updateGroups[gKey].ids.push(line.id)
-            deductQueue.push({ id: line.id, pn, qty: line.qty || 1, tracking, order: rawNum })
-          }
+        // [v23.102] same allocation as the live webhook: line item id, then exact canonical SKU, quantity-aware. No substring guessing.
+        const { got } = allocateShipment(lines, ship.shipmentItems || [], _bcanon)
+        if (!got.size) {
+          const _only = lines.filter((l: any) =&gt; String(l.fulfillment_status || '').toLowerCase() !== 'on hold')
+          const _its = (ship.shipmentItems || []).filter((i: any) =&gt; ssItemQty(i) &gt; 0)
+          if (_only.length === 1 &amp;&amp; _its.length === 1) got.set(_only[0].id, ssItemQty(_its[0])) // one line, one item: unambiguous
+          else { notFound++; continue }
+        }
+        for (const line of lines) {
+          if (!got.has(line.id)) continue
+          const lineQty = Number(line.qty) || 1
+          const soFar = lineShippedSoFar(line)
+          const deduct = _qtyColsOk ? Math.min(got.get(line.id) || 0, Math.max(0, lineQty - soFar)) : Math.max(0, lineQty - soFar)
+          if (deduct &lt;= 0) continue
+          const full = !_qtyColsOk || soFar + deduct &gt;= lineQty
+          const gKey = tracking + '|' + carrier + '|' + shippedAt.slice(0, 10) + '|' + (full ? 'S' : 'P')
+          if (!updateGroups[gKey]) updateGroups[gKey] = { ids: [], tracking, carrier, shippedAt, status: full ? 'Shipped' : 'Partial' }
+          updateGroups[gKey].ids.push(line.id)
+          deductQueue.push({ id: line.id, pn: line.pn, qty: deduct, tracking, order: rawNum, partial: !full ? soFar + deduct : null })
+          // later shipments in this same run see this one
+          line.qty_shipped = soFar + deduct
+          line.fulfillment_status = full ? 'Shipped' : 'Partial'
         }
         synced++
       }
       page++
     }
     await markDeductPending([...new Set(deductQueue.map((d: any) =&gt; d.id))] as string[], true)
+    for (const d of deductQueue) if (d.partial != null) await setLineQtyCols(d.id, { qty_shipped: d.partial, deduct_qty: d.qty })
     let applied = 0
     for (const g of Object.values(updateGroups)) {
       const deduped = [...new Set((g as any).ids)]
       for (let i = 0; i &lt; deduped.length; i += 200) {
         await db.from('sales').update({
-          fulfillment_status: 'Shipped', tracking_number: (g as any).tracking,
+          fulfillment_status: (g as any).status, tracking_number: (g as any).tracking,
           carrier: (g as any).carrier, shipped_at: (g as any).shippedAt
         }).in('id', deduped.slice(i, i+200))
         applied += Math.min(200, deduped.length - i)
       }
     }
     let deducted = 0
-    const seenLineIds = new Set()
     for (const d of deductQueue) {
-      if (seenLineIds.has(d.id)) continue
-      seenLineIds.add(d.id)
-      const did = await deductLine({ id: d.id, pn: d.pn, qty: d.qty }, d.tracking, d.order)
+      const did = await deductLine({ id: d.id, pn: d.pn, qty: d.qty, deduct_qty: d.qty }, d.tracking, d.order)
       if (did &amp;&amp; _lastDeduct === 'deducted') deducted++
     }
     return json({ synced, skipped, notFound, applied, deducted, pages: totalPages, message: 'Synced ' + synced + ' shipments, applied ' + applied + ' line updates, deducted ' + deducted + ' line(s)' })
@@ -11787,6 +12178,7 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
     const shipments = data.shipments ?? [data]
     for (const ship of shipments) {
       const orderNum = ship.orderNumber
+      if (ship.voided) { console.log('[SS] voided shipment ignored:', orderNum, ship.trackingNumber); continue }
       const tracking = ship.trackingNumber
       const carrier = ship.carrierCode?.toUpperCase() || ''
       const shippedAt = new Date().toISOString()
@@ -11844,24 +12236,15 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
       }
       const resolvedOrderNum = resolvedOrderNumOrNull
       let { data: erpLinesRaw, error: _elErr } = await db.from('sales')
-        .select('id,pn,fulfillment_status,qty,deduct_pending,shopify_line_item_id').eq('order_number', resolvedOrderNum)
+        .select('id,pn,fulfillment_status,qty,deduct_pending,shopify_line_item_id,qty_shipped,deduct_qty').eq('order_number', resolvedOrderNum)
+      if (_elErr) ({ data: erpLinesRaw, error: _elErr } = await db.from('sales').select('id,pn,fulfillment_status,qty,deduct_pending,shopify_line_item_id').eq('order_number', resolvedOrderNum))
       if (_elErr) ({ data: erpLinesRaw, error: _elErr } = await db.from('sales').select('id,pn,fulfillment_status,qty,deduct_pending').eq('order_number', resolvedOrderNum))
       if (_elErr) ({ data: erpLinesRaw } = await db.from('sales').select('id,pn,fulfillment_status,qty').eq('order_number', resolvedOrderNum))
       const erpLines = erpLinesRaw ?? []
+      const qtyTracking = _qtyColsOk &amp;&amp; erpLines.length &gt; 0 &amp;&amp; ('qty_shipped' in erpLines[0])
       const allErpPns = erpLines.map((l: any) =&gt; l.pn as string)
       const norm = (s: string) =&gt; s.trim().toUpperCase()
-      // [FIX] Root cause of "shipped 2 of 4, but tracking landed on all 4 including the on-hold
-      // ones, and lines got duplicated": this SKU match used to be a plain string comparison, no
-      // alias resolution. This ERP has a known, previously-documented legacy-pn/new_sku duality
-      // on its own TGK-numbered catalog; when ShipStation reports a shipped SKU under the OTHER
-      // alias than sales.pn holds, matchedPns came up EMPTY, which fell into the "no SKU match"
-      // branch below - a blanket update that used to include On Hold in its status list AND
-      // deduct inventory for every line on the order, genuinely-held lines included. The vendor
-      // drop-ship SKUs on the same orders never hit this (no assemblies/parts record, no
-      // duality possible) - consistent with only the TGK-catalog lines being affected in
-      // practice. Same canonical-alias resolution now used in hold_sync and shopify-orders.ts's
-      // orders/updated reconciliation, kept small here since one shipment event only ever
-      // involves a handful of SKUs.
+      // The two sides often carry DIFFERENT aliases of the same item (legacy pn vs new_sku), so both are resolved to the canonical pn.
       const _aliasList = [...new Set([...allErpPns, ...rawSkus])].filter(Boolean)
       const _canonMap: Record&lt;string, string&gt; = {}
       if (_aliasList.length) {
@@ -11875,86 +12258,66 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
         ;(p2 || []).forEach((r: any) =&gt; { if (r.new_sku &amp;&amp; !(norm(r.new_sku) in _canonMap)) _canonMap[norm(r.new_sku)] = r.pn })
       }
       const canon = (raw: string): string =&gt; { const n = norm(raw); return _canonMap[n] || n }
-      // [AUDIT] Exact (canonical) match first; substring only if nothing on the order matched exactly.
-      // See bulk_sync - the substring test alone marks and deducts the wrong line on split shipments.
-      const _exactPns = allErpPns.filter(erpPn =&gt; { const ce = canon(erpPn); return rawSkus.some((ssSku: string) =&gt; ce === canon(ssSku) || norm(erpPn) === norm(ssSku)) })
-      // [v23.97] Match on the Shopify LINE ITEM ID first. Every ERP line stores shopify_line_item_id and ShipStation carries the
-      // same value on each shipped item as lineItemKey. Matching only on SKU text meant that an item whose SKU had been EDITED in
-      // ShipStation (or that had no SKU, only a name) matched nothing, and because an unmatched On Hold line is deliberately never
-      // swept into Shipped, held orders that ShipStation had shipped stayed On Hold in the ERP, silently. The id is exact and
-      // survives any edit. SKU matching is unchanged and still applies to everything the id does not cover.
-      const _shipIds = new Set((ship.shipmentItems ?? []).map((i: any) =&gt; String(i?.lineItemKey ?? '').trim()).filter(Boolean))
-      const _idPns = erpLines.filter((l: any) =&gt; l.shopify_line_item_id != null &amp;&amp; _shipIds.has(String(l.shopify_line_item_id).trim())).map((l: any) =&gt; l.pn as string)
-      const _byIdOrExact = [...new Set([..._idPns, ..._exactPns])]
-      const matchedPns = _byIdOrExact.length ? _byIdOrExact : allErpPns.filter(erpPn =&gt; {
-        const ce = canon(erpPn)
-        return rawSkus.some((ssSku: string) =&gt; {
-          if (ce === canon(ssSku)) return true
-          const e = norm(erpPn), s = norm(ssSku)
-          return e === s || e.includes(s) || s.includes(e)
-        })
-      })
-      console.log('[SS] matchedPns', JSON.stringify(matchedPns), 'of', JSON.stringify(allErpPns), viaSplit ? '(via split link)' : '')
-      if (!matchedPns.length) {
+      const _TERMINAL = ['shipped', 'delivered', 'cancelled', 'canceled', 'refunded', 'returned', 'fulfilled']
+      // [v23.102] Match by Shopify line item id, then exact canonical SKU, and work out how many units of each line this label covers.
+      // (The substring fallback is gone: a short SKU matching a longer one marked the wrong line Shipped and deducted the wrong part.)
+      const { got, unmatched } = allocateShipment(erpLines, ship.shipmentItems ?? [], canon)
+      if (!got.size &amp;&amp; !viaSplit) {
+        // The one safe guess: an order with a single open line and a shipment with a single item can only be that line.
+        const _open = erpLines.filter((l: any) =&gt; { const st = String(l.fulfillment_status || '').toLowerCase(); return !_TERMINAL.includes(st) &amp;&amp; st !== 'on hold' })
+        const _its = (ship.shipmentItems ?? []).filter((i: any) =&gt; ssItemQty(i) &gt; 0)
+        if (_open.length === 1 &amp;&amp; _its.length === 1) {
+          got.set(_open[0].id, ssItemQty(_its[0]))
+          console.warn('[SS] order', resolvedOrderNum, 'item', JSON.stringify({ sku: _its[0]?.sku, name: _its[0]?.name }), 'matched nothing by id or SKU; it is the order\\'s only open line, so it was used')
+        }
+      }
+      if (!got.size) {
         const _held = erpLines.filter((l: any) =&gt; l.fulfillment_status === 'On Hold').length
+        if (viaSplit) console.warn('[SS] split child', salesNum, 'matched no SKU on parent', resolvedOrderNum, '- refusing blanket update, no lines touched')
         await logEdgeError('Shipment ' + tracking + ' for order ' + resolvedOrderNum + ' matched NO ERP line' + (_held ? ' - ' + _held + ' On Hold line(s) were left On Hold' : '')
           + '. ERP lines: ' + allErpPns.join(', ') + ' | ShipStation items: ' + JSON.stringify((ship.shipmentItems ?? []).map((i: any) =&gt; ({ sku: i?.sku, name: i?.name, lineItemKey: i?.lineItemKey }))).slice(0, 500)
-          + ' - mark the line(s) Shipped in the ERP by hand.')
+          + ' - nothing was changed; mark the line(s) Shipped in the ERP by hand.')
+        continue
       }
-      const isSplit = matchedPns.length &gt; 0 &amp;&amp; matchedPns.length &lt; allErpPns.length
+      if (unmatched.length) console.warn('[SS] shipment', tracking, 'order', resolvedOrderNum, ':', unmatched.length, 'shipped item(s) matched no ERP line:', JSON.stringify(unmatched.map((i: any) =&gt; i?.sku || i?.name)))
+      console.log('[SS] matched lines', JSON.stringify([...got.entries()]), 'of', allErpPns.length, viaSplit ? '(via split link)' : '')
 
-      // [AUDIT v23.65] Replaces the old whole-shipment skip ("this tracking number already has a deduction, so
-      // ignore the delivery"). If an earlier delivery died half-way, that skip meant the remaining lines were
-      // marked Shipped but never deducted - permanently. Now each line is flagged deduct_pending BEFORE it is
-      // marked Shipped and cleared only once its stock is deducted (or found already deducted), so a retry or
-      // the automatic pending sweep finishes exactly the lines that are still owed. Lines already terminal and
-      // not pending were shipped some other way (ERP Ship button, bulk ship) and are left alone.
-      // [FIX] Same defense in depth for inventory: the blanket allErpPns fallback (used only when
-      // matchedPns is empty and this isn't a split child) must never deduct stock for a line that
-      // is currently On Hold - genuine matches (matchedPns.length&gt;0) are left unrestricted, since
-      // those are confirmed real shipped items regardless of prior status.
-      const _TERMINAL = ['shipped', 'delivered', 'cancelled', 'canceled', 'refunded', 'returned', 'fulfilled']
-      const pnsToDeduct = (matchedPns.length &gt; 0 ? matchedPns : (viaSplit ? [] : allErpPns.filter((p: string) =&gt; {
-        const line = erpLines.find((l: any) =&gt; l.pn === p)
-        return !line || line.fulfillment_status !== 'On Hold'
-      })))
-      const deductLines: any[] = []
-      for (const pn of pnsToDeduct) {
-        const line: any = erpLines.find((l: any) =&gt; l.pn === pn)
-        if (!line) continue
-        if (_TERMINAL.includes(String(line.fulfillment_status || '').toLowerCase())) {
-          if (line.deduct_pending === true) deductLines.push(line) // an earlier delivery shipped it but never finished the deduction
-          else console.log('[SS] skip deduct for', pn, '- terminal status', line.fulfillment_status)
-          continue
-        }
-        deductLines.push(line)
+      // What this label means for each matched line.
+      const _activeLines = erpLines.filter((l: any) =&gt; !_NOT_SHIPPABLE.includes(String(l.fulfillment_status || '').toLowerCase()))
+      const plans: any[] = []
+      let anyPartialQty = false
+      for (const line of erpLines) {
+        if (!got.has(line.id)) continue
+        const lineQty = Number(line.qty) || 1
+        const soFar = lineShippedSoFar(line)
+        let deduct: number, full: boolean
+        if (qtyTracking) { deduct = Math.min(got.get(line.id) || 0, Math.max(0, lineQty - soFar)); full = soFar + deduct &gt;= lineQty }
+        else { deduct = Math.max(0, lineQty - soFar); full = true } // columns not migrated: whole line, as before
+        if (!full) anyPartialQty = true
+        // a deduction an earlier delivery left unfinished is finished now, together with this label's share
+        const carry = line.deduct_pending === true ? (Number(line.deduct_qty) &gt; 0 ? Number(line.deduct_qty) : soFar) : 0
+        plans.push({ line, deduct, full, newShipped: soFar + deduct, pend: carry + deduct })
       }
-      await markDeductPending(deductLines.filter((l: any) =&gt; l.deduct_pending !== true).map((l: any) =&gt; l.id), true)
+      const isSplit = plans.length &gt; 0 &amp;&amp; (anyPartialQty || plans.length &lt; _activeLines.length)
 
-      if (matchedPns.length &gt; 0) {
-        for (const pn of matchedPns) {
-          await db.from('sales').update({ fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt, is_split_shipment: isSplit }).eq('order_number', resolvedOrderNum).eq('pn', pn)
+      // [AUDIT v23.65] each line is flagged deduct_pending BEFORE it is marked shipped, and cleared once its stock is deducted.
+      for (const pl of plans) {
+        if (pl.pend &gt; 0) {
+          await markDeductPending([pl.line.id], true)
+          await setLineQtyCols(pl.line.id, { deduct_qty: pl.pend })
         }
-        if (isSplit) {
-          const unshippedPns = allErpPns.filter((p: string) =&gt; !matchedPns.includes(p))
-          for (const pn of unshippedPns) {
-            const line = erpLines.find((l: any) =&gt; l.pn === pn)
-            if (line &amp;&amp; ['Open', 'Packed'].includes(line.fulfillment_status)) {
-              await db.from('sales').update({ fulfillment_status: 'Partial', is_split_shipment: true }).eq('order_number', resolvedOrderNum).eq('pn', pn)
-            }
-          }
-        }
-      } else if (viaSplit) {
-        console.warn('[SS] split child', salesNum, 'matched no SKU on parent', resolvedOrderNum, '- refusing blanket update, no lines touched')
-      } else {
-        // [FIX] Defense in depth on top of the alias fix above: even if a match still somehow
-        // fails for some unforeseen reason, this blanket fallback must never sweep an On Hold
-        // line into Shipped - if ShipStation just reported a real shipment, it is implausible a
-        // genuinely-held line was actually part of it. Dropped from this status list.
-        console.warn('[SS] WARNING: no SKU match for order', resolvedOrderNum, '- updating all non-terminal, non-held lines')
-        await db.from('sales').update({ fulfillment_status: 'Shipped', tracking_number: tracking, carrier, shipped_at: shippedAt }).eq('order_number', resolvedOrderNum).in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'Pre-Order', 'Pre-order'])
+        const upd: any = { tracking_number: tracking, carrier, shipped_at: shippedAt }
+        if (pl.deduct &gt; 0) { upd.fulfillment_status = pl.full ? 'Shipped' : 'Partial'; upd.is_split_shipment = isSplit }
+        await db.from('sales').update(upd).eq('id', pl.line.id)
+        if (pl.deduct &gt; 0 &amp;&amp; qtyTracking) await setLineQtyCols(pl.line.id, { qty_shipped: pl.newShipped })
       }
-      for (const line of deductLines) await deductLine(line, tracking, resolvedOrderNum)
+      if (isSplit) {
+        for (const l of erpLines) {
+          if (got.has(l.id)) continue
+          if (['Open', 'Packed'].includes(l.fulfillment_status)) await db.from('sales').update({ fulfillment_status: 'Partial', is_split_shipment: true }).eq('id', l.id)
+        }
+      }
+      for (const pl of plans) if (pl.pend &gt; 0) await deductLine({ ...pl.line, deduct_qty: pl.pend }, tracking, resolvedOrderNum)
     }
   }
   if (resource_type === 'NEW_ORDER') {
@@ -12766,7 +13129,7 @@ async function bulkSyncShopifyBackorder(){
     const oh=a.total_on_hand||0;
     let isBackorder=false;
     if(a.force_backorder){isBackorder=true;}else
-    if(oh<=0){isBackorder=b.hasBOM?b.maxBuild<=0:true;}
+    {const _avb=_netAvail(a.pn,oh); if(_avb<=0){isBackorder=b.hasBOM?b.maxBuild<(1-_avb):true;}}
     const template=isBackorder?(S.settings.shopify_backorder_template||'backorder'):'';
     // Keep the original restock date if this item is already backordered, rather than pushing it
     // 30 days further out every time the bulk sync happens to run — otherwise the countdown would
@@ -13790,8 +14153,11 @@ async function syncOrdersNow(){
           order.fulfillment_status==='partial'?'Partial':
           order.fulfillment_status==='fulfilled'?'Delivered':'Open';
 
-        if(!Object.prototype.hasOwnProperty.call(existingMap,k)){
-          if(existingOrderNums.has(normON)){syncConflicts.push({orderNum,shopifyPn:pn,qty:shopifyLineQty(li),fs,date:(order.created_at||'').slice(0,10)});continue;}
+        // [v23.33] a second line with the same SKU (different Shopify line item id) is its own row, not a duplicate of the first
+        let _secondLine=false;
+        if(li.id&&Object.prototype.hasOwnProperty.call(existingMap,k)){const _same=S.sales.filter(s=>s.order_number===orderNum&&s.pn===pn);if(_same.length&&_same.every(s=>s.shopify_line_item_id&&String(s.shopify_line_item_id)!==String(li.id)))_secondLine=true;}
+        if(!Object.prototype.hasOwnProperty.call(existingMap,k)||_secondLine){
+          if(!_secondLine&&existingOrderNums.has(normON)){syncConflicts.push({orderNum,shopifyPn:pn,qty:shopifyLineQty(li),fs,date:(order.created_at||'').slice(0,10)});continue;}
           const custName=((order.shipping_address?.name||order.billing_address?.name||(order.customer?(order.customer.first_name||'')+' '+(order.customer.last_name||''):''))||'').trim()||null;
           const custEmail=(order.email||order.customer?.email||'')||null;
           const _sAddr=order.shipping_address||{};
@@ -14458,7 +14824,7 @@ async function submitApprovePO(poId){
 function _undoLostGuess(po){
   const ls=S.poLines[po.id]||[];
   const anyRecv=ls.some(l=>(l.qty_received||0)>0);
-  const allRecv=ls.length>0&&ls.every(l=>(l.qty_received||0)>=(l.qty_ordered||0));
+  const allRecv=ls.length>0&&ls.every(poLineDone);
   if(allRecv)return 'Received';
   if(anyRecv)return 'Partial';
   return (S.poTracking[po.id]||[]).length?'In Transit':'On Order';
@@ -15616,11 +15982,11 @@ function openModal(type,data){
   }
   else if(type==='editPOLine'){
     title='Edit Line — '+(data.pn||'');
-    body=`<div class="form-row">${fi('epl-pn','Part # / SKU',data.pn||'','autocomplete="off"')}</div>
+    body=`<div class="form-row">${fi('epl-pn','Part # / SKU',data.pn||'','autocomplete="off"'+((data.qty_received||0)>0?' readonly title="Locked: stock was already received against this line"':''))}</div>
     <div id="epl-info"></div>
     <div class="form-row">${fi('epl-desc','Description',data.description||'')}</div>
-    <div class="form-row cols-2">${fi('epl-qty','Qty Ordered',data.qty_ordered||1,'type="number" min="1" step="1"')} ${fi('epl-cost','Unit Cost',data.unit_cost||0,'type="number" step="0.0001" min="0"')}</div>
-    ${(data.qty_received||0)>0?`<div class="alert-row alert-row-yellow" style="margin-top:4px"><div style="font-size:var(--t-sm)"><b>Note:</b> ${data.qty_received} unit${data.qty_received!==1?'s':''} already received against this line. Lowering Qty Ordered below ${data.qty_received} will not undo the receipt — adjust inventory separately if needed.</div></div>`:''}
+    <div class="form-row cols-2">${fi('epl-qty','Qty Ordered',data.qty_ordered||1,'type="number" min="'+Math.max(1,data.qty_received||0)+'" step="1"')} ${fi('epl-cost','Unit Cost',data.unit_cost||0,'type="number" step="0.0001" min="0"')}</div>
+    ${(data.qty_received||0)>0?`<div class="alert-row alert-row-yellow" style="margin-top:4px"><div style="font-size:var(--t-sm)"><b>Note:</b> ${data.qty_received} unit${data.qty_received!==1?'s':''} already received against this line. The part number is locked and Qty Ordered cannot go below ${data.qty_received}. To change either, reverse the receipt first.</div></div>`:''}
     <div class="modal-footer"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="submitEditPOLine('${data.id}','${data.po_id}')">Save Line</button></div>`;
   }
   else if(type==='editPOHeader'){
@@ -19991,7 +20357,7 @@ function assemblyDossier(pn){
     </div>
     ${(()=>{
       const asmOpenLines=[];
-      Object.values(S.poLines).forEach(function(ls){ls.forEach(function(l){if(l.pn===pn&&(l.qty_received||0)<(l.qty_ordered||0)&&!poIsLostId(l.po_id))asmOpenLines.push(l);});});
+      Object.values(S.poLines).forEach(function(ls){ls.forEach(function(l){if(l.pn===pn&&!poLineDone(l)&&!poIsLostId(l.po_id))asmOpenLines.push(l);});});
       const asmOpenPOs=S.purchases.filter(function(po){return po.pn===pn&&po.status!=='Received'&&po.status!=='Recovered'&&po.status!=='Cancelled'&&po.status!=='Lost';});
       const total=asmOpenPOs.length+asmOpenLines.length;
       if(total===0)return'';
@@ -21272,7 +21638,7 @@ function buildOnOrderMap(){
     const _isDraft=po.status==='Draft';
     const _add=function(k,q){m[k]=(m[k]||0)+q;if(_isDraft&&q>0)dm[k]=(dm[k]||0)+q;};
     if(lines.length){
-      lines.forEach(l=>{if(!l.pn)return;_add(_k(l.pn),Math.max(0,(l.qty_ordered||0)-(l.qty_received||0)));});
+      lines.forEach(l=>{if(!l.pn)return;_add(_k(l.pn),poLineRem(l));});
     }else if(po.pn){
       _add(_k(po.pn),Math.max(0,(po.qty||0)-(po.qty_received||0)));
     }
@@ -21333,7 +21699,7 @@ function btoPullNeed(p){
 function calcSuggestedQty(p) {
   if(p.build_to_order){
     const pull=btoPullNeed(p);
-    const avail=Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn));
+    const avail=Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn)-(openOrderDemand(p.pn)||0)); // [v23.33] units already promised to open orders
     const oo=openOrderedQty(p.pn);
     let sq=Math.max(0, pull-avail-oo);
     const moq=p.moq||0; if(sq>0&&moq>0&&sq<moq)sq=moq;
@@ -21342,7 +21708,8 @@ function calcSuggestedQty(p) {
   const max = p.max_qty || 0;
   const curr = p.total_unpckgd || 0;
   const reserved = boReserved(p.pn);
-  const available = Math.max(0, curr - reserved); // reserved reduces availability — do NOT also add it to needed
+  const committed = openOrderDemand(p.pn)||0; // [v23.33] units on open (unshipped) orders are already spoken for
+  const available = curr - reserved - committed; // can go negative: that shortfall belongs in the order quantity
   const onOrder = openOrderedQty(p.pn);
   const wkDemand = effectiveWkDemand(p); // weighted blend, 4wk used when trending up, manual avg as fallback
   const lt = ltWeeks(p);
@@ -21399,7 +21766,7 @@ function advCompute(){
       var part=partByPn(l.pn);if(!part)return; // parts only; finished goods are built, not reordered
       var k=part.pn;
       var e=byPn[k]||(byPn[k]={part:part,open:[],recent:[]});
-      var rec={po:po,qty:l.qty_ordered||0,remaining:Math.max(0,(l.qty_ordered||0)-(l.qty_received||0)),t:t};
+      var rec={po:po,qty:l.qty_ordered||0,remaining:poLineRem(l),t:t};
       if(advOpenStatus(po.status)&&rec.remaining>0&&!seen['o'+k]){seen['o'+k]=1;e.open.push(rec);}
       if(t>=cutoff&&!seen['r'+k]){seen['r'+k]=1;e.recent.push(rec);}
     });
@@ -21506,7 +21873,7 @@ function advOpenPOsFor(pn){
   (S.purchases||[]).forEach(function(po){
     if(!advOpenStatus(po.status))return;
     var ls=S.poLines[po.id]||[],rem=0;
-    if(ls.length)ls.forEach(function(l){if(aliases.indexOf(l.pn)>-1)rem+=Math.max(0,(l.qty_ordered||0)-(l.qty_received||0));});
+    if(ls.length)ls.forEach(function(l){if(aliases.indexOf(l.pn)>-1)rem+=poLineRem(l);});
     else if(aliases.indexOf(po.pn)>-1)rem+=po.qty||0;
     if(rem>0)out.push({po:po,remaining:rem});
   });
@@ -21534,7 +21901,7 @@ function buildOpenPoCountMap(){
   (S.purchases||[]).forEach(function(po){
     if(!advOpenStatus(po.status))return;
     var ls=S.poLines[po.id]||[],seen={};
-    if(ls.length)ls.forEach(function(l){if(l.pn&&!seen[l.pn]&&Math.max(0,(l.qty_ordered||0)-(l.qty_received||0))>0){seen[l.pn]=1;m[l.pn]=(m[l.pn]||0)+1;}});
+    if(ls.length)ls.forEach(function(l){if(l.pn&&!seen[l.pn]&&poLineRem(l)>0){seen[l.pn]=1;m[l.pn]=(m[l.pn]||0)+1;}});
     else if(po.pn&&(po.qty||0)>0)m[po.pn]=(m[po.pn]||0)+1;
   });
   return m;
@@ -22869,7 +23236,7 @@ function olderOpenPOsFor(pn,curPo){
     var ls=S.poLines[p.id]||[],qty=0;
     if(ls.length){
       ls.forEach(function(l){
-        if(aliases.indexOf(String(l.pn))>-1)qty+=Math.max(0,(l.qty_ordered||0)-(l.qty_received||0));
+        if(aliases.indexOf(String(l.pn))>-1)qty+=poLineRem(l);
       });
     }else if(aliases.indexOf(String(p.pn))>-1){
       qty+=Math.max(0,(p.qty||0)-(p.qty_received||0));
@@ -22967,7 +23334,7 @@ async function quickReceive(poId){
   if(!po){toast('PO not found');return;}
   if(!S.poLines[poId]||S.poLines[poId].length===0) await loadPOLines(poId);
   const lines=S.poLines[poId]||[];
-  const pending=lines.filter(l=>(l.qty_received||0)<(l.qty_ordered||0));
+  const pending=lines.filter(l=>!poLineDone(l));
   if(!pending.length){toast('All lines already received <span class="ic ic-check"></span>');return;}
   const existing=document.getElementById('quick-recv-modal');if(existing)existing.remove();
   const modal=document.createElement('div');modal.id='quick-recv-modal';
@@ -23017,7 +23384,7 @@ async function quickReceive(poId){
 }
 
 async function submitQuickReceive(poId){
-  const lines=(S.poLines[poId]||[]).filter(l=>(l.qty_received||0)<(l.qty_ordered||0));
+  const lines=(S.poLines[poId]||[]).filter(l=>!poLineDone(l));
   const markTransit=document.getElementById('qr-mark-transit')?.checked;
   // Snapshot every line's checkbox/qty state BEFORE starting any async receiving calls — same fix
   // as saveBulkEdit. Reading the DOM fresh inside a sequential await loop means a mid-loop re-render
@@ -23047,7 +23414,7 @@ async function submitQuickReceive(poId){
   }
   await loadPOLines(poId);
   const updated=S.poLines[poId]||[];
-  const allDone=updated.length>0&&updated.every(l=>(l.qty_received||0)>=(l.qty_ordered||0));
+  const allDone=updated.length>0&&updated.every(poLineDone);
   const po=S.purchases.find(p=>p.id===poId);
   let newStatus=po?.status;
   if(allDone) newStatus=poDoneStatus(po);
@@ -23121,7 +23488,7 @@ function renderPODetail(po) {
   const lines = S.poLines[po.id]||[];
   const totalOrdered = lines.reduce((s,l)=>s+(l.qty_ordered||0)*(l.unit_cost||0),0);
   const totalReceived = lines.reduce((s,l)=>s+(l.qty_received||0)*(l.unit_cost||0),0);
-  const allDone = lines.length>0 && lines.every(l=>l.qty_received>=l.qty_ordered);
+  const allDone = lines.length>0 && lines.every(poLineDone);
   const freight = po.freight_cost||0;
   const landedTotal = totalOrdered + freight;
   const freightPct = totalOrdered>0 ? freight/totalOrdered : 0; // prorate by line value
@@ -23208,8 +23575,8 @@ function renderPODetail(po) {
       +'</div></div>';
   })()}
   ${lines.map(line=>{
-    const remaining=Math.max(0,(line.qty_ordered||0)-(line.qty_received||0));
-    const done=(line.qty_received||0)>=(line.qty_ordered||0);
+    const remaining=poLineRem(line);
+    const done=poLineDone(line);
     const pct=line.qty_ordered>0?Math.min(100,Math.round(((line.qty_received||0)/line.qty_ordered)*100)):0;
     return `<div class="check-row" style="background:${done?'rgba(13,148,136,.04)':'var(--bg2)'};border:1px solid var(--border);border-radius:var(--r-md);margin-bottom:8px;flex-wrap:wrap;gap:10px">
       <div style="display:flex;flex-direction:column;min-width:120px">
@@ -23230,11 +23597,12 @@ function renderPODetail(po) {
       </div>
       <span class="money-cost" style="font-size:var(--t-xs)">${fc(line.unit_cost||0)} ea</span>
       ${done
-        ?`<span style="display:flex;align-items:center;gap:6px"><span class="pill pill-teal" style="font-size:var(--t-xs)"><span class="ic ic-check"></span>Complete</span><button class="btn btn-sm" title="Edit this line" onclick="openEditPOLine('${line.id}','${po.id}')"><span class="ic ic-pencil"></span></button><button class="btn btn-sm" title="Reverse receipt" onclick="unreceiveLine('${line.id}','${po.id}')"><span class="ic ic-arrow-back"></span>Undo</button><button class="action-btn del" onclick="deletePOLine('${line.id}','${po.id}')">×</button></span>`
+        ?`<span style="display:flex;align-items:center;gap:6px"><span class="pill ${poLineClosed(line)?'pill-yellow':'pill-teal'}" style="font-size:var(--t-xs)"><span class="ic ic-check"></span>${poLineClosed(line)?'Closed short':'Complete'}</span>${poLineClosed(line)?`<button class="btn btn-sm" title="The vendor will ship the rest after all" onclick="reopenPOLine('${line.id}','${po.id}')">Reopen</button>`:''}<button class="btn btn-sm" title="Edit this line" onclick="openEditPOLine('${line.id}','${po.id}')"><span class="ic ic-pencil"></span></button><button class="btn btn-sm" title="Reverse receipt" onclick="unreceiveLine('${line.id}','${po.id}')"><span class="ic ic-arrow-back"></span>Undo</button><button class="action-btn del" onclick="deletePOLine('${line.id}','${po.id}')">×</button></span>`
         :`<span style="display:flex;align-items:center;gap:6px">
             <input class="qty-input" id="checkin-${line.id}" type="number" min="0" value="${(function(){var _d=S._rcvDraft&&S._rcvDraft[line.id];return (_d&&_d.rem===remaining&&_d.v!=='')?escHtml(String(_d.v)):remaining;})()}" oninput="(S._rcvDraft=S._rcvDraft||{})['${line.id}']={v:this.value,rem:${remaining}}" style="width:64px" placeholder="Qty">
             <span class="t3xs">(expecting ${remaining})</span>
             <button class="btn btn-teal btn-sm" onclick="checkInLine('${line.id}','${po.id}','${line.pn}',${line.qty_ordered},${line.qty_received||0})"><span class="ic ic-check"></span>Receive</button>
+            <button class="btn btn-sm" title="The vendor will not ship the rest: stop counting it as on order" onclick="closePOLineShort('${line.id}','${po.id}')">Close short</button>
             <button class="btn btn-sm" title="Edit this line" onclick="openEditPOLine('${line.id}','${po.id}')"><span class="ic ic-pencil"></span></button>
             <button class="action-btn del" onclick="deletePOLine('${line.id}','${po.id}')">×</button>
           </span>`
@@ -23329,7 +23697,7 @@ async function _checkInLineImpl(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived
 
   await loadPOLines(poId);
   const lines = S.poLines[poId]||[];
-  if(lines.every(l=>l.qty_received>=l.qty_ordered)){
+  if(lines.every(poLineDone)){
     if(poBefore)undoOps.push({action:'update',table:'purchases',data:{id:poId},prev:{...stripMeta(poBefore)}});
     const _doneSt=poDoneStatus(poBefore);
     await db.from('purchases').update({status:_doneSt,updated_at:new Date().toISOString()}).eq('id',poId);
@@ -23344,7 +23712,7 @@ async function _checkInLineImpl(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived
 
 async function receiveAllLines(poId) {
   const lines = S.poLines[poId]||[];
-  const pending = lines.filter(l=>(l.qty_received||0)<(l.qty_ordered||0));
+  const pending = lines.filter(l=>!poLineDone(l));
   if(!pending.length){toast('All lines already received');return;}
   // v20.98: this used to receive the lines and stop - no PO status roll-up, no
   // loadPOLines, no render - so the screen looked untouched and the PO stayed
@@ -23366,7 +23734,7 @@ async function receiveAllLines(poId) {
   }
   await loadPOLines(poId);
   const fresh=S.poLines[poId]||[];
-  const allIn=fresh.length>0&&fresh.every(function(l){return (l.qty_received||0)>=(l.qty_ordered||0)||l.status==='Backordered';});
+  const allIn=fresh.length>0&&fresh.every(function(l){return poLineDone(l)||l.status==='Backordered';});
   if(allIn){
     if(poBefore)undoOps.push({action:'update',table:'purchases',data:{id:poId},prev:Object.assign({},stripMeta(poBefore))});
     const _doneSt=poDoneStatus(poBefore);
@@ -23581,10 +23949,51 @@ async function submitPOLine(poId) {
   closeModal();render();toast('Line added');
 }
 
+async function _rollupPOStatus(poId){ // [v23.33] re-derive the PO's status from its lines; returns the PO's previous row when it changed
+  const po=S.purchases.find(p=>p.id===poId); const ls=S.poLines[poId]||[]; if(!po||!ls.length)return null;
+  const all=ls.every(poLineDone), doneSt=poDoneStatus(po); let ns=null;
+  if(all&&po.status!==doneSt&&['On Order','In Transit','Partial'].indexOf(po.status)>=0)ns=doneSt;
+  else if(!all&&(po.status==='Received'||po.status==='Recovered'))ns=po.lost_at?'Lost':(ls.some(l=>(l.qty_received||0)>0)?'Partial':'On Order');
+  if(!ns)return null;
+  const prev={...stripMeta(po)};
+  const r=await db.from('purchases').update({status:ns,updated_at:new Date().toISOString()}).eq('id',poId);
+  if(r&&r.error){console.warn('[PO] status roll-up failed',r.error.message);return null;}
+  S.purchases=S.purchases.map(p=>p.id===poId?{...p,status:ns}:p); S._onOrderMap=null;
+  return prev;
+}
+async function closePOLineShort(lineId,poId){
+  const l=(S.poLines[poId]||[]).find(x=>x.id===lineId); if(!l)return;
+  const rem=Math.max(0,(l.qty_ordered||0)-(l.qty_received||0));
+  if(!confirm('Close '+l.pn+' short?\n\n'+(l.qty_received||0)+' of '+(l.qty_ordered||0)+' received. The other '+rem+' will stop counting as on order. Stock is not changed.'))return;
+  const prev={...stripMeta(l)};
+  const r=await db.from('po_lines').update({status:'Closed Short',notes:rem+' not shipped (closed short)',updated_at:new Date().toISOString()}).eq('id',lineId);
+  if(r.error){toast('Not closed ('+r.error.message+')',9000);return;}
+  await loadPOLines(poId); S._onOrderMap=null;
+  const ops=[{action:'update',table:'po_lines',data:{id:lineId},prev:prev}];
+  const poPrev=await _rollupPOStatus(poId); if(poPrev)ops.push({action:'update',table:'purchases',data:{id:poId},prev:poPrev});
+  pushUndoMulti('Close short '+l.pn,ops); updateBadge(); render(); toast(l.pn+' closed short - '+rem+' no longer on order');
+}
+async function reopenPOLine(lineId,poId){
+  const l=(S.poLines[poId]||[]).find(x=>x.id===lineId); if(!l)return;
+  const prev={...stripMeta(l)}, st=(l.qty_received||0)>0?'Partial':'Pending';
+  const r=await db.from('po_lines').update({status:st,notes:null,updated_at:new Date().toISOString()}).eq('id',lineId);
+  if(r.error){toast('Not reopened ('+r.error.message+')',9000);return;}
+  await loadPOLines(poId); S._onOrderMap=null;
+  const ops=[{action:'update',table:'po_lines',data:{id:lineId},prev:prev}];
+  const poPrev=await _rollupPOStatus(poId); if(poPrev)ops.push({action:'update',table:'purchases',data:{id:poId},prev:poPrev});
+  pushUndoMulti('Reopen '+l.pn,ops); updateBadge(); render(); toast(l.pn+' reopened');
+}
+window.closePOLineShort=closePOLineShort; window.reopenPOLine=reopenPOLine;
+
 async function deletePOLine(lineId, poId) {
+  const _ln=(S.poLines[poId]||[]).find(l=>l.id===lineId);
+  if(_ln&&(_ln.qty_received||0)>0){toast('This line has '+_ln.qty_received+' received. Reverse the receipt first, or use Close short to stop waiting for the rest.',9000);return;}
   if(!confirm('Remove this line?')) return;
-  await db.from('po_lines').delete().eq('id',lineId);
+  const _d=await db.from('po_lines').delete().eq('id',lineId);
+  if(_d&&_d.error){toast('Line NOT removed ('+_d.error.message+')',8000);return;}
   if(S.poLines[poId]) S.poLines[poId]=S.poLines[poId].filter(l=>l.id!==lineId);
+  if(_ln)pushUndoMulti('Remove PO line '+_ln.pn,[{action:'delete',table:'po_lines',data:{..._ln}}]);
+  S._onOrderMap=null;
   render();toast('Line removed');
 }
 
@@ -23602,13 +24011,19 @@ async function submitEditPOLine(lineId, poId){
   const cost=parseFloat(document.getElementById('epl-cost').value)||0;
   if(!pn){toast('Part # is required');return;}
   if(!qty||qty<=0){toast('Qty must be greater than 0');return;}
-  const payload={pn:pn,description:desc,qty_ordered:qty,unit_cost:cost,updated_at:new Date().toISOString()};
   const _prevLine=(S.poLines[poId]||[]).find(function(l){return l.id===lineId;});
+  const _rcv=Number(_prevLine&&_prevLine.qty_received)||0;
+  // [v23.33] Once stock has been received against a line, its part number is locked (a later Un-receive would take stock from the wrong part) and Qty Ordered cannot drop below what arrived.
+  if(_rcv>0&&_prevLine&&pn!==_prevLine.pn){toast('This line already has '+_rcv+' received, so its part number is locked. Reverse the receipt first to change it.',9000);return;}
+  if(_rcv>0&&qty<_rcv){toast('Qty Ordered cannot be lower than the '+_rcv+' already received. Reverse the receipt first, or use Close short.',9000);return;}
+  const payload={pn:pn,description:desc,qty_ordered:qty,unit_cost:cost,updated_at:new Date().toISOString()};
+  if(_prevLine&&['Closed Short','Backordered'].indexOf(_prevLine.status)<0)payload.status=_rcv>=qty?'Complete':(_rcv>0?'Partial':'Pending'); // keep the line's status in step with its quantities
   const{error}=await db.from('po_lines').update(payload).eq('id',lineId);
   if(error){toast('Error: '+error.message);return;}
   if(S.poLines[poId]){
     S.poLines[poId]=S.poLines[poId].map(function(l){return l.id===lineId?Object.assign({},l,payload):l;});
   }
+  S._onOrderMap=null; try{await _rollupPOStatus(poId);}catch(_e){console.warn('[PO] roll-up failed',_e);}
   logAction('Edited PO line '+(_prevLine?_prevLine.pn:'')+((_prevLine&&_prevLine.pn!==pn)?(' \u2192 '+pn):'')+' (qty '+(_prevLine?_prevLine.qty_ordered:'?')+'\u2192'+qty+', cost '+(_prevLine?_prevLine.unit_cost:'?')+'\u2192'+cost+')','po_lines',_prevLine?_prevLine.pn:null,_prevLine||null,payload).catch(function(){});
   closeModal();render();toast('Line updated');
 }
@@ -24015,19 +24430,25 @@ function _isOpenDemandStatus(fs){
 // walked a single time and each lookup is O(1).
 function _openDemandMap(){
   var stamp=(S.sales?S.sales.length:0)+'|'+(S._seriesBump||0);
-  if(S._odm&&S._odm.stamp===stamp)return S._odm.map;
+  if(S._odm&&S._odm.stamp===stamp&&S._odm.arr===S.sales)return S._odm.map; // [v23.33] also invalidates when the sales array is replaced (status changes keep the length)
   var map={};
   (S.sales||[]).forEach(function(s){
     if(!s||!s.pn)return;
     if(!_isOpenDemandStatus(s.fulfillment_status))return;
     var k=(_canonItem(s.pn)||{}).pn||s.pn;
-    map[k]=(map[k]||0)+(s.qty||1);
+    var _q=(s.qty||1); if(String(s.fulfillment_status||'').toLowerCase()==='partial')_q=Math.max(0,_q-(Number(s.qty_shipped)||0));
+    map[k]=(map[k]||0)+_q;
   });
-  S._odm={stamp:stamp,map:map};
+  S._odm={stamp:stamp,arr:S.sales,map:map};
   return map;
 }
 window._openDemandMap=_openDemandMap;
 
+function _netAvail(pn,oh){ // [v23.33] on hand minus open orders; settings.backorder_net_open_orders=false restores on-hand only
+  if(S.settings&&S.settings.backorder_net_open_orders===false)return oh;
+  try{return oh-(openOrderDemand(pn)||0);}catch(e){return oh;}
+}
+window._netAvail=_netAvail;
 function openOrderDemand(pn){
   var _canon=(_canonItem(pn)||{}).pn||pn; // [CANON] count sales placed under any SKU form for this item
   return _openDemandMap()[_canon]||0;
@@ -24157,7 +24578,7 @@ function renderPackQueue(){
       <button class="btn btn-sm" onclick="S.customPackMode=true;S.customPackLines=[];render()" title="Manually record packed units for any SKU"><span class="ic ic-box"></span>Custom Pack</button>
       <label style="display:flex;align-items:center;gap:6px;font-size:var(--t-sm);color:var(--text2);cursor:pointer;padding:4px 10px;border-radius:var(--r-md);background:${S.packSkipMissing?'var(--orange-dim)':'var(--bg3)'};border:1px solid ${S.packSkipMissing?'rgba(234,88,12,.3)':'var(--border)'}" title="When on, packing proceeds even if a component is out of stock — that component simply isn't deducted, instead of blocking the whole pack">
         <input type="checkbox" ${S.packSkipMissing?'checked':''} onchange="S.packSkipMissing=this.checked;render()" style="margin:0">
-        <span style="${S.packSkipMissing?'color:var(--orange);font-weight:700':''}">Skip missing components</span>
+        <span style="${S.packSkipMissing?'color:var(--orange);font-weight:700':''}">Pack even if short</span>
       </label>
     </div>
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-top:8px;border-top:1px solid var(--border)">
@@ -24985,7 +25406,7 @@ function renderBuildPlanner(asm){
     ${asm.image_url?`<img src="${escHtml(asm.image_url)}" style="width:52px;height:52px;object-fit:cover;border-radius:var(--r-md);border:1px solid var(--border);cursor:zoom-in;transition:transform .15s" onmouseenter="this.style.transform='scale(1.1)'" onmouseleave="this.style.transform='scale(1)'" onclick="openImageLightbox('${escHtml(asm.image_url)}','${escHtml(asm.pn)}')" onerror="this.style.display='none'">`:''}
     <label style="display:flex;align-items:center;gap:6px;font-size:var(--t-sm);color:var(--text2);cursor:pointer;padding:4px 10px;border-radius:var(--r-md);background:${S.packSkipMissing?'var(--orange-dim)':'var(--bg3)'};border:1px solid ${S.packSkipMissing?'rgba(234,88,12,.3)':'var(--border)'};margin-left:auto" title="Off (default): clicking Pack shows exactly what's missing and asks before skipping it. On: always skip missing components automatically without asking.">
       <input type="checkbox" ${S.packSkipMissing?'checked':''} onchange="S.packSkipMissing=this.checked;render()" style="margin:0">
-      <span style="${S.packSkipMissing?'color:var(--orange);font-weight:700':''}">Always skip without asking</span>
+      <span style="${S.packSkipMissing?'color:var(--orange);font-weight:700':''}">Always pack anyway (shortfall to backorder)</span>
     </label>
     <div style="flex:1">
       <div style="font-size:var(--t-lg);font-weight:700;color:var(--text)">${dispPn(asm)} — Build Planner${(S.buildStack||[]).length>0?` <span style="font-size:var(--t-sm);font-weight:400;color:var(--orange)">(sub-assembly for ${dispPn(asmByPn(S.buildStack[S.buildStack.length-1].pn))||S.buildStack[S.buildStack.length-1].pn})</span>`:''}</div>
@@ -25563,7 +25984,7 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
         if(pkgShort.length && !realShort.length){
           const list=pkgShort.map(function(sh){return '  '+((typeof dispSku==='function')?dispSku(sh.pn):sh.pn)+' \u2014 short '+(sh.need-sh.avail);}).join('\n');
           if(!confirm('Out of packaging for '+qty+'\u00d7 '+((typeof dispSku==='function')?dispSku(pn):pn)+':\n\n'+list
-              +'\n\nOK = pack anyway, skip these\nCancel = don\'t pack'))return;
+              +'\n\nOK = pack anyway (shortfall goes to backorder)\nCancel = don\'t pack'))return;
           shortItems.forEach(function(s){skippedLines.push(s.pn);});
         } else {
           // A real part or subassembly is missing - name what a blocked subassembly is itself
@@ -25584,8 +26005,8 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
             +pkgShort.map(function(sh){return '  '+((typeof dispSku==='function')?dispSku(sh.pn):sh.pn);}).join('\n')):'';
           const msg='Missing component'+(realShort.length!==1?'s':'')+' for '+qty+'\u00d7 '+((typeof dispSku==='function')?dispSku(pn):pn)+':\n\n'
             +detail+pkgNote
-            +'\n\nOK = pack anyway and skip these components'
-            +'\n     WARNING: they will NOT be deducted, so stock will be overstated'
+            +'\n\nOK = pack anyway (shortfall goes to backorder)'
+            +'\n     they ARE still deducted: stock stops at 0 and the shortfall shows as backorder'
             +'\nCancel = don\'t pack';
           if(!confirm(msg))return;
           shortItems.forEach(function(s){skippedLines.push(s.pn);});
@@ -25595,7 +26016,7 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
       }
     }
   }
-  const effectiveBom=skippedLines.length?bom.filter(item=>!skippedLines.includes(item.child_pn)):bom;
+  const effectiveBom=bom; // [v23.33] short components are still deducted (stock floors at 0, the shortfall shows as backorder) - they used to be left out and overstated
 
   // [UNPACK-VERIFY] Unpack used to skip any BOM line it could not resolve (`if(!p) continue;`) without a word,
   // so a component could silently never come back to stock. Say so BEFORE touching anything.
@@ -25679,7 +26100,7 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
   // aborted the rest of the function - stock moved, no batch was created, and nothing said why.
   // Logging is useful; it is not worth losing traceability over.
   try{
-  await db.from('pack_log').insert({packed_by:packedByUser(),pn,qty:isUnpack?-qty:qty,pack_date:new Date().toISOString(),type:isUnpack?'unpack':'pack',notes:qty+'x '+(isUnpack?'unpacked':'packed')+(skippedLines.length?' — SKIPPED (not deducted, out of stock): '+skippedLines.join(', '):'')});
+  await db.from('pack_log').insert({packed_by:packedByUser(),pn,qty:isUnpack?-qty:qty,pack_date:new Date().toISOString(),type:isUnpack?'unpack':'pack',notes:qty+'x '+(isUnpack?'unpacked':'packed')+(skippedLines.length?' — SHORT (deducted, shortfall to backorder): '+skippedLines.join(', '):'')});
   }catch(_plErr){
     console.warn('[pack] pack_log insert failed (continuing):',_plErr);
     toast('Pack recorded, but the pack log entry failed \u2014 see console', 6000);
@@ -25703,7 +26124,7 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
     var _batchTxt = isUnpack ? '' : (S._lastPackLot ? (' \u2014 batch '+S._lastPackLot)
       : (' \u2014 \u26a0 NO batch: '+(S._lastPackLotErr||'reason unknown \u2014 see console')));
   toast((isUnpack?'Unpacked':'Packed')+' '+qty+'\u00d7 '+_skuNow
-    +(skippedLines.length?' \u2014 skipped '+skippedLines.length+' out-of-stock component'+(skippedLines.length!==1?'s':'')+': '+skippedLines.join(', '):'')
+    +(skippedLines.length?' \u2014 short on '+skippedLines.length+' component'+(skippedLines.length!==1?'s':'')+': '+skippedLines.join(', '):'')
     +_batchTxt+_landTxt+_missTxt+_zeroTxt, (_landTxt||_missTxt)?12000:((skippedLines.length||!isUnpack||_zeroTxt)?7000:3000));
   if(!isUnpack){var _lf=(S.labelFiles&&S.labelFiles[pn])||[];if(_lf.length)showLabelPrintPrompt(pn,qty,_lf);else checkAndPromptLabel(pn,qty);}
   } catch(e) {
@@ -27044,7 +27465,7 @@ var ERP_MIGRATION_V2377="-- ====================================================
 // an item's history chain, negative stock, shipments still waiting on a deduction, and shipped lines in the
 // last 30 days with no deduction at all. Each has a one-click fix.
 // ===================================================================================================
-function _scTotal(c){c=c||{};return (c.drift||0)+(c.gaps||0)+(c.negative||0)+(c.pending||0)+(c.undeducted||0);}
+function _scTotal(c){c=c||{};return (c.drift||0)+(c.gaps||0)+(c.negative||0)+(c.pending||0)+(c.undeducted||0)+(c.clamped||0);}
 async function runStockCheck(manual){
   if(S._stockCheckRunning)return;
   S._stockCheckRunning=true;if(manual)render();
@@ -27121,6 +27542,8 @@ function renderStockCheckPanel(){
         +'<td style="white-space:nowrap"><button class="btn btn-sm" onclick="lookupGo('+q(x.kind)+','+q(x.pn)+')">Open</button> <button class="btn btn-sm" onclick="scAcceptDrift('+[x.kind,x.id,x.pn].map(q).join(',')+','+x.last_logged+','+x.on_hand+')">Current is correct</button></td></tr>';})
     +sec('Gaps in the history','a change happened between these two logged lines - usually an edit outside the ERP',c.gaps,['Item','When','Should have started at','Started at','Logged as'],function(x){
       return '<tr><td class="pn">'+esc(x.pn)+'</td><td class="t3xs">'+d(x.created_at)+'</td><td>'+x.expected_before+'</td><td>'+x.logged_before+'</td><td class="t3xs">'+esc((x.source||'')+(x.reason?' - '+String(x.reason).slice(0,40):''))+'</td></tr>';})
+    +sec('Shipments larger than stock','stock was floored at 0 and the shortfall went to backorder - usually a count error or a build that was never recorded',c.clamped,['Item','When','Had','Asked for','Short by','Source'],function(x){
+      return '<tr><td class="pn">'+esc(x.pn)+'</td><td class="t3xs">'+d(x.created_at)+'</td><td>'+x.prev+'</td><td>'+(-x.adj)+'</td><td style="color:var(--red)"><b>'+x.shortfall+'</b></td><td class="t3xs">'+esc((x.source||'')+(x.reason?' - '+String(x.reason).slice(0,40):''))+'</td></tr>';})
     +sec('Negative stock','old format - rewrite as backorder',c.negative,['Item','On hand',''],function(x){
       return '<tr><td class="pn">'+esc(x.pn)+'</td><td style="color:var(--red)">'+x.on_hand+'</td><td><button class="btn btn-sm" onclick="normalizeNegativeStock()">Rewrite all as backorder</button></td></tr>';})
     +sec('Shipments waiting on a deduction retry','retried automatically every 5 minutes',c.pending,['Order','Item','Qty',''],function(x){
@@ -27243,7 +27666,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.84','shipstation-ship':'v23.101','ops-cron':'v1.2','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.3'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.85','shipstation-ship':'v23.102','ops-cron':'v1.3','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.3'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
@@ -29122,7 +29545,9 @@ insert into ops_jobs (name, label, description, interval_minutes) values
   ('hold_sync',     'Hold sync',               'Mirrors ShipStation holds and releases into the ERP',                                         5),
   ('deduct_retry',  'Stock-deduction retry',   'Retries shipments whose stock deduction failed',                                              5),
   ('delivery_sync', 'Delivery sync',           'Marks shipped orders Delivered from carrier tracking',                                        30),
-  ('reconcile',     'Nightly reconciliation',  'Compares Shopify with the ERP for the last 72 hours, repairs what is safe and reports the rest', 1440)
+  ('reconcile',     'Nightly reconciliation',  'Compares Shopify with the ERP for the last 72 hours, repairs what is safe and reports the rest', 1440),
+  ('void_sweep',    'Voided-label sweep',      'Finds ShipStation labels that were voided and puts the order and its stock back',                 15),
+  ('backorder_audit','Backorder audit',        'Checks Shopify availability against stock minus open orders and repairs anything that drifted',   10)
 on conflict (name) do update set label = excluded.label, description = excluded.description, interval_minutes = excluded.interval_minutes;
 
 -- ---- 5. the schedule ----------------------------------------------------------------------------------
@@ -29150,7 +29575,9 @@ begin
       ('tgk-ops-hold-sync',     '*/5 * * * *',     'hold_sync'),
       ('tgk-ops-deduct-retry',  '2-59/5 * * * *',  'deduct_retry'),
       ('tgk-ops-delivery-sync', '7,37 * * * *',    'delivery_sync'),
-      ('tgk-ops-reconcile',     '15 9 * * *',      'reconcile')      -- 09:15 UTC = 3:15 am Central (4:15 am in summer)
+      ('tgk-ops-reconcile',     '15 9 * * *',      'reconcile'),     -- 09:15 UTC = 3:15 am Central (4:15 am in summer)
+      ('tgk-ops-void-sweep',    '4-59/15 * * * *', 'void_sweep'),
+      ('tgk-ops-backorder-audit','8-59/10 * * * *','backorder_audit')
     ) as v(jobname, sched, job) loop
     if exists (select 1 from cron.job where cron.job.jobname = j.jobname) then perform cron.unschedule(j.jobname); end if;
     perform cron.schedule(j.jobname, j.sched, format('select public.ops_call(%L)', j.job));
@@ -29159,6 +29586,196 @@ end $$;
 
 -- To stop everything later:  select cron.unschedule(jobname) from cron.job where jobname like 'tgk-ops-%';
 -- To look at what the schedule is doing:  select * from cron.job_run_details order by start_time desc limit 20;
+`;
+var ERP_MIGRATION_V2333=`-- =====================================================================================================
+-- TGK ERP v23.33 migration - run once in the Supabase SQL editor. Safe to run again.
+--   1. sales.qty_shipped / sales.deduct_qty : ship and deduct the quantity ShipStation actually shipped
+--   2. unique index on sales.shopify_line_item_id : the airtight fix for duplicate / lost order lines
+--   3. erp_apply()        : allows the two new sales columns
+--   4. erp_stock_audit()  : new 'clamped' list (shipments bigger than on-hand) + stricter 'undeducted' matching
+--   5. two new background jobs : void_sweep (voided labels) and backorder_audit (Shopify availability)
+-- Until this is run the edge functions and the ERP keep working on their previous behaviour.
+-- =====================================================================================================
+
+-- 1. line-level shipment quantities
+alter table sales add column if not exists shopify_line_item_id text;
+alter table sales add column if not exists qty_shipped numeric default 0;
+alter table sales add column if not exists deduct_qty numeric;
+
+-- 2. one sales row per Shopify line item. Only created when there are no duplicates today, so nothing is deleted for you.
+--    If it says duplicates exist, run the query in the NOTICE, merge or delete the extra rows by hand, then run this again.
+do $$
+declare d int;
+begin
+  select count(*) into d from (select shopify_line_item_id from sales
+                                where shopify_line_item_id is not null and shopify_line_item_id <> ''
+                                group by 1 having count(*) > 1) x;
+  if d > 0 then
+    raise notice 'Unique index NOT created: % Shopify line items appear on more than one sales row. List them with: select shopify_line_item_id, array_agg(order_number || '' / '' || pn || '' / '' || fulfillment_status), count(*) from sales where shopify_line_item_id is not null and shopify_line_item_id <> '''' group by 1 having count(*) > 1;', d;
+  else
+    create unique index if not exists sales_shopify_line_uq on sales (shopify_line_item_id)
+      where shopify_line_item_id is not null and shopify_line_item_id <> '';
+  end if;
+end $$;
+
+-- 3. erp_apply (the v23.77 function, with qty_shipped and deduct_qty added to the sales columns it may update)
+create or replace function erp_apply(p jsonb)
+returns jsonb language plpgsql as $$
+declare
+  g jsonb; u jsonb; m jsonb; v_tbl text; v_cur text; v_cols text; v_bad text; v_n int;
+  v_allowed text[]; v_res jsonb := '[]'::jsonb;
+begin
+  for g in select * from jsonb_array_elements(coalesce(p->'guards', '[]'::jsonb)) loop
+    v_tbl := g->>'table';
+    if v_tbl not in ('sales', 'po_lines', 'purchases') then raise exception 'erp_apply: guard table % not allowed', v_tbl; end if;
+    if (g->>'field') not in ('fulfillment_status', 'status', 'qty_received') then raise exception 'erp_apply: guard field % not allowed', g->>'field'; end if;
+    execute format('select %I::text from %I where id::text = $1 for update', g->>'field', v_tbl) into v_cur using g->>'id';
+    get diagnostics v_n = row_count;  -- EXECUTE does not set FOUND
+    if v_n = 0 then raise exception 'erp_apply: % % not found', v_tbl, g->>'id'; end if;
+    if g ? 'not_in' and coalesce(v_cur, '') in (select jsonb_array_elements_text(g->'not_in')) then
+      return jsonb_build_object('ok', false, 'guard', g, 'current', v_cur);
+    end if;
+    if g ? 'equals' and coalesce(v_cur, '') <> coalesce(g->>'equals', '') then
+      return jsonb_build_object('ok', false, 'guard', g, 'current', v_cur);
+    end if;
+    if g ? 'equals_num' and coalesce(nullif(v_cur, '')::numeric, 0) <> (g->>'equals_num')::numeric then
+      return jsonb_build_object('ok', false, 'guard', g, 'current', v_cur);
+    end if;
+  end loop;
+
+  for u in select * from jsonb_array_elements(coalesce(p->'updates', '[]'::jsonb)) loop
+    v_tbl := u->>'table';
+    v_allowed := case v_tbl
+      when 'sales' then array['fulfillment_status','tracking_number','carrier','shipped_at','updated_at','is_split_shipment','deduct_pending','stock_deducted_at','qty_shipped','deduct_qty']
+      when 'po_lines' then array['qty_received','status','notes','updated_at']
+      when 'purchases' then array['status','updated_at']
+      else null end;
+    if v_allowed is null then raise exception 'erp_apply: update table % not allowed', v_tbl; end if;
+    select string_agg(k, ', ') into v_bad from jsonb_object_keys(u->'set') k where not (k = any (v_allowed));
+    if v_bad is not null then raise exception 'erp_apply: column(s) % not allowed on %', v_bad, v_tbl; end if;
+    select string_agg(format('%I = r.%I', k, k), ', ') into v_cols from jsonb_object_keys(u->'set') k;
+    if v_cols is null then continue; end if;
+    execute format('update %I t set %s from jsonb_populate_record(null::%I, $1) r where t.id::text = $2', v_tbl, v_cols, v_tbl)
+      using u->'set', u->>'id';
+    get diagnostics v_n = row_count;
+    if v_n = 0 then raise exception 'erp_apply: % % not found', v_tbl, u->>'id'; end if;
+  end loop;
+
+  for m in select * from jsonb_array_elements(coalesce(p->'moves', '[]'::jsonb)) loop
+    v_res := v_res || jsonb_build_array(erp_stock_move(
+      m->>'kind', m->>'id', (m->>'delta')::numeric,
+      coalesce(m->>'reason', p->>'reason'), coalesce(m->>'source', p->>'source'),
+      coalesce(m->>'reference_id', p->>'reference_id'), p->>'user'));
+  end loop;
+
+  return jsonb_build_object('ok', true, 'moves', v_res);
+end $$;
+
+-- 4. erp_stock_audit (the v23.77 function, plus the 'clamped' list and stricter 'undeducted' matching)
+create or replace function erp_stock_audit(p_days int default 30)
+returns jsonb language plpgsql stable as $$
+declare v jsonb;
+begin
+  with items as (
+    select 'part'::text kind, id::text id, pn, new_sku, coalesce(total_unpckgd,0)::numeric oh from parts
+    union all
+    select 'assembly', id::text, pn, new_sku, coalesce(total_on_hand,0)::numeric from assemblies
+  ),
+  keys as (
+    select kind, id, pn as key from items
+    union select kind, id, new_sku from items where coalesce(new_sku,'') <> ''
+  ),
+  log as (
+    select k.kind, k.id, c.id::text cid, c.created_at, c.previous_qty::numeric prev, c.new_qty::numeric nw, c.source, c.reason,
+           lag(c.new_qty::numeric) over w prior_new,
+           row_number() over (partition by k.kind, k.id order by c.created_at desc, c.id desc) rn
+    from inv_corrections c join keys k on k.key = c.pn
+    where c.new_qty is not null
+    window w as (partition by k.kind, k.id order by c.created_at, c.id)
+  ),
+  drift as (
+    select i.kind, i.id, i.pn, i.oh on_hand, l.nw last_logged, l.created_at last_logged_at
+    from items i join log l on l.kind = i.kind and l.id = i.id and l.rn = 1
+    where l.nw <> i.oh
+  ),
+  gaps as (
+    select l.kind, i.pn, l.created_at, l.prior_new expected_before, l.prev logged_before, l.source, l.reason
+    from log l join items i on i.kind = l.kind and i.id = l.id
+    where l.prior_new is not null and l.prev is not null and l.prev <> l.prior_new
+      and l.created_at > now() - make_interval(days => p_days)
+  ),
+  neg as (select kind, pn, oh on_hand from items where oh < 0),
+  pend as (select id::text id, order_number, pn, coalesce(deduct_qty, qty) qty from sales where deduct_pending is true),
+  shipped as (
+    select s.id::text sid, s.order_number, s.pn, s.qty, s.tracking_number, s.shipped_at, k.kind, k.id item_id
+    from sales s join keys k on k.key = s.pn
+    where s.fulfillment_status in ('Shipped','Delivered') and s.shipped_at > now() - make_interval(days => p_days)
+      and coalesce(s.source,'') not in ('Shopify History','ShipStation Import')
+  ),
+  undeducted as (
+    select sh.sid, sh.kind, sh.item_id, sh.order_number, sh.pn, sh.qty, sh.tracking_number, sh.shipped_at
+    from shipped sh
+    where not exists (
+      select 1 from inv_corrections c join keys k2 on k2.key = c.pn and k2.kind = sh.kind and k2.id = sh.item_id
+      where c.source in ('shipment','manual') and (
+            c.reference_id::text = sh.sid
+         or (coalesce(sh.tracking_number,'') <> '' and position(sh.tracking_number in coalesce(c.reason,'')) > 0)
+         -- order number must match as a whole token ('1001' no longer matches '10010'); the 3-day window rule is gone
+         or (coalesce(sh.order_number,'') <> '' and coalesce(c.reason,'') ~* ('(^|[^0-9a-z])' || regexp_replace(replace(sh.order_number,'#',''), '([^0-9A-Za-z])', '\\\\\\1', 'g') || '([^0-9a-z]|$)')))
+    )
+  ),
+  clamped as (
+    -- a move that asked for more than was on hand: stock was floored at 0 and the shortfall went to backorder.
+    -- That is the signature of a count error or an unrecorded build, and nothing else surfaces it.
+    select c.pn, c.created_at, c.previous_qty::numeric prev, c.adjustment::numeric adj, c.new_qty::numeric nw,
+           (- (c.previous_qty::numeric + c.adjustment::numeric)) shortfall, c.source, c.reason
+    from inv_corrections c
+    where c.created_at > now() - make_interval(days => p_days)
+      and c.adjustment < 0 and c.previous_qty is not null and c.new_qty is not null
+      and c.new_qty::numeric = 0 and c.previous_qty::numeric + c.adjustment::numeric < 0
+      and coalesce(c.source,'') not in ('normalize')
+  )
+  select jsonb_build_object(
+    'generated_at', now(), 'days', p_days,
+    'counts', jsonb_build_object(
+      'drift', (select count(*) from drift), 'gaps', (select count(*) from gaps), 'negative', (select count(*) from neg),
+      'pending', (select count(*) from pend), 'undeducted', (select count(*) from undeducted),
+      'clamped', (select count(*) from clamped)),
+    'drift', coalesce((select jsonb_agg(d) from (select * from drift order by abs(on_hand - last_logged) desc limit 200) d), '[]'::jsonb),
+    'gaps', coalesce((select jsonb_agg(x) from (select * from gaps order by created_at desc limit 200) x), '[]'::jsonb),
+    'negative', coalesce((select jsonb_agg(n) from (select * from neg order by on_hand limit 200) n), '[]'::jsonb),
+    'pending', coalesce((select jsonb_agg(pq) from (select * from pend limit 200) pq), '[]'::jsonb),
+    'undeducted', coalesce((select jsonb_agg(ud) from (select * from undeducted order by shipped_at desc limit 200) ud), '[]'::jsonb),
+    'clamped', coalesce((select jsonb_agg(cl) from (select * from clamped order by created_at desc limit 200) cl), '[]'::jsonb)
+  ) into v;
+  return v;
+end $$;
+
+grant execute on function erp_apply(jsonb) to authenticated;
+grant execute on function erp_stock_audit(int) to authenticated;
+
+-- 5. background jobs (needs ops_setup.sql to have been run once already; skipped quietly if it has not)
+do $$
+declare j record;
+begin
+  if to_regclass('public.ops_jobs') is null then
+    raise notice 'ops_jobs does not exist yet - run ops_setup.sql first, then run this migration again to add the two new jobs.';
+    return;
+  end if;
+  insert into ops_jobs (name, label, description, interval_minutes) values
+    ('void_sweep',      'Voided-label sweep',  'Finds ShipStation labels that were voided and puts the order and stock back',                                      15),
+    ('backorder_audit', 'Backorder audit',     'Checks Shopify availability against stock minus open orders and repairs anything that drifted',                    10)
+  on conflict (name) do update set label = excluded.label, description = excluded.description, interval_minutes = excluded.interval_minutes;
+  if to_regprocedure('public.ops_call(text,jsonb)') is not null and exists (select 1 from pg_extension where extname = 'pg_cron') then
+    for j in select * from (values
+        ('tgk-ops-void-sweep',      '4-59/15 * * * *', 'void_sweep'),
+        ('tgk-ops-backorder-audit', '8-59/10 * * * *', 'backorder_audit')
+      ) as v(jobname, sched, job) loop
+      if exists (select 1 from cron.job where cron.job.jobname = j.jobname) then perform cron.unschedule(j.jobname); end if;
+      perform cron.schedule(j.jobname, j.sched, format('select public.ops_call(%L)', j.job));
+    end loop;
+  end if;
+end $$;
 `;
 var ERP_OPS_CRON_SRC=`// ============================================================================
 // SUPABASE EDGE FUNCTION: ops-cron          (function version v1.0)
@@ -29169,6 +29786,8 @@ var ERP_OPS_CRON_SRC=`// =======================================================
 //   deduct_retry   every 5 min    retries shipments whose stock deduction failed
 //   delivery_sync  every 30 min   carrier tracking                -> orders marked Delivered
 //   reconcile      nightly        compares Shopify with the ERP for the last 72 hours, repairs what is safe, reports the rest
+//   void_sweep     every 15 min   a voided ShipStation label puts the order back to Open and returns its stock   [v1.3]
+//   backorder_audit every 10 min  checks Shopify availability (stock minus open orders) and repairs drift          [v1.3]
 //   customs_fill   every 5 min    puts the customs lines (description, HS code, origin, value) on international ShipStation orders
 //                                 (created PAUSED by customs_fill_setup.sql: turn it on after testing one order)
 //
@@ -29200,9 +29819,9 @@ var ERP_OPS_CRON_SRC=`// =======================================================
 // ============================================================================
 import { createClient } from 'npm:@supabase/supabase-js@2'
 
-const FUNCTION_VERSION = 'v1.2'
-const JOBS = ['hold_sync', 'deduct_retry', 'delivery_sync', 'reconcile', 'customs_fill']
-const LOCK_MINUTES: Record<string, number> = { hold_sync: 8, deduct_retry: 8, delivery_sync: 12, reconcile: 25, customs_fill: 10 }
+const FUNCTION_VERSION = 'v1.3'
+const JOBS = ['hold_sync', 'deduct_retry', 'delivery_sync', 'reconcile', 'customs_fill', 'void_sweep', 'backorder_audit']
+const LOCK_MINUTES: Record<string, number> = { hold_sync: 8, deduct_retry: 8, delivery_sync: 12, reconcile: 25, customs_fill: 10, void_sweep: 12, backorder_audit: 8 }
 const API_VERSION = '2024-01'
 const MAX_REPLAYS = 25
 const MAX_SHOPIFY_PAGES = 20
@@ -29381,6 +30000,8 @@ export function createHandler(deps: { env: Record<string, string | undefined>; f
       else if (name === 'deduct_retry') summary = compact(await callFn('shipstation-ship', { action: 'retry_pending_deductions' }))
       else if (name === 'delivery_sync') summary = compact(await callFn('shipstation-ship', { action: 'delivery_sync' }))
       else if (name === 'customs_fill') summary = compact(await callFn('customs-fill', { action: 'scan' }))
+      else if (name === 'void_sweep') summary = compact(await callFn('shipstation-ship', { action: 'void_sweep' })) // [v1.3] voided labels: put the order and its stock back
+      else if (name === 'backorder_audit') summary = compact(await callFn('shipstation-ship', { action: 'backorder_audit' })) // [v1.3] Shopify availability vs ERP stock minus open orders
       else summary = await reconcile(opts || {})
     } catch (e: any) { status = 'error'; error = String((e && e.message) || e).slice(0, 400) }
     const t1 = now()
@@ -31701,26 +32322,23 @@ async function adjustStock(kind, rec, delta, meta){
       } else if(rf.error){
         var mf=String(rf.error.message||'');
         if(mf.indexOf('apply_stock_delta')!==-1){_floorRpcMissing=true;console.warn('[adjustStock] apply_stock_delta not deployed - run migration-no-negative-inventory.sql. Falling back (stock may go negative).');}
-        else console.warn('[adjustStock] apply_stock_delta error, falling back:', rf.error);
+        else { console.error('[adjustStock] apply_stock_delta failed:', rf.error); toast('Stock NOT changed for '+rec.pn+' ('+mf+') - nothing was written',9000); return null; }
       }
-    }catch(e){ console.warn('[adjustStock] apply_stock_delta threw, falling back', e); }
+    }catch(e){ console.error('[adjustStock] apply_stock_delta threw', e); toast('Stock NOT changed for '+rec.pn+' ('+(e&&e.message||e)+') - nothing was written',9000); return null; }
   }
-  if(newQty===null && !_adjustRpcMissing){
+  if(newQty===null && _floorRpcMissing && !_adjustRpcMissing){
     try{
       var r = await db.rpc('adjust_stock', {p_table:table, p_id:String(rec.id), p_delta:delta});
       if(!r.error && r.data!=null){ newQty=Number(r.data); prevQty=newQty-delta; }
       else if(r.error){
         var m=String(r.error.message||'');
         if(m.indexOf('adjust_stock')!==-1 && (m.indexOf('not')!==-1 || m.indexOf('find')!==-1)){ _adjustRpcMissing=true; }
-        else { console.warn('[adjustStock] rpc error, using fallback:', r.error); }
+        else { console.error('[adjustStock] adjust_stock failed:', r.error); toast('Stock NOT changed for '+rec.pn+' ('+String(r.error.message||'')+') - nothing was written',9000); return null; }
       }
-    }catch(e){ console.warn('[adjustStock] rpc threw, using fallback', e); }
+    }catch(e){ console.error('[adjustStock] adjust_stock threw', e); toast('Stock NOT changed for '+rec.pn+' - nothing was written',9000); return null; }
   }
-  if(newQty===null){ // legacy fallback (pre-migration or rpc failure)
-    newQty = prevQty + delta;
-    var upd = {}; upd[field]=newQty; upd.updated_at=new Date().toISOString();
-    var w = await dbq(db.from(table).update(upd).eq('id', rec.id), 'adjustStock:'+table);
-    if(w && w.error) return null;
+  if(newQty===null){ // [v23.33] the old fallback wrote cached-quantity + delta straight to the table and could overwrite a webhook's change
+    toast('Stock NOT changed for '+rec.pn+' - the stock functions are not installed. Run the v23.77 migration (Integrations page).',9000); return null;
   }
   adjustStock.lastResult={pn:rec.pn,delta:delta,prevQty:prevQty,newQty:newQty,backorder:newBackorder};
   var _patch=isAsm?{total_on_hand:newQty}:{total_unpckgd:newQty};
@@ -31732,6 +32350,7 @@ async function adjustStock(kind, rec, delta, meta){
     reason:meta.reason||'', user_email:meta.user_email||S.currentUser||null, source:meta.source||'manual',
     reference_id:meta.reference_id||null}).select().single(), 'adjustStock:audit');
   adjustStock.lastCorrection=(_ins&&!_ins.error&&_ins.data)?_ins.data:null;
+  if(!adjustStock.lastCorrection&&!S._histWarned){S._histWarned=1;toast('Stock changed, but its history line failed to save ('+rec.pn+') - the daily stock check will flag it',8000);}
   if(!meta.skipSync){ try{ if(isAsm) syncShopifyTemplate(rec.pn,newQty); else cascadeShopifySync(rec.pn); }catch(_){}}
   return newQty;
 }
@@ -36878,7 +37497,7 @@ function poArrivalsForPart(pn){
   (S.purchases||[]).forEach(function(p){
     if(!p||['Received','Recovered','Cancelled','Lost'].indexOf(p.status)>=0)return;
     var lines=(S.poLines[p.id]||[]).filter(function(l){return ((_canonItem(l.pn)||{}).pn||l.pn)===k&&(l.qty_ordered||0)>(l.qty_received||0);});
-    var q=lines.reduce(function(t,l){return t+(l.qty_ordered||0)-(l.qty_received||0);},0);
+    var q=lines.reduce(function(t,l){return t+poLineRem(l);},0);
     if(!lines.length&&!(S.poLines[p.id]||[]).length&&p.pn&&((_canonItem(p.pn)||{}).pn||p.pn)===k)q=Math.max(0,(p.qty||0)-(p.qty_received||0)); // legacy single-line PO
     if(q<=0)return;
     var e=poEta(p);out.push({ms:e&&e.ms?e.ms:hpToday()+14*HP_DAY,qty:q,draft:p.status==='Draft'});
