@@ -474,7 +474,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.46</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.47</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -539,7 +539,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.46';
+const TGK_ERP_VERSION = 'v23.47';
 const TGK_ERP_BUILD_DATE = '2026-11-02';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -32819,11 +32819,23 @@ async function adjustStock(kind, rec, delta, meta){
   var field = isAsm ? 'total_on_hand' : 'total_unpckgd';
   var prevQty = isAsm ? (rec.total_on_hand||0) : (rec.total_unpckgd||0);
   var newQty = null, newBackorder = null;
+  // [v23.47] A COUNT is the truth about the shelf, not stock arriving. The database function pays any owed backorder (units shipped
+  // before their stock was recorded) from an increase before the rest reaches on-hand, which is right for a build or a receipt but
+  // made a count of 2 land as 1 on hand. So for a count that finds stock, also clear what the item owes: on hand ends up exactly
+  // at the counted number. Counts that remove stock, and everything that is not a count, behave as before.
+  var rpcDelta = delta, owedCleared = 0;
+  if(delta>0 && meta && (meta.source==='cycle_count'||meta.source==='spot_count'||meta.source==='walk_count')){
+    try{
+      var _fr = await db.from(table).select('backorder_qty').eq('id', rec.id).maybeSingle();
+      var _ow = (!_fr.error && _fr.data) ? Math.max(0, Number(_fr.data.backorder_qty)||0) : 0;
+      if(_ow>0){ rpcDelta = delta + _ow; owedCleared = _ow; }
+    }catch(_e){ /* no backorder column: nothing owed to clear */ }
+  }
   // Preferred: floored + backorder-aware. Stock cannot go below zero; the shortfall lands in
   // backorder_qty, and positive deltas settle backorder before adding to stock.
   if(!_floorRpcMissing){
     try{
-      var rf = await db.rpc('apply_stock_delta', {p_kind:(isAsm?'assembly':'part'), p_id:String(rec.id), p_delta:delta});
+      var rf = await db.rpc('apply_stock_delta', {p_kind:(isAsm?'assembly':'part'), p_id:String(rec.id), p_delta:rpcDelta});
       if(!rf.error && rf.data){
         var row = Array.isArray(rf.data)?rf.data[0]:rf.data;
         if(row && row.new_qty!=null){
@@ -32839,6 +32851,7 @@ async function adjustStock(kind, rec, delta, meta){
     }catch(e){ console.error('[adjustStock] apply_stock_delta threw', e); toast('Stock NOT changed for '+dispSku(rec.pn)+' ('+(e&&e.message||e)+') - nothing was written',9000); return null; }
   }
   if(newQty===null && _floorRpcMissing && !_adjustRpcMissing){
+    owedCleared = 0; // the older function has no backorder rule, so nothing extra to clear
     try{
       var r = await db.rpc('adjust_stock', {p_table:table, p_id:String(rec.id), p_delta:delta});
       if(!r.error && r.data!=null){ newQty=Number(r.data); prevQty=newQty-delta; }
@@ -32852,14 +32865,15 @@ async function adjustStock(kind, rec, delta, meta){
   if(newQty===null){ // [v23.33] the old fallback wrote cached-quantity + delta straight to the table and could overwrite a webhook's change
     toast('Stock NOT changed for '+dispSku(rec.pn)+' - the stock functions are not installed. Run the v23.77 migration (Integrations page).',9000); return null;
   }
-  adjustStock.lastResult={pn:rec.pn,delta:delta,prevQty:prevQty,newQty:newQty,backorder:newBackorder};
+  adjustStock.lastResult={pn:rec.pn,delta:delta,prevQty:prevQty,newQty:newQty,backorder:newBackorder,owedCleared:owedCleared};
   var _patch=isAsm?{total_on_hand:newQty}:{total_unpckgd:newQty};
   if(newBackorder!==null)_patch.backorder_qty=newBackorder;
   if(isAsm) S.assemblies=S.assemblies.map(function(x){return x.id===rec.id?Object.assign({},x,_patch):x;});
   else S.parts=S.parts.map(function(x){return x.id===rec.id?Object.assign({},x,_patch):x;});
   meta=meta||{};
+  var _owedNote = owedCleared>0 ? (' - also cleared '+owedCleared+' unit'+(owedCleared!==1?'s':'')+' owed from earlier shipments sent before stock was recorded') : '';
   var _ins=await dbq(db.from('inv_corrections').insert({pn:rec.pn, previous_qty:prevQty, new_qty:newQty, adjustment:delta,
-    reason:meta.reason||'', user_email:meta.user_email||S.currentUser||null, source:meta.source||'manual',
+    reason:(meta.reason||'')+_owedNote, user_email:meta.user_email||S.currentUser||null, source:meta.source||'manual',
     reference_id:meta.reference_id||null}).select().single(), 'adjustStock:audit');
   adjustStock.lastCorrection=(_ins&&!_ins.error&&_ins.data)?_ins.data:null;
   if(!adjustStock.lastCorrection&&!S._histWarned){S._histWarned=1;toast('Stock changed, but its history line failed to save ('+dispSku(rec.pn)+') - the daily stock check will flag it',8000);}
