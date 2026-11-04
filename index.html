@@ -474,7 +474,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.33</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.35</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -539,7 +539,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.33';
+const TGK_ERP_VERSION = 'v23.35';
 const TGK_ERP_BUILD_DATE = '2026-11-02';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -10412,8 +10412,10 @@ function allocateShipment(lines: any[], items: any[], canon: (s: string) =&gt; s
     if (!(q &gt; 0)) continue
     const key = String(it?.lineItemKey ?? '').trim()
     let cands: any[] = []
+    let viaSku = false // matched by SKU although the item named a Shopify line that is not one of this order's lines
     if (key) cands = eligible.filter((l) =&gt; l.shopify_line_item_id != null &amp;&amp; String(l.shopify_line_item_id).trim() === key)
     if (!cands.length) {
+      viaSku = key.length &gt;= 8
       const sku = norm(it?.sku), name = norm(it?.name)
       const cs = sku ? canon(sku) : '', cn = !sku &amp;&amp; name ? canon(name) : ''
       cands = eligible.filter((l) =&gt; { const cl = canon(l.pn); return (cs &amp;&amp; (cl === cs || norm(l.pn) === sku)) || (cn &amp;&amp; (cl === cn || norm(l.pn) === name)) })
@@ -10427,6 +10429,9 @@ function allocateShipment(lines: any[], items: any[], canon: (s: string) =&gt; s
       if (take &gt; 0) { got.set(l.id, (got.get(l.id) || 0) + take); left.set(l.id, cap - take); q -= take }
     }
     if (!got.has(cands[0].id)) got.set(cands[0].id, 0) // matched, but already fully shipped
+    // [v23.103] The item named a different Shopify line (a merged-in order) and this order has no room left for it: report the
+    // leftover so the caller can look for the line elsewhere, instead of silently dropping the quantity.
+    if (viaSku &amp;&amp; q &gt; 0) unmatched.push({ ...it, quantity: q })
   }
   return { got, unmatched }
 }
@@ -10485,6 +10490,48 @@ async function zeroAllLocations(gq: (q: string) =&gt; Promise&lt;any&gt;, invId:
   const sets = locIds.map((l) =&gt; '{inventoryItemId: "' + invId + '", locationId: "' + l + '", quantity: 0}').join(', ')
   const z = await gq('mutation { inventorySetOnHandQuantities(input: {reason: "correction", setQuantities: [' + sets + ']}) { userErrors { message } } }')
   return (z?.data?.inventorySetOnHandQuantities?.userErrors || []).map((u: any) =&gt; String(u?.message || u))
+}
+
+// ===================================================================================================================
+// [v23.103] COMBINED (MERGED) ORDERS. Merging orders in ShipStation produces one record that carries items from two ERP orders,
+// under a number the ERP may never have seen (or under one of the originals). The ERP used to look the shipment up by order
+// NUMBER only, so an unknown number was skipped without a trace and the other order's items matched nothing. Every item still
+// carries its Shopify line item id (lineItemKey), which no merge changes, so lines are now found by that id across ALL orders.
+// ===================================================================================================================
+async function foreignLinesFor(items: any[], exclude?: Set&lt;string&gt;): Promise&lt;any[]&gt; {
+  const keys = [...new Set((items || []).map((i: any) =&gt; String(i?.lineItemKey ?? '').trim()).filter((k: string) =&gt; k.length &gt;= 8))] // Shopify line item ids are long; short keys are ShipStation's own 1,2,3 on manual orders
+  if (!keys.length) return []
+  const sel = 'id,order_number,pn,fulfillment_status,qty,deduct_pending,shopify_line_item_id'
+  let { data, error } = await db.from('sales').select(sel + ',qty_shipped,deduct_qty').in('shopify_line_item_id', keys)
+  if (error) ({ data, error } = await db.from('sales').select(sel).in('shopify_line_item_id', keys))
+  if (error) return []
+  return (data || []).filter((l: any) =&gt; !(exclude &amp;&amp; exclude.has(l.id)) &amp;&amp; !_NOT_SHIPPABLE.includes(String(l.fulfillment_status || '').toLowerCase()))
+}
+function isMergedOrder(order: any): boolean {
+  const a = order?.advancedOptions || {}
+  return (Array.isArray(a.mergedIds) &amp;&amp; a.mergedIds.length &gt; 0) || a.mergedOrSplit === true
+}
+// Remember which ERP order a combined ShipStation order stands for, so later hold / release / cancel notices for its number resolve.
+async function linkMergedOrder(order: any): Promise&lt;string | null&gt; {
+  const adv = order?.advancedOptions || {}
+  let primary: string | null = null
+  const fl = await foreignLinesFor(order?.items || [])
+  if (fl.length) primary = fl[0].order_number
+  if (!primary &amp;&amp; Array.isArray(adv.mergedIds)) {
+    for (const id of adv.mergedIds) {
+      const o = await fetchSSOrder(id)
+      const n = o?.orderNumber ? await erpOrderNumberFor(stripHash(o.orderNumber)) : null
+      if (n) { primary = n; break }
+    }
+  }
+  if (!primary) return null
+  const childNum = stripHash(order?.orderNumber || '')
+  if (childNum &amp;&amp; childNum !== stripHash(primary)) {
+    await db.from('ss_order_links').upsert({ ss_order_number: childNum, erp_order_number: primary, ss_order_id: order?.orderId ?? null,
+      child_skus: (order?.items || []).map((i: any) =&gt; String(i?.sku || i?.name || '').trim().toUpperCase()).filter(Boolean) }, { onConflict: 'ss_order_number' })
+  }
+  console.log('[SS][merge] combined order', childNum, 'stands for ERP order', primary, '(' + fl.length + ' line(s) found by line item id)')
+  return primary
 }
 
 function ok(body: string) { return new Response(body, { headers: CORS }) }
@@ -11244,7 +11291,7 @@ async function voidSweep(): Promise&lt;any&gt; {
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.102'
+const EDGE_BUILD = 'v23.104'
 const _gateLogged: Record&lt;string, number&gt; = {}
 async function authGate(req: Request, fn: string, action: string): Promise&lt;Response | null&gt; {
   const mode = (Deno.env.get('EDGE_AUTH_MODE') || 'log').toLowerCase()
@@ -11445,6 +11492,18 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
 
     let markedHold = 0, markedOpen = 0
     const stillOnHoldLineIds = new Set&lt;string&gt;()
+    // [v23.104] Orders combined in ShipStation carry a number the ERP does not know, so the number-based matching below never saw
+    // their lines and they stayed On Hold for good. Every item still carries its Shopify line item id: find the lines by that too.
+    const byKey = new Map&lt;string, any&gt;()
+    const _keys = new Set&lt;string&gt;()
+    for (const o of allOrders) for (const i of (o.items || [])) { const k = String(i?.lineItemKey ?? '').trim(); if (k.length &gt;= 8) _keys.add(k) }
+    const _keyList = [..._keys]
+    for (let i = 0; i &lt; _keyList.length; i += 150) {
+      const { data: kl, error: kerr } = await db.from('sales').select('id,order_number,pn,fulfillment_status,shopify_line_item_id').in('shopify_line_item_id', _keyList.slice(i, i + 150))
+      if (kerr) break
+      for (const l of (kl || []) as any[]) if (l.shopify_line_item_id != null) byKey.set(String(l.shopify_line_item_id).trim(), l)
+    }
+    const linesByKey = (order: any): any[] =&gt; (order.items || []).map((i: any) =&gt; byKey.get(String(i?.lineItemKey ?? '').trim())).filter(Boolean)
     for (const order of onHoldOrders) {
       const rawNum = stripHash(order.orderNumber || '')
       const lines = orderMap[rawNum] || []
@@ -11461,6 +11520,11 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
         await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', ids)
         markedHold += ids.length
       }
+      // [v23.104] lines of other ERP orders that were merged into this record
+      const keyed = linesByKey(order).filter((l: any) =&gt; !ids.includes(l.id))
+      keyed.forEach((l: any) =&gt; stillOnHoldLineIds.add(l.id))
+      const kids = keyed.filter((l: any) =&gt; ['Open', 'Packed'].includes(l.fulfillment_status)).map((l: any) =&gt; l.id as string)
+      if (kids.length) { await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', kids); markedHold += kids.length }
     }
     const { data: heldLines } = await db.from('sales').select('id,order_number,pn').eq('fulfillment_status', 'On Hold').limit(5000)
     if (heldLines?.length) {
@@ -11476,6 +11540,9 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
           await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', toRelease)
           markedOpen += toRelease.length
         }
+        // [v23.104] release lines of merged-in orders that this record now has ready to ship
+        const kRel = linesByKey(order).filter((l: any) =&gt; l.fulfillment_status === 'On Hold' &amp;&amp; !stillOnHoldLineIds.has(l.id) &amp;&amp; !toRelease.includes(l.id)).map((l: any) =&gt; l.id as string)
+        if (kRel.length) { await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', kRel); markedOpen += kRel.length }
       }
     }
     return json({ markedHold, markedOpen, message: markedHold + ' marked On Hold, ' + markedOpen + ' released to Open' })
@@ -12229,18 +12296,27 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
         continue
       }
       const salesNum = (orderNum || '').replace(/^Manual_/i, '')
-      const { num: resolvedOrderNumOrNull, viaSplit } = await resolveShipmentOrder(salesNum, ship)
+      let { num: resolvedOrderNumOrNull, viaSplit } = await resolveShipmentOrder(salesNum, ship)
       if (!resolvedOrderNumOrNull) {
-        console.warn('[SS] order not in ERP and not a known split child:', salesNum, '- skipping')
-        continue
+        // [v23.103] a combined order has a number of its own: find its lines by Shopify line item id instead
+        const _fl = await foreignLinesFor(ship.shipmentItems ?? [])
+        if (_fl.length) {
+          resolvedOrderNumOrNull = _fl[0].order_number; viaSplit = false
+          await db.from('ss_order_links').upsert({ ss_order_number: salesNum, erp_order_number: _fl[0].order_number }, { onConflict: 'ss_order_number' })
+          console.log('[SS][merge] shipment for', salesNum, 'is not an ERP order number; its items belong to ERP order', _fl[0].order_number)
+        } else {
+          console.warn('[SS] order not in ERP, not a split child and no line item id matches:', salesNum, '- skipping')
+          await logEdgeError('Shipment ' + tracking + ' for ShipStation order ' + salesNum + ' matched no ERP order (not a known order number, split or merge). Nothing was changed - mark the order(s) shipped in the ERP by hand.')
+          continue
+        }
       }
-      const resolvedOrderNum = resolvedOrderNumOrNull
+      const resolvedOrderNum = resolvedOrderNumOrNull as string
       let { data: erpLinesRaw, error: _elErr } = await db.from('sales')
         .select('id,pn,fulfillment_status,qty,deduct_pending,shopify_line_item_id,qty_shipped,deduct_qty').eq('order_number', resolvedOrderNum)
       if (_elErr) ({ data: erpLinesRaw, error: _elErr } = await db.from('sales').select('id,pn,fulfillment_status,qty,deduct_pending,shopify_line_item_id').eq('order_number', resolvedOrderNum))
       if (_elErr) ({ data: erpLinesRaw, error: _elErr } = await db.from('sales').select('id,pn,fulfillment_status,qty,deduct_pending').eq('order_number', resolvedOrderNum))
       if (_elErr) ({ data: erpLinesRaw } = await db.from('sales').select('id,pn,fulfillment_status,qty').eq('order_number', resolvedOrderNum))
-      const erpLines = erpLinesRaw ?? []
+      let erpLines: any[] = erpLinesRaw ?? []
       const qtyTracking = _qtyColsOk &amp;&amp; erpLines.length &gt; 0 &amp;&amp; ('qty_shipped' in erpLines[0])
       const allErpPns = erpLines.map((l: any) =&gt; l.pn as string)
       const norm = (s: string) =&gt; s.trim().toUpperCase()
@@ -12262,6 +12338,17 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
       // [v23.102] Match by Shopify line item id, then exact canonical SKU, and work out how many units of each line this label covers.
       // (The substring fallback is gone: a short SKU matching a longer one marked the wrong line Shipped and deducted the wrong part.)
       const { got, unmatched } = allocateShipment(erpLines, ship.shipmentItems ?? [], canon)
+      // [v23.103] items that belong to ANOTHER ERP order (a merge) are matched by Shopify line item id and shipped with this one
+      if (unmatched.length) {
+        const _more = await foreignLinesFor(unmatched, new Set(erpLines.map((l: any) =&gt; l.id)))
+        if (_more.length) {
+          const _a2 = allocateShipment(_more, unmatched, canon)
+          for (const [k, v] of _a2.got) got.set(k, (got.get(k) || 0) + v)
+          erpLines = erpLines.concat(_more)
+          unmatched.splice(0, unmatched.length, ..._a2.unmatched)
+          console.log('[SS][merge]', _more.length, 'line(s) from other ERP order(s) matched by line item id:', JSON.stringify(_more.map((l: any) =&gt; l.order_number)))
+        }
+      }
       if (!got.size &amp;&amp; !viaSplit) {
         // The one safe guess: an order with a single open line and a shipment with a single item can only be that line.
         const _open = erpLines.filter((l: any) =&gt; { const st = String(l.fulfillment_status || '').toLowerCase(); return !_TERMINAL.includes(st) &amp;&amp; st !== 'on hold' })
@@ -12283,7 +12370,7 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
       console.log('[SS] matched lines', JSON.stringify([...got.entries()]), 'of', allErpPns.length, viaSplit ? '(via split link)' : '')
 
       // What this label means for each matched line.
-      const _activeLines = erpLines.filter((l: any) =&gt; !_NOT_SHIPPABLE.includes(String(l.fulfillment_status || '').toLowerCase()))
+      const _activeLines = erpLines.filter((l: any) =&gt; !l.order_number &amp;&amp; !_NOT_SHIPPABLE.includes(String(l.fulfillment_status || '').toLowerCase())) // this order's own lines (merged-in lines carry order_number)
       const plans: any[] = []
       let anyPartialQty = false
       for (const line of erpLines) {
@@ -12298,7 +12385,7 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
         const carry = line.deduct_pending === true ? (Number(line.deduct_qty) &gt; 0 ? Number(line.deduct_qty) : soFar) : 0
         plans.push({ line, deduct, full, newShipped: soFar + deduct, pend: carry + deduct })
       }
-      const isSplit = plans.length &gt; 0 &amp;&amp; (anyPartialQty || plans.length &lt; _activeLines.length)
+      const isSplit = plans.length &gt; 0 &amp;&amp; (anyPartialQty || plans.filter((p: any) =&gt; !p.line.order_number).length &lt; _activeLines.length)
 
       // [AUDIT v23.65] each line is flagged deduct_pending BEFORE it is marked shipped, and cleared once its stock is deducted.
       for (const pl of plans) {
@@ -12307,17 +12394,17 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
           await setLineQtyCols(pl.line.id, { deduct_qty: pl.pend })
         }
         const upd: any = { tracking_number: tracking, carrier, shipped_at: shippedAt }
-        if (pl.deduct &gt; 0) { upd.fulfillment_status = pl.full ? 'Shipped' : 'Partial'; upd.is_split_shipment = isSplit }
+        if (pl.deduct &gt; 0) { upd.fulfillment_status = pl.full ? 'Shipped' : 'Partial'; if (!pl.line.order_number) upd.is_split_shipment = isSplit }
         await db.from('sales').update(upd).eq('id', pl.line.id)
         if (pl.deduct &gt; 0 &amp;&amp; qtyTracking) await setLineQtyCols(pl.line.id, { qty_shipped: pl.newShipped })
       }
       if (isSplit) {
         for (const l of erpLines) {
-          if (got.has(l.id)) continue
+          if (got.has(l.id) || l.order_number) continue
           if (['Open', 'Packed'].includes(l.fulfillment_status)) await db.from('sales').update({ fulfillment_status: 'Partial', is_split_shipment: true }).eq('id', l.id)
         }
       }
-      for (const pl of plans) if (pl.pend &gt; 0) await deductLine({ ...pl.line, deduct_qty: pl.pend }, tracking, resolvedOrderNum)
+      for (const pl of plans) if (pl.pend &gt; 0) await deductLine({ ...pl.line, deduct_qty: pl.pend }, tracking, pl.line.order_number || resolvedOrderNum)
     }
   }
   if (resource_type === 'NEW_ORDER') {
@@ -12328,6 +12415,11 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
     if (order?.advancedOptions?.parentId || order?.advancedOptions?.parentOrderId) {
       await linkSplitChild(order)
       console.log('[SS] NEW_ORDER: split child', orderNum, '- linked to parent, not imported')
+      return ok('ok')
+    }
+    if (isMergedOrder(order)) {
+      await linkMergedOrder(order)
+      console.log('[SS] NEW_ORDER: combined order', orderNum, '- linked to its ERP order(s), not imported as a new order')
       return ok('ok')
     }
     if (!isShopify &amp;&amp; orderNum) {
@@ -12359,6 +12451,7 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
       const rawNum = stripHash(order.orderNumber)
       let resolvedNum = await erpOrderNumberFor(rawNum)
       if (!resolvedNum) resolvedNum = await linkSplitChild(order)
+      if (!resolvedNum) resolvedNum = await linkMergedOrder(order) // [v23.103]
       if (!resolvedNum) continue
       // [FIX] Same root cause as hold_sync above, confirmed on order #10497: a single order
       // number can have MULTIPLE ShipStation order records (one per split shipment), each with
@@ -12377,7 +12470,16 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
       const canon = await buildCanonMap([...rawSkus, ...erpLines.map((l: any) =&gt; l.pn || '')])
       const recCanon = new Set(rawSkus.map((x: string) =&gt; canon(x)))
       const matchesThisRecord = (l: any) =&gt; recCanon.has(canon(l.pn || ''))
-      if (order.orderStatus === 'cancelled') {
+      // [v23.103] lines of OTHER ERP orders that were merged into this ShipStation record follow its hold / release
+      const _merged = order.orderStatus === 'cancelled' ? [] : await foreignLinesFor(order.items || [], new Set(erpLines.map((l: any) =&gt; l.id)))
+      if (_merged.length) {
+        const _ids = _merged.filter((l: any) =&gt; order.orderStatus === 'on_hold' ? ['Open', 'Packed', 'Partial'].includes(l.fulfillment_status) : (order.orderStatus === 'awaiting_shipment' &amp;&amp; l.fulfillment_status === 'On Hold')).map((l: any) =&gt; l.id)
+        if (_ids.length) await db.from('sales').update({ fulfillment_status: order.orderStatus === 'on_hold' ? 'On Hold' : 'Open' }).in('id', _ids)
+      }
+      if (order.orderStatus === 'cancelled' &amp;&amp; order?.advancedOptions?.mergedOrSplit === true) {
+        // a record that was merged away reads as cancelled; the customer's order is not. Shopify's own cancel webhook is the authority.
+        console.log('[SS] ORDER_NOTIFY: cancelled record is flagged merged/split - not cancelling', resolvedNum, 'in the ERP')
+      } else if (order.orderStatus === 'cancelled') {
         await db.from('sales').update({ fulfillment_status: 'Cancelled', cancelled_at: new Date().toISOString() }).eq('order_number', resolvedNum).in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
         console.log('[SS] ORDER_NOTIFY -&gt; Cancelled:', resolvedNum)
       } else if (order.orderStatus === 'on_hold') {
@@ -27666,7 +27768,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.85','shipstation-ship':'v23.102','ops-cron':'v1.3','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.3'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.85','shipstation-ship':'v23.104','ops-cron':'v1.3','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.3'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
