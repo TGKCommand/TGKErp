@@ -474,7 +474,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.38</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.40</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -539,7 +539,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.38';
+const TGK_ERP_VERSION = 'v23.40';
 const TGK_ERP_BUILD_DATE = '2026-11-02';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -849,152 +849,14 @@ function avgWk4(p){
   return c?c.wk4:0;
 }
 // ===================================================================================================
-// [v23.38] EVENTS: Black Friday and your own. Saved in settings key demand_events as a list of
-//   {id, kind:'bf'|'custom', name, on, start, end, mult, items, cap}
-//   kind 'bf' = Black Friday week, dates found automatically unless start/end are set.
-//   mult = null: every item learns its own multiple from the same dates last year (the 8 weeks before are the baseline,
-//          items with little history lean on the shop-wide typical value); a number: use that for every item.
-//   items = null: all items, or a list of SKUs.   cap = the most any one item may be raised (default 8).
-// The app keeps only 180 days of sales in memory, so each event fetches the one week it needs (loadEventHistory).
+// [v23.39] Black Friday week. Used only by the forecast engine, to keep that week out of the normal-week average.
+// Event PLANNING (Black Friday, Holiday, promos) is the Holiday Planner on the Purchasing screen; there is no second events
+// feature. Targets and reorder suggestions no longer add an event uplift of their own.
 // ===================================================================================================
 function _evThanksgiving(y){var d=new Date(Date.UTC(y,10,1)),dow=d.getUTCDay(),first=1+((4-dow+7)%7);return new Date(Date.UTC(y,10,first+21));} // 4th Thursday of November
 function _evBF(y){var th=_evThanksgiving(y),s=new Date(th.getTime()-3*86400000);return {start:s,end:new Date(s.getTime()+6*86400000)};} // Monday..Sunday of Black Friday week
-function _evISO(d){return d.toISOString().slice(0,10);}
-function _evDate(s){var t=Date.parse(String(s||'').slice(0,10)+'T00:00:00Z');return isNaN(t)?null:new Date(t);}
-function _evDefault(){return [{id:'bf',kind:'bf',name:'Black Friday',on:true,mult:null,items:null}];}
-function evList(){
-  var raw=S.settings&&S.settings.demand_events,l=Array.isArray(raw)?raw:_evDefault(); // an empty saved list means "none", not "default"
-  return l.map(function(e,i){var c=Object.assign({},e);if(!c.kind)c.kind='custom';if(!c.id)c.id=(c.kind==='bf'?'bf':'ev'+i);return c;});
-}
-function _evNorm(e,now){
-  now=now||new Date();var start,end,last;
-  if(e.kind==='bf'){
-    var os=_evDate(e.start),oe=_evDate(e.end),w;
-    if(os&&oe&&oe.getTime()>=now.getTime()-60*86400000){start=os;end=oe;}
-    else{w=_evBF(now.getUTCFullYear());if(w.end<now)w=_evBF(now.getUTCFullYear()+1);start=w.start;end=w.end;}
-    last=_evBF(start.getUTCFullYear()-1);
-  }else{
-    start=_evDate(e.start);end=_evDate(e.end);if(!start||!end)return null;
-    last={start:new Date(start.getTime()-364*86400000),end:new Date(end.getTime()-364*86400000)};
-  }
-  var list=Array.isArray(e.items)&&e.items.length?e.items:null;
-  var set=list?new Set(list.map(function(x){return String((_canonItem(x)||{}).pn||x).toUpperCase();})):null;
-  return {id:e.id,kind:e.kind,name:e.name||'Event',on:e.on!==false,start:start,end:end,last:last,
-    mult:Number(e.mult)>0?Number(e.mult):null,items:set,itemList:list,cap:Number(e.cap)>0?Number(e.cap):null,
-    statKey:e.id+'|'+_evISO(last.start)+'|'+_evISO(last.end)};
-}
-function evAll(now){var out=[];evList().forEach(function(e){var n=_evNorm(e,now);if(n)out.push(n);});return out;}
-function demandEvents(now){ // the events that can still affect a target: switched on, and not over yet
-  now=now||new Date();
-  return evAll(now).filter(function(n){return n.on&&n.end.getTime()+86400000>=now.getTime();});
-}
-async function loadEventHistory(force){
-  try{
-    if(S._evLoading)return;
-    S._evStats=S._evStats||{};
-    var todo=demandEvents().filter(function(ev){return !ev.mult&&(force||!S._evStats[ev.statKey]);});
-    if(!todo.length)return;
-    S._evLoading=true;
-    if(!S._asmIdx||!S._partIdx)buildLookupMaps();
-    var cap=Number(S.settings&&S.settings.event_uplift_cap)>0?Number(S.settings.event_uplift_cap):8;
-    for(var i=0;i<todo.length;i++){
-      var ev=todo[i],l=ev.last,baseStart=new Date(l.start.getTime()-56*86400000);
-      var f=_evISO(baseStart),t=_evISO(l.end),ls=_evISO(l.start);
-      var rows=await fetchAll(function(a,b){return db.from('sales').select('pn,qty,sale_date,fulfillment_status').gte('sale_date',f).lte('sale_date',t).order('sale_date',{ascending:true}).range(a,b);});
-      var by={};
-      (rows||[]).forEach(function(s){
-        if(!s.pn||s.fulfillment_status==='Cancelled')return;
-        var q=Number(s.qty)||0;if(q<=0)return; // returns / reversals would only blur the multiple
-        var sd=String(s.sale_date).slice(0,10);if(sd<f||sd>t)return;
-        var k=(_canonItem(s.pn)||{}).pn||s.pn,o=by[k]||(by[k]={base:0,ev:0});
-        if(sd<ls)o.base+=q;else o.ev+=q;
-      });
-      var ratios=[];Object.keys(by).forEach(function(k){var o=by[k];if(o.base>=8)ratios.push(o.ev/(o.base/8));}); // items that sold at least a unit a week
-      ratios.sort(function(a,b){return a-b;});
-      var gm=ratios.length?ratios[Math.floor(ratios.length/2)]:1;gm=Math.max(1,Math.min(gm,Math.min(cap,6)));
-      S._evStats[ev.statKey]={gm:gm,cap:cap,by:by,skus:ratios.length};
-    }
-    S._seriesBump=(S._seriesBump||0)+1;S.calc=null;
-    if(!(typeof isUserActivelyWorking==='function'&&isUserActivelyWorking()))render();
-    if(typeof document!=='undefined'&&document.getElementById('plan-overlay'))openPlanning();
-  }catch(e){console.warn('[events] history load failed',e);}
-  finally{S._evLoading=false;}
-}
-function eventMult(pn,ev){
-  if(ev&&ev.mult)return Math.max(1,ev.mult);
-  var st=S._evStats&&ev&&S._evStats[ev.statKey];if(!st)return 1; // history not loaded yet: no uplift rather than a guess
-  var k=(_canonItem(pn)||{}).pn||pn,o=st.by[k],gm=st.gm,cap=ev.cap||st.cap||8;
-  if(!o||!(o.base>0))return Math.min(gm,cap);
-  var r=o.ev/(o.base/8),n=o.base,K=12; // few units of history -> lean on the shop-wide typical value
-  return Math.max(1,Math.min((n*r+K*gm)/(n+K),cap));
-}
-function _evExtraOne(ev,pn,baseWk,t0,t1){
-  if(ev.items){var k=String((_canonItem(pn)||{}).pn||pn).toUpperCase();if(!ev.items.has(k))return 0;}
-  var a=Math.max(t0,ev.start.getTime()),b=Math.min(t1,ev.end.getTime()+86400000);if(b<=a)return 0;
-  return baseWk*(eventMult(pn,ev)-1)*((b-a)/(7*86400000));
-}
-function eventExtra(pn,baseWk,horizonWeeks,from){
-  if(!(baseWk>0)||!(horizonWeeks>0))return 0;
-  var evs=demandEvents(from);if(!evs.length)return 0;
-  var t0=(from||new Date()).getTime(),t1=t0+horizonWeeks*7*86400000,x=0;
-  evs.forEach(function(ev){x+=_evExtraOne(ev,pn,baseWk,t0,t1);});
-  return x;
-}
-function _covUnitsWk(pn,wk,cov){return Math.ceil(wk*cov+eventExtra(pn,wk,cov));}
-function _covUnits(a,cov){var wk=asmAvgWk(a);return Math.ceil(wk*cov+eventExtra(a.pn,wk,cov));}
-function evImpact(ev){ // what this event does to build targets at the current plan window; null while still learning
-  if(!ev.mult&&!(S._evStats&&S._evStats[ev.statKey]))return null;
-  var cov=S.buildCoverage||4,t0=Date.now(),t1=t0+cov*7*86400000,n=0,sum=0,top=[];
-  (S.assemblies||[]).forEach(function(a){
-    if(a.discontinued||a.build_to_order||(typeof isDev==='function'&&isDev(a)))return;
-    var x=_evExtraOne(ev,a.pn,asmAvgWk(a),t0,t1);if(x>=0.5){n++;sum+=x;top.push({pn:a.pn,x:x});}
-  });
-  top.sort(function(p,q){return q.x-p.x;});
-  return {items:n,units:Math.round(sum),top:top.slice(0,3)};
-}
-async function evSave(list){
-  S.settings=S.settings||{};S.settings.demand_events=list;S._seriesBump=(S._seriesBump||0)+1;S.calc=null;
-  try{await db.from('settings').upsert({key:'demand_events',value:list},{onConflict:'key'});}
-  catch(e){console.warn('[events] save failed',e);if(typeof toast==='function')toast('<span class="ic ic-alert"></span>Could not save the events. Check your connection and try again.',6000);}
-  loadEventHistory();render();
-  if(typeof document!=='undefined'&&document.getElementById('plan-overlay'))openPlanning();
-}
-function evToggle(id){
-  var l=evList(),e=l.find(function(x){return x.id===id;});
-  if(!e){if(id==='bf'){l.push(_evDefault()[0]);}else return;}else e.on=(e.on===false);
-  evSave(l);
-}
-function evDelete(id){
-  var e=evList().find(function(x){return x.id===id;});if(!e)return;
-  if(typeof confirm==='function'&&!confirm('Delete "'+(e.name||'this event')+'"? Targets will stop including it. Your sales history is not touched, and you can add the event again.'))return;
-  evSave(evList().filter(function(x){return x.id!==id;}));
-}
-function evEdit(id){
-  var e=id?evList().find(function(x){return x.id===id;}):null,n=e?_evNorm(e):null;
-  S._evEdit={id:e?e.id:null,kind:e?e.kind:'custom',d:{
-    name:e?(e.name||''):'',start:n?_evISO(n.start):'',end:n?_evISO(n.end):'',
-    how:(e&&Number(e.mult)>0)?'own':'learn',mult:(e&&Number(e.mult)>0)?String(e.mult):'',
-    scope:(e&&Array.isArray(e.items)&&e.items.length)?'only':'all',items:(e&&Array.isArray(e.items))?e.items.join(', '):'',cap:(e&&Number(e.cap)>0)?String(e.cap):''}};
-  openPlanning();
-}
-function evEditSet(k,v,redraw){if(!S._evEdit)return;S._evEdit.d[k]=v;if(redraw)openPlanning();}
-function evEditCancel(){S._evEdit=null;openPlanning();}
-function evEditSave(){
-  var ed=S._evEdit;if(!ed)return;var d=ed.d,err='';
-  var name=String(d.name||'').trim();if(!name)err='Give the event a name.';
-  var s=_evDate(d.start),e=_evDate(d.end);
-  if(!err&&(!s||!e))err='Pick a start and an end date.';
-  if(!err&&e<s)err='The end date is before the start date.';
-  var mult=null;if(!err&&d.how==='own'){mult=parseFloat(d.mult);if(!(mult>=1))err='Enter a multiple of 1 or more, for example 5.';}
-  var items=null;if(!err&&d.scope==='only'){items=String(d.items||'').split(/[\s,;]+/).map(function(x){return x.trim();}).filter(Boolean);if(!items.length)err='List at least one SKU, or choose All items.';}
-  var cap=null;if(!err&&String(d.cap||'').trim()!==''){cap=parseFloat(d.cap);if(!(cap>=1))err='The cap must be 1 or more.';}
-  if(err){if(typeof toast==='function')toast('<span class="ic ic-alert"></span>'+err,6000);return;}
-  var l=evList(),ex=ed.id?l.find(function(x){return x.id===ed.id;}):null;
-  var rec={id:ed.id||('ev'+Date.now().toString(36)),kind:ex?ex.kind:'custom',name:name,on:ex?ex.on!==false:true,mult:mult,items:items,cap:cap,start:_evISO(s),end:_evISO(e)};
-  if(rec.kind==='bf'){var w=_evNorm({kind:'bf'});if(rec.start===_evISO(w.start)&&rec.end===_evISO(w.end)){rec.start=null;rec.end=null;}} // unchanged dates stay automatic
-  l=ex?l.map(function(x){return x.id===ed.id?rec:x;}):l.concat([rec]);
-  S._evEdit=null;evSave(l);
-}
+function _covUnitsWk(pn,wk,cov){return Math.ceil(wk*cov);}
+function _covUnits(a,cov){return Math.ceil(asmAvgWk(a)*cov);}
 // [/v23.36 EVENT UPLIFT]
 
 // ===================================================================================================
@@ -1051,11 +913,6 @@ function fcBuildSeries(rows,now,weeks){
 function fcEventFlags(start,weeks){
   var f=new Array(weeks).fill(false),y0=new Date(start).getUTCFullYear();
   for(var y=y0;y<=y0+2;y++){var w=_evBF(y),i=Math.round((w.start.getTime()-start)/(7*86400000));if(i>=0&&i<weeks)f[i]=true;}
-  evList().forEach(function(e){ // your own events: the same dates a year and two years back are event weeks too
-    if(e.kind!=='custom'||e.on===false)return;var s0=_evDate(e.start),e0=_evDate(e.end);if(!s0||!e0)return;
-    for(var k=0;k<=2;k++){var a=s0.getTime()-k*364*86400000,b=e0.getTime()-k*364*86400000,i0=Math.floor((a-start)/(7*86400000)),i1=Math.floor((b-start)/(7*86400000));
-      for(var j=i0;j<=i1;j++)if(j>=0&&j<weeks)f[j]=true;}
-  });
   return f;
 }
 function fcClean(y,ev){ // an event week is replaced by the median of its nearest ordinary weeks, so it cannot inflate a baseline
@@ -1175,8 +1032,6 @@ function prodControls(c){
   var sf=c.sf,esc=escHtml,cov=c.cov,chip=function(on,label,click,title){return '<button type="button" class="filter-chip '+(on?'on-teal':'')+'" aria-pressed="'+(on?'true':'false')+'"'+(title?' title="'+title+'"':'')+' onclick="'+click+'">'+label+'</button>';};
   var tog=function(v){return "setFilter('production','status',"+(sf.status===v?"''":"'"+v+"'")+")";};
   var any=!!(sf.status||sf.type||sf.search||sf.openOnly||sf.unpackOnly);
-  var evs=evList(),bf=evs.find(function(e){return e.kind==='bf';}),others=evs.filter(function(e){return e.kind!=='bf'&&e.on!==false;}).length;
-  var bfOn=!!(bf&&bf.on!==false);
   var fcm=forecastMode(),fcTip='';
   if(S._fc&&S._fc.agg&&S._fc.agg.hAct>0){var ag=S._fc.agg;fcTip='On the last 12 weeks it had not seen, the forecast was off by '+Math.round(100*ag.hChosen/ag.hAct)+'% and the plain 12-week average by '+Math.round(100*ag.hAvg12/ag.hAct)+'%.';}
   var who=packedByUser()||'',me=S.currentUser||'',alt=(who&&who!==me);
@@ -1201,7 +1056,7 @@ function prodControls(c){
   var row2='<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 14px;background:var(--bg3)">'
    +'<span class="t3s" style="font-weight:700">Plan next</span>'+[2,4,8,12].map(function(w){return chip(cov===w,w+' wk','S.buildCoverage='+w+';render()','Build and order enough for the next '+w+' weeks of sales');}).join('')
    +grp('<span style="font-size:var(--t-sm);font-weight:700">Forecast</span>'+_sw(fcm!=='off','Forecast on or off','toggleForecast()')+'<span class="t3s" title="'+fcTip+'">'+_fcStatusText()+'</span>')
-   +grp('<span style="font-size:var(--t-sm);font-weight:700">Black Friday</span>'+_sw(bfOn,'Black Friday uplift on or off',"evToggle('bf')")+(bf?pill(bfOn?'ON':'OFF',bfOn?'var(--teal)':'var(--orange)'):pill('REMOVED','var(--orange)'))+(others?'<span class="t3s">+'+others+' more</span>':''))
+   +grp('<span style="font-size:var(--t-sm);font-weight:700">Events</span><span class="t3s">Black Friday, holiday, promos</span><button type="button" class="btn btn-sm" onclick="openHolidayPlanner()" title="Plan and buy ahead of an event">Holiday Planner</button>')
    +'<button type="button" class="btn btn-sm" onclick="openPlanning()" title="What the forecast and events do, and how to change or remove them">Explain &amp; edit</button>'
    +'<span style="flex:1"></span>'
    +'<button type="button" class="btn btn-sm" style="'+(alt?'color:var(--orange);border-color:rgba(234,88,12,.45);font-weight:700':'')+'" onclick="openPackAsPicker()" title="Who is recorded as packing. Resets to the signed-in user on reload."><span class="ic ic-user"></span>'+(alt?('Packing as '+esc(who.split('@')[0])):'Packing as me')+'</button>'
@@ -1230,40 +1085,14 @@ function _plForecast(){
    +'<div style="display:flex;gap:8px;margin-top:12px"><button type="button" class="btn btn-sm" onclick="buildForecasts(true)"'+(S._fcBusy?' disabled':'')+'>'+(S._fcBusy?'Learning...':'Recompute now')+'</button><span class="t3s" style="align-self:center">Each item&#8217;s forecast is on the Data Integrity page.</span></div></div></div>';
 }
 function _plEvents(){
-  var esc=escHtml,all=evAll(),cov=S.buildCoverage||4,now=Date.now();
-  var rows=all.map(function(ev){
-    var big=ev.mult?('&times;'+ev.mult+' for every item'):('Learned from last year'+((S._evStats&&S._evStats[ev.statKey])?', typical &times;'+S._evStats[ev.statKey].gm.toFixed(1):''));
-    var eff='';
-    if(!ev.on)eff='<span class="t3s">Off</span>';
-    else if(ev.end.getTime()+86400000<now)eff='<span class="t3s">Over</span>';
-    else{var im=evImpact(ev);
-      if(!im)eff='<span class="t3s">Learning from last year...</span>';
-      else if(im.items===0&&ev.start.getTime()>now+cov*7*86400000)eff='<span class="t3s">Starts in '+Math.ceil((ev.start.getTime()-now)/86400000)+' days, so not inside your '+cov+'-week plan yet</span>';
-      else eff='<b>'+im.items+'</b> items raised, about <b>+'+im.units+'</b> units'+(im.top.length?'<div class="t3s">Most: '+im.top.map(function(x){return esc(x.pn)+' +'+Math.round(x.x);}).join(', ')+'</div>':'');}
-    return '<tr><td>'+_sw(ev.on,esc(ev.name)+' on or off',"evToggle('"+esc(ev.id)+"')")+'</td><td><b>'+esc(ev.name)+'</b>'+(ev.itemList?'<div class="t3s">'+ev.itemList.length+' chosen items</div>':'')+'</td><td>'+_evFmt(ev.start)+' to '+_evFmt(ev.end)+', '+ev.end.getUTCFullYear()+'</td><td>'+big+'</td><td>'+eff+'</td><td style="white-space:nowrap"><button type="button" class="btn btn-sm" onclick="evEdit(\''+esc(ev.id)+'\')">Edit</button> <button type="button" class="btn btn-sm" style="color:var(--red)" onclick="evDelete(\''+esc(ev.id)+'\')">Delete</button></td></tr>';
-  }).join('');
-  var hasBF=evList().some(function(e){return e.kind==='bf';});
-  var table=rows?'<div class="tbl-wrap"><table><thead><tr><th>On</th><th>Event</th><th>Dates</th><th>How big</th><th>Effect now</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>':'<div class="t3s" style="padding:12px 0">No events. Add one, or put Black Friday back.</div>';
-  var form='';
-  if(S._evEdit){
-    var ed=S._evEdit,d=ed.d,inp='class="input" style="width:100%"';
-    var lastTxt='';var sD=_evDate(d.start),eD=_evDate(d.end);
-    if(sD&&eD){var ln=ed.kind==='bf'?_evBF(sD.getUTCFullYear()-1):{start:new Date(sD.getTime()-364*86400000),end:new Date(eD.getTime()-364*86400000)};lastTxt='The matching week last year is found automatically ('+_evFmt(ln.start)+' to '+_evFmt(ln.end)+', '+ln.end.getUTCFullYear()+').';}
-    form='<div style="margin-top:14px;border:2px solid var(--teal);border-radius:var(--r-md);padding:16px 18px;background:var(--bg1)"><div style="font-weight:800;margin-bottom:10px">'+(ed.id?'Edit: '+esc(d.name||'event'):'Add an event')+'</div>'
-     +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px"><div style="display:flex;flex-direction:column;gap:10px">'
-     +'<label class="t3s" style="font-weight:700">Name<input '+inp+' value="'+esc(d.name)+'" oninput="evEditSet(\'name\',this.value)"></label>'
-     +'<div style="display:flex;gap:10px"><label class="t3s" style="font-weight:700;flex:1">Starts<input type="date" '+inp+' value="'+esc(d.start)+'" onchange="evEditSet(\'start\',this.value,true)"></label><label class="t3s" style="font-weight:700;flex:1">Ends<input type="date" '+inp+' value="'+esc(d.end)+'" onchange="evEditSet(\'end\',this.value,true)"></label></div>'
-     +'<div class="t3s">'+lastTxt+'</div></div><div>'
-     +'<div class="t3s" style="font-weight:700">How big is the spike?</div>'
-     +'<label style="display:flex;gap:8px;align-items:flex-start;padding:6px 0;cursor:pointer"><input type="radio" name="evhow" '+(d.how==='learn'?'checked':'')+' onchange="evEditSet(\'how\',\'learn\',true)"><span><b>Learn it from last year</b> (suggested)<br><span class="t3s">Each item gets its own multiple from how much it sold that week last year, compared with the 8 weeks before.</span></span></label>'
-     +'<label style="display:flex;gap:8px;align-items:center;padding:6px 0;cursor:pointer"><input type="radio" name="evhow" '+(d.how==='own'?'checked':'')+' onchange="evEditSet(\'how\',\'own\',true)"><span><b>Set my own</b></span><input aria-label="Your own multiple" class="input" style="width:64px" value="'+esc(d.mult)+'" '+(d.how==='own'?'':'disabled')+' oninput="evEditSet(\'mult\',this.value)"><span class="t3s">times a normal week, for every item</span></label>'
-     +'<div class="t3s" style="font-weight:700;margin-top:6px">Applies to</div><div style="display:flex;gap:16px;padding-top:4px"><label style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="radio" name="evwho" '+(d.scope==='all'?'checked':'')+' onchange="evEditSet(\'scope\',\'all\',true)">All items</label><label style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="radio" name="evwho" '+(d.scope==='only'?'checked':'')+' onchange="evEditSet(\'scope\',\'only\',true)">Only these SKUs</label></div>'
-     +(d.scope==='only'?'<textarea class="input" rows="2" style="width:100%;margin-top:6px" placeholder="SKUs separated by commas or spaces" oninput="evEditSet(\'items\',this.value)">'+esc(d.items)+'</textarea>':'')
-     +'<label class="t3s" style="font-weight:700;display:flex;gap:8px;align-items:center;margin-top:8px">No item raised by more than <input aria-label="Cap" class="input" style="width:64px" placeholder="8" value="'+esc(d.cap)+'" oninput="evEditSet(\'cap\',this.value)"> times</label></div></div>'
-     +'<div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px"><div style="display:flex;gap:8px"><button type="button" class="btn btn-primary btn-sm" onclick="evEditSave()">Save changes</button><button type="button" class="btn btn-sm" onclick="evEditCancel()">Cancel</button></div>'+(ed.id?'<button type="button" class="btn btn-sm" style="color:var(--red)" onclick="evDelete(\''+esc(ed.id)+'\')">Delete event</button>':'')+'</div></div>';
-  }
-  var explain='<div style="margin-top:12px;font-size:var(--t-sm);line-height:1.5;color:var(--text2);border:1px solid var(--border);border-radius:var(--r-md);padding:12px 14px;background:var(--bg3)"><b>How &ldquo;learned from last year&rdquo; works.</b> For each item, the ERP compares the matching week last year with the 8 weeks before it. For example, TGK-INT-01 sold about 3 a week before Black Friday last year and 21 in Black Friday week, roughly 7 times a normal week. Items with little history use the shop&#8217;s typical value instead, and no item is raised by more than 8 times unless you change the cap. The extra units are added to a target only when its planning window reaches the event.</div>';
-  return '<div class="panel" style="padding:0;overflow:hidden"><div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 18px;border-bottom:1px solid var(--border)"><div><h2 style="margin:0;font-size:var(--t-lg,18px)">Events, like Black Friday</h2><div class="t3s" style="margin-top:2px;max-width:640px">Some weeks sell far more than normal. Tell the ERP about them and it adds extra stock to any build or reorder target whose planning window reaches that week.</div></div><div style="display:flex;gap:6px">'+(hasBF?'':'<button type="button" class="btn btn-sm" onclick="evToggle(\'bf\')">+ Black Friday</button>')+'<button type="button" class="btn btn-primary btn-sm" onclick="evEdit(null)">+ Add event</button></div></div><div style="padding:14px 18px 18px">'+table+form+explain+'<div class="t3s" style="margin-top:10px">Examples to add: a spring sale, a product launch, a dealer order you know is coming.</div></div></div>';
+  return '<div class="panel" style="padding:0;overflow:hidden"><div style="padding:12px 18px;border-bottom:1px solid var(--border)"><h2 style="margin:0;font-size:var(--t-lg,18px)">Events, like Black Friday</h2></div>'
+   +'<div style="padding:14px 18px 18px"><div style="font-size:var(--t-sm);line-height:1.5;color:var(--text2);max-width:780px">Black Friday, the holidays and any promo are planned in the <b>Holiday Planner</b> on the Purchasing screen. It works out each item&#8217;s lift from last year, lets you override any number for any SKU, and turns that into what to build and buy, with order-by dates. The forecast above does not change those plans. It only keeps the Black Friday week out of its normal-week averages.</div>'
+   +'<div style="margin-top:12px"><button type="button" class="btn btn-primary btn-sm" onclick="openHolidayPlanner()">Open the Holiday Planner</button></div></div></div>';
+}
+function openHolidayPlanner(){closePlanning();S.planTab='events';nav('planning');}
+function purchPlanningBits(){
+  return '<span style="display:flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:var(--r-md);padding:0 10px 0 12px;min-height:32px;background:var(--bg1)"><span style="font-size:var(--t-sm);font-weight:700">Forecast</span>'+_sw(forecastMode()!=='off','Forecast on or off','toggleForecast()')+'<span class="t3s">'+_fcStatusText()+'</span></span>'
+   +'<button type="button" class="btn btn-sm" onclick="openPlanning()" title="What the forecast does, how accurate it is, and how to change it">Explain &amp; edit</button>';
 }
 function openPlanning(){
   if(typeof document==='undefined')return;
@@ -1273,7 +1102,7 @@ function openPlanning(){
     ov.onclick=function(e){if(e.target===ov)closePlanning();};document.body.appendChild(ov);}
   var st=ov.firstChild&&ov.firstChild.scrollTop;
   ov.innerHTML='<div style="max-width:1060px;margin:0 auto;background:var(--bg);border:1px solid var(--border);border-radius:var(--r-lg,14px);padding:18px 20px 22px;box-shadow:0 20px 60px rgba(0,0,0,.35)">'
-    +'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:12px"><div><div class="t3s" style="letter-spacing:.12em;font-weight:700">PRODUCTION &amp; PACKING</div><h1 style="margin:2px 0 4px;font-size:var(--t-xl,24px)">Planning</h1><div class="t3s" style="max-width:720px">By default the ERP plans from the last 12 weeks of sales. These two optional helpers adjust that. Each has an on/off switch, and nothing here deletes sales or stock data.</div></div><button type="button" class="btn btn-sm" onclick="closePlanning()">Close</button></div>'
+    +'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:12px"><div><div class="t3s" style="letter-spacing:.12em;font-weight:700">PRODUCTION &amp; PACKING</div><h1 style="margin:2px 0 4px;font-size:var(--t-xl,24px)">Planning</h1><div class="t3s" style="max-width:720px">By default the ERP plans from the last 12 weeks of sales. The forecast is an optional helper that adjusts that. It has an on/off switch, and nothing here deletes sales or stock data. Events like Black Friday are planned in the Holiday Planner.</div></div><button type="button" class="btn btn-sm" onclick="closePlanning()">Close</button></div>'
     +_plForecast()+_plEvents()+'</div>';
 }
 function closePlanning(){S._evEdit=null;var ov=typeof document!=='undefined'&&document.getElementById('plan-overlay');if(ov&&ov.remove)ov.remove();}
@@ -22254,7 +22083,7 @@ function calcSuggestedQty(p) {
     // [HORIZON] The selected horizon defines target coverage. max_qty must NOT cap this branch:
     // max is an order-up-to level computed for one default cycle, so capping here froze the
     // suggestion at the same number across 4w..52w (the "horizon doesn't adapt" bug).
-    const needed = Math.ceil(wkDemand * (fw + lt) + eventExtra(p.pn, wkDemand, fw + lt)); // [v23.36] + event uplift
+    const needed = Math.ceil(wkDemand * (fw + lt));
     sq = Math.max(0, needed - available - onOrder);
   } else {
     if(max > 0) return Math.max(0, Math.ceil(max - available - onOrder));
@@ -22805,9 +22634,9 @@ function renderPlanning() {
     <div class="tab ${S.planTab==='roi'?'active':''}" onclick="S.planTab='roi';render()" title="Track startup investment per assembly against real gross profit">&#128176; ROI</div>
     <div class="tab ${S.planTab==='events'?'active':''}" onclick="S.planTab='events';render()" title="Black Friday, holiday and promo planning - forecast, build and buy ahead of the event">&#127873; Holiday Planner</div>
   </div>
-  ${(S.planTab!=='builder'&&S.planTab!=='dev'&&S.planTab!=='roi')?`  <div class="panel" style="padding:12px 16px">
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
-      <div class="search-wrap" style="flex:1;min-width:160px"><span class="search-icon"><span class="ic ic-search"></span></span><input placeholder="Search part, description, vendor…" value="${sf.search||''}" oninput="setFilter('planning','search',this.value)"></div>
+  ${(S.planTab!=='builder'&&S.planTab!=='dev'&&S.planTab!=='roi')?`  <div class="panel" style="padding:8px 14px">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+      <div class="search-wrap" style="flex:0 1 260px;min-width:160px"><span class="search-icon"><span class="ic ic-search"></span></span><input placeholder="Search part, description, vendor…" value="${sf.search||''}" oninput="setFilter('planning','search',this.value)"></div>
       <select class="form-input" style="width:auto;padding:6px 10px;font-size:var(--t-sm)" onchange="setFilter('planning','cat',this.value)">
         <option value="">All Categories</option>
         ${cats.map(c=>`<option value="${c}" ${sf.cat===c?'selected':''}>${c}</option>`).join('')}
@@ -22824,8 +22653,8 @@ function renderPlanning() {
       <button class="btn btn-sm" onclick="openTierSavings()" title="Parts where ordering a bigger batch gets a lower price per unit" style="color:var(--green);border-color:rgba(22,163,74,.35)"><span class="ic ic-money"></span>Bulk Savings</button>
       <button class="btn btn-primary btn-sm" onclick="createSuggestedPOs()">+ Create Suggested POs (${needsReorder.length})</button>
     </div>
-    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--border)">
-      <span style="font-size:var(--t-sm);color:var(--text3);flex-shrink:0;width:44px">Status:</span>
+    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid var(--border)">
+      <span style="font-size:var(--t-sm);color:var(--text3);font-weight:700;flex-shrink:0;width:44px" title="Colors show urgency: red needs ordering, orange is on order but short, yellow is getting close, teal is covered by a PO, purple is overstock, green is OK">Show</span>
       <button class="filter-chip ${!sf.status?'on-teal':''}" onclick="setFilter('planning','status','')">All (${allTracked.length})</button>
       ${sSt('Needs Ordering','<span class="ic ic-cart"></span>Needs Ordering ('+(kpiCritical+kpiReorder)+')')}
       ${sSt('On Order – Short','<span class="ic ic-clock"></span>On Order–Short ('+kpiShort+')')}
@@ -22850,6 +22679,7 @@ function renderPlanning() {
         if(h.state==='long')return `<span style="${base};color:var(--text3);border:1px solid var(--border)" title="Buying ${h.fw}w of components while production only plans ${h.cov}w of builds. Fine if it is deliberate for MOQ or price breaks, but the parts will sit.">Production plans ${h.cov}w builds &middot; buying ${h.fw}w</span>`;
         return `<span style="${base};color:var(--teal)" title="Purchasing at ${h.fw}w covers the ${h.cov}w build plan. Each part adds its own lead time on top automatically (longest here is ${h.lead}w).">&#10003; in step with ${h.cov}w production</span>`;
       })()}
+      <span style="flex:1"></span>${purchPlanningBits()}
     </div>
   </div>`:''}
   ${S.planTab==='minmax'?renderMinMaxTab(parts):S.planTab==='builder'?renderPOBuilderTab():S.planTab==='dev'?renderDevPartsTab(devOnlyParts):S.planTab==='roi'?renderROITab():S.planTab==='events'?renderHolidayPlanner():`
@@ -25442,7 +25272,7 @@ window.derivedAvgWk=derivedAvgWk;
 function subTarget(pn){
   const a=(S._asmIdx&&S._asmIdx[pn])||null;
   if(!a)return 0;
-  const _dw=derivedAvgWk(pn),_cv=S.buildCoverage||4;const byCover=Math.ceil(_dw*_cv+eventExtra(pn,_dw,_cv));
+  const byCover=Math.ceil(derivedAvgWk(pn)*(S.buildCoverage||4));
   return Math.max(byCover, Number(a.min_qty)||0);
 }
 window.subTarget=subTarget;
@@ -28218,26 +28048,51 @@ function _opsMissingErr(e){return !!e&&(e.code==='42P01'||/does not exist|schema
 async function opsLoad(full){
   var O=_opsEnsure();if(O.loading)return;O.loading=true;
   try{
-    var since24=new Date(Date.now()-24*3600*1000).toISOString(),since7=new Date(Date.now()-7*86400*1000).toISOString();
+    var since24=new Date(Date.now()-24*3600*1000).toISOString(),since7=new Date(Date.now()-7*86400*1000).toISOString(),since3=new Date(Date.now()-3*3600*1000).toISOString();
     var qs=[db.from('ops_jobs').select('*').order('name'),
             db.from('recon_issues').select('*').in('status',['open','ignored']).order('last_seen_at',{ascending:false}).limit(300)];
     if(full)qs.push(
       db.from('ops_job_runs').select('id,job,started_at,status,duration_ms,error,trigger').order('started_at',{ascending:false}).limit(15),
       db.from('webhook_events').select('source,topic,status,via,deliveries,received_at,ref,error').gte('received_at',since24).order('received_at',{ascending:false}).limit(1500),
       db.from('recon_runs').select('*').order('started_at',{ascending:false}).limit(5),
-      db.from('recon_issues').select('*').eq('status','auto_fixed').gte('resolved_at',since7).order('resolved_at',{ascending:false}).limit(100));
+      db.from('recon_issues').select('*').eq('status','auto_fixed').gte('resolved_at',since7).order('resolved_at',{ascending:false}).limit(100),
+      db.from('ops_job_runs').select('job,started_at,status,trigger').gte('started_at',since3).order('started_at',{ascending:false}).limit(900));
     var rs=await Promise.all(qs);
     var bad=rs.find(function(r){return r&&r.error;});
     if(bad&&_opsMissingErr(bad.error)){O.missing=true;O.jobs=[];O.issues=[];O.retryAt=Date.now()+30*60000;}
     else if(bad){O.err=String(bad.error.message||bad.error);}
     else{
       O.missing=false;O.err='';O.jobs=rs[0].data||[];O.issues=rs[1].data||[];
-      if(full){O.runs=rs[2].data||[];O.events=rs[3].data||[];O.reconRuns=rs[4].data||[];O.fixed=rs[5].data||[];}
+      if(full){O.runs=rs[2].data||[];O.events=rs[3].data||[];O.reconRuns=rs[4].data||[];O.fixed=rs[5].data||[];O.runsRecent=rs[6].data||[];
+        // a job that runs less than every 12 hours (the nightly check) would fall outside the 3-hour window: fetch its latest runs separately
+        var slow=(O.jobs||[]).filter(function(j){return Number(j.interval_minutes)>=720;}).map(function(j){return j.name;});
+        if(slow.length){var sr=await db.from('ops_job_runs').select('job,started_at,status,trigger').in('job',slow).order('started_at',{ascending:false}).limit(20);
+          if(sr&&!sr.error)O.runsRecent=O.runsRecent.concat(sr.data||[]).sort(function(a,b){return String(b.started_at).localeCompare(String(a.started_at));});}
+      }
     }
     O.loadedAt=Date.now();
   }catch(e){O.err=String((e&&e.message)||e);}
   if(full)O.fullLoaded=true;
   O.loading=false;
+}
+function _opsRunInfo(O,j){ // newest first: the last run of this job, and the last one the SCHEDULE started
+  var rr=O.runsRecent||[],last=null,cron=null;
+  for(var i=0;i<rr.length;i++){if(rr[i].job!==j.name)continue;if(!last)last=rr[i];if(!cron&&rr[i].trigger==='cron')cron=rr[i];if(last&&cron)break;}
+  return {last:last,lastCron:cron};
+}
+function _opsScheduler(O){ // is the schedule itself firing? Only runs started BY THE SCHEDULE count: a run started with Run now proves nothing about it
+  var jobs=(O.jobs||[]).filter(function(j){return j.enabled!==false&&Number(j.interval_minutes)<=60;});
+  if(!jobs.length)return {state:'none'};
+  var last=null,rr=O.runsRecent||[];for(var i=0;i<rr.length;i++){if(rr[i].trigger==='cron'){last=rr[i];break;}}
+  var fastest=Math.min.apply(null,jobs.map(function(j){return Number(j.interval_minutes)||5;}));
+  var ageMin=last?(Date.now()-new Date(last.started_at).getTime())/60000:Infinity;
+  return {state:ageMin<=Math.max(fastest*3,15)?'ok':'stalled',last:last,ageMin:ageMin};
+}
+function _opsDur(m){return m<=1?'1 min':m<60?Math.round(m)+' min':(m/60).toFixed(1)+' h';}
+function _opsBanner(O){
+  var s=_opsScheduler(O);if(s.state==='none')return '';
+  if(s.state==='ok')return '<div class="panel" style="padding:8px 14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px"><span class="pill pill-teal">Scheduler working</span><span style="font-size:var(--t-sm)">Last automatic run <b>'+timeAgo(s.last.started_at)+'</b>.</span><span class="t3xs" style="color:var(--text3)">A run marked &ldquo;by hand&rdquo; was started with Run now, so it does not prove the schedule is firing.</span></div>';
+  return '<div class="panel" style="padding:10px 14px;border-left:3px solid var(--orange);margin-bottom:10px"><span class="pill pill-orange">Scheduler not firing</span> <span style="font-size:var(--t-sm)">'+(s.last?('The last automatic run was <b>'+timeAgo(s.last.started_at)+'</b>.'):'No automatic run in the last 3 hours.')+' Runs started with Run now do not count, so these jobs may only look healthy because someone pressed the button.</span><div class="t3xs" style="color:var(--text3);margin-top:4px">Check in Supabase that the cron schedule is active, and that the ops-cron function&#8217;s logs show the schedule&#8217;s calls being accepted.</div></div>';
 }
 function _opsLateMin(j){var iv=Number(j.interval_minutes)||5;return iv<=60?Math.max(iv*2.5,iv+10):iv*1.6;}
 function _opsJobHealth(j){
@@ -28321,8 +28176,8 @@ async function opsIssue(id,status){
 function _opsSetupPanel(open){
   return '<details class="panel" style="padding:0;margin-top:12px"'+(open?' open':'')+'><summary style="cursor:pointer;padding:10px 14px;font-weight:700">Setup: database, schedule and functions</summary><div style="padding:0 14px 14px;font-size:var(--t-sm)">'
    +'<ol style="margin:8px 0 10px 18px;line-height:1.6"><li><b>Database + schedule.</b> <button class="btn btn-sm" onclick="copyText(ERP_OPS_SQL,this)">Copy SQL</button> Open the Supabase SQL editor, paste it, put your <b>service_role</b> key on the line marked <code>PASTE HERE</code>, and Run. Safe to run again.</li>'
-   +'<li><b>Deploy three functions.</b> <b>ops-cron</b> is new (source below). <b>shopify-orders v23.84</b> and <b>shipstation-ship v23.99</b> add the webhook log: copy them from Integrations &rarr; Setup Guide, or push the files to GitHub.</li>'
-   +'<li><b>Come back here and press Refresh.</b> All four jobs should show OK within about five minutes.</li></ol>'
+   +'<li><b>Deploy three functions.</b> <b>ops-cron</b> (source below), <b>shopify-orders</b> and <b>shipstation-ship</b>: copy them from Integrations &rarr; Setup Guide, or push the files to GitHub. The Integrations page shows which versions are live.</li>'
+   +'<li><b>Come back here and press Refresh.</b> Every job should show On time within about five minutes, and the banner at the top should say Scheduler working.</li></ol>'
    +'<div style="display:flex;align-items:center;gap:8px;margin:6px 0"><span class="pn">supabase/functions/ops-cron/index.ts</span><button class="btn btn-sm" style="margin-left:auto" onclick="copyText(ERP_OPS_CRON_SRC,this)">Copy</button></div>'
    +'<pre style="background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);padding:12px;font-size:var(--t-xs);max-height:260px;overflow:auto;white-space:pre-wrap">'+escHtml(ERP_OPS_CRON_SRC)+'</pre>'
    +'<div class="t3xs" style="color:var(--text3);margin-top:6px">To stop everything later, run in the SQL editor: <code>select cron.unschedule(jobname) from cron.job where jobname like \'tgk-ops-%\';</code></div></div></details>';
@@ -28335,20 +28190,29 @@ function renderOpsPanel(){
   var h='<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap"><div style="font-size:var(--t-sm);color:var(--text2);flex:1;min-width:220px">These run on the server on a schedule, whether or not anyone has the ERP open.</div>'
    +'<span class="t3xs" style="color:var(--text3)">updated '+timeAgo(new Date(O.loadedAt).toISOString())+'</span><button class="btn btn-sm" '+(O.loading?'disabled':'')+' onclick="S.ops.fullLoaded=false;render()">Refresh</button></div>';
   if(O.err)h+='<div class="panel" style="padding:8px 14px;border-left:3px solid var(--red);font-size:var(--t-sm)">Could not load some data: '+escHtml(O.err)+'</div>';
+  h+=_opsBanner(O);
   // ---- jobs
-  var rows=(O.jobs||[]).map(function(j){var hh=_opsJobHealth(j),every=(j.interval_minutes>=1440?'every night':'every '+j.interval_minutes+' min'),run=!!O.running[j.name];
-    return '<tr><td style="min-width:190px;white-space:normal"><b>'+escHtml(j.label||j.name)+'</b><div class="t3xs" style="color:var(--text3);white-space:normal">'+escHtml(j.description||'')+'</div></td><td class="t3xs">'+every+'</td>'
-     +'<td><span class="pill '+hh.cls+'">'+hh.label+'</span></td>'
-     +'<td>'+(j.last_ok_at?timeAgo(j.last_ok_at):'never')+(j.last_status==='error'&&j.last_error?'<div class="t3xs" style="color:var(--red);max-width:260px">'+escHtml(String(j.last_error).slice(0,160))+'</div>':'')+'</td>'
+  var rows=(O.jobs||[]).map(function(j){
+    var hh=_opsJobHealth(j),every=(j.interval_minutes>=1440?'every night':'every '+j.interval_minutes+' min'),run=!!O.running[j.name],ri=_opsRunInfo(O,j),on=j.enabled!==false;
+    var label=j.label||j.name,lastAt=ri.last?ri.last.started_at:(j.last_started_at||null),how=ri.last?(ri.last.trigger==='cron'?'by schedule':'by hand'):'';
+    var next='<span class="t3xs">&mdash;</span>';
+    if(on&&ri.lastCron){var iv=Number(j.interval_minutes)||5,rem=(new Date(ri.lastCron.started_at).getTime()+iv*60000-Date.now())/60000;
+      next=rem>=0?('in about '+_opsDur(rem)):('<span style="color:var(--orange);font-weight:700">overdue by '+_opsDur(-rem)+'</span>');}
+    else if(on)next='<span class="t3xs">waiting for a scheduled run</span>';
+    return '<tr><td style="min-width:190px;white-space:normal"><b>'+escHtml(label)+'</b><div class="t3xs" style="color:var(--text3);white-space:normal">'+escHtml(j.description||'')+'</div></td><td class="t3xs">'+every+'</td><td class="t3xs">'+next+'</td>'
+     +'<td>'+(lastAt?timeAgo(lastAt):'never')+(how?'<div class="t3xs" style="color:'+(how==='by hand'?'var(--orange)':'var(--text3)')+'">'+how+'</div>':'')+(j.last_status==='error'&&j.last_error?'<div class="t3xs" style="color:var(--red);max-width:260px">'+escHtml(String(j.last_error).slice(0,160))+'</div>':'')+'</td>'
      +'<td class="t3xs">'+escHtml(_opsSummaryText(j.name,j.last_summary))+'</td>'
-     +'<td style="white-space:nowrap"><button class="btn btn-sm" '+(run?'disabled':'')+' onclick="opsRunNow(\''+j.name+'\')">'+(run?'Running&hellip;':'Run now')+'</button> <button class="btn btn-sm" onclick="opsToggle(\''+j.name+'\')">'+(j.enabled===false?'Resume':'Pause')+'</button></td></tr>';}).join('');
-  h+='<div class="panel" style="padding:0"><div class="panel-title"><span>Scheduled jobs</span></div><div class="tbl-wrap"><table><thead><tr><th>Job</th><th>Runs</th><th>Status</th><th>Last success</th><th>Last result</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+     +'<td><span class="pill '+hh.cls+'">'+(hh.state==='ok'?'On time':hh.label)+'</span></td>'
+     +'<td style="white-space:nowrap"><button class="btn btn-sm" '+(run?'disabled':'')+' onclick="opsRunNow(\''+j.name+'\')">'+(run?'Running&hellip;':'Run now')+'</button> <span style="display:inline-flex;align-items:center;vertical-align:middle">'+_sw(on,'Pause '+escHtml(label),"opsToggle(\'"+j.name+"\')")+'<span class="t3xs">'+(on?'Running':'Paused')+'</span></span></td></tr>';}).join('');
+  h+='<div class="panel" style="padding:0"><div class="panel-title"><span>Scheduled jobs</span></div><div class="tbl-wrap"><table><thead><tr><th>Job</th><th>How often</th><th>Next run</th><th>Last run</th><th>Last result</th><th>Status</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+   +'<div class="t3xs" style="padding:8px 14px;color:var(--text3)"><b>On time</b>: ran when expected &middot; <b>Late</b>: has not succeeded for more than two and a half runs, so check the schedule &middot; <b>Failing</b>: its last run hit an error &middot; <b>Paused</b>: switched off by you. &ldquo;Next run&rdquo; is counted from the last run the schedule started.</div></div>';
   // ---- reconciliation
   var lr=(O.reconRuns||[])[0],open=(O.issues||[]).filter(function(i){return i.status==='open';}),ign=(O.issues||[]).filter(function(i){return i.status==='ignored';});
   var runR=!!O.running.reconcile;
   h+='<div class="panel" style="padding:0;margin-top:12px"><div class="panel-title"><span>Shopify vs ERP: nightly check</span><div style="display:flex;gap:8px"><button class="btn btn-sm" '+(runR?'disabled':'')+' onclick="opsRunNow(\'reconcile\',{dry_run:true})" title="Look for differences but repair nothing">Check only</button><button class="btn btn-primary btn-sm" '+(runR?'disabled':'')+' onclick="opsRunNow(\'reconcile\')" title="Check the last 72 hours and repair what is safe to repair">'+(runR?'Running&hellip;':'Check &amp; repair now')+'</button></div></div>'
-   +'<div style="padding:8px 14px;font-size:var(--t-sm);color:var(--text2)">'+(lr?('Last check '+timeAgo(lr.started_at)+': '+escHtml(_opsSummaryText('reconcile',lr.summary)||lr.status)+'.'):'It has not run yet. It runs every night, or press the button.')+' It compares every Shopify order from the last 72 hours with the ERP, re-sends anything the ERP missed through the normal webhook path, and lists whatever is left.</div>';
+   +'<div style="padding:8px 14px;font-size:var(--t-sm);color:var(--text2)">'+(lr?('Last check '+timeAgo(lr.started_at)+': '+escHtml(_opsSummaryText('reconcile',lr.summary)||lr.status)+'.'+((!open.length&&lr.summary&&Number(lr.summary.still_open)>0)?' <b>Nothing is waiting on you now</b>: they were resolved or ignored since.':'')):'It has not run yet. It runs every night, or press the button.')+' It compares every Shopify order from the last 72 hours with the ERP, re-sends anything the ERP missed through the normal webhook path, and lists whatever is left.</div>';
   if(open.length){
+    h+='<div style="padding:6px 14px 0;font-weight:800;color:var(--orange)">Needs you ('+open.length+')</div>';
     h+='<div class="tbl-wrap"><table><thead><tr><th>Problem</th><th>Order</th><th>Detail</th><th>First seen</th><th></th></tr></thead><tbody>'+open.map(function(i){var k=OPS_KIND[i.kind]||{label:i.kind,hint:''};
       return '<tr><td><span style="color:'+(i.severity==='error'?'var(--red)':'var(--orange)')+'">&#9679;</span> <b>'+escHtml(k.label)+'</b></td>'
        +'<td>'+(i.order_number?'<a href="#" data-o="'+escHtml(i.order_number)+'" onclick="goToOrder(this.dataset.o);return false">'+escHtml(i.order_number)+'</a>':'&mdash;')+'</td>'
@@ -28366,7 +28230,7 @@ function renderOpsPanel(){
   var gl=Object.keys(groups).sort().map(function(k){return groups[k];});
   var d=new Date(),biz=d.getDay()>=1&&d.getDay()<=5&&d.getHours()>=9&&d.getHours()<19;
   var warn='';
-  if(!ev.length)warn='Nothing has been logged yet. Once shopify-orders v23.84 and shipstation-ship v23.99 are deployed, every webhook shows up here.';
+  if(!ev.length)warn='Nothing has been logged yet. Once the shopify-orders and shipstation-ship functions are deployed, every webhook shows up here.';
   else if(biz&&lastShop&&Date.now()-lastShop>8*3600*1000)warn='Shopify has not sent an order webhook for '+Math.floor((Date.now()-lastShop)/3600000)+' hours during business hours. If orders have been coming in, check the webhook settings in Shopify.';
   h+='<div class="panel" style="padding:0;margin-top:12px"><div class="panel-title"><span>Webhooks, last 24 hours</span></div>'+(warn?'<div style="padding:8px 14px;font-size:var(--t-sm);color:var(--orange)">'+escHtml(warn)+'</div>':'');
   if(gl.length)h+='<div class="tbl-wrap"><table><thead><tr><th>From</th><th>Event</th><th>Received</th><th>OK</th><th>Failed</th><th>Re-deliveries skipped</th><th>Repair replays</th><th>Last</th></tr></thead><tbody>'+gl.map(function(g){
@@ -35391,7 +35255,6 @@ function printPriceList(){
         try{startAutoBackup();}catch(e){console.error('startAutoBackup:',e);}
         try{startAutoRefresh();}catch(e){console.error('startAutoRefresh:',e);}
         try{maybeDailyStockCheck();}catch(e){console.warn('stock check:',e);}
-        try{setTimeout(function(){loadEventHistory();},4000);}catch(e){}
         try{setTimeout(function(){buildForecasts();},9000);}catch(e){}
         try{
   const _rh=(window.location.hash||'').replace(/^#/,'').split('?')[0].toLowerCase();
