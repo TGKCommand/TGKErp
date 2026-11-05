@@ -474,7 +474,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.48</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.49</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -539,7 +539,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.48';
+const TGK_ERP_VERSION = 'v23.49';
 const TGK_ERP_BUILD_DATE = '2026-11-02';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -1617,6 +1617,39 @@ async function fetchAll(query){
 // it with ensureSalesSince(); searches fall back to the database.
 var SALES_WINDOW_DAYS=180;
 var SALES_DONE=['Shipped','Delivered','Cancelled','Refunded','Returned'];
+// [v23.49] Sales Orders sorts every order, then shows the first page. Click a header: ascending, descending, then back to newest first.
+function _salesSortList(list,key,dir,stockKey){
+  var sign=dir==='desc'?-1:1,RANK=['Open','On Hold','Partial','Packed','Shipped','Delivered','Cancelled','Refunded'];
+  var val=function(s){
+    switch(key){
+      case 'date':return String(s.sale_date||(s.created_at||'').slice(0,10)||'');
+      case 'order':{var m=String(s.order_number||'').match(/\d+/);return m?parseInt(m[0],10):null;}
+      case 'customer':return String(s.customer_name||'').trim();
+      case 'sku':return s._grouped?'Multiple SKUs':String((typeof dispSku==='function'?dispSku(s.pn):s.pn)||'');
+      case 'qty':return Number(s.qty)||0;
+      case 'stock':return stockKey?stockKey(s):null;
+      case 'status':{var i=RANK.indexOf(s.fulfillment_status||'Open');return i<0?99:i;}
+      case 'tracking':return String(s.tracking_number||((s._allLines||[]).find(function(x){return x.tracking_number;})||{}).tracking_number||'');
+    }
+    return null;
+  };
+  var blank=function(v){return v===null||v===undefined||v===''||(typeof v==='number'&&isNaN(v));};
+  var rows=list.map(function(s,i){return {s:s,i:i,v:val(s)};});
+  rows.sort(function(a,b){
+    var ab=blank(a.v),bb=blank(b.v);if(ab&&bb)return a.i-b.i;if(ab)return 1;if(bb)return -1; // blanks last either way
+    var r=(typeof a.v==='number'&&typeof b.v==='number')?a.v-b.v:natCmp(a.v,b.v);
+    if(!r&&key==='date')r=String(a.s.created_at||'').localeCompare(String(b.s.created_at||'')); // same day: by time
+    if(!r&&key==='order')r=natCmp(a.s.order_number,b.s.order_number);
+    return r?r*sign:a.i-b.i; // ties keep the newest-first order
+  });
+  return rows.map(function(x){return x.s;});
+}
+function salesSortBy(key){
+  var f=S.filters.sales||(S.filters.sales={});
+  if(f.sort!==key){f.sort=key;f.dir='asc';}else if(f.dir==='asc'){f.dir='desc';}else{f.sort='';f.dir='';}
+  render();
+}
+window.salesSortBy=salesSortBy;
 function _sortSales(rows){
   return rows.sort(function(a,b){return String(b.sale_date||'').localeCompare(String(a.sale_date||''))||String(b.created_at||'').localeCompare(String(a.created_at||''));});
 }
@@ -5486,10 +5519,17 @@ function renderSales(){
   // salesLoadMore) was already here and viewport-agnostic; desktop just wasn't using it.
   const _salesIsMobile = !!(window.matchMedia && window.matchMedia('(max-width:768px)').matches);
   const _SALES_PAGE = _salesIsMobile ? 100 : 200;
-  const _salesSig = JSON.stringify([q, sf.fstatus||'', sf.readiness||'', (sf.orderNums||[]).join(',')]);
+  const _salesSig = JSON.stringify([q, sf.fstatus||'', sf.readiness||'', (sf.orderNums||[]).join(','), sf.sort||'', sf.dir||'']);
   if(window._salesMobileSig !== _salesSig){ window._salesMobileSig = _salesSig; window._salesMobileLimit = _SALES_PAGE; }
   window._salesPageSize = _SALES_PAGE;
   const _salesLimit = window._salesMobileLimit || _SALES_PAGE;
+  if(sf.sort){ // [v23.49] sort the whole filtered list first, then page it
+    list=_salesSortList(list,sf.sort,sf.dir||'asc',function(s){
+      if(s._grouped){var r=readinessFor(s);return r?({blocked:-1,split:1000001,ready:1000002}[r.level]):null;}
+      var a=asmByPn.get(s.pn),p=a?null:partByPn.get(s.pn);return a?(a.total_on_hand||0):p?(p.total_unpckgd||0):null;
+    });
+  }
+  const _sth=(key,label,tip)=>{const on=sf.sort===key;return `<th data-nosort="1" class="${on?(sf.dir==='desc'?'sorted-desc':'sorted-asc'):''}" style="cursor:pointer;user-select:none" ${tip?`title="${tip}"`:''} onclick="salesSortBy('${key}')">${label}</th>`;};
   const _salesVisible = list.slice(0, _salesLimit);
   const _salesHidden = list.length - _salesVisible.length;
 
@@ -5586,7 +5626,7 @@ function renderSales(){
   </div>
   <div id="bulk-bar" style="display:none;position:fixed;bottom:80px;left:50%;transform:translateX(-50%);z-index:200;background:#1e2022;border:1px solid #2ABFAA;border-radius:var(--r-md);box-shadow:0 4px 24px rgba(0,0,0,.45);padding:10px 18px;align-items:center;gap:10px;flex-wrap:nowrap;white-space:nowrap"><span class="bulk-cnt" style="font-size:var(--t-md);font-weight:700;color:#fff;margin-right:4px"></span><button class="btn btn-teal btn-sm" onclick="bulkMarkShipped()">&#128666; Mark Shipped</button><button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="bulkMarkDelivered()">&#10003; Mark Delivered</button><button class="btn btn-sm" style="color:var(--teal);border-color:rgba(13,148,136,.3)" onclick="bulkPrintPackingSlips()" title="Print a packing slip for every selected order as one print job">&#128230; Packing Slips</button><button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="bulkMarkCancelled()">&#215; Cancel</button><button class="btn btn-sm" style="color:var(--text3)" onclick="window._salesSel.clear();refreshBulkBar();render()">Clear</button></div>
   <div class="tbl-wrap">
-  <table data-tid="sales"><thead class="sticky-header"><tr><th style="width:34px;padding:6px 8px;text-align:center"><input type="checkbox" title="Select/deselect all visible" onchange="bulkSelAll(this.checked)" style="cursor:pointer;accent-color:#2ABFAA"></th><th>Date</th><th>Order #</th><th>Customer</th><th>SKU</th><th>Qty</th><th>Stock</th><th>Fulfillment</th><th>Tracking</th><th>Actions</th></tr></thead><tbody>
+  <table data-tid="sales"><thead class="sticky-header"><tr><th style="width:34px;padding:6px 8px;text-align:center"><input type="checkbox" title="Select/deselect all visible" onchange="bulkSelAll(this.checked)" style="cursor:pointer;accent-color:#2ABFAA"></th>${_sth('date','Date')}${_sth('order','Order #')}${_sth('customer','Customer')}${_sth('sku','SKU')}${_sth('qty','Qty')}${_sth('stock','Stock','Single orders sort by units in stock. Multi-item orders sort by how ready they are.')}${_sth('status','Fulfillment')}${_sth('tracking','Tracking')}<th>Actions</th></tr></thead><tbody>
   ${(()=>{S._salesNavCtx=list.map(s=>s.id);return'';})()}
   ${_salesVisible.map((s,_rowIdx)=>{
     const fs=s.fulfillment_status||'Open';
@@ -20654,15 +20694,76 @@ function buildActivityFeed(limit){
   return deduped.slice(0,limit||12);
 }
 
-function parseCellVal(td){
-  const t=(td.textContent||'').trim();
-  if(t==='—'||t==='-'||t==='')return{n:null,s:''};
-  const num=parseFloat(t.replace(/[$,%]/g,'').replace(/,/g,'').replace(/w$/,'').replace(/\/wk$/,''));
-  return isNaN(num)?{n:null,s:t.toLowerCase()}:{n:num,s:t.toLowerCase()};
+// ===================================================================================================
+// [v23.49 SORTING] One comparator for every table. The old column sorter read each cell with parseFloat, so "#10535" (not a number
+// because of the #) sorted as text and landed before "#9902"; "2026-11-04" parsed as the year 2026 so every date in a year tied;
+// "S-19096" sorted before "S-4600"; "9m ago" sorted as a word; and blank cells jumped to the top when sorting descending.
+// Now a column's type is decided from ALL its cells (number, date or text): numbers and order numbers compare as numbers, dates
+// and "5m ago" as moments in time, text with numbers inside in natural order (S-4600 before S-19096). Blanks are always last, and
+// rows that tie keep their current order in both directions.
+// ===================================================================================================
+var _SORT_COLL=(typeof Intl!=='undefined'&&Intl.Collator)?new Intl.Collator(undefined,{numeric:true,sensitivity:'base'}):null;
+function natCmp(a,b){a=String(a==null?'':a);b=String(b==null?'':b);return _SORT_COLL?_SORT_COLL.compare(a,b):a.localeCompare(b);}
+var _SORT_MON={jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
+function _sortDate(t,now){
+  var m,y,h,ap;
+  if((m=t.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/)))return Date.UTC(+m[1],+m[2]-1,+m[3],+(m[4]||0),+(m[5]||0),+(m[6]||0));
+  if((m=t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4}|\d{2})(?!\d)(?:,?\s*(\d{1,2}):(\d{2})\s*([AaPp][Mm])?)?/))){
+    y=+m[3];if(y<100)y+=2000;h=+(m[4]||0);
+    if(m[6]){ap=m[6].toLowerCase();if(ap==='pm'&&h<12)h+=12;if(ap==='am'&&h===12)h=0;}
+    return Date.UTC(y,+m[1]-1,+m[2],h,+(m[5]||0));
+  }
+  if((m=t.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:,?\s+(\d{4}))?(?:,?\s+(\d{1,2}):(\d{2})\s*([AaPp][Mm])?)?$/))&&_SORT_MON[m[1].slice(0,3).toLowerCase()]!==undefined){
+    var mo=_SORT_MON[m[1].slice(0,3).toLowerCase()];y=m[3]?+m[3]:new Date(now).getUTCFullYear();h=+(m[4]||0);
+    if(m[6]){ap=m[6].toLowerCase();if(ap==='pm'&&h<12)h+=12;if(ap==='am'&&h===12)h=0;}
+    var ts=Date.UTC(y,mo,+m[2],h,+(m[5]||0));
+    if(!m[3]&&ts>now+31*86400000)ts=Date.UTC(y-1,mo,+m[2],h,+(m[5]||0)); // "Dec 30" read in January means last year
+    return ts;
+  }
+  if((m=t.match(/^(?:just now|(\d+)\s*(s|sec|m|min|h|hr|d|w|mo|y)\s*ago)$/i))){
+    if(m[1]===undefined)return now;
+    var u={s:1e3,sec:1e3,m:6e4,min:6e4,h:36e5,hr:36e5,d:864e5,w:6048e5,mo:2592e6,y:31536e6}[m[2].toLowerCase()];
+    return now-(+m[1])*u;
+  }
+  return null;
+}
+function sortKeyOf(text,now){
+  var t=String(text==null?'':text).replace(/\s+/g,' ').trim();
+  if(t===''||t==='—'||t==='–'||t==='-'||t==='?'||/^n\/?a$/i.test(t))return {k:'blank',s:''};
+  now=now||Date.now();
+  var dt=_sortDate(t,now);if(dt!==null)return {k:'date',n:dt,s:t};
+  var m=t.match(/^#\s*(\d+)(?:[-.](\d+))?$/); // order numbers: #10535, #10535-1
+  if(m)return {k:'num',n:parseInt(m[1],10)+(m[2]?parseInt(m[2],10)/1e6:0),s:t};
+  if(/^\(?[+\-\u2212]?\$?\s*\d[\d,]*(?:\.\d+)?\)?\s*(?:%|x|\u00d7|w|wk|d|h|min|m|units?|\/wk|\/mo|\/d)?$/i.test(t)){
+    var neg=/^\(/.test(t)||/^[\-\u2212]/.test(t),num=parseFloat(t.replace(/[^\d.]/g,''));
+    return {k:'num',n:neg?-num:num,s:t};
+  }
+  m=t.match(/^([+\-\u2212]?\$?\d[\d,]*(?:\.\d+)?)(?=\s+\S|\s*[A-Za-z%(])/); // "0 4 BO", "3 total", "12 shipments": the leading number leads
+  if(m){var ls=m[1],ln=parseFloat(ls.replace(/[^\d.]/g,''));if(/^[\-\u2212]/.test(ls))ln=-ln;return {k:'lead',n:ln,s:t};}
+  return {k:'text',s:t};
+}
+function columnType(keys){
+  var d=0,n=0,x=0;keys.forEach(function(k){if(k.k==='date')d++;else if(k.k==='num'||k.k==='lead')n++;else if(k.k==='text')x++;});
+  var tot=d+n+x;if(!tot)return 'text';
+  if(d/tot>=0.6)return 'date';if(n/tot>=0.6)return 'num';return 'text';
+}
+function cmpSortKeys(a,b,type){
+  if(type==='date'){var ad=a.k==='date',bd=b.k==='date';if(ad&&bd)return a.n-b.n;if(ad)return -1;if(bd)return 1;return natCmp(a.s,b.s);}
+  if(type==='num'){var an=(a.k==='num'||a.k==='lead'),bn=(b.k==='num'||b.k==='lead');if(an&&bn)return (a.n-b.n)||natCmp(a.s,b.s);if(an)return -1;if(bn)return 1;return natCmp(a.s,b.s);}
+  return natCmp(a.s,b.s);
+}
+function sortOrder(texts,dir,now){ // the new row order for one column, as a list of indexes into texts
+  var keys=texts.map(function(t){return sortKeyOf(t,now);}),type=columnType(keys),idx=keys.map(function(_,i){return i;});
+  idx.sort(function(i,j){
+    var a=keys[i],b=keys[j],ab=a.k==='blank',bb=b.k==='blank';
+    if(ab&&bb)return i-j;if(ab)return 1;if(bb)return -1; // blanks last, whichever way you sort
+    var r=cmpSortKeys(a,b,type);if(!r)return i-j;return dir==='desc'?-r:r;
+  });
+  return idx;
 }
 document.addEventListener('click',function(e){
   const th=e.target.closest('thead th');
-  if(!th)return;
+  if(!th||th.dataset.nosort)return; // a header that sorts the whole list itself (Sales Orders) opts out
   if(e.target.closest('button,input,select,a'))return;
   const table=th.closest('table');const tbody=table&&table.querySelector('tbody');
   if(!tbody||tbody.rows.length<2)return;
@@ -20670,17 +20771,16 @@ document.addEventListener('click',function(e){
   const dir=th.dataset.sortDir==='asc'?'desc':'asc';
   table.querySelectorAll('thead th').forEach(h=>{h.dataset.sortDir='';h.classList.remove('sorted-asc','sorted-desc');});
   th.dataset.sortDir=dir;th.classList.add(dir==='asc'?'sorted-asc':'sorted-desc');
-  const rows=Array.from(tbody.rows);
-  rows.sort((a,b)=>{
-    const av=parseCellVal(a.cells[idx]||{textContent:''}),bv=parseCellVal(b.cells[idx]||{textContent:''});
-    let r;
-    if(av.n!==null&&bv.n!==null)r=av.n-bv.n;
-    else if(av.n!==null)r=-1;else if(bv.n!==null)r=1;
-    else r=av.s<bv.s?-1:av.s>bv.s?1:0;
-    return dir==='asc'?r:-r;
+  // a row that is just an expanded detail of the row above it travels with that row
+  const groups=[];let cur=null;
+  Array.from(tbody.rows).forEach(r=>{
+    const detail=(r.cells.length===1&&r.cells[0].colSpan>1)||/(^|\s)(detail|expand|sub-?row|child)(\s|$)/.test(r.className||'');
+    if(detail&&cur)cur.rows.push(r);else{cur={rows:[r],main:r};groups.push(cur);}
   });
-  rows.forEach(r=>tbody.appendChild(r));
+  const texts=groups.map(g=>{const c=g.main.cells[idx];if(!c)return '';const ds=c.getAttribute&&c.getAttribute('data-sort');return ds!=null?ds:(c.textContent||'');});
+  sortOrder(texts,dir).forEach(i=>groups[i].rows.forEach(r=>tbody.appendChild(r)));
 });
+// [/v23.49 SORTING]
 
 function renderLookup(){
   const q=(S.lookupQ||'').toLowerCase().trim();
@@ -22719,15 +22819,15 @@ function renderPlanning() {
   parts.sort((a,b)=>{
     let cmp=0;
     switch(sortField){
-      case 'cat':   cmp=(a.category||'').localeCompare(b.category||'');break;
-      case 'pn':    cmp=a.pn.localeCompare(b.pn);break;
+      case 'cat':   cmp=natCmp(a.category||'',b.category||'');break;
+      case 'pn':    cmp=natCmp(dispSku(a.pn),dispSku(b.pn));break;
       case 'oh':    cmp=(a.total_unpckgd||0)-(b.total_unpckgd||0);break;
       case 'demand':cmp=(avgWk(a)||calcForecast(a.pn))-(avgWk(b)||calcForecast(b.pn));break;
       case 'weeks':{const wa=avgWk(a)>0?Math.max(0,(a.total_unpckgd||0)-boReserved(a.pn))/avgWk(a):9999,wb=avgWk(b)>0?Math.max(0,(b.total_unpckgd||0)-boReserved(b.pn))/avgWk(b):9999;cmp=wa-wb;break;}
       case 'trend': cmp=trendRatio(a)-trendRatio(b);break;
       case 'status':cmp=(STATUS_PRI[pStatus(a)]||5)-(STATUS_PRI[pStatus(b)]||5);break;
-      case 'desc':  cmp=(a.description||'').localeCompare(b.description||'');break;
-      case 'vendor':cmp=(a.vendor||'').localeCompare(b.vendor||'');break;
+      case 'desc':  cmp=natCmp(a.description||'',b.description||'');break;
+      case 'vendor':cmp=natCmp(a.vendor||'',b.vendor||'');break;
       case 'boresv':cmp=boReserved(a.pn)-boReserved(b.pn);break;
       case 'inasm': cmp=(_uiaMap[a.pn]||0)-(_uiaMap[b.pn]||0);break;
       case 'orderqty':cmp=pSq(a)-pSq(b);break;
@@ -25025,7 +25125,7 @@ function renderPackQueue(){
     const kf=_pqKey[_pqSort];
     allRows.sort((x,y)=>{
       const xv=kf(x),yv=kf(y);
-      const r=(typeof xv==='string')?xv.localeCompare(yv):(xv-yv);
+      const r=(typeof xv==='string')?natCmp(xv,yv):(xv-yv);
       return _pqDir==='asc'?r:-r;
     });
   }else{
@@ -27251,7 +27351,7 @@ function renderCountDetail(count) {
     else if(ccSort==='expected'){va=a.expected_qty||0;vb=b.expected_qty||0;return ccDir==='asc'?va-vb:vb-va;}
     else if(ccSort==='variance'){va=(a.actual_qty!=null?a.actual_qty-(a.expected_qty||0):null);vb=(b.actual_qty!=null?b.actual_qty-(b.expected_qty||0):null);if(va===null&&vb===null)return 0;if(va===null)return 1;if(vb===null)return -1;return ccDir==='asc'?va-vb:vb-va;}
     else{va=a._disp;vb=b._disp;}
-    return ccDir==='asc'?(va||'').localeCompare(vb||''):(vb||'').localeCompare(va||'');
+    return ccDir==='asc'?natCmp(va||'',vb||''):natCmp(vb||'',va||'');
   });
 
   function sortTh(label,key){
