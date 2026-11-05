@@ -474,7 +474,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.49</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.50</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -539,7 +539,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.49';
+const TGK_ERP_VERSION = 'v23.50';
 const TGK_ERP_BUILD_DATE = '2026-11-02';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -26769,11 +26769,12 @@ function _expandFgBomTree(bomPn){
   return items.filter(function(i){if(seen.has(i.pn))return false;seen.add(i.pn);return true;});
 }
 
-async function createCycleCount(cat) {
+async function createCycleCount(cat,pnList) {
   let items=[];
   const liveParts=S.parts.filter(p=>!p.discontinued);
   const liveAsm=S.assemblies.filter(a=>!a.discontinued&&!isDev(a));
-  if(cat==='all') items=liveParts.map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}));
+  if(cat==='list'&&Array.isArray(pnList)) items=pnList.map(pn=>{const a=asmByPn(pn);if(a)return {pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'};const p=partByPn(pn);return p?{pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}:null;}).filter(Boolean); // [v23.50] from Data Integrity: count just these items
+  else if(cat==='all') items=liveParts.map(p=>({pn:p.pn,desc:p.description||'',exp:p.total_unpckgd||0,type:'part'}));
   else if(cat==='fg') items=liveAsm.filter(a=>!a.is_subassembly&&!isHWPack(a.pn)).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
   else if(cat==='sub') items=liveAsm.filter(a=>a.is_subassembly).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
   else if(cat==='hwp') items=liveAsm.filter(a=>isHWPack(a.pn)).map(a=>({pn:a.pn,desc:a.description||'',exp:a.total_on_hand||0,type:'assembly'}));
@@ -26794,7 +26795,7 @@ async function createCycleCount(cat) {
 
   if(!items.length){toast('Nothing in that selection');return;}
 
-  const {data,error}=await db.from('cycle_counts').insert({status:'Open',notes:'',category_filter:cat}).select().single();
+  const {data,error}=await db.from('cycle_counts').insert({status:'Open',notes:'',category_filter:(cat==='list'?'Selected items':cat)}).select().single();
   if(error){toast('Error creating count: '+error.message);return;}
 
   const makeLines=(withType)=>items.map(i=>{
@@ -30834,19 +30835,373 @@ if (!(globalThis as any).__TEST__) {
 `;
 
 
-function renderDataIntegrity(){
-  if(!S._diResults)S._diResults=null;
-  if(!S._diLoading)S._diLoading=false;
-  return renderStockCheckPanel()+renderForecastPanel()+renderDataGapsPanel()+_diStockPanel()+`
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-    <div>
-      <div style="font-size:var(--t-md);color:var(--text2);margin-bottom:4px">Automated checks for the specific failure patterns found in this system historically — not a general health check, a targeted one. Run any time you want to verify nothing has silently drifted.</div>
-    </div>
-    <button class="btn btn-primary btn-sm" id="di-run-btn" onclick="runDataIntegrityChecks()" ${S._diLoading?'disabled':''}>${S._diLoading?'<span class="ic ic-clock"></span>Running…':'▶ Run All Checks'}</button>
-  </div>
-  <div id="di-results">${S._diResults?renderDIResults(S._diResults):'<div class="panel section-empty">Click "Run All Checks" to scan for known issue patterns — duplicate shipment processing, stale Shopify backorder status, stuck ticket/claim status, orders with no recent progress, and orphaned sync data.</div>'}</div>
-  `;
+// ===================================================================================================
+// [v23.50 DATA INTEGRITY] Rebuilt. Every check now says what it means, why it matters and what its buttons do. Checks are grouped by
+// what they need from you (a decision, one safe click, or just a look), the same item is shown once even if several checks found it,
+// and a correction says what it will change before it changes it. Nothing here writes a different way than before: the old
+// correction functions (scDeductNow, scNoDeduction, normalizeNegativeStock, retryPendingDeductions, repairDuplicateDeductions,
+// cleanupOrphanedSyncLog, dgFillFromPO) are still the ones that run.
+// ===================================================================================================
+var DI_DAY=86400000;
+function _diQ(x){return "'"+escHtml(String(x==null?'':x).replace(/\\/g,'\\\\').replace(/'/g,"\\'"))+"'";} // a JS string that is safe inside an HTML attribute
+function _diWhen(x){return x?escHtml(String(x).slice(0,16).replace('T',' ')):'';}
+function _diIgn(){var m=S.settings&&S.settings.di_ignored;return(m&&typeof m==='object')?m:{};}
+function diIsIgnored(key){var e=_diIgn()[key];return !!(e&&Date.parse(e)>Date.now());}
+async function diIgnore(keys,days){
+  S.settings=S.settings||{};
+  var m=Object.assign({},_diIgn()),exp=new Date(Date.now()+(days||30)*DI_DAY).toISOString();
+  Object.keys(m).forEach(function(k){if(!(Date.parse(m[k])>Date.now()))delete m[k];}); // forget the ones that already came back
+  keys.forEach(function(k){m[k]=exp;});
+  S.settings.di_ignored=m;S._diSel={};
+  try{await db.from('settings').upsert({key:'di_ignored',value:m},{onConflict:'key'});}
+  catch(e){console.warn('[di] ignore not saved',e);toast('<span class="ic ic-alert"></span>Could not save that. Check your connection and try again.',6000);}
+  render();
 }
+async function diRestore(key){
+  var m=Object.assign({},_diIgn());delete m[key];S.settings=S.settings||{};S.settings.di_ignored=m;
+  try{await db.from('settings').upsert({key:'di_ignored',value:m},{onConflict:'key'});}catch(e){console.warn('[di] restore not saved',e);}
+  render();
+}
+var DI_TEXT={
+ drift:{title:'Stock doesn&#8217;t match the log',plain:'The ERP&#8217;s number for these items is different from the last number in the history log.',risk:['Fixing changes the log only, not stock','teal'],
+  means:'The ERP&#8217;s current stock for these items differs from the last number written in the history log.',
+  why:'The log is how you trace any stock number back to what happened. A mismatch usually means stock was edited outside the ERP, or a history line failed to save.',
+  buttons:'<b>Record as correct</b> adds the missing history line. <b>Stock is not changed.</b> Not sure of the number? <b>Count it</b> instead: it sets stock to what you count.'},
+ gaps:{title:'Gaps in the history',plain:'Stock changed between two history lines, usually an edit outside the ERP.',risk:['Review only','grey'],
+  means:'Between two lines of an item&#8217;s history the stock number jumped, so the log cannot explain the change. Each row shows what the log said it should have started at, and what it started at.',
+  why:'It is usually an edit made outside the ERP. Until it is explained you cannot trust the history to trace where those units went.',
+  buttons:'<b>Count it</b> sets stock to what you count. <b>Open</b> shows the item&#8217;s whole history. <b>Ignore for 30 days</b> hides items you have already looked at.'},
+ undeducted:{title:'Shipped with no stock deducted',plain:'An order shipped but its stock was never taken, so on hand is too high by that amount.',risk:['Changes stock','orange'],
+  means:'An order in the last 30 days is marked shipped, but nothing took its quantity off the stock.',
+  why:'On hand stays too high, so reorder and build numbers think you still have units you shipped.',
+  buttons:'<b>Deduct now</b> takes the shipped quantity off stock. <b>Not needed</b> records that this order should not take stock, for example when it shipped from stock the ERP never counted.'},
+ clamped:{title:'Shipment bigger than stock',plain:'A shipment asked for more than the ERP had. Stock was held at 0 and the shortfall became backorder.',risk:['Count it, or record the build','grey'],
+  means:'A shipment asked for more units than the ERP showed in stock. Stock was held at 0 and the difference became backorder.',
+  why:'It is usually a counting error, or a build that was never recorded: the shelf and the ERP disagreed.',
+  buttons:'<b>Count it</b> sets stock to what is on the shelf. If you built the units and never recorded them, record the build in Production instead. <b>Open</b> shows the history.'},
+ dupShip:{title:'Duplicate shipment processing',plain:'The same shipment took stock more than once.',risk:['Changes stock','orange'],
+  means:'One tracking number appears on more than one shipment deduction for the same item.',
+  why:'Every extra deduction makes on hand too low.',
+  buttons:'<b>Repair duplicate deductions</b> opens a review where you pick which extra deductions to put back. Nothing changes until you choose.'},
+ collisions:{title:'Two items claim one SKU',plain:'A SKU is the part number or active new SKU of more than one item. A person has to decide which is real.',risk:['Needs a person','grey'],
+  means:'The same SKU text belongs to more than one part or assembly.',
+  why:'Searches, orders and stock can land on the wrong item.',
+  buttons:'Click a row to inspect it and see every record that claims that SKU, then decide which to keep or rename.'},
+ negfmt:{title:'Old negative stock format',plain:'Items still showing a negative on-hand. The ERP now records a shortfall as 0 on hand plus a backorder.',risk:['No stock change','teal'],
+  means:'These items have a negative number in on hand, the old way of recording that more shipped than the ERP had.',
+  why:'Planning and availability handle negative stock badly. The newer format says the same thing in a way every screen understands.',
+  buttons:'<b>Rewrite as backorder</b> turns each negative figure into 0 on hand plus that much backorder. The facts stay the same.'},
+ pending:{title:'Deductions waiting to retry',plain:'A shipment&#8217;s stock deduction failed. It retries by itself every 5 minutes.',risk:['Safe to repeat','teal'],
+  means:'The order shipped, but taking its stock off the shelf failed, so it is queued.',
+  why:'Until it succeeds, on hand is too high by that amount.',
+  buttons:'<b>Retry now</b> runs the queue immediately. It only retries shipments that have a tracking number, which is what stops it deducting twice.'},
+ orphans:{title:'Old sync-log rows',plain:'Shopify sync-log lines pointing at SKUs that no longer exist.',risk:['No stock change','teal'],
+  means:'The log has lines for SKUs that no longer match any current part or assembly, usually after a rename.',
+  why:'They only clutter the log and these checks.',
+  buttons:'<b>Clean up</b> deletes those log rows. It does not touch stock or Shopify.'},
+ missing:{title:'Missing vendor, lead time or cost',plain:'These fields drive reorder suggestions, PO follow-ups and the Holiday Planner.',risk:['Catalog data','teal'],
+  means:'Some parts have no vendor, lead time, unit cost or MOQ, and some products have no BOM or MSRP.',
+  why:'Planning guesses when these are blank, so suggested orders can be wrong.',
+  buttons:'Edit any box and it saves when you leave it. <b>Fill from PO</b> copies vendor, price and lead time from the part&#8217;s latest PO.'},
+ noprog:{title:'Orders with no progress (14+ days)',plain:'Open, packed or partial orders with no update for two weeks.',risk:['Review only','grey'],
+  means:'These orders have sat in the same status for 14 days or more.',why:'A customer may be waiting on something nobody is working on.',buttons:'Open the order from Sales Orders to move it along.'},
+ staleBo:{title:'Stale Shopify backorder flag',plain:'An item is flagged backordered in Shopify but has stock.',risk:['Review only','grey'],
+  means:'Shopify still says these items are backordered, but the ERP shows stock or none missing.',why:'Customers may be told an item is unavailable when it is not.',buttons:'Click a row to inspect the item and its Shopify status.'},
+ stuck:{title:'Tickets or claims stuck mid-flow',plain:'A ticket has a ShipStation order but never moved past its first status.',risk:['Review only','grey'],
+  means:'A support ticket or claim created a ShipStation order and then never advanced.',why:'The replacement or return may never have been sent.',buttons:'Open the ticket in Support or Customer Resolution to continue it.'},
+ oldsku:{title:'Sales or BOM lines using an old SKU',plain:'These still refer to an item by an old part number. They work, but searches and reports can miss them.',risk:['Review only','grey'],
+  means:'Some sale lines and BOM lines name an item by its old part number instead of its current one.',why:'They still resolve, but anything that matches on the exact part number can miss them.',buttons:'Click a row to inspect the item. Fixing is a data clean-up, so nothing here changes by itself.'},
+ ledger:{title:'Stock moved outside the history',plain:'In the last 30 days an item&#8217;s stock changed without a matching history line.',risk:['Review only','grey'],
+  means:'The newest history line for these items does not match their stock today.',why:'Something changed the number without leaving a trail.',buttons:'Click a row to inspect the item. This is the same kind of problem as a stock mismatch, found a second way.'}
+};
+function diModel(){
+  var sc=S._stockCheck,r=S._diResults,lists=null,scState='none';
+  if(sc){
+    if(sc.missing)scState='missing';
+    else if(sc.error)scState='error';
+    else if(sc.summaryOnly){scState=_scTotal(sc.counts)?'summary':'ok';if(scState==='ok')lists={drift:[],gaps:[],clamped:[],negative:[],pending:[],undeducted:[]};}
+    else{scState='ok';lists=sc;}
+  }
+  var checks=[];
+  var add=function(id,group,items,keyOf){
+    var known=items!==null,list=known?items:[],ignored=0;
+    if(keyOf&&known){var keep=[];list.forEach(function(x){if(diIsIgnored(id+'|'+keyOf(x)))ignored++;else keep.push(x);});list=keep;}
+    checks.push({id:id,group:group,t:DI_TEXT[id],known:known,items:list,ignored:ignored,keyOf:keyOf||null});
+  };
+  var drift=lists?(lists.drift||[]):null,driftPns={},gapGroups=null,gapsMerged=0;
+  (drift||[]).forEach(function(x){driftPns[x.pn]=1;});
+  if(lists){ // one row per item: a gap on an item already listed as a stock mismatch is shown with that item, not twice
+    var gg={},ord=[];
+    (lists.gaps||[]).forEach(function(g){if(driftPns[g.pn]){gapsMerged++;return;}if(!gg[g.pn]){gg[g.pn]={pn:g.pn,list:[]};ord.push(g.pn);}gg[g.pn].list.push(g);});
+    gapGroups=ord.map(function(pn){var l=gg[pn].list.slice().sort(function(a,b){return String(b.created_at).localeCompare(String(a.created_at));});return {pn:pn,n:l.length,last:l[0],list:l};})
+      .sort(function(a,b){return String(b.last.created_at).localeCompare(String(a.last.created_at));});
+  }
+  if(drift){var gapBy={};((lists&&lists.gaps)||[]).forEach(function(g){if(!gapBy[g.pn]||String(g.created_at)>String(gapBy[g.pn].created_at))gapBy[g.pn]=g;});
+    drift=drift.map(function(x){return Object.assign({},x,{_gap:gapBy[x.pn]||null});});}
+  add('drift','decide',drift,function(x){return x.pn;});
+  add('gaps','decide',gapGroups,function(x){return x.pn;});
+  add('undeducted','decide',lists?(lists.undeducted||[]):null,null);
+  add('clamped','decide',lists?(lists.clamped||[]):null,function(x){return x.pn;});
+  add('dupShip','decide',r?(r.duplicateShipments||[]):null,null);
+  add('collisions','decide',r?(r.pnSkuCollisions||[]):null,null);
+  add('negfmt','safe',_negStockRows(),null);
+  add('pending','safe',lists?(lists.pending||[]):null,null);
+  add('orphans','safe',r?(r.orphanedSyncEntries||[]):null,null);
+  add('missing','safe',dataGapRows(),null);
+  add('noprog','look',r?(r.staleOrders||[]):null,null);
+  add('staleBo','look',r?(r.staleBackorders||[]):null,null);
+  add('stuck','look',r?(r.stuckTickets||[]):null,null);
+  add('oldsku','look',r?((r.nonCanonicalSales||[]).map(function(d){return Object.assign({_t:'sale'},d);}).concat((r.bomResolution||[]).map(function(d){return Object.assign({_t:'bom'},d);}))):null,null);
+  add('ledger','look',r?(r.ledgerDrift||[]):null,null);
+  var tot={decide:0,safe:0,look:0,decideChecks:0,safeChecks:0,lookChecks:0,clear:0,unknown:0};
+  checks.forEach(function(c){if(!c.known){tot.unknown++;return;}if(c.items.length){tot[c.group]+=c.items.length;tot[c.group+'Checks']++;}else tot.clear++;});
+  return {checks:checks,tot:tot,scState:scState,gapsMerged:gapsMerged,ranAt:r&&r.ranAt,scAt:sc&&sc.generated_at,scError:sc&&sc.error};
+}
+function diByKey(id){return diModel().checks.find(function(c){return c.id===id;});}
+// ---------- confirmation: every stock-log correction says what it will change before it does
+function diConfirm(o){
+  if(typeof document==='undefined')return;
+  window._diCb=o.run;
+  var ov=document.getElementById('di-overlay');
+  if(!ov){ov=document.createElement('div');ov.id='di-overlay';ov.setAttribute('role','dialog');ov.setAttribute('aria-label',o.title);
+    ov.style.cssText='position:fixed;inset:0;z-index:9100;background:rgba(10,14,18,.55);display:flex;align-items:flex-start;justify-content:center;padding:60px 16px;overflow:auto';
+    ov.onclick=function(e){if(e.target===ov)diConfirmCancel();};document.body.appendChild(ov);}
+  var rows=(o.rows||[]).slice(0,60).map(function(r){return '<tr>'+r.map(function(c,i){return '<td'+(i===0?' class="pn"':'')+'>'+escHtml(c)+'</td>';}).join('')+'</tr>';}).join('');
+  ov.innerHTML='<div style="width:min(760px,100%);background:var(--bg);border:1px solid var(--border);border-radius:var(--r-lg,14px);box-shadow:0 20px 60px rgba(0,0,0,.35);overflow:hidden">'
+   +'<div style="padding:16px 20px;border-bottom:1px solid var(--border)"><div style="font-size:var(--t-xl,20px);font-weight:800">'+escHtml(o.title)+'</div><div class="t3s" style="margin-top:4px">'+(o.sub||'')+'</div></div>'
+   +'<div style="padding:14px 20px"><div class="tbl-wrap"><table><thead><tr>'+(o.head||[]).map(function(h){return '<th>'+escHtml(h)+'</th>';}).join('')+'</tr></thead><tbody>'+rows+'</tbody></table></div>'
+   +((o.rows||[]).length>60?'<div class="t3xs" style="margin-top:4px">+'+((o.rows||[]).length-60)+' more</div>':'')
+   +(o.note?'<div style="margin-top:12px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-md);padding:10px 12px;font-size:var(--t-sm);line-height:1.5;color:var(--text2)">'+o.note+'</div>':'')+'</div>'
+   +'<div style="padding:12px 20px;background:var(--bg3);border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px"><button type="button" class="btn" onclick="diConfirmCancel()">Cancel</button><button type="button" class="btn btn-teal" id="di-go" onclick="diConfirmGo()">'+escHtml(o.confirmLabel||'Confirm')+'</button></div></div>';
+}
+function diConfirmCancel(){window._diCb=null;var ov=typeof document!=='undefined'&&document.getElementById('di-overlay');if(ov&&ov.remove)ov.remove();}
+async function diConfirmGo(){
+  var cb=window._diCb;if(!cb)return;
+  var b=typeof document!=='undefined'&&document.getElementById('di-go');if(b){b.disabled=true;b.textContent='Working...';}
+  try{await cb();}catch(e){console.warn('[di] action failed',e);toast('Not done: '+(e.message||e),7000);}
+  diConfirmCancel();
+}
+// ---------- selection
+function diSel(id,key,on){S._diSel=S._diSel||{};if(on)S._diSel[id+'|'+key]=true;else delete S._diSel[id+'|'+key];render();}
+function diSelAll(id,on){
+  var c=diByKey(id);if(!c)return;S._diSel=S._diSel||{};
+  c.items.forEach(function(x){var k=id+'|'+c.keyOf(x);if(on)S._diSel[k]=true;else delete S._diSel[k];});render();
+}
+function _diSelected(id){var c=diByKey(id);if(!c)return [];var sel=S._diSel||{};return c.items.filter(function(x){return sel[id+'|'+c.keyOf(x)];});}
+function diIgnoreSel(id){var c=diByKey(id),items=_diSelected(id);if(!items.length)return;diIgnore(items.map(function(x){return id+'|'+c.keyOf(x);}),30);}
+// ---------- record as correct (adds the missing history line; stock is not changed)
+function diRecordAsk(items){
+  var n=items.length;if(!n)return;
+  diConfirm({title:'Record '+n+' current number'+(n!==1?'s':'')+' as correct?',sub:'This adds the missing history line. <b>Stock is not changed.</b>',
+    head:['Item','ERP says','Log says now','Stock'],rows:items.map(function(i){return [dispSku(i.pn),String(i.onhand),String(i.logged),'no change'];}),
+    note:'<b>After you confirm:</b> the log shows the ERP&#8217;s number as the recorded number, marked <b>audit</b> with your name. The item leaves this list.<br><b>Not sure the number is right?</b> Cancel and use <b>Count it</b> instead. A count sets stock to what you count and logs it.',
+    confirmLabel:'Record '+n,run:function(){return diRecordRun(items);}});
+}
+function diRecordOne(kind,id,pn,logged,onhand){diRecordAsk([{kind:kind,id:id,pn:pn,logged:Number(logged)||0,onhand:Number(onhand)||0}]);}
+function diRecordSelected(){diRecordAsk(_diSelected('drift').map(function(x){return {kind:x.kind,id:x.id,pn:x.pn,logged:Number(x.last_logged)||0,onhand:Number(x.on_hand)||0};}));}
+async function diRecordRun(items){
+  var rows=items.map(function(i){return {pn:i.pn,previous_qty:i.logged,new_qty:i.onhand,adjustment:i.onhand-i.logged,reason:'Stock check: unlogged change accepted as correct',source:'audit',user_email:S.currentUser||null};});
+  var r=await db.from('inv_corrections').insert(rows).select('id,pn,previous_qty,new_qty,adjustment,reason,source,user_email,created_at');
+  if(r.error){toast('Not saved: '+r.error.message,7000);return false;}
+  var got=r.data||[],ids=got.map(function(x){return x.id;});
+  S._diSel={};S._diLastAudit={ids:ids};
+  S.corrections=got.concat(S.corrections||[]);
+  toast('Recorded '+items.length+' number'+(items.length!==1?'s':'')+' as correct. Stock unchanged. Click here to undo.',12000,function(){diUndoLast();});
+  runStockCheck(false);
+  return true;
+}
+function diUndoLast(){var l=S._diLastAudit;if(l&&l.ids&&l.ids.length)return diUndo(l.ids);}
+async function diUndo(ids){
+  if(!ids||!ids.length)return;
+  if(!confirm('Remove '+ids.length+' history line'+(ids.length!==1?'s':'')+'?\n\nThe '+(ids.length!==1?'items':'item')+' will show up in the list again. Stock is not changed.'))return;
+  var r=await db.from('inv_corrections').delete().in('id',ids);
+  if(r.error){toast('Could not undo: '+r.error.message,7000);return;}
+  var gone=ids.map(String);S.corrections=(S.corrections||[]).filter(function(c){return gone.indexOf(String(c.id))<0;});
+  S._diLastAudit=null;toast('Undone');runStockCheck(false);
+}
+// ---------- count it: set stock to what is on the shelf
+function diCountStart(key){S._diCount={key:key};render();setTimeout(function(){var e=typeof document!=='undefined'&&document.getElementById('di-count-input');if(e&&e.focus)e.focus();},0);}
+function diCountCancel(){S._diCount=null;render();}
+async function diCountApply(pn){
+  var el=typeof document!=='undefined'&&document.getElementById('di-count-input'),v=el?String(el.value):'';
+  if(v===''||isNaN(parseFloat(v))){toast('Enter the number on the shelf');return;}
+  var counted=parseFloat(v),a=asmByPn(pn),p=a?null:partByPn(pn),rec=a||p,kind=a?'assembly':'part';
+  if(!rec){toast('Item not found: '+pn);return;}
+  var fr=await db.from(kind==='assembly'?'assemblies':'parts').select(kind==='assembly'?'total_on_hand':'total_unpckgd').eq('id',rec.id).maybeSingle();
+  var cur=(!fr.error&&fr.data)?(Number(kind==='assembly'?fr.data.total_on_hand:fr.data.total_unpckgd)||0):(Number(kind==='assembly'?rec.total_on_hand:rec.total_unpckgd)||0);
+  var delta=counted-cur;
+  if(delta===0){ // the ERP number is right: only the history line is missing
+    var ins=await db.from('inv_corrections').insert({pn:rec.pn,previous_qty:cur,new_qty:cur,adjustment:0,reason:'Counted from Data Integrity: matches the ERP',source:'audit',user_email:S.currentUser||null});
+    if(ins.error){toast('Not saved: '+ins.error.message,7000);return;}
+    toast(dispSku(rec.pn)+': counted '+counted+', matches the ERP');
+  }else{
+    var nv=await adjustStock(kind,rec,delta,{reason:'Counted from Data Integrity',source:'spot_count'});
+    if(nv===null)return;
+    toast(dispSku(rec.pn)+': '+cur+' \u2192 '+counted);
+  }
+  S._diCount=null;runStockCheck(false);
+}
+function diCountThese(id){
+  var c=diByKey(id),items=_diSelected(id);if(!items.length)return;
+  var pns=items.map(function(x){return x.pn;});
+  Promise.resolve(createCycleCount('list',pns)).then(function(){nav('cyclecounts');});
+}
+// ---------- what has been fixed from here lately (the log lines are the record, so this survives a reload)
+function diRecent(){
+  var cutoff=Date.now()-7*DI_DAY,g={},ord=[];
+  (S.corrections||[]).forEach(function(c){
+    var ok=(c.source==='audit'&&/^Stock check:/.test(c.reason||''))||c.source==='normalize';
+    if(!ok||!(Date.parse(c.created_at)>=cutoff))return;
+    var k=c.source+'|'+(c.user_email||'')+'|'+String(c.created_at).slice(0,16);
+    if(!g[k]){g[k]={source:c.source,user:c.user_email||'',at:c.created_at,ids:[],n:0};ord.push(k);}
+    g[k].ids.push(c.id);g[k].n++;if(String(c.created_at)>String(g[k].at))g[k].at=c.created_at;
+  });
+  return ord.map(function(k){return g[k];}).sort(function(a,b){return String(b.at).localeCompare(String(a.at));}).slice(0,8);
+}
+function diAutoStart(){ // first visit: read the lists the daily summary only counted, and run the pattern checks once
+  var now=Date.now();if(S._diAutoAt&&now-S._diAutoAt<120000)return;S._diAutoAt=now;
+  setTimeout(function(){
+    if(!S._diResults&&!S._diLoading)runDataIntegrityChecks();
+    var sc=S._stockCheck;
+    if((!sc||(sc.summaryOnly&&_scTotal(sc.counts)))&&!S._stockCheckRunning)runStockCheck(false);
+  },0);
+}
+async function diRunAll(){
+  if(S._diBusy)return;S._diBusy=true;render();
+  try{await runStockCheck(true);await runDataIntegrityChecks();}finally{S._diBusy=false;render();}
+}
+function diToggle(id){S._diOpen=S._diOpen||{};var c=diByKey(id),cur=S._diOpen[id]!==undefined?S._diOpen[id]:(id==='drift'&&c&&c.items.length>0);S._diOpen[id]=!cur;render();}
+function diExplain(id){S._diExp=S._diExp||{};S._diExp[id]=!S._diExp[id];render();}
+function diFilter(f){S._diFilter=(S._diFilter===f)?'':f;render();}
+function diForecastToggle(){S._diFc=!S._diFc;render();}
+// ---------- drawing
+function _diTbl(cols,rows,capped,widths){return '<div class="tbl-wrap" style="overflow-x:auto"><table><thead><tr>'+cols.map(function(h,i){return '<th style="text-align:left'+((widths&&widths[i])?';width:'+widths[i]:'')+(h===''&&i===0?';padding-right:0':'')+'">'+h+'</th>';}).join('')+'</tr></thead><tbody>'+rows.join('')+'</tbody></table></div>'+(capped?'<div class="t3xs" style="padding:6px 14px;color:var(--text3)">+'+capped+' more not shown</div>':'');}
+function _diRows(items,fn,cap){cap=cap||100;return {rows:items.slice(0,cap).map(fn),capped:Math.max(0,items.length-cap)};}
+function _diBulk(c,withRecord){
+  var n=_diSelected(c.id).length,all=c.items.length;
+  return '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:10px 14px;background:var(--bg3);border-top:1px solid var(--border)">'
+   +'<div class="t3s"><b>'+n+' selected</b> &middot; <a href="#" style="color:var(--teal);font-weight:700" onclick="diSelAll('+_diQ(c.id)+','+(n===all?'false':'true')+');return false">'+(n===all?'Clear selection':'Select all '+all)+'</a></div>'
+   +'<div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" class="btn btn-sm" '+(n?'':'disabled ')+'onclick="diIgnoreSel('+_diQ(c.id)+')">Ignore for 30 days</button>'
+   +'<button type="button" class="btn btn-sm" '+(n?'':'disabled ')+'onclick="diCountThese('+_diQ(c.id)+')">Count these as a cycle count</button>'
+   +(withRecord?'<button type="button" class="btn btn-teal btn-sm" '+(n?'':'disabled ')+'onclick="diRecordSelected()">Record '+(n?n+' ':'')+'as correct</button>':'')+'</div></div>';
+}
+function _diCountCell(key,pn){
+  var cnt=S._diCount;
+  if(cnt&&cnt.key===key)return '<input id="di-count-input" type="number" step="any" min="0" aria-label="Counted on the shelf" placeholder="on shelf" style="width:90px;padding:4px 6px" onkeydown="if(event.key===\'Enter\')diCountApply('+_diQ(pn)+')"> <button type="button" class="btn btn-teal btn-sm" onclick="diCountApply('+_diQ(pn)+')">Set stock</button> <button type="button" class="btn btn-sm" onclick="diCountCancel()">Cancel</button>';
+  return '';
+}
+var DI_BODY={
+ drift:function(c){
+  var sel=S._diSel||{},x2=_diRows(c.items,function(x){
+    var key='drift|'+x.pn,on=!!sel[key],diff=(Number(x.on_hand)||0)-(Number(x.last_logged)||0),cc=_diCountCell(key,x.pn);
+    var tr='<tr'+(on?' style="background:rgba(13,148,136,.06)"':'')+'><td><input type="checkbox" aria-label="Select '+escHtml(dispSku(x.pn))+'" '+(on?'checked ':'')+'onchange="diSel(\'drift\','+_diQ(x.pn)+',this.checked)"></td>'
+     +'<td class="pn">'+escHtml(dispSku(x.pn))+'</td><td><b>'+x.on_hand+'</b></td><td>'+x.last_logged+'</td><td style="color:var(--orange);font-weight:800">'+(diff>0?'+':'')+diff+'</td><td class="t3xs">'+_diWhen(x.last_logged_at)+'</td>'
+     +'<td><div style="display:flex;gap:6px;flex-wrap:wrap">'+(cc||('<button type="button" class="btn btn-teal btn-sm" onclick="diRecordOne('+[x.kind,x.id,x.pn].map(_diQ).join(',')+','+(Number(x.last_logged)||0)+','+(Number(x.on_hand)||0)+')">Record as correct</button> <button type="button" class="btn btn-sm" onclick="diCountStart('+_diQ(key)+')">Count it</button> <button type="button" class="btn btn-sm" onclick="lookupGo('+_diQ(x.kind)+','+_diQ(x.pn)+')">Open &rsaquo;</button>'))+'</div></td></tr>';
+    if(x._gap)tr+='<tr class="detail"><td colspan="7" class="t3xs" style="background:var(--bg3);padding:8px 12px"><b>Why this one?</b> On '+_diWhen(x._gap.created_at)+' the log recorded '+escHtml((x._gap.source||'')+(x._gap.reason?' - '+_scReason(x._gap.reason,70):''))+' as starting from '+x._gap.logged_before+', but stock was '+x._gap.expected_before+'. This item is also in the gaps list; it is one problem, so it is shown once here.</td></tr>';
+    return tr;});
+  return _diTbl(['','Item','ERP says','Log says','Difference','Last logged','What would you like to do?'],x2.rows,x2.capped,['34px','150px','80px','80px','90px','140px',''])+_diBulk(c,true);
+ },
+ gaps:function(c){
+  var sel=S._diSel||{},x2=_diRows(c.items,function(g){
+    var key='gaps|'+g.pn,on=!!sel[key],cc=_diCountCell(key,g.pn),l=g.last;
+    return '<tr'+(on?' style="background:rgba(13,148,136,.06)"':'')+'><td><input type="checkbox" aria-label="Select '+escHtml(dispSku(g.pn))+'" '+(on?'checked ':'')+'onchange="diSel(\'gaps\','+_diQ(g.pn)+',this.checked)"></td>'
+     +'<td class="pn">'+escHtml(dispSku(g.pn))+'</td><td>'+g.n+'</td><td class="t3xs">'+_diWhen(l.created_at)+'</td><td>'+l.expected_before+' &rarr; '+l.logged_before+'</td><td class="t3xs">'+escHtml((l.source||'')+(l.reason?' - '+_scReason(l.reason,60):''))+'</td>'
+     +'<td><div style="display:flex;gap:6px;flex-wrap:wrap">'+(cc||('<button type="button" class="btn btn-sm" onclick="diCountStart('+_diQ(key)+')">Count it</button> <button type="button" class="btn btn-sm" onclick="lookupGo(\'assembly\','+_diQ(g.pn)+')">Open &rsaquo;</button>'))+'</div></td></tr>';});
+  return (S._diModelGapsMerged?'<div class="t3xs" style="padding:8px 14px;color:var(--text3)">'+S._diModelGapsMerged+' more gap'+(S._diModelGapsMerged!==1?'s':'')+' belong to items already listed under &ldquo;Stock doesn&#8217;t match the log&rdquo; and are shown there.</div>':'')
+   +_diTbl(['','Item','Gaps','Latest gap','Expected &rarr; started at','Logged as',''],x2.rows,x2.capped,['34px','150px','70px','140px','200px','240px',''])+_diBulk(c,false);
+ },
+ undeducted:function(c){var q=_diQ,x2=_diRows(c.items,function(x){return '<tr><td class="pn">'+escHtml(x.order_number||'')+'</td><td class="pn">'+escHtml(dispSku(x.pn))+'</td><td>'+x.qty+'</td><td class="t3xs">'+escHtml(x.tracking_number||'-')+'</td><td class="t3xs">'+_diWhen(x.shipped_at)+'</td>'
+   +'<td style="white-space:nowrap"><button type="button" class="btn btn-sm btn-teal" onclick="scDeductNow('+[x.sid,x.kind,x.item_id,x.pn,x.qty,x.order_number].map(q).join(',')+')">Deduct now</button> <button type="button" class="btn btn-sm" onclick="scNoDeduction('+[x.sid,x.kind,x.item_id,x.pn,x.order_number].map(q).join(',')+')">Not needed</button></td></tr>';});
+  return _diTbl(['Order','Item','Qty','Tracking','Shipped',''],x2.rows,x2.capped,['110px','170px','60px','170px','140px','']);},
+ clamped:function(c){var sel=S._diSel||{},x2=_diRows(c.items,function(x){var key='clamped|'+x.pn,on=!!sel[key],cc=_diCountCell(key,x.pn);
+   return '<tr><td><input type="checkbox" aria-label="Select '+escHtml(dispSku(x.pn))+'" '+(on?'checked ':'')+'onchange="diSel(\'clamped\','+_diQ(x.pn)+',this.checked)"></td><td class="pn">'+escHtml(dispSku(x.pn))+'</td><td class="t3xs">'+_diWhen(x.created_at)+'</td><td>'+x.prev+'</td><td>'+(-x.adj)+'</td><td style="color:var(--red)"><b>'+x.shortfall+'</b></td>'
+    +'<td><div style="display:flex;gap:6px;flex-wrap:wrap">'+(cc||('<button type="button" class="btn btn-sm" onclick="diCountStart('+_diQ(key)+')">Count it</button> <button type="button" class="btn btn-sm" onclick="lookupGo(\'assembly\','+_diQ(x.pn)+')">Open &rsaquo;</button>'))+'</div></td></tr>';});
+  return _diTbl(['','Item','When','Had','Asked for','Short by',''],x2.rows,x2.capped,['34px','150px','140px','70px','90px','90px',''])+_diBulk(c,false);},
+ dupShip:function(c){return c.items.slice(0,100).map(function(d){return '<div class="check-row"><span style="font-family:var(--mono);font-size:var(--t-sm)">'+escHtml(d.tracking)+'</span><span style="flex:1;font-size:var(--t-sm);color:var(--text2)">'+escHtml(dispSku(d.pn))+'</span><span class="pill pill-red" style="font-size:var(--t-xs)">'+d.count+'&times; processed</span></div>';}).join('');},
+ collisions:function(c){return c.items.slice(0,100).map(function(d){return '<div class="check-row" onclick="inspectSku('+_diQ(d.sku)+')" style="cursor:pointer"><span style="font-family:var(--mono);font-size:var(--t-sm);color:var(--teal)">'+escHtml(d.sku)+'</span><span style="flex:1;font-size:var(--t-sm);color:var(--text2)">claimed by '+d.claimants.length+' different records: '+d.claimants.map(function(x){return escHtml(dispSku(x.pn))+' ('+x.type+' via '+x.via+')';}).join(', ')+'</span><span class="pill pill-red" style="font-size:var(--t-xs)">collision</span></div>';}).join('');},
+ negfmt:function(c){return _diTbl(['Item','On hand'],c.items.slice(0,100).map(function(x){return '<tr><td class="pn">'+escHtml(dispSku(x.r.pn))+'</td><td style="color:var(--red)"><b>'+x.oh+'</b></td></tr>';}),Math.max(0,c.items.length-100));},
+ pending:function(c){return _diTbl(['Order','Item','Qty'],c.items.slice(0,100).map(function(x){return '<tr><td class="pn">'+escHtml(x.order_number||'')+'</td><td class="pn">'+escHtml(dispSku(x.pn))+'</td><td>'+x.qty+'</td></tr>';}),Math.max(0,c.items.length-100));},
+ orphans:function(c){return c.items.slice(0,100).map(function(pn){return '<div class="check-row"><span style="font-family:var(--mono);font-size:var(--t-sm);color:var(--text3)">'+escHtml(pn)+'</span><span style="flex:1;font-size:var(--t-sm);color:var(--text3)">No matching current part or assembly</span></div>';}).join('');},
+ missing:function(c){return renderDataGapsPanel();},
+ noprog:function(c){return c.items.slice(0,100).map(function(d){return '<div class="check-row"><span style="font-family:var(--mono);font-size:var(--t-sm)">'+escHtml(d.order_number||'')+'</span><span style="flex:1;font-size:var(--t-sm);color:var(--text2)">'+escHtml(dispSku(d.pn||''))+'</span><span class="pill pill-yellow" style="font-size:var(--t-xs)">'+escHtml(d.fulfillment_status)+' since '+new Date(d.updated_at).toLocaleDateString()+'</span></div>';}).join('');},
+ staleBo:function(c){return c.items.slice(0,100).map(function(d){return '<div class="check-row" onclick="inspectSku('+_diQ(d.pn)+')" style="cursor:pointer"><span style="font-family:var(--mono);font-size:var(--t-sm);color:var(--teal)">'+escHtml(dispSku(d.pn))+'</span><span style="flex:1;font-size:var(--t-sm);color:var(--text2)">On hand: '+d.onHand+'</span><span class="pill pill-yellow" style="font-size:var(--t-xs)">Shopify says backordered</span></div>';}).join('');},
+ stuck:function(c){return c.items.slice(0,100).map(function(d){return '<div class="check-row"><span style="font-size:var(--t-sm);color:var(--text2)">'+escHtml(d.type)+'</span><span style="flex:1;font-size:var(--t-sm);font-family:var(--mono)">SS#'+escHtml(d.ssOrderId)+'</span><span class="pill pill-red" style="font-size:var(--t-xs)">stuck at &ldquo;'+escHtml(d.status)+'&rdquo;</span></div>';}).join('');},
+ oldsku:function(c){return c.items.slice(0,100).map(function(d){return d._t==='sale'
+   ?'<div class="check-row" onclick="inspectSku('+_diQ(d.pn)+')" style="cursor:pointer"><span style="font-family:var(--mono);font-size:var(--t-sm);color:var(--text2)">'+escHtml(d.pn)+'</span><span style="flex:1;font-size:var(--t-sm);color:var(--text3)">'+d.count+' sale line'+(d.count!==1?'s':'')+' &mdash; current part number is '+escHtml(d.canonical)+'</span><span class="pill pill-yellow" style="font-size:var(--t-xs)">old SKU</span></div>'
+   :'<div class="check-row"><span style="font-family:var(--mono);font-size:var(--t-sm);color:var(--text2)">'+escHtml(d.parent)+'</span><span style="flex:1;font-size:var(--t-sm);color:var(--text3)">BOM line: child '+escHtml(d.child)+(d.canonical?' &mdash; current part number is '+escHtml(d.canonical):'')+'</span><span class="pill '+(d.status==='unresolved'?'pill-red':'pill-yellow')+'" style="font-size:var(--t-xs)">'+escHtml(d.status)+'</span></div>';}).join('');},
+ ledger:function(c){return c.items.slice(0,100).map(function(d){return '<div class="check-row" onclick="inspectSku('+_diQ(d.pn)+')" style="cursor:pointer"><span style="font-family:var(--mono);font-size:var(--t-sm);color:var(--teal)">'+escHtml(dispSku(d.pn))+'</span><span style="flex:1;font-size:var(--t-sm);color:var(--text2)">history says '+d.ledger+', stock is '+d.actual+'</span><span class="pill pill-red" style="font-size:var(--t-xs)">'+(d.delta>0?'+':'')+d.delta+' unexplained</span></div>';}).join('');}
+};
+function _diAction(c){
+  var n=c.items.length;if(!n)return '';
+  switch(c.id){
+   case 'dupShip':return '<button type="button" class="btn btn-sm btn-teal" onclick="repairDuplicateDeductions()">Repair duplicate deductions</button>';
+   case 'negfmt':return '<button type="button" class="btn btn-sm btn-teal" onclick="normalizeNegativeStock()">Rewrite as backorder</button>';
+   case 'pending':return '<button type="button" class="btn btn-sm btn-teal" onclick="retryPendingDeductions(false)">Retry now</button>';
+   case 'orphans':return '<button type="button" class="btn btn-sm btn-teal" onclick="cleanupOrphanedSyncLog()">Clean up</button>';
+   case 'missing':{var fill=c.items.filter(function(r){return r.kind==='part'&&r.lp&&((r.miss.indexOf('vendor')>=0&&r.lp.vendor)||(r.miss.indexOf('cost')>=0&&r.lp.cost>0)||(r.miss.indexOf('lead')>=0&&r.lp.lt));}).length;
+     return fill?'<button type="button" class="btn btn-sm btn-teal" onclick="dgFillFromPO(null)">Fill '+fill+' from POs</button>':'';}
+  }
+  return '';
+}
+function diCard(c){
+  var T=c.t,n=c.items.length,sel=S._diOpen&&S._diOpen[c.id],open=sel!==undefined?sel:(c.id==='drift'&&n>0),exp=!!(S._diExp&&S._diExp[c.id]);
+  var riskCls={teal:'pill-teal',orange:'pill-orange',grey:'pill-muted'}[T.risk[1]]||'pill-muted',cnt=c.group==='decide'?'pill-red':c.group==='safe'?'pill-teal':'pill-yellow';
+  var head='<div style="display:flex;align-items:center;gap:10px 16px;flex-wrap:wrap;padding:14px 18px">'
+   +'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:1 1 280px;min-width:240px"><b style="font-size:var(--t-lg,16px)">'+T.title+'</b><span class="pill '+riskCls+'" style="font-size:var(--t-xs)">'+T.risk[0]+'</span></div>'
+   +'<div style="flex:2 1 340px;font-size:var(--t-sm);color:var(--text2);line-height:1.45">'+T.plain+(c.ignored?' <span class="t3xs" style="color:var(--text3)">('+c.ignored+' ignored)</span>':'')+'</div>'
+   +'<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end;flex:0 0 auto"><span class="pill '+(c.known?cnt:'pill-muted')+'" aria-label="'+(c.known?n+' found':'not run yet')+'">'+(c.known?n:'not run')+'</span>'
+   +'<button type="button" class="btn btn-sm" aria-expanded="'+(exp?'true':'false')+'" onclick="diExplain('+_diQ(c.id)+')">Explain</button>'
+   +(c.known?_diAction(c):'')+'<button type="button" class="btn btn-sm" aria-expanded="'+(open?'true':'false')+'" onclick="diToggle('+_diQ(c.id)+')">'+(open?'Hide &#9652;':'Review '+(n||'')+' &#9662;')+'</button></div></div>';
+  var explain=exp?'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;padding:0 18px 14px">'
+    +[['What this means',T.means],['Why it matters',T.why],['What the buttons do',T.buttons]].map(function(b){return '<div style="border:1px solid var(--border);border-radius:var(--r-md);padding:10px 12px;background:var(--bg3)"><div style="font-weight:800;font-size:var(--t-sm);margin-bottom:3px">'+b[0]+'</div><div style="font-size:var(--t-sm);line-height:1.5;color:var(--text2)">'+b[1]+'</div></div>';}).join('')+'</div>':'';
+  var body='';
+  if(open){body='<div style="border-top:1px solid var(--border)">'+(c.known?(n?DI_BODY[c.id](c):'<div class="section-empty">Nothing here.</div>'):'<div style="padding:12px 18px;font-size:var(--t-sm);color:var(--text3)">Not run yet. Press <b>Run all checks</b>.</div>')+'</div>';}
+  return '<div class="panel" style="padding:0;overflow:hidden;margin-bottom:10px">'+head+explain+body+'</div>';
+}
+function _diGroupHead(label,desc,color){return '<div style="display:flex;align-items:baseline;gap:12px;margin:14px 0 8px 2px;flex-wrap:wrap"><span style="font-family:var(--mono);font-size:var(--t-xs);font-weight:700;letter-spacing:.14em;color:'+color+'">'+label+'</span><span class="t3s">'+desc+'</span></div>';}
+function renderDataIntegrity(){
+  diAutoStart();
+  var M=diModel(),f=S._diFilter||'',busy=!!(S._diBusy||S._diLoading||S._stockCheckRunning),esc=escHtml;
+  S._diModelGapsMerged=M.gapsMerged;
+  var have=M.scState==='ok'||!!S._diResults;
+  var tile=function(key,label,num,sub,cls,stripe){var on=f===key;return '<div class="kpi '+cls+'" role="button" aria-pressed="'+(on?'true':'false')+'" style="cursor:pointer;box-shadow:inset 0 5px 0 '+stripe+(on?',inset 0 0 0 2px #fff':'')+'" onclick="diFilter('+_diQ(key)+')"><div class="kpi-label">'+label+'</div><div class="kpi-value">'+(have?num:'&mdash;')+'</div><div class="kpi-sub">'+sub+'</div></div>';};
+  var T=M.tot;
+  var tiles='<div class="kpi-grid kpi-grid-4" style="margin-bottom:12px">'
+    +tile('decide','Needs your decision',T.decide,(have?(T.decideChecks+' check'+(T.decideChecks!==1?'s':'')+' where only you know the answer'):'Run all checks to find out'),'kpi-red','var(--red)')
+    +tile('safe','Safe to fix',T.safe,'No stock changes. One click','kpi-teal','var(--teal)')
+    +tile('look','Worth a look',T.look,'Not wrong, but may need attention','kpi-yellow','var(--yellow)')
+    +tile('clear','All clear',T.clear,'checks passed, nothing to do','','var(--green)')+'</div>';
+  var banner='';
+  if(M.scState==='missing')banner='<div class="panel" style="padding:10px 14px;border-left:3px solid var(--orange);margin-bottom:10px;font-size:var(--t-sm);color:var(--orange)">The daily stock check needs the v23.77 database migration (Integrations &rarr; Setup Guide). Until then the stock checks below cannot run.</div>';
+  else if(M.scState==='error')banner='<div class="panel" style="padding:10px 14px;border-left:3px solid var(--red);margin-bottom:10px;font-size:var(--t-sm);color:var(--red)">Stock check failed: '+esc(M.scError)+'</div>';
+  else if(M.scState==='summary'||M.scState==='none')banner='<div class="panel" style="padding:10px 14px;margin-bottom:10px;font-size:var(--t-sm);color:var(--text2)">'+(busy?'Checking your stock...':'Reading today&#8217;s stock check...')+'</div>';
+  var when='<div class="t3xs" style="color:var(--text3);margin-top:4px">Stock check: '+(M.scAt?esc(new Date(M.scAt).toLocaleString()):'not run yet')+' &middot; Other checks: '+(M.ranAt?esc(new Date(M.ranAt).toLocaleString()):'not run yet')+' &middot; The stock check also runs by itself every day.</div>';
+  var hdr='<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;margin-bottom:14px"><div style="max-width:720px"><div style="font-size:var(--t-md);color:var(--text2)">Checks that your stock, orders and catalog data agree with each other, with a one-click fix wherever it is safe. Nothing changes until you confirm.</div>'+when+'</div>'
+    +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><input id="di-inspect" placeholder="Inspect SKU..." style="width:150px;font-size:var(--t-sm);padding:6px 8px" onkeydown="if(event.key===\'Enter\')_diInspectGo()"><button type="button" class="btn btn-sm" onclick="_diInspectGo()">Inspect</button>'
+    +'<button type="button" class="btn btn-primary" id="di-run-btn" onclick="diRunAll()" '+(busy?'disabled':'')+'>'+(busy?'<span class="ic ic-clock"></span>Checking...':'&#9654; Run all checks')+'</button></div></div>';
+  var show=function(g){return !f||f===g;};
+  var grp=function(g,label,desc,color){if(!show(g))return '';var cs=M.checks.filter(function(c){return c.group===g&&(!c.known||c.items.length||c.ignored);});
+    if(!cs.length)return f===g?_diGroupHead(label,desc,color)+'<div class="panel section-empty">Nothing needs doing here.</div>':'';
+    return _diGroupHead(label,desc,color)+cs.map(diCard).join('');};
+  var passedList=M.checks.filter(function(c){return c.known&&!c.items.length;});
+  var passed=(show('clear'))?'<div class="panel" style="padding:12px 18px;margin-bottom:10px"><div style="display:flex;justify-content:space-between;align-items:center;gap:12px"><div><b>Passed</b> <span class="t3s">&middot; '+passedList.length+' check'+(passedList.length!==1?'s':'')+' found nothing wrong</span></div><button type="button" class="btn btn-sm" onclick="S._diPassed=!S._diPassed;render()">'+((S._diPassed||f==='clear')?'Hide &#9652;':'Show the list &#9662;')+'</button></div>'
+    +((S._diPassed||f==='clear')?'<div style="margin-top:8px">'+(passedList.length?passedList.map(function(c){return '<div class="check-row" style="padding:6px 0"><span style="color:var(--green)"><span class="ic ic-check"></span></span><span style="font-weight:700;font-size:var(--t-sm)">'+c.t.title+'</span><span class="t3xs" style="flex:1;color:var(--text3)">'+c.t.plain+'</span></div>';}).join(''):'<div class="t3s">Nothing has passed yet. Press Run all checks.</div>')+'</div>':'')+'</div>':'';
+  var rec=diRecent(),ign=_diIgn(),ignKeys=Object.keys(ign).filter(function(k){return Date.parse(ign[k])>Date.now();});
+  var recentHtml=(!f||f==='clear')?'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px;margin-bottom:10px">'
+    +'<div class="panel" style="padding:12px 18px"><div style="display:flex;justify-content:space-between;align-items:center"><b>Fixed from this page recently</b><span class="t3xs">last 7 days</span></div>'
+    +(rec.length?rec.map(function(g){var audit=g.source==='audit';return '<div style="font-size:var(--t-sm);margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="t3xs">'+esc(new Date(g.at).toLocaleString())+'</span><span>'+(audit?'Recorded '+g.n+' number'+(g.n!==1?'s':'')+' as correct':'Rewrote '+g.n+' negative figure'+(g.n!==1?'s':'')+' as backorder')+'</span><span class="t3xs">'+esc(g.user.split('@')[0])+'</span>'+(audit?'<a href="#" style="color:var(--teal);font-weight:700" onclick="diUndo(['+g.ids.map(_diQ).join(',')+']);return false">Undo</a>':'<span class="t3xs">(see Activity Log)</span>')+'</div>';}).join(''):'<div class="t3s" style="margin-top:6px">Nothing yet.</div>')+'</div>'
+    +'<div class="panel" style="padding:12px 18px"><div style="display:flex;justify-content:space-between;align-items:center"><b>Ignored for now ('+ignKeys.length+')</b><span class="t3xs">come back on their own after 30 days</span></div>'
+    +(ignKeys.length?ignKeys.slice(0,20).map(function(k){var p=k.split('|');return '<div style="font-size:var(--t-sm);margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span style="font-family:var(--mono)">'+esc(dispSku(p.slice(1).join('|')))+'</span><span class="t3xs">'+((DI_TEXT[p[0]]||{}).title||esc(p[0]))+' &middot; until '+esc(new Date(ign[k]).toLocaleDateString())+'</span><a href="#" style="color:var(--teal);font-weight:700" onclick="diRestore('+_diQ(k)+');return false">Restore</a></div>';}).join(''):'<div class="t3s" style="margin-top:6px">Nothing is being ignored.</div>')+'</div></div>':'';
+  var fc='<div class="panel" style="padding:12px 18px;margin-bottom:10px"><div style="display:flex;justify-content:space-between;align-items:center;gap:12px"><div><b>Forecast accuracy</b> <span class="t3s">&middot; information, not a data problem: how well the forecast predicted the last 12 weeks, item by item</span></div><button type="button" class="btn btn-sm" onclick="diForecastToggle()">'+(S._diFc?'Hide &#9652;':'Show &#9662;')+'</button></div></div>'+(S._diFc?renderForecastPanel():'');
+  return hdr+tiles+banner+grp('decide','NEEDS YOUR DECISION','Stock or orders where only you know the right answer.','var(--red)')
+    +grp('safe','SAFE TO FIX','No stock changes. Tidy-ups and retries you can do in one click.','var(--teal)')
+    +grp('look','WORTH A LOOK','Not wrong, but may need attention.','var(--yellow)')
+    +passed+recentHtml+(!f?fc:'');
+}
+Object.assign(window,{diToggle:diToggle,diExplain:diExplain,diFilter:diFilter,diForecastToggle:diForecastToggle,diRunAll:diRunAll,diSel:diSel,diSelAll:diSelAll,diIgnoreSel:diIgnoreSel,diRestore:diRestore,
+  diRecordOne:diRecordOne,diRecordSelected:diRecordSelected,diUndo:diUndo,diUndoLast:diUndoLast,diCountStart:diCountStart,diCountCancel:diCountCancel,diCountApply:diCountApply,diCountThese:diCountThese,
+  diConfirmCancel:diConfirmCancel,diConfirmGo:diConfirmGo});
+// [/v23.50 DATA INTEGRITY]
 
 /* [STAGE7] Ledger-based integrity helpers (v20.67) — pure functions so they are testable in isolation. */
 function _diLedgerDrift(corrRows){
