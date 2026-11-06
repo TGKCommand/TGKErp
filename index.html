@@ -475,7 +475,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.54</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.55</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -540,7 +540,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.54';
+const TGK_ERP_VERSION = 'v23.55';
 const TGK_ERP_BUILD_DATE = '2026-11-02';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -31310,8 +31310,46 @@ function openDealerStore(id,tab){
   var d=(S.dealers||[]).find(function(x){return String(x.id)===String(id);});if(!d)return;
   var so=(d.shipping_override&&typeof d.shipping_override==='object')?d.shipping_override:{};
   DM={id:String(d.id),d:d,tab:tab||'prices',rows:[],loaded:false,err:'',msg:'',q:'',busy:false,
+      users:[],usersLoaded:false,uf:{email:'',name:'',role:'buyer'},
       ship:{pm:(d.payment_mode==='billed_card'||d.payment_mode==='billed_invoice')?d.payment_mode:'prepay',us:so.us==null?'':String(so.us),ca:so.ca==null?'':String(so.ca),intl:so.intl==null?'':String(so.intl),fo:so.free_over==null?'':String(so.free_over)}};
-  dsModalRender();dsLoadPrices();
+  dsModalRender();dsLoadPrices();if(DM.tab==='users')dsLoadUsers();
+}
+// ---- portal users (this dealer's approved team): staff manage them here, the dealer's admins manage them in the portal
+var DS_EMAIL=/^[^\s@<>"']{1,64}@[^\s@<>"']{1,190}\.[A-Za-z]{2,}$/;
+async function dsLoadUsers(){
+  if(!DM)return;
+  try{var r=await db.from('dealer_portal_users').select('*').eq('dealer_id',DM.id).order('created_at',{ascending:true});if(r.error)throw r.error;DM.users=(r.data||[]).filter(function(u){return String(u.status||'active')==='active';});DM.err='';}
+  catch(e){DM.err='Could not load portal users: '+(e.message||e)+(/dealer_portal_users|relation|schema/i.test(String(e.message||''))?' Run dealer_users.sql in Supabase first.':'');DM.users=[];}
+  DM.usersLoaded=true;dsModalRender();
+}
+async function dsUserAdd(){
+  if(!DM||DM.busy)return;var f=DM.uf,em=String(f.email||'').trim().toLowerCase();
+  if(!DS_EMAIL.test(em)||em.length>120){DM.err='Enter a valid email address.';dsModalRender();return;}
+  if(['admin','buyer','viewer'].indexOf(f.role)<0){DM.err='Choose a role.';dsModalRender();return;}
+  if(em===String(DM.d.email||'').trim().toLowerCase()){DM.err='That is the main contact, who already has full access.';dsModalRender();return;}
+  if(DM.users.some(function(u){return String(u.email).toLowerCase()===em;})){DM.err=em+' is already on this team.';dsModalRender();return;}
+  if(DM.users.length>=15){DM.err='A team can have up to 15 people.';dsModalRender();return;}
+  DM.busy=true;DM.err='';dsModalRender();
+  try{
+    var ex=await db.from('dealer_portal_users').select('id,status').eq('dealer_id',DM.id).eq('email',em).limit(1);if(ex.error)throw ex.error;
+    var rec={name:String(f.name||'').trim().slice(0,80),role:f.role,status:'active',added_by:(S.currentUser||'ERP staff'),created_at:new Date().toISOString()};
+    var w=(ex.data&&ex.data[0])?await db.from('dealer_portal_users').update(rec).eq('id',ex.data[0].id):await db.from('dealer_portal_users').insert(Object.assign({dealer_id:DM.id,email:em},rec));
+    if(w.error)throw w.error;
+    toast('Added '+em+' to '+(DM.d.name||'the dealer'));DM.msg='Added '+em+'.';DM.uf={email:'',name:'',role:'buyer'};
+    DM.busy=false;await dsLoadUsers();return;
+  }catch(e){DM.err='Not saved: '+(e.message||e)+(/dealer_portal_users|relation|schema/i.test(String(e.message||''))?' (run dealer_users.sql in Supabase first)':'');}
+  DM.busy=false;dsModalRender();
+}
+async function dsUserRole(email,role){
+  if(!DM)return;DM.err='';DM.msg='';
+  try{var r=await db.from('dealer_portal_users').update({role:role}).eq('dealer_id',DM.id).eq('email',email);if(r.error)throw r.error;toast(email+' is now '+role);DM.msg=email+' is now '+role+'.';}catch(e){DM.err='Not saved: '+(e.message||e);}
+  await dsLoadUsers();
+}
+async function dsUserRemove(email){
+  if(!DM)return;if(!confirm('Remove '+email+' from '+(DM.d.name||'this dealer')+'\'s portal? They are signed out straight away.'))return;
+  DM.err='';DM.msg='';
+  try{var r=await db.from('dealer_portal_users').delete().eq('dealer_id',DM.id).eq('email',email);if(r.error)throw r.error;toast('Removed '+email);DM.msg='Removed '+email+'.';}catch(e){DM.err='Not removed: '+(e.message||e);}
+  await dsLoadUsers();
 }
 function dsClose(){DM=null;var ov=document.getElementById('ds-overlay');if(ov)ov.remove();}
 async function dsLoadPrices(){
@@ -31321,7 +31359,7 @@ async function dsLoadPrices(){
   catch(e){DM.loaded=true;DM.err='Could not load special prices: '+(e.message||e)+(/dealer_prices|relation|schema/i.test(String(e.message||''))?' Run dealer_storefront.sql in Supabase first.':'');}
   dsModalRender();
 }
-function dsTab(t){if(!DM)return;DM.tab=t;DM.err='';DM.msg='';dsModalRender();}
+function dsTab(t){if(!DM)return;DM.tab=t;DM.err='';DM.msg='';dsModalRender();if(t==='users'&&!DM.usersLoaded)dsLoadUsers();}
 function dsTh(cols){return cols.map(function(c){return '<th style="text-align:left'+(c[1]?';width:'+c[1]+'px':'')+'">'+c[0]+'</th>';}).join('');}
 function dsRowCells(r,i){
   var a=dsFind(r.sku),d=DM.d,std=a?dsStd(a,d):null,m=a?dsMargin(r.price,a):null,floor=dsSettings().floor,bad=(m!==null&&m<floor),p=Number(r.price);
@@ -31404,6 +31442,14 @@ function dsModalRender(){
      +'<div class="tbl-wrap" style="max-height:48vh;overflow:auto"><table><thead><tr>'+dsTh([['SKU',124],['Description'],['MSRP',72],['Standard',82],['Special price',100],['Min qty',64],['From',142],['Until',142],['Cost',74],['Margin',112],['Note',134],['',34]])+'</tr></thead><tbody>'
      +(!DM.loaded?'<tr><td colspan="12" class="t3s" style="padding:16px">Loading&hellip;</td></tr>':(DM.rows.length?DM.rows.map(dsRowHtml).join(''):'<tr><td colspan="12" class="section-empty" style="padding:18px">No special prices yet. Search for a product above to add one.</td></tr>'))+'</tbody></table></div>'
      +'<div class="t3s" style="margin-top:10px;line-height:1.5"><b>Which price wins:</b> this dealer\'s special price (in date, quantity met) &rarr; a product-wide promo price &rarr; their standard discount &rarr; MSRP. A row with a higher minimum quantity is a volume price.</div>';
+  }else if(DM.tab==='users'){
+    var ml=String(d.email||'').trim().toLowerCase(),uf=DM.uf,link='https://dealer.tgkmotorsport.com/?d='+(d.price_list_token||'');
+    var urows=(ml?'<tr><td><b>'+escHtml(d.contact_name||d.name||'Main contact')+'</b></td><td>'+escHtml(ml)+'</td><td><span class="pill pill-green">Main contact</span></td><td class="t3s">always full access</td><td></td></tr>':'<tr><td colspan="5" class="t3s">This dealer has no email on file, so there is no main contact. Add the email on the dealer record.</td></tr>')
+      +(DM.usersLoaded?DM.users.map(function(u){return '<tr><td><b>'+escHtml(u.name||'')+'</b></td><td>'+escHtml(u.email)+'</td><td><select class="form-input" style="width:120px" aria-label="Role for '+escHtml(u.email)+'" data-e="'+escHtml(u.email)+'" onchange="dsUserRole(this.dataset.e,this.value)">'+[['admin','Admin'],['buyer','Buyer'],['viewer','Viewer']].map(function(r){return '<option value="'+r[0]+'"'+(u.role===r[0]?' selected':'')+'>'+r[1]+'</option>';}).join('')+'</select></td><td class="t3s">'+(u.last_login_at?escHtml(String(u.last_login_at).slice(0,10)):'not yet')+(u.added_by?' &middot; added by '+escHtml(u.added_by):'')+'</td><td><button type="button" class="action-btn del" data-e="'+escHtml(u.email)+'" onclick="dsUserRemove(this.dataset.e)" aria-label="Remove">&times;</button></td></tr>';}).join(''):'<tr><td colspan="5" class="t3s" style="padding:14px">Loading&hellip;</td></tr>');
+    body='<div class="t3s" style="margin-bottom:10px;line-height:1.5">The people this dealer has approved to sign in to their portal. Each person signs in at the dealer\'s link with their own email and a code sent to it. <b>Admin</b> manages the team and orders, <b>Buyer</b> orders, <b>Viewer</b> only looks. The dealer\'s own admins manage this list too; changes made here are recorded the same way.</div>'
+     +'<div class="tbl-wrap"><table><thead><tr>'+dsTh([['Name'],['Email'],['Role',140],['Activity',260],['',34]])+'</tr></thead><tbody>'+urows+'</tbody></table></div>'
+     +'<div style="display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1.5fr) 140px auto;gap:10px;align-items:end;margin-top:14px"><div class="form-group" style="margin:0"><label class="form-label">Email</label><input class="form-input" value="'+escHtml(uf.email)+'" onchange="DM.uf.email=this.value"></div><div class="form-group" style="margin:0"><label class="form-label">Name (optional)</label><input class="form-input" value="'+escHtml(uf.name)+'" onchange="DM.uf.name=this.value"></div><div class="form-group" style="margin:0"><label class="form-label">Role</label><select class="form-input" onchange="DM.uf.role=this.value"><option value="admin"'+(uf.role==='admin'?' selected':'')+'>Admin</option><option value="buyer"'+(uf.role==='buyer'?' selected':'')+'>Buyer</option><option value="viewer"'+(uf.role==='viewer'?' selected':'')+'>Viewer</option></select></div><button type="button" class="btn btn-teal" onclick="dsUserAdd()"'+(DM.busy?' disabled':'')+'>Add person</button></div>'
+     +'<div class="t3s" style="margin-top:10px">Adding someone here does not email them. Send them this link and tell them to enter their email on the unlock screen: <b>'+escHtml(link)+'</b></div>';
   }else{
     var s=DM.ship,mst=m.shipping,ph=function(k){return mst[k]===undefined||mst[k]===null||mst[k]===''?'not set':String(mst[k]);};
     var inp=function(l,f,k){return '<div class="form-group"><label class="form-label">'+l+'</label><input class="form-input" value="'+escHtml(s[f])+'" placeholder="Master: '+escHtml(ph(k))+'" onchange="dsShipField(\''+f+'\',this.value)"></div>';};
@@ -31413,7 +31459,7 @@ function dsModalRender(){
      +'<div class="t3s">Shopify customer: '+(d.shopify_customer_id?'<b>linked</b> (ID '+escHtml(d.shopify_customer_id)+')':'will be linked automatically on their first order')+'</div>'
      +'<div style="margin-top:12px"><button type="button" class="btn btn-teal" onclick="dsSaveShip()"'+(DM.busy?' disabled':'')+'>'+(DM.busy?'Saving&hellip;':'Save payment and shipping')+'</button></div>';
   }
-  ov.innerHTML='<div style="width:min(1240px,100%);background:var(--bg);border:1px solid var(--border);border-radius:var(--r-lg,14px);box-shadow:0 20px 60px rgba(0,0,0,.35)"><div style="padding:14px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"><div><div style="font-size:var(--t-xl,20px);font-weight:800">Storefront &middot; '+escHtml(d.name||'')+'</div><div class="t3s">Special prices, how they pay, and their shipping. Only this dealer sees their special prices.</div></div><div style="display:flex;gap:6px">'+tabBtn('prices','Special prices')+tabBtn('ship','Payment &amp; shipping')+'<button type="button" class="btn btn-sm" onclick="dsClose()">Close</button></div></div>'
+  ov.innerHTML='<div style="width:min(1240px,100%);background:var(--bg);border:1px solid var(--border);border-radius:var(--r-lg,14px);box-shadow:0 20px 60px rgba(0,0,0,.35)"><div style="padding:14px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"><div><div style="font-size:var(--t-xl,20px);font-weight:800">Storefront &middot; '+escHtml(d.name||'')+'</div><div class="t3s">Special prices, how they pay, and their shipping. Only this dealer sees their special prices.</div></div><div style="display:flex;gap:6px">'+tabBtn('prices','Special prices')+tabBtn('ship','Payment &amp; shipping')+tabBtn('users','Portal users')+'<button type="button" class="btn btn-sm" onclick="dsClose()">Close</button></div></div>'
    +'<div style="padding:14px 20px">'+(DM.err?'<div class="panel" style="padding:9px 12px;border-left:3px solid var(--red);color:var(--red);margin-bottom:10px;font-size:var(--t-sm)">'+escHtml(DM.err)+'</div>':'')+(DM.msg?'<div class="panel" style="padding:9px 12px;border-left:3px solid var(--teal);margin-bottom:10px;font-size:var(--t-sm)">'+escHtml(DM.msg)+'</div>':'')+body+'</div>'
    +(DM.tab==='prices'?'<div style="padding:12px 20px;background:var(--bg3);border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px"><button type="button" class="btn" onclick="dsClose()">Close</button><button type="button" class="btn btn-teal" onclick="dsSavePrices()"'+(DM.busy||!DM.loaded?' disabled':'')+'>'+(DM.busy?'Saving&hellip;':'Save special pricing')+'</button></div>':'')+'</div>';
 }
@@ -31521,7 +31567,7 @@ function renderDealerOrders(){
    +'<div class="kpi-grid kpi-grid-4" style="margin-bottom:12px">'+tile('attention','Needs attention',c.attention,'kpi-red','held for you, or sending')+tile('awaiting','Awaiting payment',c.awaiting,'kpi-yellow','pay-up-front dealers')+tile('sent','Sent to Shopify today',c.sentToday,'kpi-teal','orders created')+tile('all','All orders',c.all,'','last 300')+'</div>'
    +dsSettingsHtml()+tbl;
 }
-Object.assign(window,{openDealerStore:openDealerStore,dsClose:dsClose,dsTab:dsTab,dsEdit:dsEdit,dsRowDel:dsRowDel,dsSearchPick:dsSearchPick,dsCsvExport:dsCsvExport,dsCsvImport:dsCsvImport,dsCopyFrom:dsCopyFrom,dsSavePrices:dsSavePrices,dsShipField:dsShipField,dsSaveShip:dsSaveShip,
+Object.assign(window,{dsLoadUsers:dsLoadUsers,dsUserAdd:dsUserAdd,dsUserRole:dsUserRole,dsUserRemove:dsUserRemove,openDealerStore:openDealerStore,dsClose:dsClose,dsTab:dsTab,dsEdit:dsEdit,dsRowDel:dsRowDel,dsSearchPick:dsSearchPick,dsCsvExport:dsCsvExport,dsCsvImport:dsCsvImport,dsCopyFrom:dsCopyFrom,dsSavePrices:dsSavePrices,dsShipField:dsShipField,dsSaveShip:dsSaveShip,
   dsSelect:dsSelect,dsFilter:dsFilter,dsSend:dsSend,dsReject:dsReject,dsEditQty:dsEditQty,dsSaveLines:dsSaveLines,dsDelLine:dsDelLine,dsSync:dsSync,dsLoadReqs:dsLoadReqs,dsSaveSettings:dsSaveSettings});
 
 
