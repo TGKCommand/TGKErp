@@ -475,7 +475,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.55</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.56</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -540,7 +540,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.55';
+const TGK_ERP_VERSION = 'v23.56';
 const TGK_ERP_BUILD_DATE = '2026-11-02';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -8566,16 +8566,22 @@ window.openDealerStaffView=function(ev,href){
   }catch(e){return true;} // anything unexpected: let the plain link work as it always did
 };
 function copyDealerLink(id){
-  var dealer=S.dealers.find(function(d){return d.id===id;});
+  var dealer=S.dealers.find(function(d){return String(d.id)===String(id);});
   var token=dealer&&dealer.price_list_token;
-  // No id-based fallback: the live portal (a separate deployment at dealer.tgkmotorsport.com)
-  // only ever reads '?d=<token>'. A '?dealer=<id>' link isn't a degraded version of the real
-  // one, it's a broken one -- the dealer would land on a plain error screen. Refuse to copy that.
+  // No id-based fallback: the portal only ever reads '?d=<token>'. A '?dealer=<id>' link would land the dealer on a plain error screen, so refuse to copy one.
   if(!token){toast('This dealer has no price-list link yet — use Generate Missing Links');return;}
-  var url='https://dealer.tgkmotorsport.com/?d='+token;
-  navigator.clipboard.writeText(url).then(function(){toast('\u2713 Price list link copied!');}).catch(function(){toast(url);});
+  dsCopy('https://dealer.tgkmotorsport.com/?d='+token,'✓ '+(dealer.name||'Dealer')+' link copied!');
 }
-
+function dsCopy(text,okMsg){
+  var done=function(){toast(okMsg||'Copied');};
+  var fallback=function(){
+    try{var ta=document.createElement('textarea');ta.value=text;ta.setAttribute('readonly','');ta.style.cssText='position:fixed;top:0;left:0;opacity:0';document.body.appendChild(ta);ta.focus();ta.select();
+      var ok=document.execCommand&&document.execCommand('copy');document.body.removeChild(ta);if(ok){done();return;}}catch(e){}
+    window.prompt('Press Ctrl+C to copy this link, then OK:',text);
+  };
+  try{if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done,fallback);return;}}catch(e){}
+  fallback();
+}
 function fnPill(v){
   if(v===true)return '<span style="color:var(--green);font-weight:700"><span class="ic ic-check"></span>LIVE</span>';
   if(v===false)return '<span style="color:var(--red);font-weight:700"><span class="ic ic-x"></span>not responding</span>';
@@ -31315,10 +31321,11 @@ function openDealerStore(id,tab){
   dsModalRender();dsLoadPrices();if(DM.tab==='users')dsLoadUsers();
 }
 // ---- portal users (this dealer's approved team): staff manage them here, the dealer's admins manage them in the portal
+var DS_USER_COLS='id,dealer_id,email,name,role,status,added_by,created_at,last_login_at,is_primary,password_set_at';
 var DS_EMAIL=/^[^\s@<>"']{1,64}@[^\s@<>"']{1,190}\.[A-Za-z]{2,}$/;
 async function dsLoadUsers(){
   if(!DM)return;
-  try{var r=await db.from('dealer_portal_users').select('*').eq('dealer_id',DM.id).order('created_at',{ascending:true});if(r.error)throw r.error;DM.users=(r.data||[]).filter(function(u){return String(u.status||'active')==='active';});DM.err='';}
+  try{var r=await db.from('dealer_portal_users').select(DS_USER_COLS).eq('dealer_id',DM.id).order('created_at',{ascending:true});if(r.error)throw r.error;var all=r.data||[];DM.pwSet={};all.forEach(function(u){if(u.password_set_at)DM.pwSet[String(u.email).toLowerCase()]=1;});DM.users=all.filter(function(u){return String(u.status||'active')==='active'&&!u.is_primary;});}
   catch(e){DM.err='Could not load portal users: '+(e.message||e)+(/dealer_portal_users|relation|schema/i.test(String(e.message||''))?' Run dealer_users.sql in Supabase first.':'');DM.users=[];}
   DM.usersLoaded=true;dsModalRender();
 }
@@ -31331,14 +31338,22 @@ async function dsUserAdd(){
   if(DM.users.length>=15){DM.err='A team can have up to 15 people.';dsModalRender();return;}
   DM.busy=true;DM.err='';dsModalRender();
   try{
-    var ex=await db.from('dealer_portal_users').select('id,status').eq('dealer_id',DM.id).eq('email',em).limit(1);if(ex.error)throw ex.error;
+    var ex=await db.from('dealer_portal_users').select('id,status,is_primary').eq('dealer_id',DM.id).eq('email',em).limit(1);if(ex.error)throw ex.error;
     var rec={name:String(f.name||'').trim().slice(0,80),role:f.role,status:'active',added_by:(S.currentUser||'ERP staff'),created_at:new Date().toISOString()};
     var w=(ex.data&&ex.data[0])?await db.from('dealer_portal_users').update(rec).eq('id',ex.data[0].id):await db.from('dealer_portal_users').insert(Object.assign({dealer_id:DM.id,email:em},rec));
     if(w.error)throw w.error;
-    toast('Added '+em+' to '+(DM.d.name||'the dealer'));DM.msg='Added '+em+'.';DM.uf={email:'',name:'',role:'buyer'};
+    DM.uf={email:'',name:'',role:'buyer'};var sent=true;
+    try{await dsSetupLinkCall(em);}catch(e2){sent=false;DM.err='Added, but the setup email could not be sent ('+(e2.message||e2)+'). Use Send setup link on their row.';}
+    toast('Added '+em+(sent?' and emailed a setup link':''));if(sent)DM.msg='Added '+em+'. We emailed them a link to choose their password.';
     DM.busy=false;await dsLoadUsers();return;
   }catch(e){DM.err='Not saved: '+(e.message||e)+(/dealer_portal_users|relation|schema/i.test(String(e.message||''))?' (run dealer_users.sql in Supabase first)':'');}
   DM.busy=false;dsModalRender();
+}
+function dsSetupLinkCall(email){return _dsFn({action:'users_send_setup',token:DM.d.price_list_token,email:email});}
+async function dsUserSetupLink(email){
+  if(!DM)return;DM.err='';DM.msg='';
+  try{await dsSetupLinkCall(email);toast('Setup link sent to '+email);DM.msg='Sent a link to '+email+' to choose a password. It works once.';}catch(e){DM.err='Not sent: '+(e.message||e);}
+  dsModalRender();
 }
 async function dsUserRole(email,role){
   if(!DM)return;DM.err='';DM.msg='';
@@ -31443,13 +31458,15 @@ function dsModalRender(){
      +(!DM.loaded?'<tr><td colspan="12" class="t3s" style="padding:16px">Loading&hellip;</td></tr>':(DM.rows.length?DM.rows.map(dsRowHtml).join(''):'<tr><td colspan="12" class="section-empty" style="padding:18px">No special prices yet. Search for a product above to add one.</td></tr>'))+'</tbody></table></div>'
      +'<div class="t3s" style="margin-top:10px;line-height:1.5"><b>Which price wins:</b> this dealer\'s special price (in date, quantity met) &rarr; a product-wide promo price &rarr; their standard discount &rarr; MSRP. A row with a higher minimum quantity is a volume price.</div>';
   }else if(DM.tab==='users'){
-    var ml=String(d.email||'').trim().toLowerCase(),uf=DM.uf,link='https://dealer.tgkmotorsport.com/?d='+(d.price_list_token||'');
-    var urows=(ml?'<tr><td><b>'+escHtml(d.contact_name||d.name||'Main contact')+'</b></td><td>'+escHtml(ml)+'</td><td><span class="pill pill-green">Main contact</span></td><td class="t3s">always full access</td><td></td></tr>':'<tr><td colspan="5" class="t3s">This dealer has no email on file, so there is no main contact. Add the email on the dealer record.</td></tr>')
-      +(DM.usersLoaded?DM.users.map(function(u){return '<tr><td><b>'+escHtml(u.name||'')+'</b></td><td>'+escHtml(u.email)+'</td><td><select class="form-input" style="width:120px" aria-label="Role for '+escHtml(u.email)+'" data-e="'+escHtml(u.email)+'" onchange="dsUserRole(this.dataset.e,this.value)">'+[['admin','Admin'],['buyer','Buyer'],['viewer','Viewer']].map(function(r){return '<option value="'+r[0]+'"'+(u.role===r[0]?' selected':'')+'>'+r[1]+'</option>';}).join('')+'</select></td><td class="t3s">'+(u.last_login_at?escHtml(String(u.last_login_at).slice(0,10)):'not yet')+(u.added_by?' &middot; added by '+escHtml(u.added_by):'')+'</td><td><button type="button" class="action-btn del" data-e="'+escHtml(u.email)+'" onclick="dsUserRemove(this.dataset.e)" aria-label="Remove">&times;</button></td></tr>';}).join(''):'<tr><td colspan="5" class="t3s" style="padding:14px">Loading&hellip;</td></tr>');
-    body='<div class="t3s" style="margin-bottom:10px;line-height:1.5">The people this dealer has approved to sign in to their portal. Each person signs in at the dealer\'s link with their own email and a code sent to it. <b>Admin</b> manages the team and orders, <b>Buyer</b> orders, <b>Viewer</b> only looks. The dealer\'s own admins manage this list too; changes made here are recorded the same way.</div>'
-     +'<div class="tbl-wrap"><table><thead><tr>'+dsTh([['Name'],['Email'],['Role',140],['Activity',260],['',34]])+'</tr></thead><tbody>'+urows+'</tbody></table></div>'
+    var ml=String(d.email||'').trim().toLowerCase(),uf=DM.uf;
+    var pw=function(em){return DM.pwSet&&DM.pwSet[String(em).toLowerCase()]?'<span class="pill pill-green">password set</span>':'<span class="pill pill-muted">no password yet</span>';};
+    var linkBtn=function(em){return '<button type="button" class="btn btn-sm" data-e="'+escHtml(em)+'" onclick="dsUserSetupLink(this.dataset.e)">Send setup link</button>';};
+    var urows=(ml?'<tr><td><b>'+escHtml(d.contact_name||d.name||'Main contact')+'</b></td><td>'+escHtml(ml)+'</td><td><span class="pill pill-green">Main contact</span></td><td>'+pw(ml)+'</td><td>'+linkBtn(ml)+'</td><td></td></tr>':'<tr><td colspan="6" class="t3s">This dealer has no email on file, so there is no main contact. Add the email on the dealer record.</td></tr>')
+      +(DM.usersLoaded?DM.users.map(function(u){return '<tr><td><b>'+escHtml(u.name||'')+'</b></td><td>'+escHtml(u.email)+'</td><td><select class="form-input" style="width:120px" aria-label="Role for '+escHtml(u.email)+'" data-e="'+escHtml(u.email)+'" onchange="dsUserRole(this.dataset.e,this.value)">'+[['admin','Admin'],['buyer','Buyer'],['viewer','Viewer']].map(function(r){return '<option value="'+r[0]+'"'+(u.role===r[0]?' selected':'')+'>'+r[1]+'</option>';}).join('')+'</select></td><td>'+pw(u.email)+'<div class="t3xs">'+(u.last_login_at?'last sign-in '+escHtml(String(u.last_login_at).slice(0,10)):'never signed in')+'</div></td><td>'+linkBtn(u.email)+'</td><td><button type="button" class="action-btn del" data-e="'+escHtml(u.email)+'" onclick="dsUserRemove(this.dataset.e)" aria-label="Remove">&times;</button></td></tr>';}).join(''):'<tr><td colspan="6" class="t3s" style="padding:14px">Loading&hellip;</td></tr>');
+    body='<div class="t3s" style="margin-bottom:10px;line-height:1.5">The people this dealer has approved to sign in to their portal. Each person has their own login: they choose a password from an emailed link, then sign in at the portal address with their email and that password. <b>Admin</b> manages the team and orders, <b>Buyer</b> orders, <b>Viewer</b> only looks. The dealer\'s own admins manage this list too; changes made here are recorded the same way.</div>'
+     +'<div class="tbl-wrap"><table><thead><tr>'+dsTh([['Name'],['Email'],['Role',140],['Sign-in',170],['',130],['',34]])+'</tr></thead><tbody>'+urows+'</tbody></table></div>'
      +'<div style="display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1.5fr) 140px auto;gap:10px;align-items:end;margin-top:14px"><div class="form-group" style="margin:0"><label class="form-label">Email</label><input class="form-input" value="'+escHtml(uf.email)+'" onchange="DM.uf.email=this.value"></div><div class="form-group" style="margin:0"><label class="form-label">Name (optional)</label><input class="form-input" value="'+escHtml(uf.name)+'" onchange="DM.uf.name=this.value"></div><div class="form-group" style="margin:0"><label class="form-label">Role</label><select class="form-input" onchange="DM.uf.role=this.value"><option value="admin"'+(uf.role==='admin'?' selected':'')+'>Admin</option><option value="buyer"'+(uf.role==='buyer'?' selected':'')+'>Buyer</option><option value="viewer"'+(uf.role==='viewer'?' selected':'')+'>Viewer</option></select></div><button type="button" class="btn btn-teal" onclick="dsUserAdd()"'+(DM.busy?' disabled':'')+'>Add person</button></div>'
-     +'<div class="t3s" style="margin-top:10px">Adding someone here does not email them. Send them this link and tell them to enter their email on the unlock screen: <b>'+escHtml(link)+'</b></div>';
+     +'<div class="t3s" style="margin-top:10px">Adding someone emails them a one-time link to choose their password. They sign in at <b>https://dealer.tgkmotorsport.com</b>. Use <b>Send setup link</b> to send a new link (it becomes a reset link once they have a password).</div>';
   }else{
     var s=DM.ship,mst=m.shipping,ph=function(k){return mst[k]===undefined||mst[k]===null||mst[k]===''?'not set':String(mst[k]);};
     var inp=function(l,f,k){return '<div class="form-group"><label class="form-label">'+l+'</label><input class="form-input" value="'+escHtml(s[f])+'" placeholder="Master: '+escHtml(ph(k))+'" onchange="dsShipField(\''+f+'\',this.value)"></div>';};
@@ -31567,7 +31584,7 @@ function renderDealerOrders(){
    +'<div class="kpi-grid kpi-grid-4" style="margin-bottom:12px">'+tile('attention','Needs attention',c.attention,'kpi-red','held for you, or sending')+tile('awaiting','Awaiting payment',c.awaiting,'kpi-yellow','pay-up-front dealers')+tile('sent','Sent to Shopify today',c.sentToday,'kpi-teal','orders created')+tile('all','All orders',c.all,'','last 300')+'</div>'
    +dsSettingsHtml()+tbl;
 }
-Object.assign(window,{dsLoadUsers:dsLoadUsers,dsUserAdd:dsUserAdd,dsUserRole:dsUserRole,dsUserRemove:dsUserRemove,openDealerStore:openDealerStore,dsClose:dsClose,dsTab:dsTab,dsEdit:dsEdit,dsRowDel:dsRowDel,dsSearchPick:dsSearchPick,dsCsvExport:dsCsvExport,dsCsvImport:dsCsvImport,dsCopyFrom:dsCopyFrom,dsSavePrices:dsSavePrices,dsShipField:dsShipField,dsSaveShip:dsSaveShip,
+Object.assign(window,{dsUserSetupLink:dsUserSetupLink,dsLoadUsers:dsLoadUsers,dsUserAdd:dsUserAdd,dsUserRole:dsUserRole,dsUserRemove:dsUserRemove,openDealerStore:openDealerStore,dsClose:dsClose,dsTab:dsTab,dsEdit:dsEdit,dsRowDel:dsRowDel,dsSearchPick:dsSearchPick,dsCsvExport:dsCsvExport,dsCsvImport:dsCsvImport,dsCopyFrom:dsCopyFrom,dsSavePrices:dsSavePrices,dsShipField:dsShipField,dsSaveShip:dsSaveShip,
   dsSelect:dsSelect,dsFilter:dsFilter,dsSend:dsSend,dsReject:dsReject,dsEditQty:dsEditQty,dsSaveLines:dsSaveLines,dsDelLine:dsDelLine,dsSync:dsSync,dsLoadReqs:dsLoadReqs,dsSaveSettings:dsSaveSettings});
 
 
