@@ -475,7 +475,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.56</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.57</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -540,8 +540,8 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.56';
-const TGK_ERP_BUILD_DATE = '2026-11-02';
+const TGK_ERP_VERSION = 'v23.57';
+const TGK_ERP_BUILD_DATE = '2026-11-06';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
 // functions can refuse anonymous callers (EDGE_AUTH_MODE=enforce). Done once here instead of at ~20 call sites:
@@ -2156,7 +2156,7 @@ function nav(v){
   if(v==='users'){S._profilesLoaded=false;S._profilesLoading=false;S._profilesError=null;}
   if(v==='corrections'){S._auditLogLoaded=false;S._auditLogLoading=false;}
   if(v!=='packqueue'){S.workOrderMode=false;S.customPackMode=false;}
-  S.searchQ='';if(S.view==='reports')S.rptState={...S.rptState,preview:null};
+  S.searchQ='';if(S.view==='reports'){S.rptState={...S.rptState,preview:null};S._countHist=null;}
   S.view=v;
   document.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
   const el=$('nav-'+v);if(el)el.classList.add('active');
@@ -9215,7 +9215,7 @@ async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.86'
+const EDGE_BUILD = 'v23.87'
 
 // [v23.82] The vehicle the shopper had saved on the website rides along as cart attribute "Vehicle" and arrives
 // here as an order note attribute. It is stored on each sales line (column added by fitment_7_insights.sql), so
@@ -9226,12 +9226,31 @@ function orderVehicle(order: any): string | null {
   const v = hit ? String(hit.value || '').trim() : ''
   return v ? v.slice(0, 200) : null
 }
-// Insert a sales line; if the database does not have the vehicle column yet, retry without it (orders never stop).
+// [v23.87] The price the customer actually paid for one unit of a Shopify line: the line price less its discounts (order-level
+// discount codes - how dealers buy - arrive as discount_allocations; line-level ones as total_discount). Same rule as the ERP's
+// own sync, so every report that sums revenue agrees. Without this the webhook never stored a price, and every report fell back
+// to list price x units, which overstates anything discounted, on promotion, or bought by a dealer.
+function lineUnitNet(li: any): number | null {
+  if (!li) return null
+  const q = Number(li.quantity) || 1
+  const gross = (parseFloat(li.price) || 0) * q
+  if (!(gross &gt; 0)) return null
+  const alloc = Array.isArray(li.discount_allocations) ? li.discount_allocations.reduce((t: number, d: any) =&gt; t + (parseFloat(d &amp;&amp; d.amount) || 0), 0) : 0
+  const disc = alloc &gt; 0 ? alloc : (parseFloat(li.total_discount) || 0)
+  return Math.round((Math.max(0, gross - disc) / q) * 100) / 100
+}
+function priceFields(li: any): Record&lt;string, any&gt; {
+  const u = lineUnitNet(li)
+  return u === null ? {} : { unit_price: u, price_source: 'shopify' }
+}
+// Insert a sales line; if the database does not have an optional column yet (vehicle, unit_price, price_source), retry without it (orders never stop).
 async function insertSaleLine(db: any, row: any) {
   let res = await db.from('sales').insert(row)
-  if (res.error &amp;&amp; row &amp;&amp; 'vehicle' in row &amp;&amp; /vehicle/i.test(String(res.error.message || ''))) {
-    const r2 = { ...row }; delete r2.vehicle
-    res = await db.from('sales').insert(r2)
+  for (let i = 0; i &lt; 3 &amp;&amp; res.error &amp;&amp; row; i++) {
+    const msg = String(res.error.message || ''), drop = ['vehicle', 'unit_price', 'price_source'].filter((c) =&gt; c in row &amp;&amp; new RegExp(c, 'i').test(msg))
+    if (!drop.length) break
+    row = { ...row }; drop.forEach((c) =&gt; { delete row[c] })
+    res = await db.from('sales').insert(row)
   }
   return res
 }
@@ -10125,6 +10144,43 @@ if (body.action === 'list_product_templates') {
   // once; the id lookup itself is page-fetched in 1000-row chunks rather than a single unbounded
   // select, since Supabase/PostgREST caps an unbounded request at 1000 rows by default and this
   // table can easily exceed that.
+  // [v23.87] Fills in the price actually paid on existing sales lines that were stored without one (every order the webhook created
+  // before this version). Each call handles one batch and reports how many are left; call it again until done. Lines Shopify
+  // cannot match are marked price_source = 'unavailable' so they are not retried forever.
+  if (body.action === 'backfill_prices') {
+    const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
+    const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
+    const JSONH = { ...CORS, 'Content-Type': 'application/json' }
+    if (!store || !key) return new Response(JSON.stringify({ error: 'Missing Shopify credentials' }), { status: 400, headers: JSONH })
+    const limit = Math.min(Math.max(parseInt(body.limit) || 15, 1), 30)
+    const ids = new Set&lt;string&gt;()
+    const probe = await db.from('sales').select('shopify_order_id').is('unit_price', null).is('price_source', null).not('shopify_order_id', 'is', null).order('shopify_order_id', { ascending: true }).limit(2000)
+    if (probe.error) {
+      const colMissing = /unit_price|price_source/i.test(String(probe.error.message || ''))
+      return new Response(JSON.stringify({ error: colMissing ? 'The sales table has no unit_price / price_source columns yet. Run sales_price_columns.sql in the Supabase SQL editor, then try again.' : 'Could not list orders: ' + probe.error.message, needs_sql: colMissing }), { status: colMissing ? 409 : 500, headers: JSONH })
+    }
+    for (const r of (probe.data || [])) { if (r.shopify_order_id) ids.add(String(r.shopify_order_id)) }
+    const all = [...ids], batch = all.slice(0, limit)
+    let filled = 0, unavailable = 0
+    const errors: string[] = []
+    for (const oid of batch) {
+      try {
+        const res = await fetch('https://' + store + '/admin/api/2024-01/orders/' + oid + '.json?fields=id,line_items', { headers: { 'X-Shopify-Access-Token': key } })
+        const rows = await db.from('sales').select('id,shopify_line_item_id').eq('shopify_order_id', oid).is('unit_price', null).is('price_source', null)
+        const lines = res.ok ? ((await res.json())?.order?.line_items || []) : []
+        if (!res.ok &amp;&amp; res.status !== 404) { errors.push(oid + ': Shopify ' + res.status); continue }
+        const byId: Record&lt;string, any&gt; = {}; lines.forEach((li: any) =&gt; { byId[String(li.id)] = li })
+        for (const row of (rows.data || [])) {
+          const u = row.shopify_line_item_id ? lineUnitNet(byId[String(row.shopify_line_item_id)]) : null
+          const w = u === null ? await db.from('sales').update({ price_source: 'unavailable' }).eq('id', row.id) : await db.from('sales').update({ unit_price: u, price_source: 'shopify' }).eq('id', row.id)
+          if (w.error) errors.push(oid + ' (row ' + row.id + '): ' + w.error.message); else if (u === null) unavailable++; else filled++
+        }
+        await new Promise((r) =&gt; setTimeout(r, 550))   // stay well inside Shopify's rate limit
+      } catch (e) { errors.push(oid + ': ' + String((e as any)?.message || e)) }
+    }
+    return new Response(JSON.stringify({ ok: true, orders_in_batch: batch.length, filled, unavailable, orders_remaining: Math.max(0, all.length - batch.length), more_possible: all.length &gt;= 2000, done: all.length &lt;= batch.length &amp;&amp; !errors.length, errors }), { headers: JSONH })
+  }
+
   if (body.action === 'backfill_sale_dates') {
     const store = (body.store || Deno.env.get('SHOPIFY_STORE') || '').replace('https://', '').replace('http://', '')
     const key = body.key || Deno.env.get('SHOPIFY_KEY') || ''
@@ -10381,6 +10437,7 @@ if (body.action === 'list_product_templates') {
           discount_code: orderPoCode(order),
           shopify_order_id: String(order.id),
           shopify_line_item_id: String(li.id),
+          ...priceFields(li),
         })
         if (insErr) {
           if ((insErr as any).code === '23505') console.log('[shopify-orders] line item already recorded (database refused the duplicate):', order.name, pn)
@@ -10586,6 +10643,7 @@ if (body.action === 'list_product_templates') {
             discount_code: orderPoCode(order),
             shopify_order_id: String(order.id),
             shopify_line_item_id: String(cl.li.id),
+            ...priceFields(cl.li),
           })
           if (insErr) {
             if ((insErr as any).code === '23505') console.log('[shopify-orders] orders/updated: line item already recorded (database refused the duplicate):', order.name, cl.pn)
@@ -19983,7 +20041,8 @@ function _rptSearchDebounced(){
   // losing the "updates as you type" feel.
   clearTimeout(_rptSearchTimer);
   _rptSearchTimer=setTimeout(function(){
-    render();
+    S.rptState={...S.rptState,keepPreview:true};
+ render();
     // render() rebuilds this whole view's innerHTML, including the search box itself - without
     // explicitly refocusing the freshly-created input, every debounced update would silently
     // kick the person out of the field they were actively typing into.
@@ -20038,11 +20097,13 @@ function renderReports(){
     {key:'custom',label:'Custom Range'},
   ];
   const salesCats=['Sales','Inventory','Counts','Warranty'];
-  const hasDates=['sales_orders','sales_shipped','sales_by_sku','sales_by_month','sales_by_customer','sales_by_dealer','sales_open','sales_on_hold','inv_movements','inv_receipts','cycle_counts','corrections_log','warranty_claims','shipment_errors','resolution_all','po_all','po_open','po_draft','po_received','po_by_vendor','po_lines','dead_parts'].includes(def.id);
+  const hasDates=['sales_orders','sales_shipped','sales_by_sku','sales_by_month','sales_by_customer','sales_by_dealer','inv_movements','inv_receipts','cycle_counts','corrections_log','warranty_claims','shipment_errors','resolution_all','po_all','po_open','po_received','po_by_vendor','po_lines','dead_parts'].includes(def.id);   // [v23.57] not the snapshot reports (open orders, on hold, draft POs): they ignored the range, so offering one was misleading
 
-  const preview=rs.preview;
-  const rows=preview||buildReportRows(def.id,dr,customFrom,customTo);
-  if(!rs.preview){S.rptState={...S.rptState,preview:rows};}
+  // [v23.57] The rows are rebuilt on every draw. They used to be kept from the first draw until you changed report or date, so when older
+  // orders finished loading, or an order arrived, the screen kept showing the earlier (partial) numbers. Typing in the search box is the one
+  // exception: it only filters what is already built.
+  const rows=(rs.keepPreview&&rs.preview)?rs.preview:buildReportRows(def.id,dr,customFrom,customTo);
+  S.rptState={...S.rptState,preview:rows,keepPreview:false};
 
   const hasRows=rows&&rows.data&&rows.data.length>0;
   // Reports had no search at all - the preview only ever showed the first 50 rows with no way
@@ -20086,7 +20147,8 @@ function renderReports(){
           <button class="btn" onclick="printReport('${def.id}','${dr}','${customFrom}','${customTo}')" title="Open a print-friendly version">&#128424; Print</button>
           ${canChart?`<button class="btn ${S.rptState.chartView?'btn-teal':''}" onclick="(()=>{S.rptState={...S.rptState,chartView:!S.rptState.chartView,preview:null};render()})()" title="Toggle chart view">${S.rptState.chartView?'\uD83D\uDCC3 Table':'\uD83D\uDCCA Chart'}</button>`:''}
         </div>
-        ${hasDates?`<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        ${rptNoteHtml(rows,def,dr,customFrom,customTo)}
+ ${hasDates?`<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
           <span class="t3s">Range:</span>
           ${DATE_PRESETS.map(p=>`<button class="filter-chip ${dr===p.key?'on-teal':''}" onclick="S.rptState={...S.rptState,dateRange:'${p.key}',preview:null};render()">${p.label}</button>`).join('')}
           ${dr==='custom'?`<input type="date" class="form-input" style="width:130px;padding:4px 8px;font-size:var(--t-sm)" value="${customFrom}" onchange="S.rptState={...S.rptState,from:this.value,preview:null};render()">
@@ -20120,35 +20182,144 @@ function renderReports(){
   </div>`;
 }
 
+// [v23.57] Report dates are the business day (Chicago), the same day orders are stamped with. They used UTC, so after about 6-7pm
+// Central "Today" meant tomorrow and showed nothing, and every "last N days" window slid by a day in the evening.
+function rptToday(){return centralDateOnly();}
+function rptDaysAgo(n){return centralDateOnly(Date.now()-n*86400000);}
 function getDateRange(preset, customFrom, customTo){
-  const now=new Date();
+  const today=rptToday();
   if(preset==='all')return{from:null,to:null};
-  if(preset==='today'){const d=now.toISOString().slice(0,10);return{from:d,to:d};}
-  if(preset==='7d')return{from:daysAgo(7),to:now.toISOString().slice(0,10)};
-  if(preset==='30d')return{from:daysAgo(30),to:now.toISOString().slice(0,10)};
-  if(preset==='90d')return{from:daysAgo(90),to:now.toISOString().slice(0,10)};
-  if(preset==='ytd'){const y=now.getFullYear();return{from:y+'-01-01',to:now.toISOString().slice(0,10)};}
-  if(preset==='thismonth'){const y=now.getFullYear(),m=String(now.getMonth()+1).padStart(2,'0');return{from:y+'-'+m+'-01',to:now.toISOString().slice(0,10)};}
-  if(preset==='lastmonth'){const d=new Date(now.getFullYear(),now.getMonth()-1,1);const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0');const last=new Date(now.getFullYear(),now.getMonth(),0).toISOString().slice(0,10);return{from:y+'-'+m+'-01',to:last};}
+  if(preset==='today')return{from:today,to:today};
+  if(preset==='7d')return{from:rptDaysAgo(7),to:today};
+  if(preset==='30d')return{from:rptDaysAgo(30),to:today};
+  if(preset==='90d')return{from:rptDaysAgo(90),to:today};
+  const y=+today.slice(0,4),m=+today.slice(5,7);
+  if(preset==='ytd')return{from:y+'-01-01',to:today};
+  if(preset==='thismonth')return{from:y+'-'+String(m).padStart(2,'0')+'-01',to:today};
+  if(preset==='lastmonth'){const ly=m===1?y-1:y,lm=m===1?12:m-1;return{from:ly+'-'+String(lm).padStart(2,'0')+'-01',to:new Date(Date.UTC(y,m-1,0)).toISOString().slice(0,10)};}
   if(preset==='custom')return{from:customFrom||null,to:customTo||null};
   return{from:null,to:null};
 }
 
+// A date column that holds a real moment in time (created_at, shipped_at) is read as the Chicago day; order and PO dates are plain dates.
+function rptDay(v,field){
+  if(!v)return '';
+  if(field==='created_at'||field==='shipped_at'||field==='completed_at'||field==='resolved_at'){try{return centralDateOnly(v);}catch(e){return String(v).slice(0,10);}}
+  return String(v).slice(0,10);
+}
 function filterByDate(rows, dateField, from, to){
   if(!from&&!to)return rows;
   return rows.filter(r=>{
     const v=r[dateField];if(!v)return!from; // no date → include only if no start filter
-    const s=String(v).slice(0,10);
+    const s=rptDay(v,dateField);
     if(from&&s<from)return false;
     if(to&&s>to)return false;
     return true;
   });
 }
 
+// ---- [v23.57] helpers the reports share ----
+// Lines that did not keep their money. Refunded and returned lines keep their original quantity and price on the row, so a
+// report that only left out Cancelled counted them as revenue.
+const RPT_NOT_REVENUE=['Cancelled','Refunded','Returned'];
+function rptCountsAsRevenue(s){return RPT_NOT_REVENUE.indexOf(s.fulfillment_status)<0;}
+function rptRevenueNote(kept,dropped){
+  const est=kept.filter(s=>!lineRevenue(s).actual).length,n=kept.length;
+  let note=(dropped?dropped+' cancelled, refunded or returned line'+(dropped===1?' is':'s are')+' left out. ':'')+'Revenue is the price paid per unit.';
+  if(est)note+=' '+est.toLocaleString()+' of '+n.toLocaleString()+' lines ('+Math.round(est/n*100)+'%) have no recorded paid price, so they are counted at list price (dealer orders at the dealer rate): for those lines revenue is an estimate.';
+  return{note,estimated:est};
+}
+function rptReceivedValue(p){   // value of goods actually received on this PO (partial receipts count; shipping and stub lines do not)
+  const all=S.poLines[p.id]||[],items=all.filter(l=>!isShippingLine(l)),ls=items.length?items:all;
+  const done=p.status==='Received'||p.status==='Recovered';
+  if(!ls.length)return done?poExtended(p):0;
+  if(ls.length===1&&(_stubRe.test((ls[0].description||'').trim())||_stubRe.test((p.description||'').trim())))return done?poExtended(p):0;
+  return ls.reduce((s,l)=>s+(l.qty_received||0)*(l.unit_cost||0),0);
+}
+// S.corrections holds only the newest 1000 rows. A report over an older range needs the rest, loaded here.
+function _corrFloor(){   // the day from which every correction is known to be loaded ('' = all of them)
+  if(S._corrAll||(S.corrections||[]).length<1000)return '';
+  if(S._corrFrom)return S._corrFrom;
+  let old='9999-99-99';(S.corrections||[]).forEach(c=>{const d=String(c.created_at||'').slice(0,10);if(d&&d<old)old=d;});
+  return new Date(Date.parse(old+'T00:00:00Z')+86400000).toISOString().slice(0,10);
+}
+function _corrComplete(from){const f=_corrFloor();return f===''||(!!from&&from>=f);}
+async function ensureCorrectionsSince(from){
+  if(_corrComplete(from)||S._corrLoading)return;
+  S._corrLoading=true;
+  try{
+    const rows=await fetchAll(function(f,t){var q=db.from('inv_corrections').select('id,pn,previous_qty,new_qty,adjustment,reason,source,user_email,created_at,reference_id');if(from)q=q.gte('created_at',from);return q.order('created_at',{ascending:false}).range(f,t);});
+    const have={};(S.corrections||[]).forEach(c=>{have[c.id]=1;});
+    const add=rows.filter(r=>!have[r.id]);
+    if(add.length)S.corrections=(S.corrections||[]).concat(add).sort((a,b)=>String(b.created_at||'').localeCompare(String(a.created_at||'')));
+    if(from)S._corrFrom=(S._corrFrom&&S._corrFrom<from)?S._corrFrom:from;else S._corrAll=true;
+  }catch(e){console.warn('[reports] older stock movements failed to load',e);toast('Could not load older stock movements: '+(e.message||e),6000);}
+  S._corrLoading=false;render();
+}
+// Cycle counts: the app keeps only the newest 50 counts, and the lines of whichever count is open. The report needs all of both.
+async function ensureCountHistory(){
+  if(S._countHist||S._countHistLoading)return;
+  S._countHistLoading=true;
+  try{
+    const counts=await fetchAll(function(f,t){return db.from('cycle_counts').select('*').order('created_at',{ascending:false}).range(f,t);});
+    const lines=await fetchAll(function(f,t){return db.from('cycle_count_lines').select('count_id,actual_qty,expected_qty').range(f,t);});
+    S._countHist={counts:counts,lines:lines};
+  }catch(e){console.warn('[reports] count history failed to load',e);toast('Could not load count history: '+(e.message||e),6000);}
+  S._countHistLoading=false;render();
+}
+function rptSalesComplete(from){return !!S._salesAll||(from!=null&&!!S._salesFrom&&from>=S._salesFrom);}
+function rptNeedsSales(id){return /^sales_/.test(id)||id==='dead_parts';}
+function rptNeedsCorr(id){return id==='inv_movements'||id==='inv_receipts'||id==='corrections_log';}
+function rptKickLoads(id,from){
+  if(/^sales_/.test(id))ensureSalesSince(from);
+  else if(id==='dead_parts')ensureSalesSince(null);   // "last sale (ever)" needs the whole history
+  if(rptNeedsCorr(id))ensureCorrectionsSince(from);
+  if(id==='cycle_counts')ensureCountHistory();
+}
+// Everything a report reads is loaded, or says exactly what is missing.
+function rptMissing(id,from){
+  const m=[];
+  if(rptNeedsSales(id)&&!rptSalesComplete(id==='dead_parts'?null:from))m.push('older orders');
+  if(rptNeedsCorr(id)&&!_corrComplete(from))m.push('older stock movements');
+  if(id==='cycle_counts'&&!S._countHist)m.push('the full count history');
+  return m;
+}
+function rptNoteHtml(rows,def,dr,cf,ct){
+  const{from}=getDateRange(dr,cf,ct),miss=rptMissing(def.id,from);let h='';
+  const box=(c,x)=>'<div style="margin:0 0 10px;padding:8px 12px;border-left:3px solid '+c+';background:var(--bg1);font-size:var(--t-sm);color:var(--text2);line-height:1.5">'+x+'</div>';
+  if(miss.length)h+=box('var(--orange)','Still loading '+miss.join(' and ')+'. These numbers are incomplete until it finishes, and the screen updates by itself.');
+  if(rows&&rows.note)h+=box('var(--teal)',escHtml(rows.note)+(rows.estimated>0?' <button class="btn btn-sm" style="margin-left:8px" onclick="rptBackfillPrices()">Pull real prices from Shopify</button>':''));
+  return h;
+}
+// Pulls the price actually paid from Shopify for lines that were stored without one, in batches, then reloads the orders.
+async function rptBackfillPrices(){
+  if(!confirm('Pull the price actually paid from Shopify for older orders that do not have one?\n\nIt runs in batches (a few minutes for a large history) and only fills in prices; nothing else changes.'))return;
+  const tot={filled:0,unavailable:0,errors:0};let guard=0;
+  while(guard++<400){
+    toast('Pulling prices from Shopify... '+tot.filled.toLocaleString()+' lines filled so far',30000);
+    let res,j={};
+    try{res=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'backfill_prices',limit:15,store:S.shopify&&S.shopify.store,key:S.shopify&&S.shopify.key})});j=await res.json().catch(function(){return {};});}
+    catch(e){toast('Price pull stopped: '+(e.message||e),9000);break;}
+    if(!res.ok||j.error){toast((j.needs_sql?'Run sales_price_columns.sql in Supabase first. ':'')+(j.error||'The price pull failed ('+res.status+')'),10000);break;}
+    tot.filled+=j.filled||0;tot.unavailable+=j.unavailable||0;tot.errors+=(j.errors||[]).length;
+    if(j.done||!j.orders_in_batch)break;
+    if((j.errors||[]).length&&!j.filled&&!j.unavailable){toast('Shopify is returning errors ('+j.errors[0]+'). Stopped; run it again later.',10000);break;}
+  }
+  try{S._salesExtra={};S._salesAll=false;S._salesFrom=null;S._salesHavePrice=undefined;S.sales=await loadSalesWindow();S.rptState={...S.rptState,preview:null};}catch(e){console.warn(e);}
+  toast('Prices filled in for '+tot.filled.toLocaleString()+' lines'+(tot.unavailable?' ('+tot.unavailable.toLocaleString()+' could not be matched in Shopify and stay estimated)':'')+(tot.errors?', '+tot.errors+' errors':'')+'.',9000);
+  render();
+}
+async function rptAwaitData(id,preset,cf,ct){   // exports wait for older records instead of silently leaving them out
+  const{from}=getDateRange(preset,cf,ct);rptKickLoads(id,from);
+  const t0=Date.now();
+  while((S._salesLoadingFrom||S._corrLoading||S._countHistLoading)&&Date.now()-t0<180000)await new Promise(r=>setTimeout(r,200));
+  return rptMissing(id,from);
+}
+
 function buildReportRows(id, preset, customFrom, customTo){
   const{from,to}=getDateRange(preset,customFrom,customTo);
-  ensureSalesSince(from); // [#13] older than the loaded window? fetch it, then this report re-renders
   const fd=(rows,field)=>filterByDate(rows,field,from,to);
+  rptKickLoads(id,from);   // older records load in the background; the screen shows a notice and refreshes itself
 
   switch(id){
 
@@ -20210,114 +20381,140 @@ function buildReportRows(id, preset, customFrom, customTo){
     }
 
     case 'sales_shipped':{
-      const rows=fd(S.sales.filter(s=>(s.fulfillment_status==='Shipped'||s.fulfillment_status==='Delivered')&&!isInternal(s.order_number)),'sale_date');
-      const cols=['Order #','Date','Customer','SKU','Qty','Status','Carrier','Tracking #'];
-      const data=rows.map(s=>({'Order #':s.order_number||'','Date':(s.sale_date||'').slice(0,10),'Customer':s.customer_name||'','SKU':s.pn,'Qty':s.qty||1,'Status':s.fulfillment_status,'Carrier':s.carrier||'','Tracking #':s.tracking_number||''}));
-      return{cols,data};
+      // [v23.57] "Shipped" is about when it shipped. This filtered by the ORDER date, so an order placed last month and shipped
+      // this week was missing from "Last 7 days". It now uses the ship date (the order date when none was recorded).
+      const shipDay=s=>s.shipped_at?rptDay(s.shipped_at,'shipped_at'):String(s.sale_date||'').slice(0,10);
+      const rows=S.sales.filter(s=>(s.fulfillment_status==='Shipped'||s.fulfillment_status==='Delivered')&&!isInternal(s.order_number)).filter(s=>{
+        if(!from&&!to)return true;const d=shipDay(s);if(!d)return !from;return (!from||d>=from)&&(!to||d<=to);
+      });
+      const cols=['Order #','Order Date','Shipped','Customer','SKU','Qty','Status','Carrier','Tracking #'];
+      const data=rows.map(s=>({'Order #':s.order_number||'','Order Date':(s.sale_date||'').slice(0,10),'Shipped':shipDay(s),'Customer':s.customer_name||'','SKU':s.pn,'Qty':s.qty||1,'Status':s.fulfillment_status,'Carrier':s.carrier||'','Tracking #':s.tracking_number||''}));
+      return{cols,data,note:'The date range applies to when each line shipped.'};
     }
 
     case 'sales_by_sku':{
-      const rows=fd(S.sales.filter(s=>s.fulfillment_status!=='Cancelled'&&!isInternal(s.order_number)),'sale_date');
+      // [v23.57] One row per product. A product sold under its old and its new SKU used to appear twice, and the list was sorted
+      // by units although it is called Revenue by SKU: it is now sorted by revenue.
+      const inRange=fd(S.sales.filter(s=>!isInternal(s.order_number)),'sale_date');
+      const rows=inRange.filter(rptCountsAsRevenue);
       const map={};
       rows.forEach(s=>{
-        if(!map[s.pn])map[s.pn]={SKU:s.pn,Description:'',Units:0,'Revenue ($)':0,Orders:new Set()};
-        const asm=findAsm(s.pn);
-        const _it=asm||(typeof _findPart==='function'?_findPart(s.pn):null);
-        if(_it&&_it.description)map[s.pn].Description=_it.description;
-        map[s.pn].Units+=(s.qty||1);
-        map[s.pn]['Revenue ($)']+=(typeof lineRevenue==='function'?lineRevenue(s).rev:(s.qty||1)*(asm?.msrp||0));
-        map[s.pn].Orders.add(s.order_number||s.id);
+        const it=findAsm(s.pn)||(typeof _findPart==='function'?_findPart(s.pn):null);
+        const key=it?it.pn:s.pn;
+        if(!map[key])map[key]={SKU:it?dispPn(it):s.pn,Description:(it&&it.description)||'',Units:0,'Revenue ($)':0,Orders:new Set()};
+        map[key].Units+=(s.qty||1);
+        map[key]['Revenue ($)']+=lineRevenue(s).rev;
+        map[key].Orders.add(s.order_number||s.id);
       });
       const cols=['SKU','Description','Units Sold','Order Count','Revenue ($)'];
-      const data=Object.values(map).sort((a,b)=>b.Units-a.Units).map(r=>({'SKU':r.SKU,'Description':r.Description,'Units Sold':r.Units,'Order Count':r.Orders.size,'Revenue ($)':+(r['Revenue ($)']||0).toFixed(2)}));
-      return{cols,data};
+      const data=Object.values(map).sort((a,b)=>b['Revenue ($)']-a['Revenue ($)']).map(r=>({'SKU':r.SKU,'Description':r.Description,'Units Sold':r.Units,'Order Count':r.Orders.size,'Revenue ($)':+(r['Revenue ($)']||0).toFixed(2)}));
+      return{cols,data,...rptRevenueNote(rows,inRange.length-rows.length)};
     }
 
     case 'sales_by_month':{
-      const rows=fd(S.sales.filter(s=>s.fulfillment_status!=='Cancelled'&&!isInternal(s.order_number)),'sale_date');
+      const inRange=fd(S.sales.filter(s=>!isInternal(s.order_number)),'sale_date');
+      const rows=inRange.filter(rptCountsAsRevenue);
       const map={};
       rows.forEach(s=>{
         const mo=(s.sale_date||'').slice(0,7);if(!mo)return;
         if(!map[mo])map[mo]={Month:mo,Orders:new Set(),Units:0,'Revenue ($)':0};
         map[mo].Orders.add(s.order_number||s.id);
         map[mo].Units+=(s.qty||1);
-        const asm=findAsm(s.pn);
-        map[mo]['Revenue ($)']+=(typeof lineRevenue==='function'?lineRevenue(s).rev:(s.qty||1)*(asm?.msrp||0));
+        map[mo]['Revenue ($)']+=lineRevenue(s).rev;
       });
       const cols=['Month','Order Count','Units Sold','Revenue ($)'];
       const data=Object.values(map).sort((a,b)=>a.Month.localeCompare(b.Month)).map(r=>({'Month':r.Month,'Order Count':r.Orders.size,'Units Sold':r.Units,'Revenue ($)':+(r['Revenue ($)']||0).toFixed(2)}));
-      return{cols,data};
+      return{cols,data,...rptRevenueNote(rows,inRange.length-rows.length)};
     }
 
     case 'sales_by_customer':{
-      const rows=fd(S.sales.filter(s=>s.fulfillment_status!=='Cancelled'&&!isInternal(s.order_number)),'sale_date');
+      const inRange=fd(S.sales.filter(s=>!isInternal(s.order_number)),'sale_date');
+      const rows=inRange.filter(rptCountsAsRevenue);
       const map={};
       rows.forEach(s=>{
         const k=s.customer_name||'(no name)';
         if(!map[k])map[k]={Customer:k,Orders:new Set(),Units:0,'Revenue ($)':0,'First Order':'','Last Order':''};
         map[k].Orders.add(s.order_number||s.id);
         map[k].Units+=(s.qty||1);
-        const asm=findAsm(s.pn);
-        map[k]['Revenue ($)']+=(typeof lineRevenue==='function'?lineRevenue(s).rev:(s.qty||1)*(asm?.msrp||0));
+        map[k]['Revenue ($)']+=lineRevenue(s).rev;
         const d=(s.sale_date||'').slice(0,10);
         if(d){if(!map[k]['First Order']||d<map[k]['First Order'])map[k]['First Order']=d;if(!map[k]['Last Order']||d>map[k]['Last Order'])map[k]['Last Order']=d;}
       });
       const cols=['Customer','Order Count','Units','Revenue ($)','First Order','Last Order'];
-      const data=Object.values(map).sort((a,b)=>b['Revenue ($)']-a['Revenue ($)']).map(r=>({...r,'Order Count':r.Orders.size,'Revenue ($)':+(r['Revenue ($)']||0).toFixed(2)}));
-      return{cols,data};
+      const data=Object.values(map).sort((a,b)=>b['Revenue ($)']-a['Revenue ($)']).map(r=>({'Customer':r.Customer,'Order Count':r.Orders.size,'Units':r.Units,'Revenue ($)':+(r['Revenue ($)']||0).toFixed(2),'First Order':r['First Order'],'Last Order':r['Last Order']}));
+      return{cols,data,...rptRevenueNote(rows,inRange.length-rows.length)};
     }
 
     case 'sales_by_dealer':{
+      // [v23.57] Recognises a dealer order by its code even when the code is just the dealer's prefix (dealers who pay up front),
+      // and leaves out cancelled, refunded and returned lines.
       const dealerNames=new Set(S.dealers.map(d=>d.name));
       const _dealerOf=s=>{
-        if(s.discount_code&&typeof parseDealerPO==='function'){try{const pd=parseDealerPO(s.discount_code,S.dealers);if(pd&&pd.dealer)return pd.dealer.name;}catch(e){}}
+        if(s.discount_code){try{const pd=parseDealerCode(s.discount_code,S.dealers);if(pd&&pd.dealer)return pd.dealer.name;}catch(e){}}
         if(s.customer_name&&dealerNames.has(s.customer_name))return s.customer_name;
         return null;
       };
-      const rows=fd(S.sales.filter(s=>!isInternal(s.order_number)&&_dealerOf(s)),'sale_date');
+      const inRange=fd(S.sales.filter(s=>!isInternal(s.order_number)&&_dealerOf(s)),'sale_date');
+      const rows=inRange.filter(rptCountsAsRevenue);
       const cols=['Dealer','Order #','Date','SKU','Qty','Status','Revenue ($)'];
-      const data=rows.map(s=>({'Dealer':_dealerOf(s)||'','Order #':s.order_number||'','Date':(s.sale_date||'').slice(0,10),'SKU':s.pn,'Qty':s.qty||1,'Status':s.fulfillment_status||'Open','Revenue ($)':+((typeof lineRevenue==='function'?lineRevenue(s).rev:0)).toFixed(2)}));
-      return{cols,data};
+      const data=rows.map(s=>({'Dealer':_dealerOf(s)||'','Order #':s.order_number||'','Date':(s.sale_date||'').slice(0,10),'SKU':s.pn,'Qty':s.qty||1,'Status':s.fulfillment_status||'Open','Revenue ($)':+lineRevenue(s).rev.toFixed(2)}));
+      return{cols,data,...rptRevenueNote(rows,inRange.length-rows.length)};
     }
 
     case 'sales_open':{
-      const rows=S.sales.filter(s=>(!s.fulfillment_status||s.fulfillment_status==='Open'||s.fulfillment_status==='Packed')&&!isInternal(s.order_number));
+      // [v23.57] Everything still to be fulfilled: Open, Packed, Partial and Pre-order lines (held orders have their own report).
+      // It left out Partial and Pre-order lines. Days Open counts business days on the calendar, not hours.
+      const today=rptToday();
+      const rows=S.sales.filter(s=>{const st=s.fulfillment_status;return (!st||(SALES_DONE.indexOf(st)<0&&st!=='On Hold'))&&!isInternal(s.order_number);});
       const cols=['Order #','Date','Customer','SKU','Qty','Status','Days Open'];
       const data=rows.map(s=>{
-        const open=s.sale_date?Math.floor((Date.now()-new Date(s.sale_date))/(86400000)):null;
-        return{'Order #':s.order_number||'','Date':(s.sale_date||'').slice(0,10),'Customer':s.customer_name||'','SKU':s.pn,'Qty':s.qty||1,'Status':s.fulfillment_status||'Open','Days Open':open};
+        const d=(s.sale_date||'').slice(0,10);
+        const open=d?Math.max(0,Math.round((Date.parse(today+'T00:00:00Z')-Date.parse(d+'T00:00:00Z'))/86400000)):null;
+        return{'Order #':s.order_number||'','Date':d,'Customer':s.customer_name||'','SKU':s.pn,'Qty':s.qty||1,'Status':s.fulfillment_status||'Open','Days Open':open};
       }).sort((a,b)=>(b['Days Open']||0)-(a['Days Open']||0));
-      return{cols,data};
+      return{cols,data,note:'A snapshot of right now, so the date range does not apply. Held orders are in On Hold Orders.'};
     }
 
     case 'sales_on_hold':{
       const rows=S.sales.filter(s=>s.fulfillment_status==='On Hold'&&!isInternal(s.order_number));
       const cols=['Order #','Date','Customer','SKU','Qty'];
       const data=rows.map(s=>({'Order #':s.order_number||'','Date':(s.sale_date||'').slice(0,10),'Customer':s.customer_name||'','SKU':s.pn,'Qty':s.qty||1}));
-      return{cols,data};
+      return{cols,data,note:'A snapshot of right now, so the date range does not apply.'};
     }
 
     case 'inv_snapshot':{
       const cols=['Part #','Description','Category','Vendor','On Hand','Unit Cost ($)','Total Value ($)','Location','Min','Max','Safety','Lead Time (wks)'];
-      const data=S.parts.filter(p=>!p.discontinued).map(p=>({'Part #':p.pn,'Description':p.description||'','Category':p.category||'','Vendor':p.vendor||'','On Hand':p.total_unpckgd||0,'Unit Cost ($)':p.unit_cost||0,'Total Value ($)':(p.total_unpckgd||0)*(p.unit_cost||0),'Location':p.location||'','Min':p.min_qty||0,'Max':p.max_qty||0,'Safety':p.safety_stock||0,'Lead Time (wks)':p.lead_time_weeks||0})).sort((a,b)=>a['Part #'].localeCompare(b['Part #']));
-      return{cols,data};
+      // [v23.57] Value never goes below zero: a part showing negative stock is worth nothing here, the same rule the valuation and the dashboard use.
+      const data=S.parts.filter(p=>!p.discontinued).map(p=>({'Part #':p.pn,'Description':p.description||'','Category':p.category||'','Vendor':p.vendor||'','On Hand':p.total_unpckgd||0,'Unit Cost ($)':p.unit_cost||0,'Total Value ($)':+(Math.max(0,p.total_unpckgd||0)*(p.unit_cost||0)).toFixed(2),'Location':p.location||'','Min':p.min_qty||0,'Max':p.max_qty||0,'Safety':p.safety_stock||0,'Lead Time (wks)':p.lead_time_weeks||0}));
+      return{cols,data,note:'Raw parts only (finished goods are in Assemblies On-Hand and Inventory Valuation). Negative stock is valued at zero.'};
     }
 
     case 'inv_valuation':{
-      const cols=['Part #','Description','Vendor','On Hand','Unit Cost ($)','Total Value ($)'];
-      const data=S.parts.filter(p=>!p.discontinued&&(p.total_unpckgd||0)>0).map(p=>({'Part #':p.pn,'Description':p.description||'','Vendor':p.vendor||'','On Hand':p.total_unpckgd||0,'Unit Cost ($)':+(p.unit_cost||0).toFixed(4),'Total Value ($)':+((p.total_unpckgd||0)*(p.unit_cost||0)).toFixed(2)})).sort((a,b)=>b['Total Value ($)']-a['Total Value ($)']);
-      const total=data.reduce((s,r)=>s+r['Total Value ($)'],0);
-      data.push({'Part #':'— TOTAL —','Description':'','Vendor':'','On Hand':'','Unit Cost ($)':'','Total Value ($)':+total.toFixed(2)});
-      return{cols,data};
+      // [v23.57] Raw parts at unit cost PLUS finished goods and subassemblies at BOM cost: exactly what the Inventory Valuation
+      // Snapshot records, so the two totals now agree. This report used to list raw parts only.
+      const cols=['Type','Part #','Description','Vendor','On Hand','Unit Cost ($)','Total Value ($)'];
+      let pv=0,fv=0;
+      const parts=S.parts.filter(p=>!p.discontinued&&(p.total_unpckgd||0)>0).map(p=>{const oh=p.total_unpckgd||0,uc=p.unit_cost||0;pv+=oh*uc;return{'Type':'Part','Part #':p.pn,'Description':p.description||'','Vendor':p.vendor||'','On Hand':oh,'Unit Cost ($)':+uc.toFixed(4),'Total Value ($)':+(oh*uc).toFixed(2)};});
+      const fgs=S.assemblies.filter(a=>!a.discontinued&&(a.total_on_hand||0)>0).map(a=>{const oh=a.total_on_hand||0,bc=(typeof bomCostOf==='function'?bomCostOf(a.pn,0):0)||0;fv+=oh*bc;return{'Type':a.is_subassembly?'Subassembly':'Finished good','Part #':dispPn(a),'Description':a.description||'','Vendor':'','On Hand':oh,'Unit Cost ($)':+bc.toFixed(4),'Total Value ($)':+(oh*bc).toFixed(2)};});
+      const data=parts.concat(fgs).sort((a,b)=>b['Total Value ($)']-a['Total Value ($)']);
+      const blank={'Description':'','Vendor':'','On Hand':'','Unit Cost ($)':''};
+      data.push({'Type':'','Part #':'\u2014 PARTS SUBTOTAL \u2014',...blank,'Total Value ($)':+pv.toFixed(2)});
+      data.push({'Type':'','Part #':'\u2014 FINISHED GOODS SUBTOTAL \u2014',...blank,'Total Value ($)':+fv.toFixed(2)});
+      data.push({'Type':'','Part #':'\u2014 TOTAL \u2014',...blank,'Total Value ($)':+(pv+fv).toFixed(2)});
+      return{cols,data,note:'Raw parts at unit cost plus finished goods and subassemblies at BOM cost, the same as the Inventory Valuation Snapshot. Discontinued items are excluded (see Discontinued Inventory).'};
     }
 
     case 'inv_reorder':{
-      const cols=['Part #','Description','Vendor','On Hand','Reorder Point','Shortage','Suggested Order','Unit Cost ($)'];
-      const data=S.parts.filter(p=>!p.discontinued).filter(p=>(p.total_unpckgd||0)<=calcReorderPoint(p)).map(p=>{
-        const rp=calcReorderPoint(p);const oh=p.total_unpckgd||0;const sq=calcSuggestedQty(p);
-        return{'Part #':p.pn,'Description':p.description||'','Vendor':p.vendor||'','On Hand':oh,'Reorder Point':rp,'Shortage':Math.max(0,rp-oh),'Suggested Order':sq,'Unit Cost ($)':+(p.unit_cost||0).toFixed(4)};
-      }).sort((a,b)=>a['On Hand']-b['On Hand']);
-      return{cols,data};
+      // [v23.57] The same test Purchasing and the dashboard use: stock NET of units reserved for backorders is at or below the
+      // reorder point, and the part actually sells (or has a floor or a need). It compared raw stock, so a part with no demand
+      // and none on the shelf appeared here with a suggested order of 0, and dev-only parts were listed too.
+      const cols=['Part #','Description','Vendor','On Hand','Reserved','On Order','Reorder Point','Shortage','Suggested Order','Unit Cost ($)'];
+      const devOnly=(typeof devOnlyPartSet==='function')?devOnlyPartSet():new Set();
+      const data=S.parts.filter(p=>!p.discontinued&&!devOnly.has(p.pn)).map(p=>{
+        const rp=calcReorderPoint(p),oh=p.total_unpckgd||0,res=boReserved(p.pn)||0,net=Math.max(0,oh-res),sq=calcSuggestedQty(p);
+        return{p,rp,oh,res,net,sq};
+      }).filter(x=>x.net<=x.rp&&(avgWk(x.p)>0||(typeof calcForecast==='function'&&calcForecast(x.p.pn)>0)||x.sq>0)).map(x=>({'Part #':x.p.pn,'Description':x.p.description||'','Vendor':x.p.vendor||'','On Hand':x.oh,'Reserved':x.res,'On Order':openOrderedQty(x.p.pn)||0,'Reorder Point':x.rp,'Shortage':Math.max(0,x.rp-x.net),'Suggested Order':x.sq,'Unit Cost ($)':+(x.p.unit_cost||0).toFixed(4)})).sort((a,b)=>(a['On Hand']-a['Reserved'])-(b['On Hand']-b['Reserved']));
+      return{cols,data,note:'Same test as Purchasing: stock after units reserved for backorders is at or below the reorder point. Parts with no sales, no minimum and nothing to build are not listed. Open PO quantities are shown but not subtracted.'};
     }
 
     case 'inv_overstock':{
@@ -20369,59 +20566,65 @@ function buildReportRows(id, preset, customFrom, customTo){
       const rows=fd(S.purchases,'order_date');
       const cols=['Date','Vendor','Description','Lines','Qty','Extended ($)','Status'];
       const data=rows.map(p=>{
-        const lines=S.poLines[p.id]||[];
+        const all=S.poLines[p.id]||[],items=all.filter(l=>!isShippingLine(l)),lines=items.length?items:all;   // a shipping charge is not a line of goods
         return{'Date':p.order_date||'','Vendor':p.vendor,'Description':p.description||p.pn||'','Lines':lines.length||1,'Qty':lines.length?lines.reduce((s,l)=>s+(l.qty_ordered||0),0):p.qty||0,'Extended ($)':+poExtended(p).toFixed(2),'Status':p.status||''};
       });
       return{cols,data};
     }
 
     case 'po_open':{
-      const rows=fd(S.purchases.filter(p=>p.status!=='Received'&&p.status!=='Recovered'&&p.status!=='Cancelled'&&p.status!=='Lost'),'order_date');
+      // [v23.57] Open = placed and not yet received (On Order, In Transit). Drafts were counted as open although nothing has been ordered;
+      // they are in Draft POs.
+      const rows=fd(S.purchases.filter(p=>p.status!=='Draft'&&p.status!=='Received'&&p.status!=='Recovered'&&p.status!=='Cancelled'&&p.status!=='Lost'),'order_date');
       const cols=['Date','Vendor','Description','Extended ($)','Status'];
       const data=rows.map(p=>({'Date':p.order_date||'','Vendor':p.vendor,'Description':p.description||p.pn||'','Extended ($)':+poExtended(p).toFixed(2),'Status':p.status||''}));
-      return{cols,data};
+      return{cols,data,note:'Placed and not yet received. Values are goods only (shipping charges are not included). Drafts are in Draft POs; cancelled, lost and received POs are left out.'};
     }
 
     case 'po_draft':{
       const rows=S.purchases.filter(p=>p.status==='Draft');
       const cols=['Date','Vendor','Lines','Extended ($)'];
-      const data=rows.map(p=>{const lines=S.poLines[p.id]||[];return{'Date':p.order_date||'','Vendor':p.vendor,'Lines':lines.length,'Extended ($)':+poExtended(p).toFixed(2)};});
-      return{cols,data};
+      const data=rows.map(p=>{const all=S.poLines[p.id]||[],items=all.filter(l=>!isShippingLine(l));return{'Date':p.order_date||'','Vendor':p.vendor,'Lines':(items.length?items:all).length,'Extended ($)':+poExtended(p).toFixed(2)};});
+      return{cols,data,note:'A snapshot of right now, so the date range does not apply.'};
     }
 
     case 'po_received':{
+      // [v23.57] Received value now covers every received PO, including older single-line POs that have no line rows (they showed $0), and counts goods only.
       const rows=fd(S.purchases.filter(p=>p.status==='Received'||p.status==='Recovered'),'order_date');
       const cols=['Date','Vendor','Description','Lines','Received Value ($)'];
       const data=rows.map(p=>{
-        const lines=S.poLines[p.id]||[];
-        const recv=lines.reduce((s,l)=>s+(l.qty_received||0)*(l.unit_cost||0),0);
-        return{'Date':p.order_date||'','Vendor':p.vendor,'Description':p.description||p.pn||'','Lines':lines.length,'Received Value ($)':+recv.toFixed(2)};
+        const all=S.poLines[p.id]||[],items=all.filter(l=>!isShippingLine(l));
+        return{'Date':p.order_date||'','Vendor':p.vendor,'Description':p.description||p.pn||'','Lines':(items.length?items:all).length,'Received Value ($)':+rptReceivedValue(p).toFixed(2)};
       });
-      return{cols,data};
+      return{cols,data,note:'Goods received (shipping charges are not counted). The date range is the PO order date.'};
     }
 
     case 'po_by_vendor':{
-      const rows=fd(S.purchases,'order_date');
+      // [v23.57] Spend is what was actually ordered: drafts and cancelled POs are left out (they were counted as spend). Received is every
+      // unit received so far, including partial receipts on POs that are still open.
+      const rows=fd(S.purchases.filter(p=>p.status!=='Draft'&&p.status!=='Cancelled'),'order_date');
       const map={};
       rows.forEach(p=>{
         if(!map[p.vendor])map[p.vendor]={Vendor:p.vendor,'Total POs':0,'Open POs':0,'Total Spend ($)':0,'Received ($)':0};
         map[p.vendor]['Total POs']++;
-        if(p.status!=='Received'&&p.status!=='Recovered'&&p.status!=='Cancelled'&&p.status!=='Lost')map[p.vendor]['Open POs']++;
+        if(p.status!=='Received'&&p.status!=='Recovered'&&p.status!=='Lost')map[p.vendor]['Open POs']++;
         map[p.vendor]['Total Spend ($)']+=poExtended(p);
-        if(p.status==='Received'||p.status==='Recovered'){const lines=S.poLines[p.id]||[];map[p.vendor]['Received ($)']+=lines.reduce((s,l)=>s+(l.qty_received||0)*(l.unit_cost||0),0);}
+        map[p.vendor]['Received ($)']+=rptReceivedValue(p);
       });
       const cols=['Vendor','Total POs','Open POs','Total Spend ($)','Received ($)'];
       const data=Object.values(map).sort((a,b)=>b['Total Spend ($)']-a['Total Spend ($)']).map(r=>({...r,'Total Spend ($)':+r['Total Spend ($)'].toFixed(2),'Received ($)':+r['Received ($)'].toFixed(2)}));
-      return{cols,data};
+      return{cols,data,note:'Placed POs only: drafts and cancelled POs are left out. Lost POs count as spend. Values are goods only (shipping charges are not included, the same as the PO totals). Received is every unit received so far, including partial receipts.'};
     }
 
     case 'po_lines':{
       const pos=fd(S.purchases,'order_date');
-      const poMap={};pos.forEach(p=>poMap[p.id]=p);
       const allLines=[];
       pos.forEach(p=>{(S.poLines[p.id]||[]).forEach(l=>allLines.push({po:p,line:l}));});
       const cols=['PO Date','Vendor','Part #','Description','Qty Ordered','Qty Received','Unit Cost ($)','Extended ($)','Line Status'];
-      const data=allLines.map(({po,line})=>({'PO Date':po.order_date||'','Vendor':po.vendor,'Part #':line.pn,'Description':line.description||'','Qty Ordered':line.qty_ordered||0,'Qty Received':line.qty_received||0,'Unit Cost ($)':+(line.unit_cost||0).toFixed(4),'Extended ($)':+((line.qty_ordered||0)*(line.unit_cost||0)).toFixed(2),'Line Status':line.status||''}));
+      const data=allLines.map(({po,line})=>{
+        const stub=_stubRe.test((line.description||'').trim());   // a "3 items" stub line holds the whole total in its cost, the way the PO total reads it
+        return{'PO Date':po.order_date||'','Vendor':po.vendor,'Part #':line.pn,'Description':line.description||'','Qty Ordered':line.qty_ordered||0,'Qty Received':line.qty_received||0,'Unit Cost ($)':+(line.unit_cost||0).toFixed(4),'Extended ($)':+(stub?(line.unit_cost||0):(line.qty_ordered||0)*(line.unit_cost||0)).toFixed(2),'Line Status':line.status||''};
+      });
       return{cols,data};
     }
 
@@ -20448,13 +20651,15 @@ function buildReportRows(id, preset, customFrom, customTo){
     }
 
     case 'bom_detail':{
+      // [v23.57] Costs are today's part costs (the same numbers BOM Cost Rollup uses), not the cost copied onto the BOM line when it was
+      // entered, so a BOM's lines add up to its rollup cost.
       const rows=[];
       Object.entries(S.boms).forEach(([parent,items])=>{
         const asm=asmByPn(parent);
-        items.forEach(i=>rows.push({'Assembly':parent,'Asm Description':asm?.description||'','Child PN':i.child_pn,'Child Type':i.item_type||'part','Qty Per':i.qty||1,'Unit Cost ($)':+(i.unit_cost||0).toFixed(4),'Extended ($)':+((i.qty||1)*(i.unit_cost||0)).toFixed(4)}));
+        items.forEach(i=>rows.push({'Assembly':parent,'Asm Description':asm?.description||'','Child PN':i.child_pn,'Child Type':i.item_type||'part','Qty Per':i.qty||1,'Unit Cost ($)':+lineUnitCost(i).toFixed(4),'Extended ($)':+lineCost(i).toFixed(4)}));
       });
       rows.sort((a,b)=>a.Assembly.localeCompare(b.Assembly)||a['Child PN'].localeCompare(b['Child PN']));
-      return{cols:['Assembly','Asm Description','Child PN','Child Type','Qty Per','Unit Cost ($)','Extended ($)'],data:rows};
+      return{cols:['Assembly','Asm Description','Child PN','Child Type','Qty Per','Unit Cost ($)','Extended ($)'],data:rows,note:'Costs are current part costs (the same ones BOM Cost Rollup uses).'};
     }
 
     case 'bom_cost_rollup':{
@@ -20467,12 +20672,15 @@ function buildReportRows(id, preset, customFrom, customTo){
     }
 
     case 'cycle_counts':{
-      const rows=fd(S.cycleCounts,'created_at');
-      const cols=['Date','Name','Type','Status','Items','Variances','Completed'];
+      // [v23.57] Reads every count and every count line (loaded when the report opens). It looked at the lines of whichever count was
+      // open, so every other count showed 0 items and 0 variances, and it only knew the newest 50 counts.
+      const H=S._countHist,counts=H?H.counts:S.cycleCounts,byCount={};
+      (H?H.lines:[]).forEach(l=>{(byCount[l.count_id]=byCount[l.count_id]||[]).push(l);});
+      const rows=fd(counts,'created_at');
+      const cols=['Date','Name','Type','Status','Items','Counted','Variances','Completed'];
       const data=rows.map(c=>{
-        const lines=S.countLines.filter(l=>l.count_id===c.id);
-        const vars=lines.filter(l=>l.actual_qty!=null&&l.actual_qty!==(l.expected_qty||0)).length;
-        return{'Date':new Date(c.created_at).toLocaleDateString(),'Name':c.name||'','Type':c.count_type||'','Status':c.status||'','Items':lines.length||0,'Variances':vars,'Completed':c.completed_at?new Date(c.completed_at).toLocaleDateString():''};
+        const lines=byCount[c.id]||[],counted=lines.filter(l=>l.actual_qty!=null),vars=counted.filter(l=>Number(l.actual_qty)!==Number(l.expected_qty||0)).length;
+        return{'Date':c.created_at?centralDateOnly(c.created_at):'','Name':c.name||c.category_filter||'','Type':c.count_type||'','Status':c.status||'','Items':lines.length,'Counted':counted.length,'Variances':vars,'Completed':c.completed_at?centralDateOnly(c.completed_at):''};
       });
       return{cols,data};
     }
@@ -20536,10 +20744,16 @@ function buildReportRows(id, preset, customFrom, customTo){
   }
 }
 
-function runExport(fmt, reportId, preset, customFrom, customTo){
-  const def=REPORT_DEFS.find(d=>d.id===reportId);
-  if(!def)return;
-  const{cols,data}=buildReportRows(reportId,preset,customFrom,customTo);
+async function runExport(fmt, reportId, preset, customFrom, customTo){
+ const def=REPORT_DEFS.find(d=>d.id===reportId);
+ if(!def)return;
+ // [v23.57] Older orders, stock movements and count history load in the background. Wait for them: a file missing them would be wrong.
+ if(rptMissing(reportId,getDateRange(preset,customFrom,customTo).from).length){
+  toast('Loading older records before exporting...',60000);
+  const miss=await rptAwaitData(reportId,preset,customFrom,customTo);
+  if(miss.length){toast('Could not load '+miss.join(' and ')+' for this range, so nothing was exported (a partial file would be wrong). Try again.',10000);return;}
+ }
+ const{cols,data}=buildReportRows(reportId,preset,customFrom,customTo);
   if(!data.length){toast('No data to export');return;}
   const filename=def.label.replace(/[^a-z0-9]+/gi,'-').toLowerCase()+'_'+new Date().toISOString().slice(0,10);
   if(fmt==='csv'){
@@ -20573,6 +20787,7 @@ function runExport(fmt, reportId, preset, customFrom, customTo){
 }
 
 function printReport(reportId, preset, customFrom, customTo){
+ if(rptMissing(reportId,getDateRange(preset,customFrom,customTo).from).length){rptKickLoads(reportId,getDateRange(preset,customFrom,customTo).from);toast('Older records are still loading. Print again in a moment.',6000);return;}
   const def=REPORT_DEFS.find(d=>d.id===reportId);
   if(!def)return;
   const built=buildReportRows(reportId,preset,customFrom,customTo);
@@ -22083,7 +22298,7 @@ function lineRevenue(x){
     //    single biggest way this used to overstate revenue, so apply the dealer's rate.
     if(x&&x.discount_code&&typeof parseDealerPO==='function'&&Array.isArray(S.dealers)){
       try{
-        var pd=parseDealerPO(x.discount_code,S.dealers);
+        var pd=(typeof parseDealerCode==='function'?parseDealerCode:parseDealerPO)(x.discount_code,S.dealers);
         if(pd&&pd.dealer){
           var dp=(typeof pd.dealer.discount_pct==='number')?pd.dealer.discount_pct:0.20;
           var du=Math.round(list*(1-dp)*100)/100;
@@ -28292,7 +28507,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.86','shipstation-ship':'v23.104','ops-cron':'v1.3','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.3'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.87','shipstation-ship':'v23.104','ops-cron':'v1.3','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.3'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
@@ -31244,7 +31459,7 @@ Object.assign(window,{diToggle:diToggle,diExplain:diExplain,diFilter:diFilter,di
 //   Sales > Dealer orders: every PO a dealer submits, where it went in Shopify, and anything that needs you.
 // Nothing here talks to Shopify directly: sending an order goes through the dealer-portal server function.
 // ===================================================================================================
-var DS={reqs:[],loaded:false,loading:false,err:'',sel:null,filter:'',busy:false,edit:null,_badgeAt:0,_syncAt:0};
+var DS={reqs:[],loaded:false,loading:false,err:'',sel:null,filter:'',busy:false,edit:null,_badgeAt:0,_syncAt:0,showRemoved:false,pick:{}};
 var DM=null; // the open "Storefront" window for one dealer
 var DS_PAY=[['prepay','Pays up front: gets a secure Shopify payment link'],['billed_card','Billed by us: card on file, processed in QuickBooks (order is marked paid)'],['billed_invoice','Billed by us: QuickBooks invoice (order is marked paid)']];
 var DS_PAYSHORT={prepay:'Pays up front',billed_card:'QuickBooks card',billed_invoice:'QuickBooks invoice'};
@@ -31481,11 +31696,13 @@ function dsModalRender(){
    +(DM.tab==='prices'?'<div style="padding:12px 20px;background:var(--bg3);border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px"><button type="button" class="btn" onclick="dsClose()">Close</button><button type="button" class="btn btn-teal" onclick="dsSavePrices()"'+(DM.busy||!DM.loaded?' disabled':'')+'>'+(DM.busy?'Saving&hellip;':'Save special pricing')+'</button></div>':'')+'</div>';
 }
 // ---------------------------------------------------------------- Sales > Dealer orders
-var DS_STATUS={new:['New','pill-teal'],sending:['Sending','pill-muted'],attention:['Needs attention','pill-red'],awaiting_payment:['Awaiting payment','pill-yellow'],sent:['In Shopify','pill-green'],rejected:['Rejected','pill-muted']};
+var DS_STATUS={new:['New','pill-teal'],sending:['Sending','pill-muted'],attention:['Needs attention','pill-red'],awaiting_payment:['Awaiting payment','pill-yellow'],sent:['In Shopify','pill-green'],rejected:['Rejected','pill-muted'],cancelled:['Cancelled','pill-muted']};
 function dsStatusPill(st){var x=DS_STATUS[st]||[st,'pill-muted'];return '<span class="pill '+x[1]+'">'+escHtml(x[0])+'</span>';}
+function dsLive(){return DS.reqs.filter(function(r){return !r.archived_at;});}
+function dsRemovedList(){return DS.reqs.filter(function(r){return !!r.archived_at;});}
 function dsCounts(){
-  var c={attention:0,awaiting:0,sentToday:0,all:DS.reqs.length},today=new Date().toISOString().slice(0,10);
-  DS.reqs.forEach(function(r){if(r.status==='attention'||r.status==='new'||r.status==='sending')c.attention++;if(r.status==='awaiting_payment')c.awaiting++;if(r.status==='sent'&&String(r.sent_at||'').slice(0,10)===today)c.sentToday++;});
+  var c={attention:0,awaiting:0,sentToday:0,all:dsLive().length},today=new Date().toISOString().slice(0,10);
+  dsLive().forEach(function(r){if(r.status==='attention'||r.status==='new'||r.status==='sending')c.attention++;if(r.status==='awaiting_payment')c.awaiting++;if(r.status==='sent'&&String(r.sent_at||'').slice(0,10)===today)c.sentToday++;});
   return c;
 }
 function dsBadge(){var el=typeof document!=='undefined'&&document.getElementById('dealerorders-badge');if(!el)return;var n=dsCounts().attention;el.textContent=n;el.style.display=n>0?'inline':'none';}
@@ -31505,7 +31722,7 @@ async function dsSync(quiet){
 }
 function dsSelect(id){DS.sel=(String(DS.sel)===String(id)?null:id);DS.edit=null;render();}
 function dsFilter(f){DS.filter=(DS.filter===f?'':f);render();}
-function dsRows(){var f=DS.filter;return DS.reqs.filter(function(r){if(f==='attention')return r.status==='attention'||r.status==='new'||r.status==='sending';if(f==='awaiting')return r.status==='awaiting_payment';if(f==='sent')return r.status==='sent';return true;});}
+function dsRows(){var f=DS.filter;if(DS.showRemoved)return dsRemovedList();return dsLive().filter(function(r){if(f==='attention')return r.status==='attention'||r.status==='new'||r.status==='sending';if(f==='awaiting')return r.status==='awaiting_payment';if(f==='sent')return r.status==='sent';return true;});}
 async function dsSend(id){
   if(DS.busy)return;DS.busy=true;render();
   try{var j=await _dsFn({action:'send_to_shopify',request_id:id});toast(j.status==='awaiting_payment'?'Sent to Shopify: the dealer has a payment link':'Sent to Shopify as '+(j.order_name||'an order'),6000);}
@@ -31517,6 +31734,42 @@ async function dsReject(id){
   var lab=r.po_number?'PO '+r.po_number:'this order';var why=prompt('Why is '+lab+' not accepted? The dealer will see this.');if(why===null)return;why=String(why).trim();if(!why){toast('Please give a short reason');return;}
   var u=await db.from('dealer_order_requests').update({status:'rejected',reject_reason:why,updated_at:new Date().toISOString()}).eq('id',id);
   if(u.error){toast('Not saved: '+u.error.message,7000);return;}toast((r.po_number?'PO '+r.po_number:'The order')+' rejected');await dsLoadReqs();
+}
+// ---- removing orders (v23.57)
+function dsStop(ev){if(ev&&ev.stopPropagation)ev.stopPropagation();}
+function dsPick(id,on){if(on)DS.pick[String(id)]=1;else delete DS.pick[String(id)];render();}
+function dsPickAll(on){DS.pick={};if(on)dsRows().forEach(function(r){DS.pick[String(r.id)]=1;});render();}
+function dsPicked(){return Object.keys(DS.pick).filter(function(id){return DS.reqs.some(function(r){return String(r.id)===id;});});}
+function dsToggleRemoved(){DS.showRemoved=!DS.showRemoved;DS.pick={};DS.sel=null;render();}
+function dsRemoveMsg(rs){
+  var pay=rs.filter(function(r){return r.status==='awaiting_payment';}).length,sent=rs.filter(function(r){return r.status==='sent';}).length,msg='Remove '+(rs.length===1?(rs[0].po_number?'PO '+rs[0].po_number:'this order'):rs.length+' orders')+'?\n\nIt disappears from this list and from the dealer\'s portal. You can bring it back with Show removed.';
+  if(pay)msg+='\n\n'+pay+' waiting for payment: removing '+(pay===1?'it':'them')+' also deletes the payment link in Shopify, so the dealer can no longer pay '+(pay===1?'it':'them')+'.';
+  if(sent)msg+='\n\n'+sent+' already exist'+(sent===1?'s':'')+' in Shopify. Removing only hides '+(sent===1?'it':'them')+' here and from the dealer; the Shopify order stays as it is.';
+  return msg;
+}
+function dsDoneMsg(j,verb){var n=(verb==='deleted'?j.deleted:j.removed)||0,sk=j.skipped||[];return (n?n+' order'+(n===1?'':'s')+' '+verb+'.':'Nothing '+verb+'.')+(sk.length?' Skipped '+sk.length+': '+sk[0].why:'');}
+async function dsRemove(ids){
+  var rs=(ids||[]).map(function(id){return DS.reqs.find(function(r){return String(r.id)===String(id);});}).filter(Boolean);if(!rs.length||DS.busy)return;
+  if(!confirm(dsRemoveMsg(rs)))return;
+  var fail='';DS.busy=true;DS.err='';render();
+  try{var j=await _dsFn({action:'staff_remove_request',ids:rs.map(function(r){return r.id;})});toast(dsDoneMsg(j,'removed'),j.skipped&&j.skipped.length?9000:5000);}
+  catch(e){fail='Not removed: '+e.message;}
+  DS.busy=false;DS.pick={};DS.sel=null;await dsLoadReqs();if(fail){DS.err=fail;render();}
+}
+async function dsRestore(ids){
+  if(DS.busy||!ids||!ids.length)return;var fail='';DS.busy=true;DS.err='';render();
+  try{var j=await _dsFn({action:'staff_restore_request',ids:ids});toast((j.restored||0)+' order'+(j.restored===1?'':'s')+' restored. A cancelled order stays cancelled.',6000);}
+  catch(e){fail='Not restored: '+e.message;}
+  DS.busy=false;DS.pick={};await dsLoadReqs();if(fail){DS.err=fail;render();}
+}
+async function dsDeleteForever(ids){
+  var rs=(ids||[]).map(function(id){return DS.reqs.find(function(r){return String(r.id)===String(id);});}).filter(Boolean);if(!rs.length||DS.busy)return;
+  var sent=rs.filter(function(r){return r.shopify_order_id;}).length;
+  if(!confirm('Delete '+(rs.length===1?'this order':rs.length+' orders')+' for good?\n\nThis cannot be undone.'+(sent?'\n\n'+sent+' of them exist in Shopify and will be skipped: those can only be removed from view.':'')))return;
+  var fail='';DS.busy=true;DS.err='';render();
+  try{var j=await _dsFn({action:'staff_remove_request',ids:rs.map(function(r){return r.id;}),hard:true});toast(dsDoneMsg(j,'deleted'),j.skipped&&j.skipped.length?9000:5000);}
+  catch(e){fail='Not deleted: '+e.message;}
+  DS.busy=false;DS.pick={};DS.sel=null;await dsLoadReqs();if(fail){DS.err=fail;render();}
 }
 function dsEditQty(sku,v){if(!DS.edit)DS.edit={};DS.edit[sku]=Math.max(1,Math.min(9999,parseInt(v,10)||1));}
 async function dsSaveLines(id){
@@ -31549,7 +31802,8 @@ function dsReview(r){
    +(editable?'<button type="button" class="btn btn-teal" onclick="dsSend(DS.sel)"'+(DS.busy?' disabled':'')+'>'+(DS.busy?'Sending&hellip;':(r.status==='attention'?'Retry: send to Shopify':'Send to Shopify'))+'</button>':'')
    +(editable&&DS.edit?'<button type="button" class="btn" onclick="dsSaveLines(DS.sel)">Save quantity changes</button>':'')
    +(link?'<a class="btn" href="'+escHtml(link)+'" target="_blank" rel="noopener">Open in Shopify &rarr;</a>':'')
-   +((r.status==='new'||r.status==='attention'||r.status==='awaiting_payment')?'<button type="button" class="btn btn-red" onclick="dsReject(DS.sel)">Reject with reason</button>':'')
+   +((!r.archived_at&&(r.status==='new'||r.status==='attention'||r.status==='awaiting_payment'))?'<button type="button" class="btn btn-red" onclick="dsReject(DS.sel)">Reject with reason</button>':'')
+   +(r.archived_at?'<button type="button" class="btn" onclick="dsRestore([DS.sel])">Restore</button>'+(r.shopify_order_id?'':'<button type="button" class="btn btn-red" onclick="dsDeleteForever([DS.sel])">Delete for good</button>'):'<button type="button" class="btn" onclick="dsRemove([DS.sel])">Remove order</button>')
    +'</div></div>';
 }
 function dsSettingsHtml(){
@@ -31575,17 +31829,25 @@ function renderDealerOrders(){
   else if(DS.loaded&&!DS.loading&&(!DS._syncAt||Date.now()-DS._syncAt>120000)&&DS.reqs.some(function(r){return r.status==='awaiting_payment';})){DS._syncAt=Date.now();dsSync(true);}
   var c=dsCounts(),rows=dsRows(),sel=DS.sel&&DS.reqs.find(function(r){return String(r.id)===String(DS.sel);});
   var tile=function(key,label,n,cls,sub){var on=DS.filter===key;return '<div class="kpi '+cls+'" role="button" aria-pressed="'+(on?'true':'false')+'" style="cursor:pointer'+(on?';box-shadow:inset 0 0 0 2px #fff':'')+'" onclick="dsFilter(\''+key+'\')"><div class="kpi-label">'+label+'</div><div class="kpi-value">'+n+'</div><div class="kpi-sub">'+sub+'</div></div>';};
-  var tbl=rows.length?'<div class="panel" style="padding:0;overflow:hidden"><div class="tbl-wrap"><table><thead><tr>'+dsTh([['PO',100],['Dealer'],['Submitted',130],['Lines',110],['Total',100],['Payment',130],['Stock',90],['Status',140]])+'</tr></thead><tbody>'
-    +rows.map(function(r){var st=r.stock_check||[],sh=st.reduce(function(s,x){return s+(x.short||0);},0),t=r.totals||{};
-      return '<tr style="cursor:pointer'+(String(DS.sel)===String(r.id)?';background:var(--bg3)':'')+'" onclick="dsSelect(\''+escHtml(r.id)+'\')"><td><b>'+escHtml(r.po_number||'No PO')+'</b></td><td>'+escHtml(r.dealer_name||'')+'</td><td class="t3s">'+escHtml(new Date(r.created_at).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}))+'</td><td>'+(r.lines||[]).length+' &middot; '+(t.units||0)+' units</td><td><b>'+dsMoney(t.total)+'</b></td><td class="t3s">'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</td><td style="color:'+(sh?'var(--red)':'var(--green)')+';font-weight:700;font-size:var(--t-sm)">'+(sh?sh+' short':'In stock')+'</td><td>'+dsStatusPill(r.status)+'</td></tr>'+(String(DS.sel)===String(r.id)?'<tr><td colspan="8" style="padding:10px 12px;background:var(--bg3)">'+dsReview(r)+'</td></tr>':'');}).join('')+'</tbody></table></div></div>'
-    :'<div class="panel section-empty">'+(DS.loading?'Loading&hellip;':(DS.filter?'Nothing here.':'No dealer orders yet. They appear here when a dealer submits a PO from their shop.'))+'</div>';
-  return '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:12px"><div class="t3s" style="max-width:720px">Every PO a dealer submits from their shop. Orders go straight to Shopify; anything that cannot is held here for you. '+(dsSettings().autoSend?'':'<b style="color:var(--orange)">Automatic sending is OFF: every order waits for you.</b>')+'</div><div style="display:flex;gap:8px"><button class="btn btn-sm" onclick="dsSync()">Check payments</button><button class="btn btn-sm" onclick="dsLoadReqs()">Refresh</button></div></div>'
+  var picked=dsPicked(),allOn=rows.length&&rows.every(function(r){return DS.pick[String(r.id)];});
+  var bulk=picked.length?'<div class="panel" style="padding:8px 14px;margin-bottom:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;border-left:3px solid var(--teal)"><b>'+picked.length+' selected</b>'
+    +(DS.showRemoved?'<button type="button" class="btn btn-sm" onclick="dsRestore(dsPicked())">Restore</button><button type="button" class="btn btn-sm btn-red" onclick="dsDeleteForever(dsPicked())">Delete for good</button>':'<button type="button" class="btn btn-sm btn-red" onclick="dsRemove(dsPicked())">Remove selected</button>')
+    +'<button type="button" class="btn btn-sm" onclick="DS.pick={};render()">Clear</button></div>':'';
+  var colN=10;
+  var tbl=rows.length?bulk+'<div class="panel" style="padding:0;overflow:hidden"><div class="tbl-wrap"><table><thead><tr><th style="width:34px"><input type="checkbox" aria-label="Select all" '+(allOn?'checked ':'')+'onchange="dsPickAll(this.checked)"></th>'+dsTh([['PO',100],['Dealer'],['Submitted',130],['Lines',110],['Total',100],['Payment',130],['Stock',90],['Status',140]])+'<th style="width:44px"></th></tr></thead><tbody>'
+    +rows.map(function(r){var st=r.stock_check||[],sh=st.reduce(function(s,x){return s+(x.short||0);},0),t=r.totals||{},on=String(DS.sel)===String(r.id);
+      return '<tr style="cursor:pointer'+(on?';background:var(--bg3)':'')+'" onclick="dsSelect(\''+escHtml(r.id)+'\')"><td onclick="dsStop(event)"><input type="checkbox" aria-label="Select this order" '+(DS.pick[String(r.id)]?'checked ':'')+'onchange="dsPick(\''+escHtml(r.id)+'\',this.checked)"></td><td><b>'+escHtml(r.po_number||'No PO')+'</b></td><td>'+escHtml(r.dealer_name||'')+'</td><td class="t3s">'+escHtml(new Date(r.created_at).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}))+'</td><td>'+(r.lines||[]).length+' &middot; '+(t.units||0)+' units</td><td><b>'+dsMoney(t.total)+'</b></td><td class="t3s">'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</td><td style="color:'+(sh?'var(--red)':'var(--green)')+';font-weight:700;font-size:var(--t-sm)">'+(sh?sh+' short':'In stock')+'</td><td>'+dsStatusPill(r.status)+'</td>'
+        +'<td onclick="dsStop(event)">'+(DS.showRemoved?'<button type="button" class="action-btn" title="Restore" aria-label="Restore this order" onclick="dsRestore([\''+escHtml(r.id)+'\'])">&#8634;</button>':'<button type="button" class="action-btn del" title="Remove this order" aria-label="Remove this order" onclick="dsRemove([\''+escHtml(r.id)+'\'])">&times;</button>')+'</td></tr>'
+        +(on?'<tr><td colspan="'+colN+'" style="padding:10px 12px;background:var(--bg3)">'+dsReview(r)+'</td></tr>':'');}).join('')+'</tbody></table></div></div>'
+    :'<div class="panel section-empty">'+(DS.loading?'Loading&hellip;':(DS.showRemoved?'Nothing has been removed.':(DS.filter?'Nothing here.':'No dealer orders yet. They appear here when a dealer submits a PO from their shop.')))+'</div>';
+  return '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:12px"><div class="t3s" style="max-width:720px">Every PO a dealer submits from their shop. Orders go straight to Shopify; anything that cannot is held here for you. '+(dsSettings().autoSend?'':'<b style="color:var(--orange)">Automatic sending is OFF: every order waits for you.</b>')+'</div><div style="display:flex;gap:8px"><button type="button" class="btn btn-sm" onclick="dsToggleRemoved()">'+(DS.showRemoved?'&larr; Back to orders':'Show removed ('+dsRemovedList().length+')')+'</button><button class="btn btn-sm" onclick="dsSync()">Check payments</button><button class="btn btn-sm" onclick="dsLoadReqs()">Refresh</button></div></div>'
+   +(DS.showRemoved?'<div class="panel" style="padding:8px 14px;margin-bottom:12px;border-left:3px solid var(--orange);font-size:var(--t-sm)"><b>Removed orders.</b> Dealers cannot see these. Restore one to bring it back, or delete it for good (not possible for orders that exist in Shopify).</div>':'')
    +(DS.err?'<div class="panel" style="padding:10px 14px;border-left:3px solid var(--red);color:var(--red);margin-bottom:12px;font-size:var(--t-sm)">'+escHtml(DS.err)+'</div>':'')
    +'<div class="kpi-grid kpi-grid-4" style="margin-bottom:12px">'+tile('attention','Needs attention',c.attention,'kpi-red','held for you, or sending')+tile('awaiting','Awaiting payment',c.awaiting,'kpi-yellow','pay-up-front dealers')+tile('sent','Sent to Shopify today',c.sentToday,'kpi-teal','orders created')+tile('all','All orders',c.all,'','last 300')+'</div>'
    +dsSettingsHtml()+tbl;
 }
 Object.assign(window,{dsUserSetupLink:dsUserSetupLink,dsLoadUsers:dsLoadUsers,dsUserAdd:dsUserAdd,dsUserRole:dsUserRole,dsUserRemove:dsUserRemove,openDealerStore:openDealerStore,dsClose:dsClose,dsTab:dsTab,dsEdit:dsEdit,dsRowDel:dsRowDel,dsSearchPick:dsSearchPick,dsCsvExport:dsCsvExport,dsCsvImport:dsCsvImport,dsCopyFrom:dsCopyFrom,dsSavePrices:dsSavePrices,dsShipField:dsShipField,dsSaveShip:dsSaveShip,
-  dsSelect:dsSelect,dsFilter:dsFilter,dsSend:dsSend,dsReject:dsReject,dsEditQty:dsEditQty,dsSaveLines:dsSaveLines,dsDelLine:dsDelLine,dsSync:dsSync,dsLoadReqs:dsLoadReqs,dsSaveSettings:dsSaveSettings});
+  dsStop:dsStop,dsRemove:dsRemove,dsRestore:dsRestore,dsDeleteForever:dsDeleteForever,dsPick:dsPick,dsPickAll:dsPickAll,dsPicked:dsPicked,dsToggleRemoved:dsToggleRemoved,dsRows:dsRows,dsSelect:dsSelect,dsFilter:dsFilter,dsSend:dsSend,dsReject:dsReject,dsEditQty:dsEditQty,dsSaveLines:dsSaveLines,dsDelLine:dsDelLine,dsSync:dsSync,dsLoadReqs:dsLoadReqs,dsSaveSettings:dsSaveSettings});
 
 
 /* [STAGE7] Ledger-based integrity helpers (v20.67) — pure functions so they are testable in isolation. */
@@ -35128,7 +35390,7 @@ function _initReportChart(){
       datasets:[{label:'Revenue ($)',data:d.map(r=>n(r['Revenue ($)'])),backgroundColor:d.map((_,i)=>PAL[i%PAL.length])}]},
     options:{...baseOpts,indexAxis:'y'}};
   } else if(id==='inv_valuation'){
-    const d=data.filter(r=>r['Part #']!=='— TOTAL —').slice(0,20);
+    const d=data.filter(r=>!String(r['Part #']).startsWith('\u2014')&&!String(r['Part #']).startsWith('—')).slice(0,20);
     cfg={type:'bar',data:{labels:d.map(r=>r['Part #']),
       datasets:[{label:'Total Value ($)',data:d.map(r=>n(r['Total Value ($)'])),backgroundColor:d.map((_,i)=>PAL[i%PAL.length])}]},
     options:{...baseOpts,indexAxis:'y'}};
@@ -35144,13 +35406,11 @@ function _initReportChart(){
       datasets:[{label:'Total Spend ($)',data:d.map(r=>n(r['Total Spend ($)'])),backgroundColor:d.map((_,i)=>PAL[i%PAL.length])}]},
     options:{...baseOpts,indexAxis:'y'}};
   } else if(id==='sales_by_dealer'){
-    const d=data.slice(0,20);
-    const lKey=d[0]?Object.keys(d[0]).find(k=>k.toLowerCase().includes('revenue')||k.toLowerCase().includes('spend')):'Revenue ($)';
-    cfg={type:'bar',data:{labels:d.map(r=>r['Dealer']||r['Dealer Code']||r['Customer']||''),
-      datasets:[{label:lKey||'Amount',data:d.map(r=>n(r[lKey])),backgroundColor:d.map((_,i)=>PAL[i%PAL.length])}]},
-    options:{...baseOpts}};
-  }
-  if(!cfg)return;
+ const agg={};data.forEach(r=>{const k=r['Dealer']||'(unknown)';agg[k]=(agg[k]||0)+n(r['Revenue ($)']);});
+ const d=Object.keys(agg).map(k=>({k,v:agg[k]})).sort((a,b)=>b.v-a.v).slice(0,20);
+ cfg={type:'bar',data:{labels:d.map(r=>r.k),datasets:[{label:'Revenue ($)',data:d.map(r=>+r.v.toFixed(2)),backgroundColor:d.map((_,i)=>PAL[i%PAL.length])}]},options:{...baseOpts}};
+ }
+ if(!cfg)return;
   try{canvas.height=420;window._rptChartInst=new Chart(canvas,cfg);}catch(e){console.warn('Chart error:',e);}
 }
 
@@ -39800,6 +40060,15 @@ function parseDealerPO(discountCode,dealers){
   return null;
 }
 
+// [v23.57] A dealer who pays up front uses just their prefix as the code (no PO after it); parseDealerPO only knows
+// "prefix + PO" for billed dealers, so those orders were never recognised as dealer orders (Dealer Sales missed them and
+// revenue priced them at list). This reads both shapes; parseDealerPO itself is unchanged.
+function parseDealerCode(discountCode,dealers){
+  var po=parseDealerPO(discountCode,dealers);if(po)return po;
+  var code=String(discountCode||'').trim().toLowerCase();if(!code||!Array.isArray(dealers))return null;
+  for(var i=0;i<dealers.length;i++){var d=dealers[i],pf=String(d.po_code_prefix||'').trim().toLowerCase();if(pf&&code===pf)return{dealer:d,poNumber:'',rawCode:String(discountCode).trim()};}
+  return null;
+}
 function _buildDealerPOs(dealerId){
   var dealer=S.dealers.find(function(d){return d.id===dealerId;})||{};
   var disc=typeof dealer.discount_pct==='number'?dealer.discount_pct:0.20;
