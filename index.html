@@ -475,7 +475,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.57</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.59</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -540,8 +540,8 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.57';
-const TGK_ERP_BUILD_DATE = '2026-11-06';
+const TGK_ERP_VERSION = 'v23.59';
+const TGK_ERP_BUILD_DATE = '2026-11-07';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
 // functions can refuse anonymous callers (EDGE_AUTH_MODE=enforce). Done once here instead of at ~20 call sites:
@@ -1888,7 +1888,9 @@ function setupRealtime(){
       // maps, and the second rtRender was a duplicate. View lists unioned into the single call.
       rtRender(['assemblies','dashboard','inventory','planning','purchases','packqueue','lookup','cyclecounts','pobuilder','boms','pricelist','production']);
     })
-    .on('postgres_changes',{event:'*',schema:'public',table:'sales'},p=>{
+    .on('postgres_changes',{event:'*',schema:'public',table:'dealer_order_requests'},p=>{try{if(typeof dsLiveChange==='function')dsLiveChange(p);}catch(e){console.warn('[TGK] dealer orders live update failed:',e);}})
+  .on('postgres_changes',{event:'*',schema:'public',table:'sales'},p=>{
+   try{if(typeof dsLiveSale==='function')dsLiveSale(p);}catch(_e){}   // [v23.58] a dealer's open portal learns of the shipment or status change
       if(p.eventType==='INSERT'){
         if(!S.sales.find(s=>s.id===p.new.id)){
           // [FIX v23.75] Insert in date order (newest first, same as the initial load) instead of always at the
@@ -2071,6 +2073,7 @@ function setupRealtime(){
       if(status==='SUBSCRIBED'&&wasDown){
         // Websocket was down — realtime does NOT replay missed events, so catch up with a full refresh
         console.warn('[TGK] Realtime reconnected after gap — running catch-up refresh');
+ if(typeof dsLoadReqs==='function'&&typeof DS!=='undefined'&&DS.loaded)dsLoadReqs();   // [v23.58] dealer orders missed while disconnected
         if(typeof refreshAll==='function')refreshAll().catch(e=>console.warn('[TGK] catch-up refresh failed:',e?.message||e));
       }
       if(status==='CHANNEL_ERROR'){
@@ -31462,6 +31465,9 @@ Object.assign(window,{diToggle:diToggle,diExplain:diExplain,diFilter:diFilter,di
 var DS={reqs:[],loaded:false,loading:false,err:'',sel:null,filter:'',busy:false,edit:null,_badgeAt:0,_syncAt:0,showRemoved:false,pick:{}};
 var DM=null; // the open "Storefront" window for one dealer
 var DS_PAY=[['prepay','Pays up front: gets a secure Shopify payment link'],['billed_card','Billed by us: card on file, processed in QuickBooks (order is marked paid)'],['billed_invoice','Billed by us: QuickBooks invoice (order is marked paid)']];
+// Payment terms (v23.59): how long a billed dealer has to pay, counted from the day the LAST item on a PO ships.
+var DS_TERMS=[['','No terms set'],['0','Due on receipt'],['10','Net 10'],['15','Net 15'],['30','Net 30'],['45','Net 45'],['60','Net 60'],['90','Net 90']];
+function dsTermsFromDealer(d){var v=d&&d.terms_days;if(v===null||v===undefined||v==='')return {tm:'',tmd:''};var s=String(parseInt(v,10));return DS_TERMS.some(function(t){return t[0]===s&&s!=='';})?{tm:s,tmd:''}:{tm:'other',tmd:isNaN(parseInt(v,10))?'':s};}
 var DS_PAYSHORT={prepay:'Pays up front',billed_card:'QuickBooks card',billed_invoice:'QuickBooks invoice'};
 function dsR2(n){return Math.round((Number(n)+Number.EPSILON)*100)/100;}
 function dsMoney(n){n=Number(n)||0;var s=Math.abs(n).toFixed(2).split('.');s[0]=s[0].replace(/\B(?=(\d{3})+(?!\d))/g,',');return (n<0?'-':'')+'$'+s.join('.');}
@@ -31532,7 +31538,7 @@ function openDealerStore(id,tab){
   var so=(d.shipping_override&&typeof d.shipping_override==='object')?d.shipping_override:{};
   DM={id:String(d.id),d:d,tab:tab||'prices',rows:[],loaded:false,err:'',msg:'',q:'',busy:false,
       users:[],usersLoaded:false,uf:{email:'',name:'',role:'buyer'},
-      ship:{pm:(d.payment_mode==='billed_card'||d.payment_mode==='billed_invoice')?d.payment_mode:'prepay',us:so.us==null?'':String(so.us),ca:so.ca==null?'':String(so.ca),intl:so.intl==null?'':String(so.intl),fo:so.free_over==null?'':String(so.free_over)}};
+      ship:{tm:dsTermsFromDealer(d).tm,tmd:dsTermsFromDealer(d).tmd,pm:(d.payment_mode==='billed_card'||d.payment_mode==='billed_invoice')?d.payment_mode:'prepay',us:so.us==null?'':String(so.us),ca:so.ca==null?'':String(so.ca),intl:so.intl==null?'':String(so.intl),fo:so.free_over==null?'':String(so.free_over)}};
   dsModalRender();dsLoadPrices();if(DM.tab==='users')dsLoadUsers();
 }
 // ---- portal users (this dealer's approved team): staff manage them here, the dealer's admins manage them in the portal
@@ -31651,9 +31657,15 @@ async function dsSaveShip(){
   if(bad.length){DM.err=bad.join(' ');dsModalRender();return;}
   var ov={};if(s.us!=='')ov.us=Number(s.us);if(s.ca!=='')ov.ca=Number(s.ca);if(s.intl!=='')ov.intl=Number(s.intl);if(s.fo!=='')ov.free_over=Number(s.fo);
   var patch={payment_mode:s.pm==='prepay'?null:s.pm,shipping_override:Object.keys(ov).length?ov:null};
+  if(s.pm!=='prepay'){   // terms only mean something for a dealer we bill; a pay-up-front dealer's terms are left alone
+    var tdays=s.tm==='other'?String(s.tmd).trim():s.tm;
+    if(tdays===''&&s.tm==='other'){DM.err='Enter the number of days for the payment terms, or choose one from the list.';dsModalRender();return;}
+    if(tdays!==''&&(!/^\d{1,3}$/.test(tdays)||Number(tdays)>365)){DM.err='Payment terms must be a whole number of days from 0 to 365.';dsModalRender();return;}
+    patch.terms_days=tdays===''?null:Number(tdays);
+  }
   DM.busy=true;DM.err='';dsModalRender();
   try{var r=await db.from('dealers').update(patch).eq('id',DM.d.id);if(r.error)throw r.error;Object.assign(DM.d,patch);toast('Payment and shipping saved for '+(DM.d.name||'the dealer'));DM.msg='Saved.';}
-  catch(e){DM.err='Not saved: '+(e.message||e)+(/column|schema/i.test(String(e.message||''))?' (run dealer_storefront.sql in Supabase first)':'');}
+  catch(e){DM.err='Not saved: '+(e.message||e)+(/terms_days/i.test(String(e.message||''))?' (run dealer_terms.sql in Supabase first)':(/column|schema/i.test(String(e.message||''))?' (run dealer_storefront.sql in Supabase first)':''));}
   DM.busy=false;dsModalRender();
 }
 function dsModalRender(){
@@ -31686,6 +31698,7 @@ function dsModalRender(){
     var s=DM.ship,mst=m.shipping,ph=function(k){return mst[k]===undefined||mst[k]===null||mst[k]===''?'not set':String(mst[k]);};
     var inp=function(l,f,k){return '<div class="form-group"><label class="form-label">'+l+'</label><input class="form-input" value="'+escHtml(s[f])+'" placeholder="Master: '+escHtml(ph(k))+'" onchange="dsShipField(\''+f+'\',this.value)"></div>';};
     body='<div class="form-group"><label class="form-label">How this dealer pays</label><select class="form-input" onchange="dsShipField(\'pm\',this.value)">'+DS_PAY.map(function(p){return '<option value="'+p[0]+'"'+(s.pm===p[0]?' selected':'')+'>'+escHtml(p[1])+'</option>';}).join('')+'</select><div class="t3xs" style="margin-top:3px">A dealer with nothing chosen pays up front. Billed dealers\' orders go to Shopify marked as paid, and are tagged so you know how to bill them in QuickBooks.</div></div>'
+     +(s.pm!=='prepay'?'<div class="form-group"><label class="form-label">Payment terms</label><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><select class="form-input" style="max-width:260px" onchange="dsShipField(\'tm\',this.value);dsModalRender()">'+DS_TERMS.map(function(t){return '<option value="'+t[0]+'"'+(s.tm===t[0]?' selected':'')+'>'+escHtml(t[1])+'</option>';}).join('')+'<option value="other"'+(s.tm==='other'?' selected':'')+'>Other number of days&hellip;</option></select>'+(s.tm==='other'?'<input class="form-input" style="width:110px" type="number" min="0" max="365" step="1" placeholder="Days" aria-label="Days" value="'+escHtml(s.tmd)+'" onchange="dsShipField(\'tmd\',this.value)"> <span class="t3s">days</span>':'')+'</div><div class="t3xs" style="margin-top:3px">The clock starts the day the <b>last</b> item on a PO ships: a PO shipped in parts, or across several orders, is billed when the final one goes out. Net 30 means due 30 days after that day; Due on receipt means due that day. The dealer sees their terms, when each PO was billed, when it is due and how late it is, in their portal.</div></div>':'')
      +'<div style="font-weight:800;margin:14px 0 4px">Flat shipping for this dealer</div><div class="t3s" style="margin-bottom:8px">Leave a box empty to use your master rate (shown in each box). Set it on the Dealer orders screen.</div>'
      +'<div class="form-row cols-2">'+inp('United States, per order ($)','us','us')+inp('Canada, per order ($)','ca','ca')+'</div><div class="form-row cols-2">'+inp('Everywhere else, per order ($)','intl','intl')+inp('Free shipping when the order reaches ($)','fo','free_over')+'</div>'
      +'<div class="t3s">Shopify customer: '+(d.shopify_customer_id?'<b>linked</b> (ID '+escHtml(d.shopify_customer_id)+')':'will be linked automatically on their first order')+'</div>'
@@ -31733,7 +31746,51 @@ async function dsReject(id){
   var r=DS.reqs.find(function(x){return String(x.id)===String(id);});if(!r)return;
   var lab=r.po_number?'PO '+r.po_number:'this order';var why=prompt('Why is '+lab+' not accepted? The dealer will see this.');if(why===null)return;why=String(why).trim();if(!why){toast('Please give a short reason');return;}
   var u=await db.from('dealer_order_requests').update({status:'rejected',reject_reason:why,updated_at:new Date().toISOString()}).eq('id',id);
-  if(u.error){toast('Not saved: '+u.error.message,7000);return;}toast((r.po_number?'PO '+r.po_number:'The order')+' rejected');await dsLoadReqs();
+  if(u.error){toast('Not saved: '+u.error.message,7000);return;}toast((r.po_number?'PO '+r.po_number:'The order')+' rejected');dsPingDealer(r.dealer_id,'requests');await dsLoadReqs();
+}
+// ---- live updates (v23.58)
+// Dealer Orders updates the moment a dealer submits, cancels or pays, the way Shopify orders do. The ERP listens to the table directly
+// (dsLiveChange). In the other direction it nudges the dealer's open portal on their private live channel (dsPingDealer): after staff
+// change an order, and whenever a Shopify or ShipStation change touches one of that dealer's orders. A nudge carries no order data.
+async function dsLiveTopic(token){var h=await crypto.subtle.digest('SHA-256',new TextEncoder().encode('tgk-live:'+token));return 'dealer-'+Array.from(new Uint8Array(h)).map(function(b){return b.toString(16).padStart(2,'0');}).join('').slice(0,40);}
+var DS_PING_AT={};
+async function dsPingDealer(dealerId,what){
+  try{
+    var d=(S.dealers||[]).find(function(x){return String(x.id)===String(dealerId);});if(!d||!d.price_list_token)return;
+    var k=String(dealerId)+':'+what,now=Date.now();if(DS_PING_AT[k]&&now-DS_PING_AT[k]<1500)return;DS_PING_AT[k]=now;   // a burst of changes is one nudge
+    var tok=null;try{tok=await _poTok();}catch(e){}
+    await fetch(SUPA_URL+'/realtime/v1/api/broadcast',{method:'POST',headers:{'Content-Type':'application/json',apikey:SUPA_KEY,Authorization:'Bearer '+(tok||SUPA_KEY)},body:JSON.stringify({messages:[{topic:await dsLiveTopic(d.price_list_token),event:'changed',payload:{what:what},private:false}]})});
+  }catch(e){/* the dealer's page also refreshes itself every little while */}
+}
+function dsDealerOfCode(code){   // the dealer whose prefix this discount code starts with ("ecs", "ecs 1455912", "ecs1455912"), never "ecsfoo"
+  var c=String(code||'').trim().toLowerCase();if(!c)return null;
+  var ds=S.dealers||[];
+  for(var i=0;i<ds.length;i++){var pf=String(ds[i].po_code_prefix||'').trim().toLowerCase();if(pf&&c.indexOf(pf)===0&&!/^[a-z]/.test(c.slice(pf.length)))return ds[i];}
+  return null;
+}
+function dsLiveSale(p){var row=p&&(p.new||p.old);if(!row||!row.discount_code)return;var d=dsDealerOfCode(row.discount_code);if(d)dsPingDealer(d.id,'orders');}
+function dsLiveAlert(r){
+  var lab=(r.po_number?'PO '+r.po_number:'an order with no PO')+' from '+(r.dealer_name||'a dealer')+' ('+dsMoney((r.totals||{}).total)+')';
+  toast('<span class="ic ic-cart"></span>New dealer order \u2014 '+escHtml(lab),8000,function(){if(typeof nav==='function')nav('dealerorders');DS.sel=r.id;render();});
+  try{if(typeof pushActivity==='function')pushActivity({icon:'<span class="ic ic-cart"></span>',type:'order',text:'Dealer order '+(r.po_number?'PO '+r.po_number:'(no PO)'),sub:(r.dealer_name||'')+' \u00b7 '+dsMoney((r.totals||{}).total),ts:r.created_at||new Date().toISOString()});}catch(e){}
+  try{if(typeof Notification!=='undefined'&&Notification.permission==='granted'){var n=new Notification('TGK \u2014 New dealer order',{body:lab,tag:'dealer-order-'+r.id});n.onclick=function(){try{window.focus();}catch(e){}n.close();};}}catch(e){}
+}
+function dsLiveChange(p){
+  var row=p&&(p.new||p.old);if(!row||row.id===undefined||row.id===null)return;
+  var i=DS.reqs.findIndex(function(r){return String(r.id)===String(row.id);}),before=i>=0?DS.reqs[i]:null;
+  if(p.eventType==='DELETE'){if(i>=0)DS.reqs.splice(i,1);if(String(DS.sel)===String(row.id))DS.sel=null;}
+  else if(p.eventType==='INSERT'){if(i<0){DS.reqs=[p.new].concat(DS.reqs);dsLiveAlert(p.new);}}
+  else{   // UPDATE: merged, so a column the payload leaves out (large unchanged values) is kept
+    var now=Object.assign({},before||{},p.new);if(i>=0)DS.reqs[i]=now;else DS.reqs=[now].concat(DS.reqs);
+    var lab=(now.po_number?'PO '+now.po_number:'An order')+' from '+(now.dealer_name||'a dealer');
+    if(before&&before.status!==now.status&&!now.archived_at){
+      if(now.status==='sent'&&before.status==='awaiting_payment')toast('<span class="ic ic-check"></span>'+escHtml(lab)+' was paid and is in Shopify'+(now.shopify_order_name?' as '+escHtml(now.shopify_order_name):''),7000);
+      else if(now.status==='attention')toast('<span class="ic ic-alert"></span>'+escHtml(lab)+' needs attention'+(now.error?': '+escHtml(String(now.error).slice(0,120)):''),9000);
+      else if(now.status==='cancelled')toast(escHtml(lab)+' was cancelled by the dealer',6000);
+    }
+  }
+  if(!DS.loaded){DS._badgeAt=0;try{dsBadgeKick();}catch(e){}}else{try{dsBadge();}catch(e){}}
+  if(DS.loaded){if(typeof rtRender==='function')rtRender(['dealerorders']);else render();}
 }
 // ---- removing orders (v23.57)
 function dsStop(ev){if(ev&&ev.stopPropagation)ev.stopPropagation();}
@@ -31780,7 +31837,7 @@ async function dsSaveLines(id){
   var totals={merchandise:merch,msrp_total:msrp,savings:dsR2(msrp-merch),shipping:ship,total:dsR2(merch+(ship||0)),units:lines.reduce(function(s,l){return s+l.qty;},0)};
   var stock=lines.map(function(l){var a=dsFind(l.sku),oh=a?(Number(a.total_on_hand)||0):0;return {sku:l.sku,qty:l.qty,on_hand:oh,short:Math.max(0,l.qty-Math.max(0,oh))};});
   var u=await db.from('dealer_order_requests').update({lines:lines,totals:totals,stock_check:stock,updated_at:new Date().toISOString()}).eq('id',id);
-  if(u.error){toast('Not saved: '+u.error.message,7000);return;}DS.edit=null;toast('Order updated');await dsLoadReqs();
+  if(u.error){toast('Not saved: '+u.error.message,7000);return;}DS.edit=null;toast('Order updated');dsPingDealer(r.dealer_id,'requests');await dsLoadReqs();
 }
 function dsDelLine(sku){if(!DS.edit)DS.edit={};DS.edit['__del__'+sku]=1;var r=DS.reqs.find(function(x){return String(x.id)===String(DS.sel);});if(r)dsSaveLines(r.id);}
 function dsShopifyLink(r){var st=(S.shopify&&S.shopify.store)||'';if(!st)return '';st=String(st).replace(/^https?:\/\//,'').replace(/\/+$/,'');if(r.shopify_order_id)return 'https://'+st+'/admin/orders/'+encodeURIComponent(r.shopify_order_id);if(r.shopify_draft_id)return 'https://'+st+'/admin/draft_orders/'+encodeURIComponent(r.shopify_draft_id);return '';}
@@ -31847,7 +31904,7 @@ function renderDealerOrders(){
    +dsSettingsHtml()+tbl;
 }
 Object.assign(window,{dsUserSetupLink:dsUserSetupLink,dsLoadUsers:dsLoadUsers,dsUserAdd:dsUserAdd,dsUserRole:dsUserRole,dsUserRemove:dsUserRemove,openDealerStore:openDealerStore,dsClose:dsClose,dsTab:dsTab,dsEdit:dsEdit,dsRowDel:dsRowDel,dsSearchPick:dsSearchPick,dsCsvExport:dsCsvExport,dsCsvImport:dsCsvImport,dsCopyFrom:dsCopyFrom,dsSavePrices:dsSavePrices,dsShipField:dsShipField,dsSaveShip:dsSaveShip,
-  dsStop:dsStop,dsRemove:dsRemove,dsRestore:dsRestore,dsDeleteForever:dsDeleteForever,dsPick:dsPick,dsPickAll:dsPickAll,dsPicked:dsPicked,dsToggleRemoved:dsToggleRemoved,dsRows:dsRows,dsSelect:dsSelect,dsFilter:dsFilter,dsSend:dsSend,dsReject:dsReject,dsEditQty:dsEditQty,dsSaveLines:dsSaveLines,dsDelLine:dsDelLine,dsSync:dsSync,dsLoadReqs:dsLoadReqs,dsSaveSettings:dsSaveSettings});
+  dsLiveChange:dsLiveChange,dsLiveSale:dsLiveSale,dsLiveAlert:dsLiveAlert,dsPingDealer:dsPingDealer,dsDealerOfCode:dsDealerOfCode,dsLiveTopic:dsLiveTopic,dsStop:dsStop,dsTermsFromDealer:dsTermsFromDealer,dsRemove:dsRemove,dsRestore:dsRestore,dsDeleteForever:dsDeleteForever,dsPick:dsPick,dsPickAll:dsPickAll,dsPicked:dsPicked,dsToggleRemoved:dsToggleRemoved,dsRows:dsRows,dsSelect:dsSelect,dsFilter:dsFilter,dsSend:dsSend,dsReject:dsReject,dsEditQty:dsEditQty,dsSaveLines:dsSaveLines,dsDelLine:dsDelLine,dsSync:dsSync,dsLoadReqs:dsLoadReqs,dsSaveSettings:dsSaveSettings});
 
 
 /* [STAGE7] Ledger-based integrity helpers (v20.67) — pure functions so they are testable in isolation. */
@@ -40069,6 +40126,34 @@ function parseDealerCode(discountCode,dealers){
   for(var i=0;i<dealers.length;i++){var d=dealers[i],pf=String(d.po_code_prefix||'').trim().toLowerCase();if(pf&&code===pf)return{dealer:d,poNumber:'',rawCode:String(discountCode).trim()};}
   return null;
 }
+// ---- Payment terms (v23.59). A PO is BILLED the day its LAST item ships (a PO shipped in parts, or across several orders, waits for the final
+// one; cancelled lines do not count). It is DUE that many days later: Net 30 = 30 days, Due on receipt = the same day. The dealer's portal uses the same rule.
+function dealerTermsDays(d){var v=d&&d.terms_days;if(v===null||v===undefined||v==='')return null;var n=parseInt(v,10);return isNaN(n)?null:Math.max(0,Math.min(365,n));}
+function dealerTermsLabel(d){var n=dealerTermsDays(d);return n===null?'':(n===0?'Due on receipt':'Net '+n);}
+function _poShippedQty(s){var q=Number(s.qty)||0,st=String(s.fulfillment_status||'').toLowerCase();if(/^(shipped|delivered|fulfilled)$/.test(st))return q;if(st==='partial')return Math.max(0,Math.min(q,Number(s.qty_shipped)||0));if(s.shipped_at&&String(s.tracking_number||'').trim())return q;return 0;}
+function _poLive(s){return !s.cancelled_at&&!/^(cancelled|canceled|refunded|returned)$/i.test(String(s.fulfillment_status||''));}
+function _poDay(v){var x=String(v||'');if(/^\d{4}-\d{2}-\d{2}( 00:00:00(\+00(:00)?)?)?$/.test(x))return x.slice(0,10);try{return centralDateOnly(x);}catch(e){return x.slice(0,10);}}
+function _poAdd(d,n){return new Date(Date.parse(d+'T00:00:00Z')+n*86400000).toISOString().slice(0,10);}
+function _poGap(a,b){return Math.round((Date.parse(a+'T00:00:00Z')-Date.parse(b+'T00:00:00Z'))/86400000);}
+function dealerPOBilling(rows,dealer){
+  var live=(rows||[]).filter(_poLive),n=dealerTermsDays(dealer),today=centralDateOnly();
+  var left=live.filter(function(s){return _poShippedQty(s)<(Number(s.qty)||0);});
+  var out={fully:live.length>0&&!left.length,billed_on:null,due_on:null,state:'unbilled',days_over:0,days_to_due:null,unshipped:left.length,terms:n};
+  if(!out.fully)return out;
+  var days=live.map(function(s){return _poDay(s.shipped_at||s.updated_at||s.sale_date);}).sort();
+  out.billed_on=days[days.length-1];
+  if(n===null){out.state='unpaid';return out;}
+  out.due_on=_poAdd(out.billed_on,n);out.state=today>out.due_on?'overdue':'due';
+  if(out.state==='overdue')out.days_over=_poGap(today,out.due_on);else out.days_to_due=_poGap(out.due_on,today);
+  return out;
+}
+function _poTermsSummary(pos,dealerId){
+  var d=(S.dealers||[]).find(function(x){return String(x.id)===String(dealerId);})||{},lab=dealerTermsLabel(d);
+  var billed=0,over=0,overN=0,wait=0,waitN=0;
+  pos.forEach(function(po){var b=po.billing||{};if(po.payment)return;if(b.fully){billed+=po.total;if(b.state==='overdue'){over+=po.total;overN++;}}else{wait+=po.total;waitN++;}});
+  return '<div style="padding:10px 16px;border-bottom:1px solid var(--border);font-size:var(--t-sm);line-height:1.7"><b>Terms:</b> '+(lab?escHtml(lab):'<span style="color:var(--orange)">not set (set them in Storefront)</span>')+' <span class="t3s">&middot; counted from the day the last item on a PO ships</span><br>'
+    +'Billed and unpaid <b>$'+billed.toFixed(2)+'</b>'+(overN?' &middot; <b style="color:var(--red)">overdue $'+over.toFixed(2)+' ('+overN+' PO'+(overN!==1?'s':'')+')</b>':' &middot; none overdue')+' &middot; not billed yet <b>$'+wait.toFixed(2)+'</b> ('+waitN+' PO'+(waitN!==1?'s':'')+' still shipping)</div>';
+}
 function _buildDealerPOs(dealerId){
   var dealer=S.dealers.find(function(d){return d.id===dealerId;})||{};
   var disc=typeof dealer.discount_pct==='number'?dealer.discount_pct:0.20;
@@ -40083,7 +40168,8 @@ function _buildDealerPOs(dealerId){
     var dealerPrice=+(msrp*(1-disc)).toFixed(4);
     var lineTotal=+(dealerPrice*(s.qty||1)).toFixed(4);
     var msrpLine=+(msrp*(s.qty||1)).toFixed(4);
-    if(!poMap[po])poMap[po]={poNumber:po,rawCode:parsed.rawCode,orders:[],total:0,msrpTotal:0};
+    if(!poMap[po])poMap[po]={poNumber:po,rawCode:parsed.rawCode,orders:[],rows:[],total:0,msrpTotal:0};
+ poMap[po].rows.push(s);
     var _cancelled=s.fulfillment_status==='Cancelled';
     if(!poMap[po].orders.find(function(o){return o.id===s.id;})){
       poMap[po].orders.push({id:s.id,order_number:s.order_number,sale_date:s.sale_date,
@@ -40095,7 +40181,7 @@ function _buildDealerPOs(dealerId){
     return(b.orders[0]?.sale_date||'').localeCompare(a.orders[0]?.sale_date||'');
   });
   var open=[],paid=[];
-  all.forEach(function(po){
+  all.forEach(function(po){po.billing=dealerPOBilling(po.rows,dealer);
     var k=dealerId+'_'+po.poNumber;
     if(S.dealerPOPayments[k]){po.payment=S.dealerPOPayments[k];paid.push(po);}
     else open.push(po);
@@ -40105,10 +40191,11 @@ function _buildDealerPOs(dealerId){
 
 function _dealerPORows(pos,dealerId,isPaid){
   if(!pos.length)return '<div style="padding:40px;text-align:center;color:var(--text3);font-size:var(--t-md)">'+(isPaid?'No paid POs yet.':'No open POs — orders with matching discount codes will appear here.')+'</div>';
-  return '<table style="width:100%;border-collapse:collapse;font-size:var(--t-md)"><thead><tr style="background:var(--bg2);border-bottom:2px solid var(--border)">'
+  return (isPaid?'':_poTermsSummary(pos,dealerId))+'<table style="width:100%;border-collapse:collapse;font-size:var(--t-md)"><thead><tr style="background:var(--bg2);border-bottom:2px solid var(--border)">'
     +'<th style="padding:8px 16px;text-align:left;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">PO #</th>'
     +'<th style="padding:8px 12px;text-align:left;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Orders</th>'
     +'<th style="padding:8px 12px;text-align:left;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Date</th>'
+ +(isPaid?'':'<th style="padding:8px 12px;text-align:left;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Billed</th><th style="padding:8px 12px;text-align:left;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Due</th>')
     +'<th style="padding:8px 12px;text-align:right;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Dealer Price</th>'
     +(isPaid?'<th style="padding:8px 12px;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Paid On</th>':'')
     +'<th style="padding:8px 16px;text-align:right;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Actions</th>'
@@ -40125,6 +40212,10 @@ function _dealerPORows(pos,dealerId,isPaid){
         +'<td style="padding:10px 16px;font-family:var(--mono);font-size:var(--t-md);font-weight:700">'+escHtml(po.poNumber)+'</td>'
         +'<td style="padding:10px 12px">'+badges+'</td>'
         +'<td style="padding:10px 12px;font-size:var(--t-sm);color:var(--text3)">'+((po.orders[0]?.sale_date||'').slice(0,10)||'—')+'</td>'
+ +(isPaid?'':(function(){var b=po.billing||{};
+ if(!b.fully)return '<td style="padding:10px 12px;font-size:var(--t-sm)" colspan="2"><span class="pill pill-muted">Not billed yet</span> <span class="t3xs">'+(b.unshipped?b.unshipped+' line'+(b.unshipped!==1?'s':'')+' still to ship':'waiting on shipment')+'</span></td>';
+ var due=b.state==='overdue'?'<b style="color:var(--red)">'+escHtml(b.due_on)+'</b><div class="t3xs" style="color:var(--red)">'+b.days_over+' day'+(b.days_over!==1?'s':'')+' overdue</div>':(b.due_on?'<b>'+escHtml(b.due_on)+'</b><div class="t3xs">'+(b.days_to_due===0?'due today':'in '+b.days_to_due+' day'+(b.days_to_due!==1?'s':''))+'</div>':'<span class="t3xs">no terms set</span>');
+ return '<td style="padding:10px 12px;font-size:var(--t-sm)">'+escHtml(b.billed_on)+'</td><td style="padding:10px 12px;font-size:var(--t-sm)">'+due+'</td>';})())
         +(()=>{
           var cxCount=po.orders.filter(function(o){return o.cancelled;}).length;
           var cxNote=cxCount?'<div style="font-size:var(--t-xs);color:var(--red);margin-top:2px">'+cxCount+' cancelled</div>':'';
@@ -40221,7 +40312,7 @@ async function saveDealerPOPayments(){
 async function markDealerPOPaid(dealerId,poNumber){
   var k=dealerId+'_'+poNumber;
   S.dealerPOPayments[k]={paid_at:new Date().toISOString().slice(0,10),paid_by:S.currentUser||''};
-  await saveDealerPOPayments();
+  await saveDealerPOPayments();try{if(typeof dsPingDealer==='function')dsPingDealer(dealerId,'orders');}catch(_e){}
   logAction('Dealer PO paid: '+poNumber,'dealers',dealerId,null,{poNumber,paid_at:S.dealerPOPayments[k].paid_at}).catch(function(){});
   var dd=document.getElementById('dd-ov');
   if(dd&&dd.firstElementChild)dd.firstElementChild.innerHTML=_renderDealerDetailContent(dealerId);
@@ -40232,7 +40323,7 @@ async function markDealerPOPaid(dealerId,poNumber){
 async function unmarkDealerPO(dealerId,poNumber){
   var k=dealerId+'_'+poNumber;
   delete S.dealerPOPayments[k];
-  await saveDealerPOPayments();
+  await saveDealerPOPayments();try{if(typeof dsPingDealer==='function')dsPingDealer(dealerId,'orders');}catch(_e){}
   var dd=document.getElementById('dd-ov');
   if(dd&&dd.firstElementChild)dd.firstElementChild.innerHTML=_renderDealerDetailContent(dealerId);
   else _updateDDTabs('paid');
@@ -40249,7 +40340,7 @@ async function markAllDealerPOsPaid(dealerId){
   data.open.forEach(function(po){
     S.dealerPOPayments[dealerId+'_'+po.poNumber]={paid_at:now,paid_by:S.currentUser||''};
   });
-  await saveDealerPOPayments();
+  await saveDealerPOPayments();try{if(typeof dsPingDealer==='function')dsPingDealer(dealerId,'orders');}catch(_e){}
   logAction('Dealer bulk paid: '+data.open.map(function(p){return p.poNumber;}).join(', '),'dealers',dealerId,null,{count:data.open.length,total:total.toFixed(2)}).catch(function(){});
   toast('<span class="ic ic-check"></span>'+data.open.length+' PO'+(data.open.length!==1?'s':'')+' marked paid — $'+total.toFixed(2));
   var dd=document.getElementById('dd-ov');
