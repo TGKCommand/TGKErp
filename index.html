@@ -543,7 +543,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.77</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.78</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -608,7 +608,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.77';
+const TGK_ERP_VERSION = 'v23.78';
 const TGK_ERP_BUILD_DATE = '2026-11-09';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -32547,7 +32547,8 @@ async function dsLoadReqs(){
   DS.loading=true;
   try{var r=await db.from('dealer_order_requests').select('*').order('created_at',{ascending:false}).limit(300);if(r.error)throw r.error;DS.reqs=r.data||[];DS.err='';}
   catch(e){DS.err=(e.message||String(e))+(/dealer_order_requests|relation|schema/i.test(String(e.message||''))?' Run dealer_storefront.sql in Supabase first.':'');}
-  DS.loaded=true;DS.loading=false;dsBadge();if(S.view==='dealerorders')render();
+  DS.loaded=true;DS.loading=false;try{await dsReconcileCancelled();}catch(_e){}
+ dsBadge();if(S.view==='dealerorders')render();
 }
 async function dsSync(quiet){
   try{var j=await _dsFn({action:'sync_awaiting'});DS._syncAt=Date.now();if(!quiet)toast(j.updated?j.updated+' payment'+(j.updated!==1?'s':'')+' found':'No new payments yet');}catch(e){if(!quiet)toast('Could not check payments: '+e.message,7000);}
@@ -32588,7 +32589,7 @@ function dsDealerOfCode(code){   // the dealer whose prefix this discount code s
   for(var i=0;i<ds.length;i++){var pf=String(ds[i].po_code_prefix||'').trim().toLowerCase();if(pf&&c.indexOf(pf)===0&&!/^[a-z]/.test(c.slice(pf.length)))return ds[i];}
   return null;
 }
-function dsLiveSale(p){var row=p&&(p.new||p.old);if(!row||!row.discount_code)return;var d=dsDealerOfCode(row.discount_code);if(d)dsPingDealer(d.id,'orders');}
+function dsLiveSale(p){dsReconcileSoon();var row=p&&(p.new||p.old);if(!row||!row.discount_code)return;var d=dsDealerOfCode(row.discount_code);if(d)dsPingDealer(d.id,'orders');}
 function dsLiveAlert(r){
   var lab=(r.po_number?'PO '+r.po_number:'an order with no PO')+' from '+(r.dealer_name||'a dealer')+' ('+dsMoney((r.totals||{}).total)+')';
   toast('<span class="ic ic-cart"></span>New dealer order \u2014 '+escHtml(lab),8000,function(){if(typeof nav==='function')nav('dealerorders');DS.sel=r.id;render();});
@@ -41022,6 +41023,7 @@ function _poAdd(d,n){return new Date(Date.parse(d+'T00:00:00Z')+n*86400000).toIS
 function _poGap(a,b){return Math.round((Date.parse(a+'T00:00:00Z')-Date.parse(b+'T00:00:00Z'))/86400000);}
 function dealerPOBilling(rows,dealer){
   var live=(rows||[]).filter(_poLive),n=dealerTermsDays(dealer),today=centralDateOnly();
+ if((rows||[]).length&&!live.length)return {fully:false,billed_on:null,due_on:null,state:'cancelled',days_over:0,days_to_due:null,unshipped:0,terms:n};   // every order on it was cancelled: nothing to bill
   var left=live.filter(function(s){return _poShippedQty(s)<(Number(s.qty)||0);});
   var out={fully:live.length>0&&!left.length,billed_on:null,due_on:null,state:'unbilled',days_over:0,days_to_due:null,unshipped:left.length,terms:n};
   if(!out.fully)return out;
@@ -41069,20 +41071,21 @@ function _buildDealerPOs(dealerId){
   all.forEach(function(po){po.billing=dealerPOBilling(po.rows,dealer);
     var k=dealerId+'_'+po.poNumber;
     if(S.dealerPOPayments[k]){po.payment=S.dealerPOPayments[k];paid.push(po);}
-    else open.push(po);
+    else if(po.billing.state==='cancelled'){po.payment={closed:true,auto:true,reason:'cancelled'};paid.push(po);}   // every order cancelled: closed automatically, nothing to pay
+ else open.push(po);
   });
   return{open:open,paid:paid,disc:disc};
 }
 
 function _dealerPORows(pos,dealerId,isPaid){
-  if(!pos.length)return '<div style="padding:40px;text-align:center;color:var(--text3);font-size:var(--t-md)">'+(isPaid?'No paid POs yet.':'No open POs — orders with matching discount codes will appear here.')+'</div>';
+  if(!pos.length)return '<div style="padding:40px;text-align:center;color:var(--text3);font-size:var(--t-md)">'+(isPaid?'No paid or closed POs yet.':'No open POs — orders with matching discount codes will appear here.')+'</div>';
   return (isPaid?'':_poTermsSummary(pos,dealerId))+'<table style="width:100%;border-collapse:collapse;font-size:var(--t-md)"><thead><tr style="background:var(--bg2);border-bottom:2px solid var(--border)">'
     +'<th style="padding:8px 16px;text-align:left;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">PO #</th>'
     +'<th style="padding:8px 12px;text-align:left;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Orders</th>'
     +'<th style="padding:8px 12px;text-align:left;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Date</th>'
  +(isPaid?'':'<th style="padding:8px 12px;text-align:left;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Billed</th><th style="padding:8px 12px;text-align:left;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Due</th>')
     +'<th style="padding:8px 12px;text-align:right;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Dealer Price</th>'
-    +(isPaid?'<th style="padding:8px 12px;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Paid On</th>':'')
+    +(isPaid?'<th style="padding:8px 12px;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Paid / closed</th>':'')
     +'<th style="padding:8px 16px;text-align:right;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">Actions</th>'
     +'</tr></thead><tbody>'
     +pos.map(function(po){
@@ -41108,12 +41111,13 @@ function _dealerPORows(pos,dealerId,isPaid){
             +(po.msrpTotal&&Math.abs(po.msrpTotal-po.total)>0.01?'<div class="t3xs">MSRP $'+po.msrpTotal.toFixed(2)+'</div>':'')
             +cxNote+'</td>';
         })()
-        +(isPaid?'<td style="padding:10px 12px;font-size:var(--t-sm);color:var(--teal)"><b>'+escHtml(po.payment?.paid_at||'')+'</b></td>':'')
+        +(isPaid?_poPaidCell(po):'')
         +'<td style="padding:10px 16px"><div style="display:flex;gap:6px;justify-content:flex-end">'
         +(isPaid
-          ?'<button class="btn btn-sm" style="color:var(--text3)" data-did="'+dealerId+'" data-po="'+escHtml(po.poNumber)+'" onclick="unmarkDealerPO(this.dataset.did,this.dataset.po)">&#8617; Reopen</button>'
+          ?(po.payment&&po.payment.auto?'<span class="t3xs">nothing to pay</span>':'<button class="btn btn-sm" style="color:var(--text3)" data-did="'+dealerId+'" data-po="'+escHtml(po.poNumber)+'" onclick="unmarkDealerPO(this.dataset.did,this.dataset.po)">&#8617; Reopen</button>')
           :'<button class="btn btn-sm" style="color:var(--blue);border-color:rgba(37,99,235,.3)" data-did="'+dealerId+'" data-po="'+escHtml(po.poNumber)+'" onclick="printDealerInvoice(this.dataset.did,this.dataset.po)">&#128438; Invoice</button>'
-           +'<button class="btn btn-sm btn-teal" data-did="'+dealerId+'" data-po="'+escHtml(po.poNumber)+'" onclick="markDealerPOPaid(this.dataset.did,this.dataset.po)">&#10003; Mark Paid</button>')
+           +'<button class="btn btn-sm" data-did="'+dealerId+'" data-po="'+escHtml(po.poNumber)+'" onclick="closeDealerPO(this.dataset.did,this.dataset.po)" title="Close this PO WITHOUT payment: the order was cancelled, you issued a credit, or you are writing it off">Close&hellip;</button>'
+ +'<button class="btn btn-sm btn-teal" data-did="'+dealerId+'" data-po="'+escHtml(po.poNumber)+'" onclick="markDealerPOPaid(this.dataset.did,this.dataset.po)">&#10003; Mark Paid</button>')
         +'</div></td></tr>';
     }).join('')+'</tbody></table>';
 }
@@ -41158,7 +41162,7 @@ function _renderDealerDetailContent(dealerId){
       +'<button id="dd-tab-open" style="padding:10px 24px;font-size:var(--t-md);font-weight:700;border:none;cursor:pointer;border-bottom:3px solid '+(tab==='open'?'var(--teal)':'transparent')+';color:'+(tab==='open'?'var(--teal)':'var(--text3)')+';background:transparent" onclick="S.dealerDetailTab=\'open\';document.getElementById(\'dd-content\').innerHTML=_dealerPORows(_buildDealerPOs(\''+dealerId+'\').open,\''+dealerId+'\',false);_updateDDTabs(\'open\')">'
         +'&#128220; Open POs <span style="font-size:var(--t-sm);background:var(--bg3);border-radius:var(--r-md);padding:1px 7px;margin-left:4px">'+data.open.length+'</span></button>'
       +'<button id="dd-tab-paid" style="padding:10px 24px;font-size:var(--t-md);font-weight:700;border:none;cursor:pointer;border-bottom:3px solid '+(tab==='paid'?'var(--teal)':'transparent')+';color:'+(tab==='paid'?'var(--teal)':'var(--text3)')+';background:transparent" onclick="S.dealerDetailTab=\'paid\';document.getElementById(\'dd-content\').innerHTML=_dealerPORows(_buildDealerPOs(\''+dealerId+'\').paid,\''+dealerId+'\',true);_updateDDTabs(\'paid\')">'
-        +'&#10003; Paid POs <span style="font-size:var(--t-sm);background:var(--bg3);border-radius:var(--r-md);padding:1px 7px;margin-left:4px">'+data.paid.length+'</span></button>'
+        +'&#10003; Paid / closed <span style="font-size:var(--t-sm);background:var(--bg3);border-radius:var(--r-md);padding:1px 7px;margin-left:4px">'+data.paid.length+'</span></button>'
     +'</div>'
     +'<div id="dd-content" style="flex:1;overflow-y:auto">'+_dealerPORows(tab==='open'?data.open:data.paid,dealerId,tab==='paid')+'</div>');
 }
@@ -41194,6 +41198,56 @@ async function saveDealerPOPayments(){
   }catch(e){console.warn('[dealer billing]',e.message);}
 }
 
+// ---- (v23.78) CLOSE A PO WITHOUT PAYMENT. "Mark Paid" says money arrived; a cancelled, credited or written-off PO needs a different answer.
+// A closed PO leaves the balance, the overdue list, the statement and the reminders, and the dealer sees "Closed" (or "Cancelled"), never "Paid". It can be reopened.
+var PO_CLOSE_REASONS=[['cancelled','Order cancelled'],['credit','Credit issued'],['writeoff','Written off'],['other','Other']];
+function _poCloseLabel(r){for(var i=0;i<PO_CLOSE_REASONS.length;i++)if(PO_CLOSE_REASONS[i][0]===r)return PO_CLOSE_REASONS[i][1];return 'Closed';}
+function _poPaidCell(po){
+ var p=po.payment||{};
+ if(p.closed)return '<td style="padding:10px 12px;font-size:var(--t-sm)"><span class="pill pill-muted">Closed</span><div class="t3xs">'+escHtml(p.auto?'All orders cancelled':_poCloseLabel(p.reason))+(p.note?' &middot; '+escHtml(p.note):'')+(p.closed_at?' &middot; '+escHtml(p.closed_at):'')+'</div></td>';
+ return '<td style="padding:10px 12px;font-size:var(--t-sm);color:var(--teal)"><b>'+escHtml(p.paid_at||'')+'</b></td>';
+}
+function closeDealerPO(dealerId,poNumber){
+ var ex=document.getElementById('po-close-ov');if(ex)ex.remove();
+ var ov=document.createElement('div');ov.id='po-close-ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:100000;display:flex;align-items:center;justify-content:center;padding:20px';
+ ov.innerHTML='<div style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(460px,96vw);box-shadow:0 16px 48px rgba(0,0,0,.3)">'
+  +'<div style="padding:16px 20px;border-bottom:1px solid var(--border);font-size:var(--t-lg);font-weight:700">Close PO '+escHtml(poNumber)+' without payment</div>'
+  +'<div style="padding:16px 20px"><div class="t3s" style="margin-bottom:12px">Use this when the PO will never be paid. It leaves what the dealer owes, the overdue list, their statement and the payment reminders. It is not counted as paid. You can reopen it later.</div>'
+  +'<div class="form-group" style="margin-bottom:12px"><label class="form-label">Why</label><select id="poc-reason" class="form-input">'+PO_CLOSE_REASONS.map(function(r){return '<option value="'+r[0]+'">'+r[1]+'</option>';}).join('')+'</select></div>'
+  +'<div class="form-group"><label class="form-label">Note (optional, only your team sees it)</label><input id="poc-note" class="form-input" placeholder="e.g. credit memo 1042"></div></div>'
+  +'<div style="padding:14px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px"><button class="btn" onclick="document.getElementById(\'po-close-ov\').remove()">Cancel</button><button class="btn btn-primary" id="poc-go" onclick="confirmCloseDealerPO(\''+escHtml(String(dealerId))+'\',\''+escHtml(String(poNumber).replace(/\'/g,"\\'"))+'\')">Close PO</button></div></div>';
+ ov.addEventListener('mousedown',function(e){if(e.target===ov)ov.remove();});
+ document.body.appendChild(ov);
+}
+async function confirmCloseDealerPO(dealerId,poNumber){
+ var rs=document.getElementById('poc-reason'),nt=document.getElementById('poc-note'),reason=rs?rs.value:'other',note=nt?String(nt.value||'').trim().slice(0,200):'';
+ if(reason==='other'&&!note){toast('Add a short note for "Other"');return;}
+ var k=dealerId+'_'+poNumber,day=new Date().toISOString().slice(0,10);
+ S.dealerPOPayments[k]={closed:true,reason:reason,note:note,closed_at:day,closed_by:S.currentUser||''};
+ await saveDealerPOPayments();try{if(typeof dsPingDealer==='function')dsPingDealer(dealerId,'orders');}catch(_e){}
+ logAction('Dealer PO closed without payment: '+poNumber,'dealers',dealerId,null,{poNumber:poNumber,reason:reason,note:note}).catch(function(){});
+ var ov=document.getElementById('po-close-ov');if(ov)ov.remove();
+ var dd=document.getElementById('dd-ov');
+ if(dd&&dd.firstElementChild)dd.firstElementChild.innerHTML=_renderDealerDetailContent(dealerId);else _updateDDTabs('open');
+ toast('PO '+poNumber+' closed ('+_poCloseLabel(reason).toLowerCase()+')');
+}
+// ---- (v23.78) A dealer order that was sent to Shopify and then CANCELLED there is marked Cancelled here by itself (and frees its PO number).
+function _dsNo(x){return String(x==null?'':x).replace(/^#+/,'').trim().toLowerCase();}
+function dsOrderRows(r){var nm=_dsNo(r.shopify_order_name),id=String(r.shopify_order_id||'');if(!nm&&!id)return [];return (S.sales||[]).filter(function(s){return (id&&String(s.shopify_order_id||'')===id)||(nm&&_dsNo(s.order_number)===nm);});}
+function dsCancelledInShopify(r){if(!r||r.status!=='sent')return false;var rows=dsOrderRows(r);return rows.length>0&&rows.every(function(s){return !_poLive(s);});}
+async function dsReconcileCancelled(){
+ var list=(DS.reqs||[]).filter(dsCancelledInShopify);if(!list.length)return 0;
+ var n=0,today=new Date().toISOString().slice(0,10);
+ for(var i=0;i<list.length;i++){
+  var r=list[i],note=(r.internal_note?r.internal_note+' | ':'')+'Cancelled in Shopify '+today;
+  try{var u=await db.from('dealer_order_requests').update({status:'cancelled',internal_note:note,updated_at:new Date().toISOString()}).eq('id',r.id).eq('status','sent');if(u&&u.error)throw u.error;r.status='cancelled';r.internal_note=note;n++;try{if(typeof dsPingDealer==='function')dsPingDealer(r.dealer_id,'orders');}catch(_e){}}
+  catch(e){console.warn('[dealer orders] could not mark '+r.po_number+' cancelled:',e&&e.message);}
+ }
+ if(n){dsBadge();if(S.view==='dealerorders')render();toast(n+' dealer order'+(n===1?'':'s')+' cancelled in Shopify, updated here');}
+ return n;
+}
+var _dsRecT=null;
+function dsReconcileSoon(){clearTimeout(_dsRecT);_dsRecT=setTimeout(function(){dsReconcileCancelled().catch(function(){});},2500);}
 async function markDealerPOPaid(dealerId,poNumber){
   var k=dealerId+'_'+poNumber;
   S.dealerPOPayments[k]={paid_at:new Date().toISOString().slice(0,10),paid_by:S.currentUser||''};
