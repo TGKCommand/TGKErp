@@ -475,7 +475,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.61</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.65</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -540,7 +540,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.61';
+const TGK_ERP_VERSION = 'v23.65';
 const TGK_ERP_BUILD_DATE = '2026-11-09';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -7831,6 +7831,277 @@ function _dblastToggleAll(cb){
   document.querySelectorAll('.dblast-recip').forEach(function(x){x.checked=cb.checked;});
   _dblastCount();
 }
+// ---- (v23.62) DEALER PROMOTIONS AND STOCKING ORDERS. Both are a TOTAL percentage off MSRP that only ever lowers a dealer's price (their own discount or special price
+// stays if it is already lower), and only the best single offer applies: they never stack. The dealer portal reads these two settings; nothing else needs changing.
+function promoList(){var p=S.settings&&S.settings.dealer_promos;return Array.isArray(p)?p:[];}
+function promoStocking(){var s=S.settings&&S.settings.dealer_stocking;return (s&&typeof s==='object')?s:{enabled:false,discount_pct:'',min_order:'',note:''};}
+function promoStatus(p,today){
+ today=today||centralDateOnly();
+ if(p.active===false)return {k:'off',label:'Off',color:'var(--text3)'};
+ if(p.starts_on&&String(p.starts_on).slice(0,10)>today)return {k:'soon',label:'Scheduled',color:'var(--yellow)'};
+ if(p.ends_on&&String(p.ends_on).slice(0,10)<today)return {k:'ended',label:'Ended',color:'var(--text3)'};
+ return {k:'live',label:'Live now',color:'var(--teal)'};
+}
+function promoClean(d){
+ var name=String(d.name||'').trim(),pct=parseFloat(d.discount_pct),min=parseFloat(d.min_order)||0,err='';
+ if(!name)err='Give the promotion a name (dealers see it).';
+ else if(!(pct>0&&pct<100))err='The discount must be more than 0% and less than 100% off MSRP.';
+ else if(min<0)err='The minimum order cannot be negative.';
+ else if(d.starts_on&&d.ends_on&&String(d.ends_on)<String(d.starts_on))err='The end date is before the start date.';
+ if(err)return {err:err};
+ return {promo:{id:d.id,name:name,active:d.active!==false,starts_on:d.starts_on||'',ends_on:d.ends_on||'',discount_pct:Math.round(pct*100)/100,min_order:min,dealer_ids:(d.dealer_ids||[]).map(String),note:String(d.note||'').trim()}};
+}
+async function promoPersist(key,value){
+ var r=await db.from('settings').upsert({key:key,value:value},{onConflict:'key'});
+ if(r&&r.error){toast('Not saved: '+r.error.message,7000);return false;}
+ S.settings=Object.assign({},S.settings,{[key]:value});return true;
+}
+function dsOfferChip(r){
+ var o=r&&r.totals&&r.totals.offer;if(!o)return '';
+ return ' <span class="pill pill-orange" title="'+escHtml((o.kind==='stocking'?'Stocking order':'Promotion')+': '+o.pct+'% off MSRP. Saved the dealer '+dsMoney(o.saved_vs_normal)+' compared with their usual prices')+'">'+(o.kind==='stocking'?'STOCKING ORDER':'PROMO: '+escHtml(String(o.name||'').toUpperCase()))+' '+o.pct+'%</span>';
+}
+function promoHtml(){
+ var st=promoStocking(),list=promoList(),today=centralDateOnly(),ed=S._promo&&S._promo.draft,dealers=(S.dealers||[]).filter(function(d){return d.status==='Active';});
+ var lab='font-size:var(--t-xs);font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--text3)',inp='padding:6px 8px;font-size:var(--t-md);background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);color:var(--text)';
+ var h='<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px"><div style="flex:1"><div style="font-size:var(--t-lg);font-weight:700">Dealer promotions &amp; stocking orders</div><div class="t3s">Each is a TOTAL % off MSRP. It can only lower a dealer\'s price, never raise it, and only the best one applies (they do not stack).</div></div><button class="btn btn-sm" onclick="promoClose()">Close</button></div><div style="padding:16px 20px;overflow:auto">';
+ h+='<div style="border:1px solid var(--border);border-radius:var(--r-md);padding:14px 16px;margin-bottom:16px"><div style="font-weight:700;margin-bottom:8px">Stocking orders</div><div class="t3s" style="margin-bottom:10px">A dealer ticks &ldquo;This is a stocking order&rdquo; at checkout. If the order reaches the minimum (at their usual prices) they get this discount, or a live promotion if that is better.</div>'
+  +'<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end"><label style="display:flex;align-items:center;gap:6px;font-weight:600"><input type="checkbox" id="pm-sk-en" '+(st.enabled===true?'checked ':'')+'> Stocking orders are on</label>'
+  +'<label style="display:flex;flex-direction:column;gap:3px;'+lab+'">Discount (off MSRP)<span style="display:flex;gap:4px;align-items:center"><input type="number" id="pm-sk-pct" min="1" max="99" step="0.5" value="'+escHtml(st.discount_pct===undefined?'':st.discount_pct)+'" style="width:80px;'+inp+'">%</span></label>'
+  +'<label style="display:flex;flex-direction:column;gap:3px;'+lab+'">Minimum order<span style="display:flex;gap:4px;align-items:center">$<input type="number" id="pm-sk-min" min="0" step="50" value="'+escHtml(st.min_order===undefined?'':st.min_order)+'" style="width:110px;'+inp+'"></span></label>'
+  +'<label style="display:flex;flex-direction:column;gap:3px;flex:1;min-width:200px;'+lab+'">Note shown to dealers (optional)<input type="text" id="pm-sk-note" value="'+escHtml(st.note||'')+'" style="'+inp+'"></label>'
+  +'<button class="btn btn-teal btn-sm" onclick="promoSaveStocking()">Save</button>'+(parseFloat(st.discount_pct)>0?'<button class="btn btn-sm" onclick="promoSeeMargins('+parseFloat(st.discount_pct)+')" title="Open the Margin &amp; Promo Calculator at this discount">What do we make?</button>':'')+'</div></div>';
+ h+='<div style="display:flex;align-items:center;margin-bottom:8px"><div style="font-weight:700;flex:1">Promotions</div><button class="btn btn-teal btn-sm" onclick="promoEdit(\'new\')">+ Add promotion</button></div>';
+ if(!list.length)h+='<div class="t3s" style="padding:14px;border:1px dashed var(--border);border-radius:var(--r-md)">No promotions yet. Add one for Black Friday, a slow season, or a push on one product line.</div>';
+ else h+='<table style="width:100%"><thead><tr><th>Promotion</th><th>Dates</th><th>% off MSRP</th><th>Minimum</th><th>Dealers</th><th>Status</th><th></th></tr></thead><tbody>'+list.map(function(p){var s=promoStatus(p,today);return '<tr><td><b>'+escHtml(p.name||'')+'</b>'+(p.note?'<div class="t3xs">'+escHtml(p.note)+'</div>':'')+'</td><td class="t3s">'+(p.starts_on||'now')+' &rarr; '+(p.ends_on||'until switched off')+'</td><td>'+escHtml(p.discount_pct)+'%</td><td>'+(p.min_order>0?'$'+Number(p.min_order).toLocaleString():'none')+'</td><td class="t3s">'+((p.dealer_ids||[]).length?(p.dealer_ids.length+' chosen'):'All dealers')+'</td><td><span style="font-weight:700;color:'+s.color+'">'+s.label+'</span></td><td style="white-space:nowrap;text-align:right"><button class="btn btn-sm" onclick="promoSeeMargins('+parseFloat(p.discount_pct)+')" title="Margin &amp; Promo Calculator at this discount">Margins</button> <button class="btn btn-sm" onclick="promoToggle(\''+escHtml(p.id)+'\')">'+(p.active===false?'Switch on':'Switch off')+'</button> <button class="btn btn-sm" onclick="promoEdit(\''+escHtml(p.id)+'\')">Edit</button> <button class="btn btn-sm" onclick="promoDelete(\''+escHtml(p.id)+'\')">Delete</button></td></tr>';}).join('')+'</tbody></table>';
+ if(ed){
+  var sel=function(id){return (ed.dealer_ids||[]).indexOf(String(id))>=0;};
+  h+='<div id="pm-form" style="margin-top:16px;border:1px solid var(--teal);border-radius:var(--r-md);padding:14px 16px;background:var(--bg1)"><div style="font-weight:700;margin-bottom:10px">'+(ed.id?'Edit promotion':'New promotion')+'</div><div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">'
+   +'<label style="display:flex;flex-direction:column;gap:3px;flex:1;min-width:200px;'+lab+'">Name (dealers see this)<input type="text" value="'+escHtml(ed.name||'')+'" onchange="promoField(\'name\',this.value)" placeholder="Black Friday" style="'+inp+'"></label>'
+   +'<label style="display:flex;flex-direction:column;gap:3px;'+lab+'">Starts<input type="date" value="'+escHtml(ed.starts_on||'')+'" onchange="promoField(\'starts_on\',this.value)" style="'+inp+'"></label>'
+   +'<label style="display:flex;flex-direction:column;gap:3px;'+lab+'">Ends (last day)<input type="date" value="'+escHtml(ed.ends_on||'')+'" onchange="promoField(\'ends_on\',this.value)" style="'+inp+'"></label>'
+   +'<label style="display:flex;flex-direction:column;gap:3px;'+lab+'">% off MSRP<input type="number" min="1" max="99" step="0.5" value="'+escHtml(ed.discount_pct===undefined?'':ed.discount_pct)+'" onchange="promoField(\'discount_pct\',this.value)" style="width:90px;'+inp+'"></label>'
+   +'<label style="display:flex;flex-direction:column;gap:3px;'+lab+'">Minimum order ($)<input type="number" min="0" step="50" value="'+escHtml(ed.min_order===undefined?'':ed.min_order)+'" onchange="promoField(\'min_order\',this.value)" style="width:110px;'+inp+'"></label>'
+   +'<label style="display:flex;flex-direction:column;gap:3px;flex:1;min-width:200px;'+lab+'">Note (optional)<input type="text" value="'+escHtml(ed.note||'')+'" onchange="promoField(\'note\',this.value)" style="'+inp+'"></label></div>'
+   +'<div style="margin-top:12px"><div style="'+lab+';margin-bottom:6px">Which dealers (none ticked = all dealers)</div><div style="display:flex;flex-wrap:wrap;gap:4px 16px;max-height:140px;overflow:auto">'+dealers.map(function(d){return '<label style="display:flex;align-items:center;gap:6px;font-size:var(--t-md)"><input type="checkbox" '+(sel(d.id)?'checked ':'')+'onchange="promoDealer(\''+escHtml(d.id)+'\',this.checked)">'+escHtml(d.name||'')+'</label>';}).join('')+'</div></div>'
+   +'<div id="pm-err" style="color:var(--red);font-size:var(--t-sm);margin-top:8px;min-height:16px"></div><div style="display:flex;gap:8px"><button class="btn btn-teal" onclick="promoSave()">Save promotion</button><button class="btn" onclick="promoEdit(null)">Cancel</button></div></div>';
+ }
+ return h+'</div>';
+}
+function openPromos(){
+ var ex=document.getElementById('promo-ov');if(ex)ex.remove();
+ S._promo={draft:null};
+ var ov=document.createElement('div');ov.id='promo-ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
+ ov.innerHTML='<div id="promo-box" style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(920px,96vw);max-height:92vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.25)"></div>';
+ document.body.appendChild(ov);promoRedraw();
+}
+function promoRedraw(){var b=document.getElementById('promo-box');if(b)b.innerHTML=promoHtml();}
+function promoClose(){var ov=document.getElementById('promo-ov');if(ov)ov.remove();S._promo=null;}
+function promoEdit(id){
+ if(id===null){S._promo={draft:null};promoRedraw();return;}
+ if(id==='new'){S._promo={draft:{id:'p'+Date.now().toString(36),name:'',active:true,starts_on:'',ends_on:'',discount_pct:'',min_order:0,dealer_ids:[],note:'',_new:true}};}
+ else{var p=promoList().find(function(x){return String(x.id)===String(id);});if(!p)return;S._promo={draft:Object.assign({},p,{dealer_ids:(p.dealer_ids||[]).slice()})};}
+ promoRedraw();
+}
+function promoField(k,v){if(S._promo&&S._promo.draft)S._promo.draft[k]=v;}
+function promoDealer(id,on){var d=S._promo&&S._promo.draft;if(!d)return;var a=(d.dealer_ids||[]).map(String).filter(function(x){return x!==String(id);});if(on)a.push(String(id));d.dealer_ids=a;}
+async function promoSave(){
+ var d=S._promo&&S._promo.draft;if(!d)return;
+ var c=promoClean(d);if(c.err){var e=document.getElementById('pm-err');if(e)e.textContent=c.err;return;}
+ var list=promoList().filter(function(x){return String(x.id)!==String(c.promo.id);});list.push(c.promo);
+ if(!(await promoPersist('dealer_promos',list)))return;
+ toast('Promotion saved');S._promo={draft:null};promoRedraw();
+}
+async function promoToggle(id){var list=promoList().map(function(p){return String(p.id)===String(id)?Object.assign({},p,{active:p.active===false}):p;});if(await promoPersist('dealer_promos',list)){toast('Promotion updated');promoRedraw();}}
+async function promoDelete(id){
+ var p=promoList().find(function(x){return String(x.id)===String(id);});if(!p)return;
+ if(!confirm('Delete the promotion "'+(p.name||'')+'"? Dealers will stop seeing it straight away.'))return;
+ if(await promoPersist('dealer_promos',promoList().filter(function(x){return String(x.id)!==String(id);}))){toast('Promotion deleted');promoRedraw();}
+}
+async function promoSaveStocking(){
+ var g=function(id){var e=document.getElementById(id);return e?e.value:'';},on=!!(document.getElementById('pm-sk-en')||{}).checked,pct=parseFloat(g('pm-sk-pct')),min=parseFloat(g('pm-sk-min'))||0;
+ if(on&&!(pct>0&&pct<100)){toast('Enter a stocking discount between 1 and 99% off MSRP');return;}
+ if(min<0){toast('The minimum order cannot be negative');return;}
+ if(await promoPersist('dealer_stocking',{enabled:on,discount_pct:isFinite(pct)?pct:'',min_order:min,note:String(g('pm-sk-note')).trim()})){toast(on?'Stocking orders are on':'Stocking orders are off');promoRedraw();}
+}
+function promoSeeMargins(pct){
+ promoClose();
+ S.rptState=Object.assign({},S.rptState,{sel:'margin_promo',preview:null,search:'',promo:Object.assign({},(S.rptState&&S.rptState.promo)||{},{promo:String(pct)})});
+ nav('reports');
+}
+// ---- (v23.63) DEALER SIGN-INS: who has set up a portal password, who has been invited, who has no email on file, and sending the invites.
+function signinStatus(r){
+ if(!r.has_email)return {k:'noemail',label:'No email on file',color:'var(--red)'};
+ if(r.has_password)return {k:'done',label:'Signed up',color:'var(--teal)'};
+ if(r.invited_at)return {k:'invited',label:'Invited '+String(r.invited_at).slice(0,10),color:'var(--yellow)'};
+ return {k:'none',label:'Not invited',color:'var(--text3)'};
+}
+function signinSummary(rows){
+ var c={done:0,invited:0,none:0,noemail:0};(rows||[]).forEach(function(r){c[signinStatus(r).k]++;});
+ return {total:(rows||[]).length,done:c.done,invited:c.invited,none:c.none,noemail:c.noemail};
+}
+function signinSendable(rows){return (rows||[]).filter(function(r){return r.has_email&&!r.has_password;}).map(function(r){return String(r.id);});}
+function signinHtml(){
+ var st=S._signins||{rows:[],loading:true,err:'',sel:{},filter:'all',results:null},rows=st.rows||[],sm=signinSummary(rows);
+ var list=rows.filter(function(r){var k=signinStatus(r).k;return st.filter==='all'||(st.filter==='todo'&&k!=='done')||(st.filter==='done'&&k==='done');});
+ var tile=function(n,l,c){return '<div style="flex:1;min-width:110px;border:1px solid var(--border);border-radius:var(--r-md);padding:10px 12px"><div style="font-size:22px;font-weight:800;color:'+c+'">'+n+'</div><div class="t3s">'+l+'</div></div>';};
+ var nSel=Object.keys(st.sel||{}).filter(function(k){return st.sel[k];}).length;
+ var h='<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px"><div style="flex:1"><div style="font-size:var(--t-lg);font-weight:700">Dealer portal sign-ins</div><div class="t3s">Dealers sign in with their own email and password. An invite emails the main contact a link to choose their password.</div></div><button class="btn btn-sm" onclick="signinLoad()">Refresh</button> <button class="btn btn-sm" onclick="signinClose()">Close</button></div><div style="padding:16px 20px;overflow:auto">';
+ if(st.err)h+='<div style="padding:10px 12px;border-left:3px solid var(--red);background:var(--bg1);margin-bottom:12px;color:var(--red)">'+escHtml(st.err)+'</div>';
+ if(st.loading&&!rows.length)return h+'<div class="t3s">Loading&hellip;</div></div>';
+ h+='<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">'+tile(sm.done+' of '+sm.total,'signed up','var(--teal)')+tile(sm.invited,'invited, waiting','var(--yellow)')+tile(sm.none,'not invited yet','var(--text2)')+tile(sm.noemail,'no email on file','var(--red)')+'</div>';
+ h+='<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">'
+  +['all:All','todo:Not signed up','done:Signed up'].map(function(x){var p=x.split(':');return '<button class="filter-chip '+(st.filter===p[0]?'on-teal':'')+'" onclick="signinFilter(\''+p[0]+'\')">'+p[1]+'</button>';}).join('')
+  +'<span style="flex:1"></span><button class="btn btn-sm" onclick="signinPickTodo()" title="Tick every dealer with an email who has not signed up">Tick everyone not signed up</button>'
+  +(sm.noemail?'<button class="btn btn-sm" onclick="signinCopyNoEmail()">Copy the '+sm.noemail+' with no email</button>':'')
+  +'<button class="btn btn-teal btn-sm" onclick="signinSend()" '+(nSel&&!st.busy?'':'disabled ')+'>'+(st.busy?'Sending&hellip;':'Send invites to the '+nSel+' ticked')+'</button></div>';
+ if(st.results){var rs=st.results;h+='<div style="padding:10px 12px;border-left:3px solid var(--teal);background:var(--bg1);margin-bottom:12px;font-size:var(--t-sm)"><b>'+rs.sent+' invite'+(rs.sent===1?'':'s')+' sent</b>'+(rs.skipped?', '+rs.skipped+' skipped':'')+(rs.failed?', <span style="color:var(--red)">'+rs.failed+' failed</span>':'')+(rs.results.filter(function(x){return x.status!=='sent';}).length?'<div class="t3s" style="margin-top:4px">'+rs.results.filter(function(x){return x.status!=='sent';}).map(function(x){return escHtml((x.name||x.id)+': '+(x.why||x.status));}).join(' &middot; ')+'</div>':'')+'</div>';}
+ h+='<table style="width:100%"><thead><tr><th></th><th>Dealer</th><th>Main contact</th><th>Status</th><th>Last sign-in</th><th>Team</th></tr></thead><tbody>'+list.map(function(r){var s=signinStatus(r);return '<tr><td><input type="checkbox" '+(st.sel&&st.sel[r.id]?'checked ':'')+(r.has_email?'':'disabled ')+'onchange="signinTick(\''+escHtml(r.id)+'\',this.checked)" aria-label="Select '+escHtml(r.name||'')+'"></td><td><b>'+escHtml(r.name||'')+'</b></td><td class="t3s">'+(r.email?escHtml(r.email):'&mdash;')+'</td><td><span style="font-weight:700;color:'+s.color+'">'+escHtml(s.label)+'</span></td><td class="t3s">'+(r.last_login_at?escHtml(String(r.last_login_at).slice(0,10)):'never')+'</td><td class="t3s">'+(r.team?(r.team_signed_up+' of '+r.team+' signed up'):'&mdash;')+'</td></tr>';}).join('')+'</tbody></table></div>';
+ return h;
+}
+async function openSignins(){
+ var ex=document.getElementById('signin-ov');if(ex)ex.remove();
+ S._signins={rows:[],loading:true,err:'',sel:{},filter:'todo',results:null,busy:false};
+ var ov=document.createElement('div');ov.id='signin-ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
+ ov.innerHTML='<div id="signin-box" style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(980px,96vw);max-height:92vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.25)"></div>';
+ document.body.appendChild(ov);signinRedraw();await signinLoad();
+}
+function signinRedraw(){var b=document.getElementById('signin-box');if(b)b.innerHTML=signinHtml();}
+function signinClose(){var ov=document.getElementById('signin-ov');if(ov)ov.remove();S._signins=null;}
+async function signinLoad(){
+ var st=S._signins;if(!st)return;st.loading=true;st.err='';signinRedraw();
+ try{var j=await _dsFn({action:'staff_signins'});st.rows=j.dealers||[];}
+ catch(e){st.err=(e&&e.message)||'Could not load the sign-in list';}
+ st.loading=false;signinRedraw();
+}
+function signinFilter(f){if(S._signins){S._signins.filter=f;signinRedraw();}}
+function signinTick(id,on){if(S._signins){S._signins.sel[id]=!!on;signinRedraw();}}
+function signinPickTodo(){var st=S._signins;if(!st)return;signinSendable(st.rows).forEach(function(id){st.sel[id]=true;});signinRedraw();}
+async function signinSend(){
+ var st=S._signins;if(!st||st.busy)return;
+ var ids=Object.keys(st.sel).filter(function(k){return st.sel[k];});if(!ids.length)return;
+ if(!confirm('Email a sign-in invite to the main contact of '+ids.length+' dealer'+(ids.length===1?'':'s')+'?'))return;
+ st.busy=true;st.err='';signinRedraw();
+ var tot={sent:0,skipped:0,failed:0,results:[]};
+ try{for(var i=0;i<ids.length;i+=100){var j=await _dsFn({action:'staff_send_invites',dealer_ids:ids.slice(i,i+100)});tot.sent+=j.sent;tot.skipped+=j.skipped;tot.failed+=j.failed;tot.results=tot.results.concat(j.results||[]);}}
+ catch(e){st.err=(e&&e.message)||'Could not send the invites';}
+ st.busy=false;st.results=tot;st.sel={};signinRedraw();
+ if(tot.sent)toast(tot.sent+' invite'+(tot.sent===1?'':'s')+' sent');
+ await signinLoad();
+}
+function signinCopyNoEmail(){
+ var st=S._signins;if(!st)return;var names=st.rows.filter(function(r){return !r.has_email;}).map(function(r){return r.name;}).join('\n');
+ try{navigator.clipboard.writeText(names);toast('Copied '+st.rows.filter(function(r){return !r.has_email;}).length+' dealer names');}catch(e){toast(names.replace(/\n/g,', '),9000);}
+}
+// ---- (v23.64) STATEMENTS: email a dealer what they owe (balance, overdue and how overdue). The dealer-portal server builds and sends the email from the POs sent here.
+function _poStatementRows(pos){
+ return (pos||[]).filter(function(po){var b=po.billing||{};return !po.payment&&b.fully&&po.total>0;}).map(function(po){var b=po.billing;return {po:po.poNumber,billed_on:b.billed_on||'',due_on:b.due_on||'',days_over:b.days_over||0,amount:po.total,state:b.state==='overdue'?'overdue':(b.state==='unpaid'?'unpaid':'due')};});
+}
+function _poStmtBtn(pos,dealerId){
+ var n=_poStatementRows(pos).length;if(!n)return '';
+ return '<button class="btn btn-sm" style="float:right;margin-top:-4px" onclick="emailDealerStatement(\''+escHtml(String(dealerId))+'\')" title="Email this dealer a statement of what they owe, with a copy to orders@">&#9993; Email statement ('+n+' PO'+(n===1?'':'s')+')</button>';
+}
+async function emailDealerStatement(dealerId){
+ var d=(S.dealers||[]).find(function(x){return String(x.id)===String(dealerId);});if(!d){toast('Dealer not found');return;}
+ var data=_buildDealerPOs(dealerId),rows=_poStatementRows(data.open);
+ if(!rows.length){toast('Nothing is billed and unpaid for '+d.name);return;}
+ if(!d.email){toast(d.name+' has no email address on file');return;}
+ var bal=rows.reduce(function(s,r){return s+r.amount;},0),od=rows.filter(function(r){return r.state==='overdue';}).reduce(function(s,r){return s+r.amount;},0);
+ if(!confirm('Email a statement to '+d.email+' ?\n\n'+rows.length+' PO'+(rows.length===1?'':'s')+', balance due $'+bal.toFixed(2)+(od>0?', overdue $'+od.toFixed(2):'')+'\nA copy goes to orders@.'))return;
+ try{var j=await _dsFn({action:'staff_send_statement',dealer_id:String(dealerId),rows:rows});toast('Statement sent to '+j.sent_to+' (balance $'+Number(j.balance).toFixed(2)+')');}
+ catch(e){toast('Not sent: '+((e&&e.message)||e),8000);}
+}
+// ---- (v23.64) RESTOCK DATES: the day a backordered product is expected back. Dealers see "ships about Dec 3" while it is ahead; a date that has passed goes quiet by itself.
+function restockMap(){var m=S.settings&&S.settings.dealer_restock;return (m&&typeof m==='object'&&!Array.isArray(m))?m:{};}
+function restockDateOf(e){return String(e&&(typeof e==='string'?e:e.date)||'').slice(0,10);}
+function restockRows(){
+ var st=S._restock||{q:'',all:false,edits:{}},map=restockMap(),q=String(st.q||'').toLowerCase();
+ return S.assemblies.filter(plPoolOk).map(function(a){var sku=dispPn(a),key=String(sku).toLowerCase(),saved=restockDateOf(map[key]),ed=st.edits&&st.edits[key];return {key:key,sku:sku,desc:a.description||'',onHand:a.total_on_hand||0,date:ed!==undefined?ed:saved,saved:saved};})
+  .filter(function(r){if(q&&r.sku.toLowerCase().indexOf(q)<0&&r.desc.toLowerCase().indexOf(q)<0)return false;return st.all||r.onHand<=0||r.saved||r.date;})
+  .sort(function(a,b){return String(a.sku).localeCompare(String(b.sku));});
+}
+function restockHtml(){
+ var st=S._restock||{q:'',all:false,edits:{}},rows=restockRows(),today=centralDateOnly(),pend=Object.keys(st.edits||{}).length;
+ var inp='padding:5px 8px;font-size:var(--t-md);background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);color:var(--text)';
+ var h='<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px"><div style="flex:1"><div style="font-size:var(--t-lg);font-weight:700">Restock dates</div><div class="t3s">The day a backordered product is expected back. Dealers see &ldquo;ships about &hellip;&rdquo; on the product, the price list, checkout and their orders while the date is ahead; once it passes they see &ldquo;ships when available&rdquo; again.</div></div><button class="btn btn-sm" onclick="restockClose()">Close</button></div><div style="padding:14px 20px;overflow:auto">'
+  +'<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:12px"><input type="text" id="rs-q" placeholder="Search SKU or description" value="'+escHtml(st.q||'')+'" oninput="restockSearch(this.value)" style="flex:1;min-width:200px;'+inp+'"><label style="display:flex;align-items:center;gap:6px"><input type="checkbox" '+(st.all?'checked ':'')+'onchange="restockAll(this.checked)"> Show every product (not just ones out of stock)</label><button class="btn btn-teal" onclick="restockSave()" '+(pend?'':'disabled ')+'>Save '+(pend?pend+' change'+(pend===1?'':'s'):'')+'</button></div>';
+ h+=rows.length?'<table style="width:100%"><thead><tr><th>SKU</th><th>Description</th><th style="text-align:right">On hand</th><th>Expected back</th><th></th></tr></thead><tbody>'+rows.map(function(r){var past=r.saved&&r.saved<today&&r.date===r.saved;return '<tr><td class="pn">'+escHtml(r.sku)+'</td><td class="t2s">'+escHtml(r.desc)+'</td><td style="text-align:right">'+r.onHand+'</td><td><input type="date" value="'+escHtml(r.date||'')+'" onchange="restockSet(\''+escHtml(r.key)+'\',this.value)" style="'+inp+'"> '+(past?'<span class="t3xs">passed: dealers see &ldquo;ships when available&rdquo;</span>':'')+'</td><td>'+(r.date?'<button class="btn btn-sm" onclick="restockSet(\''+escHtml(r.key)+'\',\'\')">Clear</button>':'')+'</td></tr>';}).join('')+'</tbody></table>':'<div class="t3s" style="padding:14px;border:1px dashed var(--border);border-radius:var(--r-md)">Nothing is out of stock right now. Tick &ldquo;Show every product&rdquo; to set a date on any product.</div>';
+ return h+'</div>';
+}
+function openRestock(){
+ var ex=document.getElementById('restock-ov');if(ex)ex.remove();
+ S._restock={q:'',all:false,edits:{}};
+ var ov=document.createElement('div');ov.id='restock-ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
+ ov.innerHTML='<div id="restock-box" style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(980px,96vw);max-height:92vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.25)"></div>';
+ document.body.appendChild(ov);restockRedraw();
+}
+function restockRedraw(){var b=document.getElementById('restock-box');if(b){var f=document.getElementById('rs-q'),had=f&&document.activeElement===f;b.innerHTML=restockHtml();if(had){var n=document.getElementById('rs-q');if(n){n.focus();n.setSelectionRange(n.value.length,n.value.length);}}}}
+function restockClose(){var ov=document.getElementById('restock-ov');if(ov)ov.remove();S._restock=null;}
+function restockSearch(q){if(S._restock){S._restock.q=q;restockRedraw();}}
+function restockAll(on){if(S._restock){S._restock.all=!!on;restockRedraw();}}
+function restockSet(key,v){
+ if(!S._restock)return;v=String(v||'').slice(0,10);
+ if(v&&!/^\d{4}-\d{2}-\d{2}$/.test(v)){toast('Pick a date');return;}
+ var saved=restockDateOf(restockMap()[key]);
+ if(v===saved)delete S._restock.edits[key];else S._restock.edits[key]=v;
+ restockRedraw();
+}
+async function restockSave(){
+ var st=S._restock;if(!st)return;var map=Object.assign({},restockMap()),n=0;
+ Object.keys(st.edits).forEach(function(k){var v=st.edits[k];if(v)map[k]={date:v};else delete map[k];n++;});
+ if(!n)return;
+ if(await promoPersist('dealer_restock',map)){toast(n+' restock date'+(n===1?'':'s')+' saved');S._restock.edits={};restockRedraw();}
+}
+// ---- (v23.65) AUTOMATIC DEALER NOTIFICATIONS: a shipment email (with tracking) when a dealer's order ships, and a reminder when a billed PO is overdue. Both are OFF until switched on here.
+// The dealer-portal function does the work when a scheduler calls it (see the setup steps in this window); "Preview" shows what would be sent right now without sending.
+function notifyState(){var v=S.settings&&S.settings.dealer_notify;return {ship_emails:!!(v&&v.ship_emails===true),overdue_reminders:!!(v&&v.overdue_reminders===true)};}
+function notifyResultHtml(j){
+ if(!j)return '';
+ var one=function(title,s,fmt){if(!s)return '';return '<div style="margin-bottom:10px"><b>'+title+'</b>: '+(j.dry_run?s.would_send.length+' would be sent':s.sent+' sent')+(s.failed&&s.failed.length?', <span style="color:var(--red)">'+s.failed.length+' failed</span>':'')+(s.skipped&&s.skipped.length?', '+s.skipped.length+' skipped':'')
+  +(j.dry_run&&s.would_send.length?'<div class="t3s" style="margin-top:3px">'+s.would_send.map(fmt).join('<br>')+'</div>':'')
+  +(s.skipped&&s.skipped.length?'<div class="t3s" style="margin-top:3px">Skipped: '+s.skipped.map(function(x){return escHtml((x.dealer||'')+(x.order?' '+x.order:'')+': '+x.why);}).join(' &middot; ')+'</div>':'')
+  +(s.failed&&s.failed.length?'<div class="t3s" style="margin-top:3px;color:var(--red)">Failed: '+s.failed.map(function(x){return escHtml((x.dealer||'')+(x.order?' '+x.order:'')+': '+x.why);}).join(' &middot; ')+'</div>':'')+'</div>';};
+ return '<div style="padding:10px 12px;border-left:3px solid var(--teal);background:var(--bg1);margin-top:12px;font-size:var(--t-sm)"><div style="font-weight:700;margin-bottom:6px">'+(j.dry_run?'Preview (nothing was sent)':'Done')+'</div>'
+  +(one('Shipment emails',j.ship,function(x){return escHtml(x.dealer+' &middot; '+(x.po?'PO '+x.po:'order '+x.order)+' &middot; '+x.tracking.join(', ')).replace(/&amp;middot;/g,'&middot;');})||'<div class="t3s">Shipment emails are switched off.</div>')
+  +(one('Overdue reminders',j.overdue,function(x){return escHtml(x.dealer+': '+x.pos.map(function(p){return 'PO '+p.po+' ('+p.days_over+' days over)';}).join(', ')+' &middot; $'+Number(x.overdue).toFixed(2)+' overdue').replace(/&amp;middot;/g,'&middot;');})||'<div class="t3s">Overdue reminders are switched off.</div>')+'</div>';
+}
+function notifyHtml(){
+ var st=notifyState(),r=S._notify&&S._notify.result,busy=S._notify&&S._notify.busy,base=(typeof SUPA_URL==='string'&&SUPA_URL)||'https://YOUR-PROJECT.supabase.co';
+ var sw=function(key,on,title,desc){return '<label style="display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border:1px solid var(--border);border-radius:var(--r-md);margin-bottom:10px;cursor:pointer"><input type="checkbox" '+(on?'checked ':'')+'onchange="notifySet(\''+key+'\',this.checked)" style="margin-top:3px"><span><b>'+title+'</b> <span style="font-weight:700;color:'+(on?'var(--teal)':'var(--text3)')+'">'+(on?'ON':'OFF')+'</span><div class="t3s">'+desc+'</div></span></label>';};
+ var sql="select cron.schedule('tgk-dealer-notify', '*/15 * * * *', $$ select net.http_post(\n  url := '"+base+"/functions/v1/dealer-portal',\n  headers := '{\"Content-Type\":\"application/json\",\"Authorization\":\"Bearer YOUR-ANON-KEY\"}'::jsonb,\n  body := '{\"action\":\"cron_notify\",\"secret\":\"YOUR-CRON-SECRET\"}'::jsonb) $$);";
+ return '<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px"><div style="flex:1"><div style="font-size:var(--t-lg);font-weight:700">Automatic dealer notifications</div><div class="t3s">Emails go to the dealer\'s main contact with a copy to orders@. Nothing is sent until you switch it on.</div></div><button class="btn btn-sm" onclick="notifyClose()">Close</button></div><div style="padding:16px 20px;overflow:auto">'
+  +sw('ship_emails',st.ship_emails,'Shipment emails','When one of a dealer\'s orders ships, email the carrier, the tracking link, what was in the box, and whether anything is still to ship (with the back-in-stock date if you set one). Only shipments from the last 3 days are ever sent, and each package is emailed once.')
+  +sw('overdue_reminders',st.overdue_reminders,'Overdue reminders','When a billed PO goes overdue, email the dealer a statement with a friendly reminder: at 1, 8, 15, 31, 46, 61 and 90 days overdue, once per PO each time. Only dealers we bill, with payment terms set and an email on file. POs you have marked paid are never included.')
+  +'<div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0"><button class="btn" onclick="notifyPreview()" '+(busy?'disabled':'')+'>'+(busy==='preview'?'Checking&hellip;':'Preview what would be sent now')+'</button><button class="btn btn-teal" onclick="notifyRunNow()" '+(busy||(!st.ship_emails&&!st.overdue_reminders)?'disabled':'')+' title="Send now whatever is due (the scheduler does this by itself every 15 minutes)">'+(busy==='run'?'Sending&hellip;':'Send what is due now')+'</button></div>'
+  +notifyResultHtml(r)
+  +'<details style="margin-top:18px"><summary style="cursor:pointer;font-weight:700">Setting up the automatic schedule (one time)</summary><ol class="t3s" style="line-height:1.7;margin:10px 0 0 18px"><li>In the Supabase SQL editor, run <b>dealer_notifications.sql</b> (two small tables so nothing is sent twice).</li><li>In Supabase: Edge Functions &rarr; dealer-portal &rarr; Secrets: add <b>CRON_SECRET</b> with a long random value.</li><li>Redeploy dealer-portal.ts (v1.19), then run this once in the SQL editor (replace the three YOUR- values; turn on the pg_cron and pg_net extensions first):<pre style="white-space:pre-wrap;background:var(--bg1);border:1px solid var(--border);padding:10px;border-radius:var(--r-md);font-size:12px;margin-top:6px">'+escHtml(sql)+'</pre></li><li>Press <b>Preview</b> above to check what would go out, then switch the notifications on.</li></ol></details></div>';
+}
+function openNotify(){
+ var ex=document.getElementById('notify-ov');if(ex)ex.remove();
+ S._notify={result:null,busy:''};
+ var ov=document.createElement('div');ov.id='notify-ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
+ ov.innerHTML='<div id="notify-box" style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(860px,96vw);max-height:92vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.25)"></div>';
+ document.body.appendChild(ov);notifyRedraw();
+}
+function notifyRedraw(){var b=document.getElementById('notify-box');if(b)b.innerHTML=notifyHtml();}
+function notifyClose(){var ov=document.getElementById('notify-ov');if(ov)ov.remove();S._notify=null;}
+async function notifySet(key,on){
+ var next=Object.assign({},notifyState(),{[key]:!!on});
+ if(await promoPersist('dealer_notify',next)){toast((key==='ship_emails'?'Shipment emails ':'Overdue reminders ')+(on?'switched on':'switched off'));}
+ notifyRedraw();
+}
+async function notifyPreview(){
+ if(!S._notify)return;S._notify.busy='preview';S._notify.result=null;notifyRedraw();
+ try{S._notify.result=await _dsFn({action:'cron_notify',dry_run:true});}catch(e){toast('Could not check: '+((e&&e.message)||e),8000);}
+ S._notify.busy='';notifyRedraw();
+}
+async function notifyRunNow(){
+ if(!S._notify)return;
+ if(!confirm('Send whatever is due right now to dealers?\n\n(Tip: press Preview first to see what that is.)'))return;
+ S._notify.busy='run';notifyRedraw();
+ try{S._notify.result=await _dsFn({action:'cron_notify'});var j=S._notify.result,n=((j.ship&&j.ship.sent)||0)+((j.overdue&&j.overdue.sent)||0);toast(n+' email'+(n===1?'':'s')+' sent');}
+ catch(e){toast('Not sent: '+((e&&e.message)||e),8000);}
+ S._notify.busy='';notifyRedraw();
+}
 function openDealerBlast(){
   var dealers=_dealerBlastActive();
   var from=(S.settings&&S.settings.dealer_blast_from)||'TGK Motorsport <sales@mail.tgkmotorsport.com>';
@@ -8399,7 +8670,7 @@ function renderDealers(){
   <div class="panel" style="padding:0">
     <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
       <div class="panel-title" style="margin:0;padding:0;border:none">Dealers <span style="color:var(--text);font-size:var(--t-md);font-weight:400;margin-left:6px;text-transform:none;letter-spacing:0">(${list.length})</span></div>
-      <div style="display:flex;gap:8px;align-items:center"><button class="btn btn-sm btn-teal" onclick="openDealerBlast()" title="Email all active dealers (BCC)">&#9993; Email Dealers</button><button class="btn btn-sm btn-primary" onclick="dnOpen()" title="Fitment updates, pre-order, out of stock, stop sell - templates, send and log">&#128227; Dealer Notices</button>${totalVisits>0?`<button class="btn btn-sm" onclick="showAllVisitLog()" title="View all dealer visits"><span class="ic ic-chart"></span>All Visits (${totalVisits})</button>`:''}</div>
+      <div style="display:flex;gap:8px;align-items:center"><button class="btn btn-sm" onclick="openNotify()" title="Automatic shipment emails and overdue reminders to dealers">&#128276; Notifications</button><button class="btn btn-sm" onclick="openRestock()" title="Back-in-stock dates dealers see on backordered products">&#128197; Restock dates</button><button class="btn btn-sm" onclick="openSignins()" title="Who has signed up to the dealer portal, and send sign-in invites">&#128273; Sign-ins</button><button class="btn btn-sm" onclick="openPromos()" title="Dealer promotions and the stocking order discount">&#127991; Promotions</button><button class="btn btn-sm btn-teal" onclick="openDealerBlast()" title="Email all active dealers (BCC)">&#9993; Email Dealers</button><button class="btn btn-sm btn-primary" onclick="dnOpen()" title="Fitment updates, pre-order, out of stock, stop sell - templates, send and log">&#128227; Dealer Notices</button>${totalVisits>0?`<button class="btn btn-sm" onclick="showAllVisitLog()" title="View all dealer visits"><span class="ic ic-chart"></span>All Visits (${totalVisits})</button>`:''}</div>
     </div>
     <table><thead><tr><th>Dealer</th><th>Contact</th><th>Discount</th><th>Status</th><th style="text-align:right">Actions</th></tr></thead><tbody>
     ${list.map(d=>{
@@ -31941,7 +32212,7 @@ function dsReview(r){
     return '<tr><td class="pn" style="white-space:nowrap">'+escHtml(l.sku)+'</td><td>'+escHtml(l.desc||'')+(l.special?' <span class="pill pill-orange">special</span>':'')+'</td><td>'+(editable?'<input type="number" class="form-input" style="width:76px" min="1" value="'+(ed[l.sku]||l.qty)+'" onchange="dsEditQty(this.dataset.s,this.value)" data-s="'+escHtml(l.sku)+'">':l.qty)+'</td><td><b>'+dsMoney(l.unit)+'</b></td><td class="t3s">'+dsMoney(l.std)+'</td><td style="font-weight:800;color:'+(bad?'var(--red)':'var(--green)')+'">'+(mg===null?'&mdash;':mg+'%')+'</td><td style="color:'+(short?'var(--red)':'var(--green)')+';font-weight:700">'+(short?sc.short+' short':'in stock')+'</td>'+(editable?'<td><button type="button" class="action-btn del" data-s="'+escHtml(l.sku)+'" onclick="dsDelLine(this.dataset.s)" aria-label="Remove line">&times;</button></td>':'')+'</tr>';
   }).join('');
   var sh=r.ship_to||{},tt=r.totals||{},link=dsShopifyLink(r);
-  return '<div class="panel" style="padding:0;margin-bottom:12px;border-left:3px solid var(--teal)"><div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap"><div><b style="font-size:var(--t-lg,16px)">'+(r.po_number?'PO '+escHtml(r.po_number):'Order with no PO')+'</b> &middot; '+escHtml(r.dealer_name||'')+' '+dsStatusPill(r.status)+'</div><div class="t3s">Submitted '+escHtml(new Date(r.created_at).toLocaleString())+'</div></div>'
+  return '<div class="panel" style="padding:0;margin-bottom:12px;border-left:3px solid var(--teal)"><div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap"><div><b style="font-size:var(--t-lg,16px)">'+(r.po_number?'PO '+escHtml(r.po_number):'Order with no PO')+'</b> &middot; '+escHtml(r.dealer_name||'')+' '+dsStatusPill(r.status)+dsOfferChip(r)+'</div><div class="t3s">Submitted '+escHtml(new Date(r.created_at).toLocaleString())+'</div></div>'
    +(r.error?'<div style="padding:10px 16px;background:rgba(220,38,38,.07);color:var(--red);font-size:var(--t-sm);border-bottom:1px solid var(--border)"><b>Why it did not go through:</b> '+escHtml(r.error)+'</div>':'')
    +(r.status==='rejected'&&r.reject_reason?'<div style="padding:10px 16px" class="t3s">Rejected: '+escHtml(r.reject_reason)+'</div>':'')
    +'<div class="tbl-wrap"><table><thead><tr>'+dsTh([['SKU',130],['Item'],['Qty',90],['Dealer price',104],['Standard',90],['Margin',80],['Stock',90]].concat(editable?[['',36]]:[]))+'</tr></thead><tbody>'+rowsH+'</tbody></table></div>'
@@ -31986,7 +32257,7 @@ function renderDealerOrders(){
   var colN=10;
   var tbl=rows.length?bulk+'<div class="panel" style="padding:0;overflow:hidden"><div class="tbl-wrap"><table><thead><tr><th style="width:34px"><input type="checkbox" aria-label="Select all" '+(allOn?'checked ':'')+'onchange="dsPickAll(this.checked)"></th>'+dsTh([['PO',100],['Dealer'],['Submitted',130],['Lines',110],['Total',100],['Payment',130],['Stock',90],['Status',140]])+'<th style="width:44px"></th></tr></thead><tbody>'
     +rows.map(function(r){var st=r.stock_check||[],sh=st.reduce(function(s,x){return s+(x.short||0);},0),t=r.totals||{},on=String(DS.sel)===String(r.id);
-      return '<tr style="cursor:pointer'+(on?';background:var(--bg3)':'')+'" onclick="dsSelect(\''+escHtml(r.id)+'\')"><td onclick="dsStop(event)"><input type="checkbox" aria-label="Select this order" '+(DS.pick[String(r.id)]?'checked ':'')+'onchange="dsPick(\''+escHtml(r.id)+'\',this.checked)"></td><td><b>'+escHtml(r.po_number||'No PO')+'</b></td><td>'+escHtml(r.dealer_name||'')+'</td><td class="t3s">'+escHtml(new Date(r.created_at).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}))+'</td><td>'+(r.lines||[]).length+' &middot; '+(t.units||0)+' units</td><td><b>'+dsMoney(t.total)+'</b></td><td class="t3s">'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</td><td style="color:'+(sh?'var(--red)':'var(--green)')+';font-weight:700;font-size:var(--t-sm)">'+(sh?sh+' short':'In stock')+'</td><td>'+dsStatusPill(r.status)+'</td>'
+      return '<tr style="cursor:pointer'+(on?';background:var(--bg3)':'')+'" onclick="dsSelect(\''+escHtml(r.id)+'\')"><td onclick="dsStop(event)"><input type="checkbox" aria-label="Select this order" '+(DS.pick[String(r.id)]?'checked ':'')+'onchange="dsPick(\''+escHtml(r.id)+'\',this.checked)"></td><td><b>'+escHtml(r.po_number||'No PO')+'</b></td><td>'+escHtml(r.dealer_name||'')+'</td><td class="t3s">'+escHtml(new Date(r.created_at).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}))+'</td><td>'+(r.lines||[]).length+' &middot; '+(t.units||0)+' units</td><td><b>'+dsMoney(t.total)+'</b></td><td class="t3s">'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</td><td style="color:'+(sh?'var(--red)':'var(--green)')+';font-weight:700;font-size:var(--t-sm)">'+(sh?sh+' short':'In stock')+'</td><td>'+dsStatusPill(r.status)+dsOfferChip(r)+'</td>'
         +'<td onclick="dsStop(event)">'+(DS.showRemoved?'<button type="button" class="action-btn" title="Restore" aria-label="Restore this order" onclick="dsRestore([\''+escHtml(r.id)+'\'])">&#8634;</button>':'<button type="button" class="action-btn del" title="Remove this order" aria-label="Remove this order" onclick="dsRemove([\''+escHtml(r.id)+'\'])">&times;</button>')+'</td></tr>'
         +(on?'<tr><td colspan="'+colN+'" style="padding:10px 12px;background:var(--bg3)">'+dsReview(r)+'</td></tr>':'');}).join('')+'</tbody></table></div></div>'
     :'<div class="panel section-empty">'+(DS.loading?'Loading&hellip;':(DS.showRemoved?'Nothing has been removed.':(DS.filter?'Nothing here.':'No dealer orders yet. They appear here when a dealer submits a PO from their shop.')))+'</div>';
@@ -40306,7 +40577,7 @@ function _poTermsSummary(pos,dealerId){
   var billed=0,over=0,overN=0,wait=0,waitN=0;
   pos.forEach(function(po){var b=po.billing||{};if(po.payment)return;if(b.fully){billed+=po.total;if(b.state==='overdue'){over+=po.total;overN++;}}else{wait+=po.total;waitN++;}});
   return '<div style="padding:10px 16px;border-bottom:1px solid var(--border);font-size:var(--t-sm);line-height:1.7"><b>Terms:</b> '+(lab?escHtml(lab):'<span style="color:var(--orange)">not set (set them in Storefront)</span>')+' <span class="t3s">&middot; counted from the day the last item on a PO ships</span><br>'
-    +'Billed and unpaid <b>$'+billed.toFixed(2)+'</b>'+(overN?' &middot; <b style="color:var(--red)">overdue $'+over.toFixed(2)+' ('+overN+' PO'+(overN!==1?'s':'')+')</b>':' &middot; none overdue')+' &middot; not billed yet <b>$'+wait.toFixed(2)+'</b> ('+waitN+' PO'+(waitN!==1?'s':'')+' still shipping)</div>';
+    +'Billed and unpaid <b>$'+billed.toFixed(2)+'</b>'+(overN?' &middot; <b style="color:var(--red)">overdue $'+over.toFixed(2)+' ('+overN+' PO'+(overN!==1?'s':'')+')</b>':' &middot; none overdue')+' &middot; not billed yet <b>$'+wait.toFixed(2)+'</b> ('+waitN+' PO'+(waitN!==1?'s':'')+' still shipping)'+_poStmtBtn(pos,dealerId)+'</div>';
 }
 function _buildDealerPOs(dealerId){
   var dealer=S.dealers.find(function(d){return d.id===dealerId;})||{};
