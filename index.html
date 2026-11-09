@@ -543,7 +543,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.76</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.77</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -608,7 +608,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.76';
+const TGK_ERP_VERSION = 'v23.77';
 const TGK_ERP_BUILD_DATE = '2026-11-09';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -3460,20 +3460,7 @@ function dashPipelineHtml(devItems){
 }
 function toggleDevPipelineOpen(){localStorage.setItem('dev_pipeline_open',String(localStorage.getItem('dev_pipeline_open')!=='true'));scheduleRender();}
 // ---- fulfillment queue, grouped by part
-function dashQueueGroups(openLines,packedLines){
- var by={},gs=[];
- (openLines||[]).forEach(function(s){var k=String(s.pn||'?'),g=by[k]||(by[k]={pn:k,lines:[],date:'9999'});g.lines.push(s);var d=String(s.sale_date||'9999').slice(0,10);if(d<g.date)g.date=d;});
- Object.keys(by).forEach(function(k){
-  var g=by[k],a=findAsm(g.pn),p=a?null:partByPn(g.pn),stock=a?(a.total_on_hand||0):(p?(p.total_unpckgd||0):null);
-  g.lines.sort(function(x,y){return String(x.sale_date||'9999').localeCompare(String(y.sale_date||'9999'))||(Number(x.id)||0)-(Number(y.id)||0);});
-  var left=stock,cover=0;g.lines.forEach(function(l){var q=l.qty||1;if(left!==null&&left>=q){left-=q;cover++;}});
-  g.stock=stock;g.cover=stock===null?0:cover;g.short=stock===null?0:g.lines.length-cover;g.units=g.lines.reduce(function(n,l){return n+(l.qty||1);},0);
-  g.orders=new Set(g.lines.map(function(l){return l.order_number||l.id;})).size;
-  gs.push(g);
- });
- gs.sort(function(a,b){return ((b.cover>0)-(a.cover>0))||a.date.localeCompare(b.date);});
- return {packed:packedLines||[],groups:gs};
-}
+
 
 
 // Pack every order of one part that stock covers, oldest first (never more than the stock on hand), with ONE label prompt at the end instead of one per order
@@ -3515,30 +3502,57 @@ function _d2Line(s,packed){
   +(packed?'<button class="btn btn-primary btn-sm" onclick="openShipModal(\''+s.id+'\',\''+s.pn+'\','+q+')">Ship</button>'
    :'<button class="btn btn-teal btn-sm" '+(can?'':'disabled ')+'onclick="markPacked(\''+s.id+'\',\''+s.pn+'\','+q+')">Pack</button>'+labelBtn(s.pn,q))+'</div>';
 }
-function _d2Single(g){
- var s=g.lines[0],q=s.qty||1,age=d2Age(s.sale_date),can=g.stock!==null&&g.stock>=q;
- var pill=g.stock===null?' &middot; <span class="t3s">stock unknown</span>':(g.cover===0?' &middot; <span class="dsh-bad">none covered</span>':'');
- return '<div class="dsh-ln"><span class="dsh-sku">'+escHtml(dispSku(g.pn)||g.pn)+'</span><span class="c"><b>'+escHtml(s.order_number||'')+'</b>'+(s.customer_name?' &middot; '+escHtml(s.customer_name):'')+(q>1?' &middot; &times;'+q:'')+(g.stock!==null?' &middot; stock '+g.stock:'')+pill+'</span>'
+
+
+// The queue, one entry per ORDER (the box you pack). Stock is handed out oldest order first, so two orders can never be promised the same unit:
+// full = every item is in stock and is reserved for it; fit = items that would still fit; unknown = a SKU the ERP cannot find.
+function dashQueueOrders(openLines,packedLines){
+ var by={},list=[],rem={};
+ (openLines||[]).forEach(function(s){var k=String(s.order_number||('line '+s.id)),o=by[k];if(!o){o=by[k]={no:s.order_number||'',customer:'',date:'9999',lines:[]};list.push(o);}o.lines.push(s);if(!o.customer&&s.customer_name)o.customer=s.customer_name;var d=String(s.sale_date||'9999').slice(0,10);if(d<o.date)o.date=d;});
+ list.sort(function(a,b){return a.date.localeCompare(b.date)||String(a.no).localeCompare(String(b.no),undefined,{numeric:true});});
+ var stockOf=function(pn){var a=findAsm(pn),p=a?null:partByPn(pn);return a?(a.total_on_hand||0):(p?(p.total_unpckgd||0):null);};
+ var avail=function(pn){if(!(pn in rem))rem[pn]=stockOf(pn);return rem[pn];};
+ list.forEach(function(o){
+  o.lines.sort(function(x,y){return (Number(x.id)||0)-(Number(y.id)||0);});
+  o.units=o.lines.reduce(function(n,l){return n+(l.qty||1);},0);
+  var need={};o.lines.forEach(function(l){need[l.pn]=(need[l.pn]||0)+(l.qty||1);});
+  o.unknown=o.lines.some(function(l){return avail(l.pn)===null;});
+  o.full=Object.keys(need).every(function(pn){var a=avail(pn);return a!==null&&a>=need[pn];});
+  if(o.full)Object.keys(need).forEach(function(pn){rem[pn]-=need[pn];});
+  var used={};o.fit=0;
+  o.lines.forEach(function(l){var a=avail(l.pn),q=l.qty||1,u=used[l.pn]||0;l.stock=stockOf(l.pn);l.fit=a!==null&&(o.full||a-u>=q);if(l.fit){used[l.pn]=u+q;o.fit++;}});
+  o.short=o.lines.length-o.fit;
+ });
+ return {packed:packedLines||[],orders:list};
+}
+function _d2Item(s){
+ var q=s.qty||1;
+ return '<div class="dsh-od"><span class="dsh-sku">'+escHtml(dispSku(s.pn)||s.pn)+'</span><span class="c">&times;'+q+' &middot; '+(s.stock===null||s.stock===undefined?'<span class="t3s">stock unknown</span>':(s.fit?'stock '+s.stock:'<span class="dsh-bad">stock '+s.stock+'</span>'))+'</span>'
+  +'<button class="btn btn-teal btn-sm" '+(s.fit?'':'disabled ')+'onclick="markPacked(\''+s.id+'\',\''+s.pn+'\','+q+')">Pack</button>'+labelBtn(s.pn,q)+'</div>';
+}
+function _d2OrderLine(o){
+ var s=o.lines[0],q=s.qty||1,age=d2Age(o.date),pill=s.stock===null||s.stock===undefined?' &middot; <span class="t3s">stock unknown</span>':(s.fit?'':' &middot; <span class="dsh-bad">none covered</span>');
+ return '<div class="dsh-ln"><span class="dsh-sku">'+escHtml(dispSku(s.pn)||s.pn)+'</span><span class="c"><b>'+escHtml(o.no)+'</b>'+(o.customer?' &middot; '+escHtml(o.customer):'')+(q>1?' &middot; &times;'+q:'')+(s.stock!==null&&s.stock!==undefined?' &middot; stock '+s.stock:'')+pill+'</span>'
   +(age?'<span class="dsh-age'+(age.old?' old':'')+'">'+age.txt+'</span>':'')
-  +'<button class="btn btn-teal btn-sm" '+(can?'':'disabled ')+'onclick="markPacked(\''+s.id+'\',\''+s.pn+'\','+q+')">Pack</button>'+labelBtn(s.pn,q)+'</div>';
+  +'<button class="btn btn-teal btn-sm" '+(s.fit?'':'disabled ')+'onclick="markPacked(\''+s.id+'\',\''+s.pn+'\','+q+')">Pack</button>'+labelBtn(s.pn,q)+'</div>';
 }
 function d2Ship(c){
- var q=dashQueueGroups(c.openLines,c.packedLines),ready=q.packed.length,toPack=(c.freshOpen||0)+(c.partialCount||0),shipped=d2ShippedToday();
- var shortLines=q.groups.reduce(function(n,g){return n+g.short;},0),coverable=q.groups.reduce(function(n,g){return n+g.cover;},0);
- var sum='<div class="dsh-sh">'+(ready?'<span class="dsh-n t">'+ready+'</span> ready to ship &middot; ':'')+'<span class="dsh-n">'+toPack+'</span> to pack &middot; <span class="dsh-n r">'+shortLines+'</span> short of stock &middot; <span class="dsh-n m">'+(c.onHoldCount||0)+'</span> on hold'+(shipped?' &middot; <span class="dsh-n g">'+shipped+'</span> shipped today':'')
-  +(coverable>0?'<button class="btn btn-sm btn-teal" style="margin-left:auto" onclick="qPackAll()">Pack everything covered ('+coverable+')</button>':'')+'</div>';
+ var q=dashQueueOrders(c.openLines,c.packedLines),ready=q.packed.length,toPack=q.orders.length,shipped=d2ShippedToday();
+ var shortOrders=q.orders.filter(function(o){return !o.full;}).length,coverable=q.orders.filter(function(o){return o.full;}).length;
+ var sum='<div class="dsh-sh">'+(ready?'<span class="dsh-n t">'+ready+'</span> ready to ship &middot; ':'')+'<span class="dsh-n">'+toPack+'</span> order'+(toPack===1?'':'s')+' to pack &middot; <span class="dsh-n r">'+shortOrders+'</span> short of stock &middot; <span class="dsh-n m">'+(c.onHoldCount||0)+'</span> on hold'+(shipped?' &middot; <span class="dsh-n g">'+shipped+'</span> shipped today':'')
+  +(coverable>0?'<button class="btn btn-sm btn-teal" style="margin-left:auto" onclick="qPackAll()" title="Packs every order whose items are ALL in stock">Pack everything covered ('+coverable+' order'+(coverable===1?'':'s')+')</button>':'')+'</div>';
  var html='',rows=0,MAXR=8,openOne=false,used=0;
- if(ready){html+='<div class="dsh-gp open"><div class="dsh-gh" onclick="this.parentNode.classList.toggle(\'open\')"><span class="ch">&rsaquo;</span><span class="dsh-sku" style="color:var(--teal)">READY TO SHIP</span><span class="c">'+ready+' packed order line'+(ready===1?'':'s')+' &middot; print the label and ship</span></div><div class="dsh-bd">'+q.packed.slice(0,12).map(function(s){return _d2Line(s,true);}).join('')+'</div></div>';rows++;}
- q.groups.forEach(function(g){
+ if(ready){html+='<div class="dsh-gp open"><div class="dsh-gh" onclick="this.parentNode.classList.toggle(\'open\')"><span class="ch">&rsaquo;</span><span class="dsh-sku" style="color:var(--teal)">READY TO SHIP</span><span class="c">'+ready+' packed item'+(ready===1?'':'s')+' &middot; print the label and ship</span></div><div class="dsh-bd">'+q.packed.slice(0,12).map(function(s){return _d2Line(s,true);}).join('')+'</div></div>';rows++;}
+ q.orders.forEach(function(o){
   if(rows>=MAXR)return;used++;rows++;
-  if(g.lines.length===1){html+=_d2Single(g);return;}
-  var pill=g.stock===null?'<span class="t3s">stock unknown</span>':g.short===0?'<span class="dsh-ok">all covered</span>':'<span class="dsh-bad">'+(g.cover===0?'none covered':g.short+' short')+'</span>';
-  var open=!openOne&&(g.short>0||(!ready&&used===1));if(open)openOne=true;
-  html+='<div class="dsh-gp'+(open?' open':'')+'"><div class="dsh-gh" onclick="this.parentNode.classList.toggle(\'open\')"><span class="ch">&rsaquo;</span><span class="dsh-sku">'+escHtml(dispSku(g.pn)||g.pn)+'</span><span class="c">'+g.orders+' order'+(g.orders===1?'':'s')+(g.units!==g.lines.length?' &middot; '+g.units+' units':'')+(g.stock!==null?' &middot; stock '+g.stock:'')+' &middot; '+pill+'</span>'
-   +(g.cover>0?'<button class="btn btn-teal btn-sm" onclick="event.stopPropagation();qPackGroup(\''+escHtml(String(g.pn).replace(/\'/g,"\\'"))+'\')">Pack '+g.cover+'</button>':'')+'</div><div class="dsh-bd">'+g.lines.slice(0,4).map(function(s){return _d2Line(s,false);}).join('')+(g.lines.length>4?'<div class="dsh-od"><b>+ '+(g.lines.length-4)+' more</b><span class="c"></span><button class="btn btn-sm" onclick="nav(\'sales\')">Show all</button></div>':'')+'</div></div>';
+  if(o.lines.length===1){html+=_d2OrderLine(o);return;}
+  var age=d2Age(o.date),pill=o.unknown&&o.fit===0?'<span class="t3s">stock unknown</span>':o.full?'<span class="dsh-ok">all in stock</span>':'<span class="dsh-bad">'+o.short+' short</span>',no=escHtml(String(o.no).replace(/\'/g,"\\'"));
+  var btn=o.full?'<button class="btn btn-teal btn-sm" onclick="event.stopPropagation();qPackOrder(\''+no+'\')">Pack order</button>':(o.fit>0?'<button class="btn btn-sm" onclick="event.stopPropagation();qPackOrder(\''+no+'\')" title="Packs the items that are in stock and leaves the rest">Pack '+o.fit+' of '+o.lines.length+'</button>':'<button class="btn btn-teal btn-sm" disabled>Pack order</button>');
+  var open=!openOne&&o.short>0;if(open)openOne=true;
+  html+='<div class="dsh-gp'+(open?' open':'')+'"><div class="dsh-gh" onclick="this.parentNode.classList.toggle(\'open\')"><span class="ch">&rsaquo;</span><span class="dsh-sku" style="min-width:0"><b style="color:var(--text)">'+escHtml(o.no)+'</b></span><span class="c">'+(o.customer?escHtml(o.customer)+' &middot; ':'')+o.lines.length+' items &middot; '+pill+'</span>'+(age?'<span class="dsh-age'+(age.old?' old':'')+'">'+age.txt+'</span>':'')+btn+'</div><div class="dsh-bd">'+o.lines.slice(0,10).map(_d2Item).join('')+(o.lines.length>10?'<div class="dsh-od"><b>+ '+(o.lines.length-10)+' more items</b><span class="c"></span><button class="btn btn-sm" onclick="nav(\'sales\')">Show all</button></div>':'')+'</div></div>';
  });
- var hidden=Math.max(0,q.groups.length-used);
- if(hidden>0)html+='<div class="dsh-more">+ '+hidden+' more part'+(hidden===1?'':'s')+' &middot; <a onclick="nav(\'sales\')">All orders</a></div>';
+ var hidden=Math.max(0,q.orders.length-used);
+ if(hidden>0)html+='<div class="dsh-more">+ '+hidden+' more order'+(hidden===1?'':'s')+' &middot; <a onclick="nav(\'sales\')">All orders</a></div>';
  if(!html)html='<div class="section-empty">All orders fulfilled <span class="ic ic-check"></span></div>';
  return '<div class="panel" id="dash2-ship"><div class="panel-title"><span class="panel-title-left"><span class="ic ic-truck"></span>Ship today</span><button class="btn btn-sm" onclick="nav(\'sales\')">All Orders &rarr;</button></div>'+sum+html+'</div>';
 }
@@ -3584,32 +3598,34 @@ function dash2Html(c){
 }
 // ---- Pack: for one part, or for everything stock covers (oldest orders first, never more than the stock on hand)
 function _openQueueLines(){return S.sales.filter(function(s){return !isInternal(s.order_number)&&(!s.fulfillment_status||s.fulfillment_status==='Open')&&(!s.sale_date||s.sale_date>=daysAgo(60));});}
-function _qPickCovered(pn){
- var a=findAsm(pn),p=a?null:partByPn(pn),stock=a?(a.total_on_hand||0):(p?(p.total_unpckgd||0):0);
- var lines=_openQueueLines().filter(function(s){return s.pn===pn;}).sort(function(x,y){return String(x.sale_date||'9999').localeCompare(String(y.sale_date||'9999'))||(Number(x.id)||0)-(Number(y.id)||0);});
- var pick=[];lines.forEach(function(l){var q=l.qty||1;if(stock>=q){stock-=q;pick.push(l);}});
- return {lines:lines,pick:pick,units:pick.reduce(function(n,l){return n+(l.qty||1);},0)};
+// ---- Pack: one order, or every order whose items are ALL in stock (oldest first, stock never promised twice)
+function _qPickOrder(no){
+ var lines=_openQueueLines().filter(function(s){return String(s.order_number||'')===String(no);}).sort(function(x,y){return (Number(x.id)||0)-(Number(y.id)||0);}),left={},pick=[];
+ lines.forEach(function(l){var pn=l.pn,a=findAsm(pn),p=a?null:partByPn(pn),st=a?(a.total_on_hand||0):(p?(p.total_unpckgd||0):null),q=l.qty||1;if(!(pn in left))left[pn]=st;if(left[pn]!==null&&left[pn]>=q){left[pn]-=q;pick.push(l);}});
+ return {lines:lines,pick:pick,units:pick.reduce(function(n,l){return n+(l.qty||1);},0),pns:Array.from(new Set(pick.map(function(l){return l.pn;})))};
 }
-async function qPackGroup(pn){
- var r=_qPickCovered(pn),pick=r.pick,short=r.lines.length-pick.length;
- if(!pick.length){toast('Nothing in stock to pack for '+dispSku(pn));return;}
- if(!confirm('Pack '+pick.length+' order'+(pick.length===1?'':'s')+' of '+dispSku(pn)+' ('+r.units+' unit'+(r.units===1?'':'s')+')?'+(short>0?'\n\n'+short+' more order'+(short===1?'':'s')+' will be left, as there is not enough stock.':'')+'\n\nStock is deducted when they ship.'))return;
+async function qPackOrder(no){
+ var r=_qPickOrder(no),left=r.lines.length-r.pick.length,pl=function(n,w){return n+' '+w+(n===1?'':'s');};
+ if(!r.pick.length){toast('Nothing in stock to pack for order '+no);return;}
+ if(!confirm('Pack '+(left?r.pick.length+' of '+pl(r.lines.length,'item'):pl(r.lines.length,'item'))+' of order '+no+'?'+(left?'\n\n'+pl(left,'item')+' will be left, as there is not enough stock.':'')+'\n\nStock is deducted when it ships.'))return;
  var done=0;
- for(var i=0;i<pick.length;i++){var ok=await markPacked(pick[i].id,pn,pick[i].qty||1,{quiet:true});if(ok)done++;else break;}
- render();toast('Packed '+done+' order'+(done===1?'':'s')+' of '+dispSku(pn));
- if(done){var _lf=(S.labelFiles&&S.labelFiles[pn])||[];if(_lf.length)showLabelPrintPrompt(pn,r.units,_lf);else checkAndPromptLabel(pn,r.units);}
+ for(var i=0;i<r.pick.length;i++){var ok=await markPacked(r.pick[i].id,r.pick[i].pn,r.pick[i].qty||1,{quiet:true});if(ok)done++;else break;}
+ render();toast('Packed '+pl(done,'item')+' of order '+no);
+ if(done&&r.pns.length===1){var _lf=(S.labelFiles&&S.labelFiles[r.pns[0]])||[];if(_lf.length)showLabelPrintPrompt(r.pns[0],r.units,_lf);else checkAndPromptLabel(r.pns[0],r.units);}
 }
 async function qPackAll(){
- var pns=Array.from(new Set(_openQueueLines().map(function(s){return s.pn;}).filter(Boolean))),plan=[];
- pns.forEach(function(pn){var r=_qPickCovered(pn);if(r.pick.length)plan.push({pn:pn,pick:r.pick,units:r.units});});
- if(!plan.length){toast('Nothing in stock to pack');return;}
- var orders=plan.reduce(function(n,p){return n+p.pick.length;},0);
- if(!confirm('Pack '+orders+' order'+(orders===1?'':'s')+' across '+plan.length+' part'+(plan.length===1?'':'s')+'?\n\n'+plan.slice(0,8).map(function(p){return dispSku(p.pn)+': '+p.pick.length+' order'+(p.pick.length===1?'':'s');}).join('\n')+(plan.length>8?'\n...and '+(plan.length-8)+' more':'')+'\n\nOnly orders that stock fully covers are packed. Stock is deducted when they ship.'))return;
- var done=0,failed=false;
- for(var i=0;i<plan.length&&!failed;i++){for(var j=0;j<plan[i].pick.length;j++){var ok=await markPacked(plan[i].pick[j].id,plan[i].pn,plan[i].pick[j].qty||1,{quiet:true});if(ok)done++;else{failed=true;break;}}}
- render();toast('Packed '+done+' order'+(done===1?'':'s')+(plan.length>1?' across '+plan.length+' parts. Print labels with each order\'s Label button.':''),plan.length>1?7000:undefined);
- if(done&&plan.length===1){var _lf=(S.labelFiles&&S.labelFiles[plan[0].pn])||[];if(_lf.length)showLabelPrintPrompt(plan[0].pn,plan[0].units,_lf);else checkAndPromptLabel(plan[0].pn,plan[0].units);}
+ var plan=dashQueueOrders(_openQueueLines(),[]).orders.filter(function(o){return o.full;}),pl=function(n,w){return n+' '+w+(n===1?'':'s');};
+ if(!plan.length){toast('No order has every item in stock');return;}
+ var items=plan.reduce(function(n,o){return n+o.lines.length;},0);
+ if(!confirm('Pack '+pl(plan.length,'order')+' ('+pl(items,'item')+')?\n\n'+plan.slice(0,8).map(function(o){return o.no+(o.customer?' ('+o.customer+')':'')+': '+pl(o.lines.length,'item');}).join('\n')+(plan.length>8?'\n...and '+(plan.length-8)+' more':'')+'\n\nOnly orders where EVERY item is in stock are packed. Stock is deducted when they ship.'))return;
+ var done=0,doneItems=0,failed=false;
+ for(var i=0;i<plan.length&&!failed;i++){var ok=true;for(var j=0;j<plan[i].lines.length;j++){var l=plan[i].lines[j],r=await markPacked(l.id,l.pn,l.qty||1,{quiet:true});if(r)doneItems++;else{failed=true;ok=false;break;}}if(ok)done++;}
+ render();toast('Packed '+pl(done,'order')+' ('+pl(doneItems,'item')+')'+(plan.length>1?'. Print labels with each item\'s Label button.':''),plan.length>1?7000:undefined);
+ if(done===1&&plan.length===1){var pns=Array.from(new Set(plan[0].lines.map(function(l){return l.pn;})));if(pns.length===1){var _lf=(S.labelFiles&&S.labelFiles[pns[0]])||[];if(_lf.length)showLabelPrintPrompt(pns[0],plan[0].units,_lf);else checkAndPromptLabel(pns[0],plan[0].units);}}
 }
+
+
+
 function renderDashboard(){
   const devItems=S.assemblies.filter(a=>!a.discontinued&&isDev(a));
   const critical=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&liveStatus(a)==='critical').length;
