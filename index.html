@@ -545,7 +545,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.85</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.87</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -610,7 +610,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.85';
+const TGK_ERP_VERSION = 'v23.87';
 const TGK_ERP_BUILD_DATE = '2026-11-09';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -2694,11 +2694,21 @@ function cascadeShopifySync(childPn,_seen){
       // a genuine finished good: re-check it once, if it has no stock of its own
       if(!seen['S:'+parentPn]){
         seen['S:'+parentPn]=1;
-        if(_netAvail(parentPn,parent.total_on_hand||0)<=0)syncShopifyTemplate(parentPn,parent.total_on_hand||0);
+        if((Number(parent.total_on_hand)||0)<=0)syncShopifyTemplate(parentPn,parent.total_on_hand||0);   // (v23.86) only a finished good with nothing on hand can change state when a component's stock changes
       }
     }
     cascadeShopifySync(parentPn,seen); // keep climbing: sub-assemblies and hardware packs are not products, and bundles may contain this finished good
   });
+}
+// ---- (v23.86) THE BACKORDER RULE, in one place (the server's shipstation-ship uses the same three lines):
+//  1. A SKU with stock on hand is NEVER on backorder, whatever the open orders say.
+//  2. A SKU with none on hand is NOT on backorder if it can be built from its raw components. Packaging and supplies never count (a box can always be found).
+//  3. Only a SKU with nothing on hand that cannot be built is on backorder. A manual hold (force_backorder) is the one deliberate exception.
+// Open orders no longer reduce availability: the old "on hand minus open orders" test put SKUs that had stock, or could be built, on backorder.
+function decideBackorder(forced,onHand,hasBOM,maxBuild){
+ if(forced)return true;
+ if((Number(onHand)||0)>0)return false;
+ return !(hasBOM&&maxBuild>=1);
 }
 function syncShopifyTemplate(pn,newOh){
   if(!pn||!S.shopify||!S.shopify.store)return; // key now lives in edge function secrets
@@ -2729,15 +2739,11 @@ function syncShopifyTemplate(pn,newOh){
     isBackorder=true;
     console.log('[Shopify backorder] '+pn+' FORCED on backorder by manual override');
   }
-  else if((_av=_netAvail(canonPn,newOh))<=0){
-    var b=buildabilityForBackorder(canonPn);
-    if(b.hasBOM){
-      isBackorder=(b.maxBuild<(1-_av));
-    }else{
-      isBackorder=true;
-      console.warn('[Shopify backorder] '+pn+' has no BOM -- flagging as backorder (cannot verify buildability)');
-    }
-  }
+  else if((Number(newOh)||0)<=0){
+ var b=buildabilityForBackorder(canonPn);
+ isBackorder=decideBackorder(false,newOh,b.hasBOM,b.maxBuild);
+ if(!b.hasBOM)console.warn('[Shopify backorder] '+pn+' has no BOM -- flagging as backorder (cannot verify buildability)');
+ }
   const template=isBackorder?(S.settings.shopify_backorder_template||'backorder'):'';
   console.log('[Shopify template] '+pn+': newOh='+newOh+' -> template='+(template||'(revert to normal)'));
   var restockDate='';
@@ -9833,7 +9839,7 @@ function renderIntegrations(){
         </div>
         <div>
           <div style="font-size:var(--t-md);font-weight:600;color:var(--text)">Auto-sync backorder status to Shopify</div>
-          <div style="font-size:var(--t-xs);color:var(--text3);margin-top:1px">When off, shipping via ShipStation or the ERP will never change Shopify templates. Use to pause sync without removing credentials.</div>
+          <div style="font-size:var(--t-xs);color:var(--text3);margin-top:1px">When off, shipping via ShipStation or the ERP will never change Shopify templates. Use to pause sync without removing credentials. <b>The rule:</b> stock on hand means never backorder; none on hand but buildable from raw components (packaging never counts) means in stock; only nothing on hand and not buildable means backorder. A manual hold on an item overrides it.</div>
         </div>
       </label>
     </div>
@@ -10281,7 +10287,7 @@ async function reconcileProductTemplate(gqlFn: any, prodId: string): Promise&lt;
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.87'
+const EDGE_BUILD = 'v23.88'
 
 // [v23.82] The vehicle the shopper had saved on the website rides along as cart attribute "Vehicle" and arrives
 // here as an order note attribute. It is stored on each sales line (column added by fitment_7_insights.sql), so
@@ -10390,6 +10396,67 @@ async function authGate(req: Request, fn: string, action: string): Promise&lt;Re
   return null
 }
 
+// [v23.88] A dealer order CANCELLED (or fully refunded) in Shopify must reach the dealer's order REQUEST and their open portal at once. The sales lines are cancelled by the
+// handler below; this also marks the portal request "cancelled" (which frees its PO number for reuse) and nudges the dealer's open portal on its private live channel, so the
+// order shows as cancelled there without anyone refreshing and without the ERP being open. The portal asks for its own data when nudged: a nudge carries none. This never
+// breaks the webhook: if anything here fails the order is still cancelled and the ERP's reconcile and the portal's own refresh catch up.
+const _DEAD_STATUS = ['cancelled', 'canceled', 'refunded', 'returned']
+async function _liveTopic(token: string): Promise&lt;string&gt; {
+  const h = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('tgk-live:' + token)))
+  return 'dealer-' + Array.from(h).map((b) =&gt; b.toString(16).padStart(2, '0')).join('').slice(0, 40)
+}
+async function _pingDealer(dealer: any, what: string): Promise&lt;void&gt; {
+  try {
+    const url = String(Deno.env.get('SUPABASE_URL') || '').replace(/\\/+$/, ''), key = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || ''
+    if (!url || !key || !dealer || !dealer.price_list_token) return
+    await fetch(url + '/realtime/v1/api/broadcast', { method: 'POST', headers: { apikey: key, Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' }, body: JSON.stringify({ messages: [{ topic: await _liveTopic(dealer.price_list_token), event: 'changed', payload: { what }, private: false }] }) })
+  } catch (_e) { /* a missed nudge costs a few seconds, nothing more */ }
+}
+// the same rule as the ERP and the portal: the LONGEST dealer code that the discount code starts with (followed by a separator or digit), or equals
+function _dealerOfCode(code: string, dealers: any[]): any | null {
+  const c = String(code || '').trim().toLowerCase()
+  if (!c) return null
+  let best: any = null, bl = 0
+  for (const d of dealers) {
+    const p = String(d.po_code_prefix || '').trim().toLowerCase()
+    if (!p) continue
+    if (c === p || (c.startsWith(p) &amp;&amp; /^[\\s\\-*_0-9]/.test(c.slice(p.length)))) { if (p.length &gt; bl) { best = d; bl = p.length } }
+  }
+  return best
+}
+async function dealerCancelSync(order: any): Promise&lt;void&gt; {
+  try {
+    const id = String(order.id || '').trim(), name = String(order.name || '').trim()
+    if (!id &amp;&amp; !name) return
+    const bare = name.replace(/^#+/, '')
+    const names = Array.from(new Set([name, bare, bare ? '#' + bare : ''].filter(Boolean)))
+    // 1. the portal requests that created this order (by Shopify id, or by order number with or without the #)
+    const reqs: any[] = [], seen = new Set&lt;string&gt;()
+    const add = (rows: any[]) =&gt; (rows || []).forEach((r: any) =&gt; { if (!seen.has(String(r.id))) { seen.add(String(r.id)); reqs.push(r) } })
+    const cols = 'id,dealer_id,po_number,status,internal_note'
+    if (id) add((await db.from('dealer_order_requests').select(cols).eq('shopify_order_id', id)).data || [])
+    for (const n of names) add((await db.from('dealer_order_requests').select(cols).eq('shopify_order_name', n)).data || [])
+    // 2. is the WHOLE order dead? A line that already shipped stays live, so a part-shipped order is not cancelled as a whole.
+    const { data: lines } = await db.from('sales').select('fulfillment_status,cancelled_at').eq('order_number', name)
+    const allDead = (lines || []).length &gt; 0 &amp;&amp; (lines || []).every((l: any) =&gt; !!l.cancelled_at || _DEAD_STATUS.includes(String(l.fulfillment_status || '').toLowerCase()))
+    const today = new Date().toISOString().slice(0, 10), dealerIds = new Set&lt;string&gt;()
+    for (const r of reqs) {
+      if (r.dealer_id) dealerIds.add(String(r.dealer_id))
+      if (!allDead || r.status !== 'sent') continue   // only an order that was sent to Shopify; never one still awaiting payment, rejected or already cancelled
+      const note = (r.internal_note ? r.internal_note + ' | ' : '') + 'Cancelled in Shopify ' + today
+      const u = await db.from('dealer_order_requests').update({ status: 'cancelled', internal_note: note, updated_at: new Date().toISOString() }).eq('id', r.id).eq('status', 'sent')
+      if (u.error) console.warn('[shopify-orders] could not mark dealer request', r.id, 'cancelled:', u.error.message)
+    }
+    // 3. orders placed on the website with a dealer's code have no request, but the dealer's portal must still refresh
+    const { data: dealers } = await db.from('dealers').select('id,po_code_prefix,price_list_token')
+    const byId: Record&lt;string, any&gt; = {}
+    ;(dealers || []).forEach((d: any) =&gt; { byId[String(d.id)] = d })
+    const codes = (Array.isArray(order.discount_codes) ? order.discount_codes : []).map((x: any) =&gt; String((x &amp;&amp; x.code) || '').trim()).filter(Boolean)
+    for (const c of codes) { const d = _dealerOfCode(c, dealers || []); if (d) dealerIds.add(String(d.id)) }
+    // 4. nudge each affected dealer's open portal
+    for (const did of dealerIds) await _pingDealer(byId[did], 'orders')
+  } catch (e) { console.warn('[shopify-orders] dealer cancel sync failed (the order itself was cancelled fine):', e) }
+}
 async function handleRequest(req: Request): Promise&lt;Response&gt; {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
   if (req.method === 'GET') return new Response('pong', { headers: CORS })
@@ -11764,6 +11831,8 @@ if (body.action === 'list_product_templates') {
       }
     }
     if (_recheck.size) queueBackorderRecheck(_recheck)
+    // [v23.88] a dealer order cancelled (or fully refunded) in Shopify: update the dealer's request and nudge their open portal
+    if (topic === 'orders/cancelled' || (topic === 'orders/updated' &amp;&amp; (fin === 'refunded' || fin === 'voided' || order.cancelled_at))) await dealerCancelSync(order)
     if (body.action === 'create_refund') {
     // [AUDIT] This URL is public (Shopify must reach it), so a refund requires a signed-in ERP user's token.
     const _tok = (req.headers.get('Authorization') || '').replace('Bearer ', '')
@@ -11976,7 +12045,7 @@ const CORS = {
 //    whole-line behaviour is kept).
 //  * Items are matched by Shopify line item id, then by exact canonical SKU. The substring guess is gone.
 //  * A voided label puts the order and its stock back (void_sweep).
-//  * Shopify availability = on hand minus open orders (setting backorder_net_open_orders = false turns this off).
+//  * Backorder rule (v23.86): stock on hand = never backorder; none on hand but buildable from raw components (packaging never counts) = in stock; only unbuildable with none on hand = backorder. Open orders do not reduce availability, and settings.backorder_net_open_orders is ignored.
 // ===================================================================================================================
 let _qtyColsOk = true
 async function setLineQtyCols(id: string, patch: { qty_shipped?: number, deduct_qty?: number | null }): Promise&lt;void&gt; {
@@ -12509,6 +12578,16 @@ function isManagedBackorderTemplate(templateSuffix: string | null | undefined): 
   return cur === boTpl
 }
 
+// [v23.86] THE BACKORDER RULE, in one place (the ERP's decideBackorder() is the same three lines):
+//   1. A SKU with stock on hand is NEVER on backorder, whatever the open orders say.
+//   2. A SKU with none on hand is NOT on backorder if it can be built from its raw components. Packaging and supplies never count (a box can always be found).
+//   3. Only a SKU with nothing on hand that cannot be built is on backorder. A manual hold (force_backorder) is the one deliberate exception.
+// Open orders no longer reduce availability: the old "on hand minus open orders" test put SKUs that had stock, or could be built, on backorder.
+function decideBackorder(forced: boolean, onHand: number, hasBOM: boolean, maxBuild: number): boolean {
+  if (forced) return true
+  if ((Number(onHand) || 0) &gt; 0) return false
+  return !(hasBOM &amp;&amp; maxBuild &gt;= 1)
+}
 async function syncShopifyBackorder(pn: string, newOh: number, trigger: string = 'shipstation_webhook', opts: { onlyIfChanged?: boolean } = {}): Promise&lt;void&gt; {
   _lastSync = 'skipped'
   const { data: toggleRow } = await db.from('settings').select('value').eq('key', 'shopify_backorder_sync_enabled').limit(1)
@@ -12542,22 +12621,20 @@ async function syncShopifyBackorder(pn: string, newOh: number, trigger: string =
   let template = ''
   let ssRestock = ''
   const forcedBO = !!(eligItem &amp;&amp; eligItem.force_backorder)
-  let _demand = 0
   if (forcedBO) {
     template = Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder'
     console.log('[SS-&gt;Shopify]', pn, 'FORCED on backorder by manual override')
-  } else if (newOh - (_demand = await openDemandFor(canonPn, eligItem?.new_sku)) &lt;= 0) {
-    // [v23.102] "out" now means on hand minus open orders is zero or less. Short by N means N more units must be buildable.
-    const avail = newOh - _demand
+  } else if ((Number(newOh) || 0) &lt;= 0) {
+    // [v23.86] Nothing on hand: it is on backorder only if it cannot be built from its raw components (packaging never counts).
+    // Anything on hand is never backordered, whatever the open orders; open orders no longer reduce availability.
     const { hasBOM, maxBuild } = await bomMaxBuild(canonPn)
-    const isBackorder = !hasBOM || maxBuild &lt; (1 - avail)
-    if (isBackorder) {
+    if (decideBackorder(false, newOh, hasBOM, maxBuild)) {
       template = Deno.env.get('SHOPIFY_BACKORDER_TEMPLATE') || 'backorder'
       const { data: rdRow } = await db.from('settings').select('value').eq('key', 'shopify_restock_days').limit(1)
       const rdDays = Number(rdRow?.[0]?.value) || 30
       ssRestock = new Date(Date.now() + rdDays * 86400000).toISOString().slice(0, 10)
     }
-    console.log('[SS-&gt;Shopify]', pn, 'newOh='+newOh, 'openOrders='+_demand, 'hasBOM='+hasBOM, 'maxBuild='+maxBuild, '-&gt;', template || '(revert)', ssRestock ? 'restock:'+ssRestock : '')
+    console.log('[SS-&gt;Shopify]', pn, 'newOh='+newOh, 'hasBOM='+hasBOM, 'maxBuild='+maxBuild, '-&gt;', template || '(in stock)', ssRestock ? 'restock:'+ssRestock : '')
   }
   try {
     const isBO = template !== ''
@@ -12643,7 +12720,7 @@ async function cascadeShopifyBackorder(childPn: string, seen: Set&lt;string&gt; 
   for (const parent of (parents || [])) {
     if (isEligibleForBackorderSync(parent) &amp;&amp; !seen.has('S:' + parent.pn)) {
       seen.add('S:' + parent.pn)
-      if ((parent.total_on_hand || 0) - (await openDemandFor(parent.pn, parent.new_sku)) &lt;= 0) await syncShopifyBackorder(parent.pn, parent.total_on_hand || 0)
+      if ((Number(parent.total_on_hand) || 0) &lt;= 0) await syncShopifyBackorder(parent.pn, parent.total_on_hand || 0)   // [v23.86] only a finished good with nothing on hand can change state when a component's stock changes
     }
     await cascadeShopifyBackorder(parent.pn, seen)
   }
@@ -12736,8 +12813,7 @@ async function deductForShipment(pn: string, qty: number, tracking: string, orde
 
 
 // ---- scheduled job: compare Shopify availability with the ERP and repair drift --------------------------------------------
-// Looks at the items most likely to be wrong: everything the sync log last put on backorder, and everything whose open orders
-// are at or above its stock. A cursor (settings.backorder_audit_cursor) walks the list a few at a time, so one run stays short.
+// Looks at the items most likely to be wrong: everything the sync log last put on backorder, and every finished good with nothing on hand. A cursor (settings.backorder_audit_cursor) walks the list a few at a time, so one run stays short.
 async function backorderAudit(limit: number): Promise&lt;any&gt; {
   const out: any = { candidates: 0, examined: 0, repaired: 0, unchanged: 0, skipped: 0, errors: 0, cursor: 0 }
   const cand = new Set&lt;string&gt;()
@@ -12748,30 +12824,12 @@ async function backorderAudit(limit: number): Promise&lt;any&gt; {
     seen.add(r.pn)
     if (r.action === 'backorder' || r.action === 'partial') cand.add(r.pn)
   }
-  if (await netBackorderEnabled()) {
-    const st = 'fulfillment_status.is.null,fulfillment_status.in.(Open,Packed,Partial,partial,"On Hold")'
-    let { data: open, error: oe } = await db.from('sales').select('pn,qty,qty_shipped,fulfillment_status').or(st).limit(50000)
-    if (oe) ({ data: open, error: oe } = await db.from('sales').select('pn,qty,fulfillment_status').or(st).limit(50000))
-    if (!oe) {
-      const raw: Record&lt;string, number&gt; = {}
-      for (const r of (open || []) as any[]) {
-        if (!r.pn) continue
-        const partial = String(r.fulfillment_status || '').toLowerCase() === 'partial'
-        raw[r.pn] = (raw[r.pn] || 0) + Math.max(0, (Number(r.qty) || 1) - (partial ? (Number(r.qty_shipped) || 0) : 0))
-      }
-      const canon = await buildCanonMapBig(Object.keys(raw))
-      const demand: Record&lt;string, number&gt; = {}
-      for (const [k, q] of Object.entries(raw)) { const c = canon(k); demand[c] = (demand[c] || 0) + q }
-      const keys = Object.keys(demand)
-      for (let i = 0; i &lt; keys.length; i += 150) {
-        const chunk = keys.slice(i, i + 150)
-        const { data: a } = await db.from('assemblies').select('pn,total_on_hand').in('pn', chunk)
-        ;(a || []).forEach((r: any) =&gt; { if ((Number(r.total_on_hand) || 0) - (demand[r.pn] || 0) &lt;= 0) cand.add(r.pn) })
-        const { data: p } = await db.from('parts').select('pn,total_unpckgd').in('pn', chunk)
-        ;(p || []).forEach((r: any) =&gt; { if ((Number(r.total_unpckgd) || 0) - (demand[r.pn] || 0) &lt;= 0) cand.add(r.pn) })
-      }
-    }
-  }
+  // [v23.86] plus every finished good with nothing on hand: those are the only ones that can be on backorder, and one that can no longer be built (or
+  // can be built again) needs its state checked. Open orders no longer matter.
+  try {
+    const { data: zero } = await db.from('assemblies').select('pn,new_sku,discontinued,stage,is_subassembly,category,total_on_hand').lte('total_on_hand', 0).limit(5000)
+    for (const r of (zero || []) as any[]) { if (isEligibleForBackorderSync(r)) cand.add(r.pn) }
+  } catch (e) { console.warn('[SS] backorder_audit: zero-stock lookup failed', e) }
   const list = [...cand].sort()
   out.candidates = list.length
   let cursor = 0
@@ -12890,7 +12948,7 @@ async function voidSweep(): Promise&lt;any&gt; {
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.104'
+const EDGE_BUILD = 'v23.105'
 const _gateLogged: Record&lt;string, number&gt; = {}
 async function authGate(req: Request, fn: string, action: string): Promise&lt;Response | null&gt; {
   const mode = (Deno.env.get('EDGE_AUTH_MODE') || 'log').toLowerCase()
@@ -14858,9 +14916,7 @@ async function bulkSyncShopifyBackorder(){
     if(done>0)await new Promise(function(res){setTimeout(res,120);}); // pace: each SKU now does several Shopify calls
     const b=buildabilityForBackorder(a.pn);
     const oh=a.total_on_hand||0;
-    let isBackorder=false;
-    if(a.force_backorder){isBackorder=true;}else
-    {const _avb=_netAvail(a.pn,oh); if(_avb<=0){isBackorder=b.hasBOM?b.maxBuild<(1-_avb):true;}}
+    let isBackorder=decideBackorder(!!a.force_backorder,oh,b.hasBOM,b.maxBuild);
     const template=isBackorder?(S.settings.shopify_backorder_template||'backorder'):'';
     // Keep the original restock date if this item is already backordered, rather than pushing it
     // 30 days further out every time the bulk sync happens to run — otherwise the countdown would
@@ -26510,7 +26566,7 @@ function _openDemandMap(){
 }
 window._openDemandMap=_openDemandMap;
 
-function _netAvail(pn,oh){ // [v23.33] on hand minus open orders; settings.backorder_net_open_orders=false restores on-hand only
+function _netAvail(pn,oh){ // [v23.86] NO LONGER USED for the backorder decision (see decideBackorder): open orders do not reduce availability. Kept only for other readers.
   if(S.settings&&S.settings.backorder_net_open_orders===false)return oh;
   try{return oh-(openOrderDemand(pn)||0);}catch(e){return oh;}
 }
@@ -29720,7 +29776,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.87','shipstation-ship':'v23.104','ops-cron':'v1.3','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.3'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.88','shipstation-ship':'v23.105','ops-cron':'v1.3','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.3'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
@@ -32997,7 +33053,7 @@ function dsLiveChange(p){
     if(before&&before.status!==now.status&&!now.archived_at){
       if(now.status==='sent'&&before.status==='awaiting_payment')toast('<span class="ic ic-check"></span>'+escHtml(lab)+' was paid and is in Shopify'+(now.shopify_order_name?' as '+escHtml(now.shopify_order_name):''),7000);
       else if(now.status==='attention')toast('<span class="ic ic-alert"></span>'+escHtml(lab)+' needs attention'+(now.error?': '+escHtml(String(now.error).slice(0,120)):''),9000);
-      else if(now.status==='cancelled')toast(escHtml(lab)+' was cancelled by the dealer',6000);
+      else if(now.status==='cancelled')toast(escHtml(lab)+(before.status==='sent'?' was cancelled in Shopify':' was cancelled by the dealer'),6000);
     }
   }
   if(!DS.loaded){DS._badgeAt=0;try{dsBadgeKick();}catch(e){}}else{try{dsBadge();}catch(e){}}
@@ -33571,6 +33627,7 @@ async function submitManualCorrection(pn, newQty, reason) {
     const _nq=await adjustStock('part',part,adj,{reason:reason||'Manual adjustment',source:'manual',skipSync:true});
     if(_nq===null)return;
     if(adjustStock.lastCorrection)S.corrections=[adjustStock.lastCorrection,...S.corrections];
+ try{cascadeShopifySync(part.pn);}catch(_e){console.warn('[manual correction] backorder re-check failed:',_e);}   // (v23.86) the finished goods built from this part may now be buildable, or not
   }
   pushUndo('update','parts',{...part,total_unpckgd:newQty},part,'Correction: '+pn+' → '+newQty);
   closeModal();updateBadge();toast('Correction applied');render();
