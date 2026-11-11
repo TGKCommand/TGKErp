@@ -545,7 +545,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.87</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.88</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -610,7 +610,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.87';
+const TGK_ERP_VERSION = 'v23.88';
 const TGK_ERP_BUILD_DATE = '2026-11-09';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -5574,6 +5574,17 @@ function renderPurchases(){
   </tbody></table></div>`}`;
 }
 
+// (v23.88) "Open" means NOT SHIPPED YET. A line or order whose status is Partial (some units, or some lines, have shipped and the rest are still waiting)
+// is still open, so the Open filter includes it. When a part is being searched for, the order counts only if THAT part is still unshipped: a part that
+// already left does not make its order "open" for it. The Partial chip still shows partial orders on their own.
+function salesLinePending(l){return !['Shipped','Delivered','Cancelled','Refunded'].includes((l&&l.fulfillment_status)||'Open');}
+function salesOpenIncludesPartial(s,allowed,q){
+ if(!allowed||!allowed.has('Open')||allowed.has('Partial'))return false;
+ if(((s&&s.fulfillment_status)||'Open')!=='Partial')return false;
+ var lines=s._grouped?(s._allLines||[]):[s],term=String(q||'').toLowerCase();
+ var hit=term?lines.filter(function(l){return String(l.pn||'').toLowerCase().indexOf(term)>=0;}):[];
+ return (hit.length?hit:lines).some(salesLinePending);
+}
 function renderSales(){
   if(S.activeSale){const s=S.sales.find(x=>x.id===S.activeSale);if(s)return renderSaleDetail(s);}
 
@@ -5647,6 +5658,7 @@ function renderSales(){
   let list=allGrouped;
   if(q)list=list.filter(s=>{
     if(s.pn.toLowerCase().includes(q))return true;
+ if(s._grouped&&(s._allLines||[]).some(function(l){return String(l.pn||'').toLowerCase().includes(q);}))return true;   // (v23.88) a part on one line of a multi-line order
     if((s.order_number||'').toLowerCase().includes(q))return true;
     if((s.source||'').toLowerCase().includes(q))return true;
     if((s.customer_name||'').toLowerCase().includes(q))return true;
@@ -5672,6 +5684,7 @@ function renderSales(){
     const _inclRef=allowed.has('Refunded');
     list=list.filter(s=>{
       if(allowed.has(s.fulfillment_status||'Open'))return true;
+ if(salesOpenIncludesPartial(s,allowed,q))return true;
       if(_inclRef){
         const _lines=s._grouped?s._allLines:[s];
         return _lines.some(function(l){return l.financial_status==='partially_refunded';});
@@ -12948,7 +12961,7 @@ async function voidSweep(): Promise&lt;any&gt; {
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.105'
+const EDGE_BUILD = 'v23.106'
 const _gateLogged: Record&lt;string, number&gt; = {}
 async function authGate(req: Request, fn: string, action: string): Promise&lt;Response | null&gt; {
   const mode = (Deno.env.get('EDGE_AUTH_MODE') || 'log').toLowerCase()
@@ -12968,117 +12981,8 @@ async function authGate(req: Request, fn: string, action: string): Promise&lt;Re
   return null
 }
 
-async function handleRequest(req: Request): Promise&lt;Response&gt; {
-  if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
-  const body = await req.json().catch(() =&gt; ({})) as any
-  if (req.method === 'GET' || body.ping) return new Response('pong', { headers: CORS })
-  if (body.action === 'version') return json({ fn: 'shipstation-ship', build: EDGE_BUILD })
-  if (body.action || body.check_secrets) { // ShipStation's own webhooks carry resource_url, never an action
-    const _gate = await authGate(req, 'shipstation-ship', String(body.action || 'check_secrets'))
-    if (_gate) return _gate
-  }
-  if (body.check_secrets) {
-    const k = Deno.env.get('SS_KEY') || '', s = Deno.env.get('SS_SECRET') || ''
-    return json({ ss_key_set: k.length &gt; 0, ss_key_length: k.length, ss_key_preview: k.length &gt; 4 ? k.slice(0,2)+'...'+k.slice(-2) : '(empty)', ss_secret_set: s.length &gt; 0, ss_secret_length: s.length, ss_secret_preview: s.length &gt; 4 ? s.slice(0,2)+'...'+s.slice(-2) : '(empty)', ss_v2_key_set: (Deno.env.get('SS_V2_KEY') || '').length &gt; 0 })
-  }
-  if (body.action === 'retry_pending_deductions') {
-    return json(await retryPendingDeductions(200))
-  }
-  if (body.action === 'resync_backorder') {
-    // [v23.102] shopify-orders calls this when an order is placed, cancelled or edited: open demand changed, so availability may have.
-    const pns: string[] = Array.isArray(body.pns) ? body.pns.map((x: any) =&gt; String(x).trim()).filter(Boolean).slice(0, 20) : []
-    const done: string[] = []
-    for (const raw of pns) {
-      try {
-        const it = await resolveItem(raw)
-        const target = it ? await onHandOf(it.pn) : null
-        if (!target) continue
-        await syncShopifyBackorder(target.row.pn, target.oh, 'order_event', { onlyIfChanged: true })
-        done.push(target.row.pn)
-      } catch (e) { console.warn('[SS] resync_backorder failed for', raw, e) }
-    }
-    return json({ ok: true, rechecked: done.length, pns: done })
-  }
-  if (body.action === 'backorder_audit') return json(await backorderAudit(Math.min(Math.max(parseInt(body.limit) || 25, 1), 40)))
-  if (body.action === 'void_sweep') return json(await voidSweep())
-  if (body.action === 'bulk_sync') {
-    const auth = ssAuth()
-    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
-    const since = body.since || new Date(Date.now() - 30*24*60*60*1000).toISOString().slice(0,10)
-    const until = body.until || new Date().toISOString().slice(0,10)
-    const orderMap = await buildOrderMap()
-    const norm = (s: string) =&gt; s.trim().toUpperCase()
-    const updateGroups: any = {}
-    const deductQueue: any[] = []
-    let page = 1, totalPages = 1, synced = 0, skipped = 0, notFound = 0
-    while (page &lt;= totalPages) {
-      const url = 'https://ssapi.shipstation.com/shipments?shipDateStart=' + since + '&amp;shipDateEnd=' + until + '&amp;pageSize=500&amp;page=' + page + '&amp;includeShipmentItems=true'
-      const res = await fetch(url, { headers: { Authorization: 'Basic ' + auth } })
-      if (!res.ok) return json({ error: 'ShipStation error ' + res.status }, 502)
-      const data = await res.json()
-      totalPages = data.pages || 1
-      const _pageSkus: string[] = []
-      for (const _s of (data.shipments || [])) {
-        for (const i of (_s.shipmentItems || [])) { const v = String(i?.sku || i?.name || '').trim(); if (v) _pageSkus.push(v) }
-        for (const l of (orderMap[stripHash(_s.orderNumber || '')] || [])) if (l.pn) _pageSkus.push(l.pn)
-      }
-      const _bcanon = await buildCanonMapBig(_pageSkus)
-      for (const ship of (data.shipments || [])) {
-        if (ship.voided || !ship.trackingNumber) { skipped++; continue }
-        const rawNum = stripHash(ship.orderNumber || '')
-        const lines = orderMap[rawNum] || []
-        if (!lines.length) { notFound++; continue }
-        const tracking = ship.trackingNumber
-        const carrier = (ship.carrierCode || '').toUpperCase()
-        const shippedAt = ship.shipDate ? new Date(ship.shipDate).toISOString() : new Date().toISOString()
-        // [v23.102] same allocation as the live webhook: line item id, then exact canonical SKU, quantity-aware. No substring guessing.
-        const { got } = allocateShipment(lines, ship.shipmentItems || [], _bcanon)
-        if (!got.size) {
-          const _only = lines.filter((l: any) =&gt; String(l.fulfillment_status || '').toLowerCase() !== 'on hold')
-          const _its = (ship.shipmentItems || []).filter((i: any) =&gt; ssItemQty(i) &gt; 0)
-          if (_only.length === 1 &amp;&amp; _its.length === 1) got.set(_only[0].id, ssItemQty(_its[0])) // one line, one item: unambiguous
-          else { notFound++; continue }
-        }
-        for (const line of lines) {
-          if (!got.has(line.id)) continue
-          const lineQty = Number(line.qty) || 1
-          const soFar = lineShippedSoFar(line)
-          const deduct = _qtyColsOk ? Math.min(got.get(line.id) || 0, Math.max(0, lineQty - soFar)) : Math.max(0, lineQty - soFar)
-          if (deduct &lt;= 0) continue
-          const full = !_qtyColsOk || soFar + deduct &gt;= lineQty
-          const gKey = tracking + '|' + carrier + '|' + shippedAt.slice(0, 10) + '|' + (full ? 'S' : 'P')
-          if (!updateGroups[gKey]) updateGroups[gKey] = { ids: [], tracking, carrier, shippedAt, status: full ? 'Shipped' : 'Partial' }
-          updateGroups[gKey].ids.push(line.id)
-          deductQueue.push({ id: line.id, pn: line.pn, qty: deduct, tracking, order: rawNum, partial: !full ? soFar + deduct : null })
-          // later shipments in this same run see this one
-          line.qty_shipped = soFar + deduct
-          line.fulfillment_status = full ? 'Shipped' : 'Partial'
-        }
-        synced++
-      }
-      page++
-    }
-    await markDeductPending([...new Set(deductQueue.map((d: any) =&gt; d.id))] as string[], true)
-    for (const d of deductQueue) if (d.partial != null) await setLineQtyCols(d.id, { qty_shipped: d.partial, deduct_qty: d.qty })
-    let applied = 0
-    for (const g of Object.values(updateGroups)) {
-      const deduped = [...new Set((g as any).ids)]
-      for (let i = 0; i &lt; deduped.length; i += 200) {
-        await db.from('sales').update({
-          fulfillment_status: (g as any).status, tracking_number: (g as any).tracking,
-          carrier: (g as any).carrier, shipped_at: (g as any).shippedAt
-        }).in('id', deduped.slice(i, i+200))
-        applied += Math.min(200, deduped.length - i)
-      }
-    }
-    let deducted = 0
-    for (const d of deductQueue) {
-      const did = await deductLine({ id: d.id, pn: d.pn, qty: d.qty, deduct_qty: d.qty }, d.tracking, d.order)
-      if (did &amp;&amp; _lastDeduct === 'deducted') deducted++
-    }
-    return json({ synced, skipped, notFound, applied, deducted, pages: totalPages, message: 'Synced ' + synced + ' shipments, applied ' + applied + ' line updates, deducted ' + deducted + ' line(s)' })
-  }
-  if (body.action === 'hold_sync') {
+// [v23.106] The full hold sync, unchanged, as a function: the 5-minute job and the quick hold_poll check below both run it.
+async function holdSyncCore(): Promise&lt;Response&gt; {
     const auth = ssAuth()
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
     const orderMap = await buildOrderMap()
@@ -13204,6 +13108,157 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
     }
     return json({ markedHold, markedOpen, message: markedHold + ' marked On Hold, ' + markedOpen + ' released to Open' })
   }
+// [v23.106] FAST HOLD-RELEASE CHECK. hold_sync walks every on-hold and awaiting-shipment order in ShipStation, which is far too heavy to run every few seconds, so a
+// release taken in ShipStation used to wait for the next 5-minute pass. This is the cheap gate in front of it: it reads only the ERP's held lines and ShipStation's
+// awaiting-shipment list, and runs the FULL hold_sync (with all its split-order and flip-flop protections) only when a held order has actually reappeared as ready
+// to ship. Safe to call every ~20 seconds: with nothing held, or nothing released, it costs at most one or two ShipStation calls.
+let _holdPollSig = '', _holdPollAt = 0, _holdPollIdle = false, _holdPollLast = 0
+async function holdPoll(): Promise&lt;any&gt; {
+  if (!Deno.env.get('SS_KEY')) return { error: 'SS_KEY or SS_SECRET not set' }
+  const now = Date.now()
+  if (now - _holdPollLast &lt; 8000) return { ok: true, throttled: true }   // several browser tabs asking at once cost a single check
+  _holdPollLast = now
+  const { data: held } = await db.from('sales').select('order_number,shopify_line_item_id').eq('fulfillment_status', 'On Hold').limit(5000)
+  if (!held || !held.length) return { ok: true, held: 0, candidates: 0, markedOpen: 0 }
+  const nums = new Set&lt;string&gt;(), keys = new Set&lt;string&gt;()
+  for (const l of held as any[]) {
+    const n = stripHash(String(l.order_number || '')); if (n) nums.add(n)
+    const k = String(l.shopify_line_item_id ?? '').trim(); if (k.length &gt;= 8) keys.add(k)   // orders merged in ShipStation carry a number the ERP does not know: match by line item id too
+  }
+  const auth = ssAuth(), cand: any[] = []
+  let page = 1, pages = 1
+  while (page &lt;= pages &amp;&amp; page &lt;= 4) {
+    const r = await fetch('https://ssapi.shipstation.com/orders?orderStatus=awaiting_shipment&amp;pageSize=500&amp;page=' + page, { headers: { Authorization: 'Basic ' + auth } })
+    if (!r.ok) return { error: 'ShipStation error ' + r.status }
+    const d = await r.json(); pages = d.pages || 1
+    for (const o of (d.orders || [])) {
+      if (nums.has(stripHash(o.orderNumber || '')) || (o.items || []).some((i: any) =&gt; keys.has(String(i?.lineItemKey ?? '').trim()))) cand.push(o)
+    }
+    page++
+  }
+  if (!cand.length) { _holdPollSig = ''; return { ok: true, held: held.length, candidates: 0, markedOpen: 0 } }   // everything held is still on hold in ShipStation
+  const sig = cand.map((o: any) =&gt; String(o.orderId)).sort().join(',')
+  // the same ready orders as last time that released nothing (a split order whose other half is still held): do not repeat the full sync every few seconds
+  if (sig === _holdPollSig &amp;&amp; _holdPollIdle &amp;&amp; now - _holdPollAt &lt; 5 * 60000) return { ok: true, held: held.length, candidates: cand.length, markedOpen: 0, unchanged: true }
+  const res = await holdSyncCore()
+  let out: any = {}
+  try { out = await res.clone().json() } catch (_) { /* not json */ }
+  if (res.status &gt;= 400) return { error: out.error || 'hold_sync failed' }
+  _holdPollSig = sig; _holdPollAt = now; _holdPollIdle = !(Number(out.markedOpen) &gt; 0)
+  return { ok: true, held: held.length, candidates: cand.length, markedHold: out.markedHold || 0, markedOpen: out.markedOpen || 0 }
+}
+async function handleRequest(req: Request): Promise&lt;Response&gt; {
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
+  const body = await req.json().catch(() =&gt; ({})) as any
+  if (req.method === 'GET' || body.ping) return new Response('pong', { headers: CORS })
+  if (body.action === 'version') return json({ fn: 'shipstation-ship', build: EDGE_BUILD })
+  if (body.action || body.check_secrets) { // ShipStation's own webhooks carry resource_url, never an action
+    const _gate = await authGate(req, 'shipstation-ship', String(body.action || 'check_secrets'))
+    if (_gate) return _gate
+  }
+  if (body.check_secrets) {
+    const k = Deno.env.get('SS_KEY') || '', s = Deno.env.get('SS_SECRET') || ''
+    return json({ ss_key_set: k.length &gt; 0, ss_key_length: k.length, ss_key_preview: k.length &gt; 4 ? k.slice(0,2)+'...'+k.slice(-2) : '(empty)', ss_secret_set: s.length &gt; 0, ss_secret_length: s.length, ss_secret_preview: s.length &gt; 4 ? s.slice(0,2)+'...'+s.slice(-2) : '(empty)', ss_v2_key_set: (Deno.env.get('SS_V2_KEY') || '').length &gt; 0 })
+  }
+  if (body.action === 'retry_pending_deductions') {
+    return json(await retryPendingDeductions(200))
+  }
+  if (body.action === 'resync_backorder') {
+    // [v23.102] shopify-orders calls this when an order is placed, cancelled or edited: open demand changed, so availability may have.
+    const pns: string[] = Array.isArray(body.pns) ? body.pns.map((x: any) =&gt; String(x).trim()).filter(Boolean).slice(0, 20) : []
+    const done: string[] = []
+    for (const raw of pns) {
+      try {
+        const it = await resolveItem(raw)
+        const target = it ? await onHandOf(it.pn) : null
+        if (!target) continue
+        await syncShopifyBackorder(target.row.pn, target.oh, 'order_event', { onlyIfChanged: true })
+        done.push(target.row.pn)
+      } catch (e) { console.warn('[SS] resync_backorder failed for', raw, e) }
+    }
+    return json({ ok: true, rechecked: done.length, pns: done })
+  }
+  if (body.action === 'backorder_audit') return json(await backorderAudit(Math.min(Math.max(parseInt(body.limit) || 25, 1), 40)))
+  if (body.action === 'void_sweep') return json(await voidSweep())
+  if (body.action === 'bulk_sync') {
+    const auth = ssAuth()
+    if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY or SS_SECRET not set' }, 400)
+    const since = body.since || new Date(Date.now() - 30*24*60*60*1000).toISOString().slice(0,10)
+    const until = body.until || new Date().toISOString().slice(0,10)
+    const orderMap = await buildOrderMap()
+    const norm = (s: string) =&gt; s.trim().toUpperCase()
+    const updateGroups: any = {}
+    const deductQueue: any[] = []
+    let page = 1, totalPages = 1, synced = 0, skipped = 0, notFound = 0
+    while (page &lt;= totalPages) {
+      const url = 'https://ssapi.shipstation.com/shipments?shipDateStart=' + since + '&amp;shipDateEnd=' + until + '&amp;pageSize=500&amp;page=' + page + '&amp;includeShipmentItems=true'
+      const res = await fetch(url, { headers: { Authorization: 'Basic ' + auth } })
+      if (!res.ok) return json({ error: 'ShipStation error ' + res.status }, 502)
+      const data = await res.json()
+      totalPages = data.pages || 1
+      const _pageSkus: string[] = []
+      for (const _s of (data.shipments || [])) {
+        for (const i of (_s.shipmentItems || [])) { const v = String(i?.sku || i?.name || '').trim(); if (v) _pageSkus.push(v) }
+        for (const l of (orderMap[stripHash(_s.orderNumber || '')] || [])) if (l.pn) _pageSkus.push(l.pn)
+      }
+      const _bcanon = await buildCanonMapBig(_pageSkus)
+      for (const ship of (data.shipments || [])) {
+        if (ship.voided || !ship.trackingNumber) { skipped++; continue }
+        const rawNum = stripHash(ship.orderNumber || '')
+        const lines = orderMap[rawNum] || []
+        if (!lines.length) { notFound++; continue }
+        const tracking = ship.trackingNumber
+        const carrier = (ship.carrierCode || '').toUpperCase()
+        const shippedAt = ship.shipDate ? new Date(ship.shipDate).toISOString() : new Date().toISOString()
+        // [v23.102] same allocation as the live webhook: line item id, then exact canonical SKU, quantity-aware. No substring guessing.
+        const { got } = allocateShipment(lines, ship.shipmentItems || [], _bcanon)
+        if (!got.size) {
+          const _only = lines.filter((l: any) =&gt; String(l.fulfillment_status || '').toLowerCase() !== 'on hold')
+          const _its = (ship.shipmentItems || []).filter((i: any) =&gt; ssItemQty(i) &gt; 0)
+          if (_only.length === 1 &amp;&amp; _its.length === 1) got.set(_only[0].id, ssItemQty(_its[0])) // one line, one item: unambiguous
+          else { notFound++; continue }
+        }
+        for (const line of lines) {
+          if (!got.has(line.id)) continue
+          const lineQty = Number(line.qty) || 1
+          const soFar = lineShippedSoFar(line)
+          const deduct = _qtyColsOk ? Math.min(got.get(line.id) || 0, Math.max(0, lineQty - soFar)) : Math.max(0, lineQty - soFar)
+          if (deduct &lt;= 0) continue
+          const full = !_qtyColsOk || soFar + deduct &gt;= lineQty
+          const gKey = tracking + '|' + carrier + '|' + shippedAt.slice(0, 10) + '|' + (full ? 'S' : 'P')
+          if (!updateGroups[gKey]) updateGroups[gKey] = { ids: [], tracking, carrier, shippedAt, status: full ? 'Shipped' : 'Partial' }
+          updateGroups[gKey].ids.push(line.id)
+          deductQueue.push({ id: line.id, pn: line.pn, qty: deduct, tracking, order: rawNum, partial: !full ? soFar + deduct : null })
+          // later shipments in this same run see this one
+          line.qty_shipped = soFar + deduct
+          line.fulfillment_status = full ? 'Shipped' : 'Partial'
+        }
+        synced++
+      }
+      page++
+    }
+    await markDeductPending([...new Set(deductQueue.map((d: any) =&gt; d.id))] as string[], true)
+    for (const d of deductQueue) if (d.partial != null) await setLineQtyCols(d.id, { qty_shipped: d.partial, deduct_qty: d.qty })
+    let applied = 0
+    for (const g of Object.values(updateGroups)) {
+      const deduped = [...new Set((g as any).ids)]
+      for (let i = 0; i &lt; deduped.length; i += 200) {
+        await db.from('sales').update({
+          fulfillment_status: (g as any).status, tracking_number: (g as any).tracking,
+          carrier: (g as any).carrier, shipped_at: (g as any).shippedAt
+        }).in('id', deduped.slice(i, i+200))
+        applied += Math.min(200, deduped.length - i)
+      }
+    }
+    let deducted = 0
+    for (const d of deductQueue) {
+      const did = await deductLine({ id: d.id, pn: d.pn, qty: d.qty, deduct_qty: d.qty }, d.tracking, d.order)
+      if (did &amp;&amp; _lastDeduct === 'deducted') deducted++
+    }
+    return json({ synced, skipped, notFound, applied, deducted, pages: totalPages, message: 'Synced ' + synced + ' shipments, applied ' + applied + ' line updates, deducted ' + deducted + ' line(s)' })
+  }
+  if (body.action === 'hold_sync') return await holdSyncCore()
+  if (body.action === 'hold_poll') { const _hp = await holdPoll(); return json(_hp, _hp.error ? 502 : 200) }
   if (body.action === 'cancel_sync') {
     if (!Deno.env.get('SS_KEY')) return json({ error: 'SS_KEY not set' }, 400)
     const auth = ssAuth()
@@ -21028,7 +21083,9 @@ function startAutoRefresh(){
       }
     }catch(e){console.warn('[TGK] Auto hold sync failed:',e.message);}
   },5*60*1000);
-  if(S.autoDeliverySyncTimer)clearInterval(S.autoDeliverySyncTimer);
+  if(S.autoHoldPollTimer)clearInterval(S.autoHoldPollTimer);
+ S.autoHoldPollTimer=setInterval(function(){holdPollTick();},20*1000);   // (v23.88) fast hold release
+ if(S.autoDeliverySyncTimer)clearInterval(S.autoDeliverySyncTimer);
   // Auto delivery sync — ShipStation has no real-time "delivered" webhook the way it does for
   // shipping/holds/cancellations; delivery status only exists by polling carrier tracking data.
   // This was previously 100% manual (the "Deliveries" button), meaning orders sat as "Shipped"
@@ -29776,7 +29833,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.88','shipstation-ship':'v23.105','ops-cron':'v1.3','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.3'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.88','shipstation-ship':'v23.106','ops-cron':'v1.3','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.3'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
@@ -29887,6 +29944,29 @@ function _opsNeedsAttention(j){
   return false;
 }
 // the old browser timers step aside while the server is handling a job (or the job was paused on purpose)
+// (v23.88) FAST HOLD RELEASE. The server runs the full hold sync every 5 minutes, which is too heavy to repeat every few seconds. This asks the server's cheap
+// hold_poll check every ~20 seconds while the ERP is open and something is On Hold: it looks only at ShipStation's awaiting-shipment list and runs the full sync
+// only when a held order has actually been released there. Nothing held means nothing is asked.
+async function holdPollTick(force){
+ if(!S.currentUserId||S._holdPollBusy)return;
+ if(!(S.shopify&&S.shopify.store))return;
+ if(S._holdPollBackoff&&Date.now()<S._holdPollBackoff)return;
+ if(!force&&typeof document!=='undefined'&&document.visibilityState==='hidden'&&Date.now()-(S._holdPollAt||0)<60000)return;   // a hidden tab checks once a minute
+ if(!(S.sales||[]).some(function(s){return s.fulfillment_status==='On Hold';}))return;
+ S._holdPollBusy=true;S._holdPollAt=Date.now();
+ try{
+  var res=await fetch(SUPA_URL+'/functions/v1/shipstation-ship',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({action:'hold_poll'})});
+  if(!res.ok){S._holdPollBackoff=Date.now()+120000;return;}   // not deployed yet, or ShipStation is unhappy: ask again in 2 minutes
+  var d=await res.json().catch(function(){return {};});S._holdPollBackoff=0;
+  var o=d.markedOpen||0,h=d.markedHold||0;
+  if(o+h>0){
+   await refreshSales();
+   if(!isUserActivelyWorking())render();
+   toast('<span class="ic ic-clock"></span>'+(o?o+' line'+(o===1?'':'s')+' released from hold':'')+(o&&h?', ':'')+(h?h+' put on hold':''),4000);
+  }
+ }catch(e){S._holdPollBackoff=Date.now()+120000;console.warn('[TGK] hold poll failed:',e&&e.message);}
+ finally{S._holdPollBusy=false;}
+}
 function _opsClientShouldSkip(name){
   var O=S.ops;if(!O||O.missing||!O.jobs||!O.jobs.length)return false;
   var j=O.jobs.find(function(x){return x.name===name;});if(!j)return false;
