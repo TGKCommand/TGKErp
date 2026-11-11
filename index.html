@@ -545,7 +545,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.97</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.98</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -610,7 +610,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.97';
+const TGK_ERP_VERSION = 'v23.98';
 const TGK_ERP_BUILD_DATE = '2026-11-09';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -5591,6 +5591,37 @@ function renderPurchases(){
 // (v23.88) "Open" means NOT SHIPPED YET. A line or order whose status is Partial (some units, or some lines, have shipped and the rest are still waiting)
 // is still open, so the Open filter includes it. When a part is being searched for, the order counts only if THAT part is still unshipped: a part that
 // already left does not make its order "open" for it. The Partial chip still shows partial orders on their own.
+// (v23.98) CUSTOMER RESOLUTIONS IN SALES ORDERS. A warranty replacement or a ship-error correction sent to ShipStation is not a sale, so it has no sales
+// line: it lives on the warranty / ship-error record, and Sales Orders skipped anything numbered WARRANTY- or SHERROR-. It could not be seen there and no
+// packing slip could be printed. These rows are built from the record itself (the items and the ship-to address entered when it was sent), under the same
+// order number ShipStation shows. They are for viewing and printing only: they are never counted as revenue and never change stock (that was done when the
+// resolution was sent).
+function resolutionSalesRows(){
+ var out=[],cut=daysAgo(90);
+ function add(list,kind){
+ (list||[]).forEach(function(c){
+ if(!c||!c.ss_order_id)return;                                   // only once it has been sent to ShipStation
+ var shipped=!!String(c.tracking_number||'').trim();
+ if(shipped&&c.shipped_at&&String(c.shipped_at).slice(0,10)<cut)return;   // shipped long ago: no longer listed
+ var items=kind==='Warranty'?c.claim_items:c.line_items;
+ if(!Array.isArray(items)||!items.length)items=[{pn:c.pn||c.expected_pn||'',qty:c.qty||c.expected_qty||1,description:c.description||''}];
+ var sd=c.shipping_details||{},on=(kind==='Warranty'?'WARRANTY-':'SHERROR-')+c.id;
+ var when=String((kind==='Warranty'?c.resolved_at:null)||c.updated_at||c.created_at||'');
+ items.forEach(function(it,i){
+ if(!it||!it.pn)return;
+ out.push({id:'res-'+(kind==='Warranty'?'wc':'se')+c.id+'-'+i,order_number:on,pn:it.pn,qty:Number(it.qty)||1,description:it.description||'',
+ customer_name:sd.name||c.customer_name||'',customer_email:c.customer_email||'',source:kind==='Warranty'?'Warranty':'Reship',
+ fulfillment_status:shipped?'Shipped':'Open',tracking_number:c.tracking_number||null,carrier:c.carrier||null,shipped_at:c.shipped_at||null,
+ sale_date:when.slice(0,10),created_at:when,
+ shipping_address1:sd.street1||null,shipping_address2:sd.street2||null,shipping_city:sd.city||null,shipping_province:sd.state||null,shipping_zip:sd.postal_code||null,shipping_country:sd.country||null,
+ notes:(kind==='Warranty'?'Warranty replacement':'Shipment error correction')+(c.order_number?' for order '+c.order_number:''),
+ _res:true,_kind:kind,_claimId:c.id,_orig:String(c.order_number||'')});
+ });
+ });
+ }
+ add(S.warrantyClaims,'Warranty');add(S.shipmentErrors,'Reship');
+ return out;
+}
 function salesLinePending(l){return !['Shipped','Delivered','Cancelled','Refunded'].includes((l&&l.fulfillment_status)||'Open');}
 function salesOpenIncludesPartial(s,allowed,q){
  if(!allowed||!allowed.has('Open')||allowed.has('Partial'))return false;
@@ -5600,12 +5631,13 @@ function salesOpenIncludesPartial(s,allowed,q){
  return (hit.length?hit:lines).some(salesLinePending);
 }
 function renderSales(){
-  if(S.activeSale){const s=S.sales.find(x=>x.id===S.activeSale);if(s)return renderSaleDetail(s);}
+ if(S.activeSale&&String(S.activeSale).indexOf('res-')===0){S.activeSale=null;setTimeout(function(){try{navResolution('claims');}catch(e){}},0);}   // (v23.98) a resolution row opens Customer Resolution
+ if(S.activeSale){const s=S.sales.find(x=>x.id===S.activeSale);if(s)return renderSaleDetail(s);}
 
   function groupSales(rows){
     const groups={},noNum=[];
     rows.forEach(s=>{
-      if(isInternal(s.order_number))return; // skip warranty & shipment-error orders
+      if(isInternal(s.order_number)&&!s._res)return; // skip warranty & shipment-error SALES lines; (v23.98) the resolution rows built for this page are kept
       if(!s.order_number){noNum.push(s);return;}
       (groups[s.order_number]=groups[s.order_number]||[]).push(s);
     });
@@ -5634,7 +5666,7 @@ function renderSales(){
     });
   }
 
-  const allGrouped=groupSales(S.sales);
+  const allGrouped=groupSales(S.sales.concat(resolutionSalesRows()));   // (v23.98) + customer resolutions sent to ShipStation
   // ---- perf: O(1) SKU lookup maps (mirror findAsm: pn wins, then new_sku) + memoized ship-readiness.
   // Rebuilt each render; replaces the per-row/per-line linear .find() scans that made this view crawl on mobile.
   const asmByPn=new Map();
@@ -39482,6 +39514,7 @@ function _openPrintWindow(html){
 async function printPackingSlip(orderNum,saleId){
  if(!S.sales){toast('Sales data not loaded');return;}
  var lines=orderNum?S.sales.filter(function(x){return x.order_number===orderNum&&!isInternal(x.order_number);}):[];
+ if(!lines.length&&orderNum&&isInternal(orderNum))lines=resolutionSalesRows().filter(function(x){return x.order_number===orderNum;});   // (v23.98) a warranty or reship: its items and address come from the resolution record
  if(!lines.length&&saleId){var single=S.sales.find(function(x){return x.id===saleId;});if(single)lines=[single];}
  if(!lines.length){toast('No order lines found');return;}
  var w=_slipOpenWindow();
