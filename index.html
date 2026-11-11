@@ -545,7 +545,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.88</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.91</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -610,7 +610,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.88';
+const TGK_ERP_VERSION = 'v23.91';
 const TGK_ERP_BUILD_DATE = '2026-11-09';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -1322,21 +1322,29 @@ function asmAvgWk(a){
   return a.avg_sales_wk||0;
 }
 function boReserved(pn){return(S.calc&&S.calc.boReservedPart&&S.calc.boReservedPart[pn])||0;}
+// (v23.89) A finished good with nothing on hand is only CRITICAL when it cannot be built. If its raw parts are on the shelf (packaging never counts) it is
+// "Build needed": the same line the backorder rule draws, so the alerts stop listing everything that is simply built to order.
+function _asmBuildable(a){
+ if(S._lsP!==S.parts||S._lsA!==S.assemblies||S._lsB!==S.boms){S._lsP=S.parts;S._lsA=S.assemblies;S._lsB=S.boms;S._lsCache={};}
+ var k=a.pn;if(k in S._lsCache)return S._lsCache[k];
+ var ok=false;try{var b=buildabilityForBackorder(a.pn);ok=!!(b&&b.hasBOM&&b.maxBuild>=1);}catch(e){ok=false;}
+ return (S._lsCache[k]=ok);
+}
 function liveStatus(a){
-  if(a&&a.stage==='dev')return 'dev';
-  const oh=a.total_on_hand||0;
-  const wk=asmAvgWk(a);
-  if(oh<=0)return 'critical';
-  if(wk>0&&oh<wk*2)return 'low';
-  return 'ok';
+ if(a&&a.stage==='dev')return 'dev';
+ const oh=a.total_on_hand||0;
+ const wk=asmAvgWk(a);
+ if(oh<=0)return _asmBuildable(a)?'build':'critical';
+ if(wk>0&&oh<wk*2)return 'low';
+ return 'ok';
 }
 const wks = p => { const w=effectiveWkDemand(p); return w>0 ? Math.round(Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn))/w) : null; };
 const wkColor = w => w===null?'var(--green)':w<2?'var(--red)':w<6?'var(--yellow)':'var(--green)';
 const wkPct  = w => w===null?100:Math.min(100,Math.round(w/12*100));
 
 function statusPill(s){
-  const m={ok:'pill-teal',low:'pill-yellow',critical:'pill-red',dev:'pill-dev'};
-  const l={ok:'In Stock',low:'Low',critical:'Critical',dev:'Dev'};
+  const m={ok:'pill-teal',low:'pill-yellow',critical:'pill-red',build:'pill-orange',dev:'pill-dev'};
+  const l={ok:'In Stock',low:'Low',critical:'Critical',build:'Build needed',dev:'Dev'};
   return `<span class="pill ${m[s]||'pill-muted'}">${l[s]||s}</span>`;
 }
 function poPill(s){
@@ -2645,21 +2653,10 @@ function eligibleForBackorderSync(item){
 // kind of thing that drifts apart silently (already happened once this session between the
 // ship-time and bulk-sync backorder logic).
 function isPackagingOrSupplyPart(childPn,itemType){
-  if(itemType==='packaging')return true;
-  if(!S._partIdx)buildLookupMaps();
-  var cp=S._partIdx?S._partIdx[childPn]:null;
-  if(!cp)return false;
-  // SUPPLY_CATS is declared with `const` later in this same script block -- referencing it before
-  // that line has executed throws a ReferenceError (temporal dead zone) rather than giving
-  // undefined, and this helper can be reached from inventory events early in the session. The
-  // typeof guard makes that impossible; the explicit packaging/shipping checks below still apply
-  // regardless, so an early call degrades to slightly-narrower matching rather than an exception.
-  var supplyLower=(typeof SUPPLY_CATS!=='undefined'&&SUPPLY_CATS?SUPPLY_CATS:[]).map(function(s){return s.toLowerCase();});
-  var catFull=(cp.category||'').toLowerCase();
-  var topLevel=catFull.split('/')[0].trim();
-  if(supplyLower.some(function(s){return catFull===s||topLevel===s;}))return true;
-  if(topLevel==='packaging'||topLevel==='shipping')return true;
-  return false;
+ // (v23.90) the same answer as the build check, instead of a narrower list of its own (it missed Boxes, Cartons and Labels)
+ if(!S._partIdx)buildLookupMaps();
+ var cp=S._partIdx?S._partIdx[childPn]:null;
+ return isNonRawSupplyItem(itemType,(cp&&cp.category),(cp&&cp.description),childPn);
 }
 
 function cascadeShopifySync(childPn,_seen){
@@ -3397,7 +3394,7 @@ function setFilter(ns,k,val){
 // again.
 function _isBoxCat(category){
   var top=(category||'').toLowerCase().split('/')[0].trim();
-  return top==='box'||top==='boxes'||top==='packaging'||top==='shipping';
+  return top==='box'||top==='boxes'||top==='carton'||top==='cartons'||top==='packaging'||top==='shipping';
 }
 
 function addAction(){const m={parts:'addPart',assemblies:'addAsm',purchases:'addPO',dealers:'addDealer',sales:'addSale'};if(m[S.view])openModal(m[S.view],{});}
@@ -3430,7 +3427,12 @@ function dashNeedsRows(c,opts){
  if(toFulfill>0&&!opts.skipOrders)rows.push({level:'orange',cnt:String(toFulfill),title:'Orders to fulfill',sub:(c.freshOpen||0)+' open \u00b7 '+(c.partialCount||0)+' partial'+(c.onHoldCount>0?' \u00b7 '+c.onHoldCount+' more on hold':''),nav:"setFilter('sales','fstatus','Open|Partial');nav('sales')",lbl:'Orders'});
  if(c.resTotal>0)rows.push({level:'orange',cnt:String(c.resTotal),title:'Customer resolutions',sub:(c.resOpenW||0)+' warranty \u00b7 '+(c.resOpenSE||0)+' ship error'+(c.resOpenSE===1?'':'s'),nav:"navResolution('claims')",lbl:'Resolutions'});
  if(sa>0&&!opts.skipStock)rows.push({level:zeroN>0?'red':(c.critical>0?'orange':'yellow'),cnt:String(sa),title:'Assembly stock alerts',sub:(c.critical||0)+' critical \u00b7 '+(c.lowStock||0)+' low'+(zeroN>0?' \u00b7 '+zeroN+' at zero stock':''),nav:"nav('assemblies')",lbl:'Assemblies'});
- if(c.needsReorder>0)rows.push({level:'yellow',cnt:String(c.needsReorder),title:'Parts below their reorder point',sub:fc(c.invVal||0,0)+' of stock on hand',nav:"nav('planning')",lbl:'Planning'});
+ if(c.needsReorder>0)rows.push({level:'yellow',cnt:String(c.needsReorder),title:'Parts to reorder',sub:'about '+fc(c.reorderVal||0,0)+' at current cost, after what is already on order',nav:"nav('planning')",lbl:'Planning'});
+ if(c.buildNeeded>0)rows.push({level:'teal',cnt:String(c.buildNeeded),title:'Finished goods to build',sub:'none on hand, but the parts are on the shelf',nav:"nav('packqueue')",lbl:'Pack queue'});
+ if(c.noLeadTime>0)rows.push({level:'yellow',cnt:String(c.noLeadTime),title:'Parts that sell but have no lead time',sub:'planned as 2 weeks until one is entered',nav:"nav('planning')",lbl:'Planning'});
+ if(c.pkgGuess>0)rows.push({level:'yellow',cnt:String(c.pkgGuess),title:'Parts treated as packaging by their name or category',sub:'confirm each one, so a real part is never ignored in a build check',nav:"openPackagingReview()",lbl:'Review'});
+ if(c.costReview>0)rows.push({level:'yellow',cnt:String(c.costReview),title:'Parts received at a different cost',sub:'paid 10% or more above or below the cost on file',nav:"openCostReview()",lbl:'Review'});
+ if(c.staleDrafts>0)rows.push({level:'yellow',cnt:String(c.staleDrafts),title:'Draft POs older than 7 days',sub:'they count as on order, so their parts are not suggested again',nav:"nav('purchases')",lbl:'View POs'});
  rows.forEach(function(r,i){r._i=i;});
  rows.sort(function(a,b){return ((NY_LEVEL[a.level]===undefined?4:NY_LEVEL[a.level])-(NY_LEVEL[b.level]===undefined?4:NY_LEVEL[b.level]))||(a._i-b._i);});
  return rows;
@@ -3483,7 +3485,7 @@ var FEED_CHIPS=[['all','All'],['ship','Shipped'],['order','New orders'],['stock'
 function d2Age(day){var n=dlSince(day);if(n===null)return null;return {txt:n<=0?'today':n+'d',old:n>=3};}
 function d2ShippedToday(){var today=centralDateOnly(),seen={};(S.sales||[]).forEach(function(s){if(!s.shipped_at||isInternal(s.order_number))return;if(!/^(shipped|delivered)$/i.test(String(s.fulfillment_status||'')))return;var d;try{d=centralDateOnly(s.shipped_at);}catch(e){return;}if(d===today)seen[s.order_number||s.id]=1;});return Object.keys(seen).length;}
 function _lc(s){s=String(s==null?'':s);return /^[A-Z][a-z]/.test(s)?s.charAt(0).toLowerCase()+s.slice(1):s;}
-function _d2Txt(r){var s=r.cnt?(r.cnt+' '+_lc(r.title)):String(r.title||'');if(r.cnt==='1')s=s.replace(/^1 assembly stock alerts/,'1 assembly stock alert').replace(/^1 parts /,'1 part ').replace(/^1 customer resolutions/,'1 customer resolution');return s;}
+function _d2Txt(r){var s=r.cnt?(r.cnt+' '+_lc(r.title)):String(r.title||'');if(r.cnt==='1')s=s.replace(/^1 assembly stock alerts/,'1 assembly stock alert').replace(/^1 parts /,'1 part ').replace(/^1 part that sell but have/,'1 part that sells but has').replace(/^1 finished goods/,'1 finished good').replace(/^1 draft POs/,'1 draft PO').replace(/^1 parts? treated as packaging/,'1 part treated as packaging').replace(/^1 customer resolutions/,'1 customer resolution');return s;}
 function _d2Tag(r){return /\bPOs?\b|purchase|vendor|reorder/i.test(r.title+' '+(r.sub||''))?'BUY':'FIX';}
 function d2Strip(c){
  var open=localStorage.getItem('dev_pipeline_open')==='true';
@@ -3591,7 +3593,7 @@ function feedFilter(k){
  var e=document.querySelector('#dash2-feed .d2-fe');if(e)e.style.display=n?'none':'';
 }
 function d2Reorder(){
- var list=S.parts.filter(function(p){return !p.discontinued&&(avgWk(p)>0)&&Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn))<=calcReorderPoint(p);}).sort(function(a,b){
+ var list=S.parts.filter(partNeedsReorder).sort(function(a,b){
   var w=function(p){var d=avgWk(p)||calcForecast(p.pn);if(!d)return 999;return Math.max(-99,(p.total_unpckgd||0)-boReserved(p.pn))/d;};return w(a)-w(b);}).slice(0,4);
  var rows=list.map(function(p){var sq=calcSuggestedQty(p);
   return '<div class="dsh-ac"><b class="dsh-sku" style="min-width:140px">'+escHtml(dispPn(p))+'</b><small style="flex:1"><b style="color:var(--red)">'+(p.total_unpckgd||0)+'</b> on hand &middot; reorder point '+calcReorderPoint(p)+'</small><button class="action-btn" onclick=\'createPOFromSuggestion("'+p.pn+'","'+(p.vendor||'')+'",'+sq+','+(p.unit_cost||0)+',"")\'>Order '+sq+'</button></div>';}).join('');
@@ -3638,7 +3640,13 @@ function renderDashboard(){
   const devItems=S.assemblies.filter(a=>!a.discontinued&&isDev(a));
   const critical=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&liveStatus(a)==='critical').length;
   const lowStock=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&liveStatus(a)==='low').length;
-  const needsReorder=S.parts.filter(p=>!p.discontinued&&(avgWk(p)>0||calcForecast(p.pn)>0)&&Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn))<=calcReorderPoint(p)).length;
+  const needsReorder=S.parts.filter(partNeedsReorder).length;
+ const reorderVal=S.parts.reduce((s,p)=>s+(partNeedsReorder(p)?calcSuggestedQty(p)*(p.unit_cost||0):0),0);   // (v23.89) what it would cost to order them, not the whole stock value
+ const buildNeeded=S.assemblies.filter(a=>!a.discontinued&&!isDev(a)&&liveStatus(a)==='build').length;
+ const noLeadTime=S.parts.filter(p=>!p.discontinued&&!p.build_to_order&&effectiveWkDemand(p)>0&&!(p.lead_time_weeks>0)).length;
+ const pkgGuess=packagingToReview().length;
+ const costReview=costsToReview().length;
+ const staleDrafts=S.purchases.filter(p=>p.status==='Draft'&&String(p.order_date||p.created_at||'').slice(0,10)&&String(p.order_date||p.created_at||'').slice(0,10)<daysAgo(7)).length;
   const invVal=S.parts.reduce((s,p)=>s+Math.max(0,p.total_unpckgd||0)*(p.unit_cost||0),0);
   const openOrders  =countGroupedStatus('Open');
   const onHoldCount =countGroupedStatus('On Hold');
@@ -3727,7 +3735,7 @@ function renderDashboard(){
     ${openWarranty>0?`<button class="filter-chip" onclick="nav('warranty')">${openWarranty} open warranty claim${openWarranty>1?'s':''}</button>`:''}
     ${openCounts>0?`<button class="filter-chip" onclick="nav('cyclecounts')">${openCounts} cycle count${openCounts>1?'s':''} in progress</button>`:''}
   </div>`:''}
-  ${dash2Html({devItems:devItems,freshOpen:freshOpen,partialCount:partialCount,onHoldCount:onHoldCount,packedCount:packedCount,critical:critical,lowStock:lowStock,needsReorder:needsReorder,invVal:invVal,resTotal:resTotal,resOpenW:resOpenW,resOpenSE:resOpenSE,revThisMonth:revThisMonth,thisMonthOrderCount:thisMonthOrderCount,avgShipDays:avgShipDays,shipped30:_ship30.length,returnRate:returnRate,orders30:_orders30,openPOs:openPOs,openPOAmt:openPOAmt,overduePOCount:(function(){try{return poFollowCounts().list.filter(function(f){return f.state==='overdue';}).length;}catch(e){return 0;}})(),openLines:freshOpenLines,packedLines:packedLines,feed:feed})}`;
+  ${dash2Html({devItems:devItems,freshOpen:freshOpen,partialCount:partialCount,onHoldCount:onHoldCount,packedCount:packedCount,critical:critical,lowStock:lowStock,needsReorder:needsReorder,reorderVal:reorderVal,buildNeeded:buildNeeded,noLeadTime:noLeadTime,staleDrafts:staleDrafts,pkgGuess:pkgGuess,costReview:costReview,invVal:invVal,resTotal:resTotal,resOpenW:resOpenW,resOpenSE:resOpenSE,revThisMonth:revThisMonth,thisMonthOrderCount:thisMonthOrderCount,avgShipDays:avgShipDays,shipped30:_ship30.length,returnRate:returnRate,orders30:_orders30,openPOs:openPOs,openPOAmt:openPOAmt,overduePOCount:(function(){try{return poFollowCounts().list.filter(function(f){return f.state==='overdue';}).length;}catch(e){return 0;}})(),openLines:freshOpenLines,packedLines:packedLines,feed:feed})}`;
 }
 
 /* ===== Note keyword -> row highlight ===== */
@@ -6437,7 +6445,10 @@ function _orderBOMBoxParts(orderNum){
       var part=partByPn(b.child_pn);
       if(!part||seen[part.pn])return;
       var pnl=(part.pn||'').toLowerCase();
-      if(_isBoxCat(part.category)||pnl.includes('box')||pnl.includes('pkg')||pnl.includes('-ship')){
+      if(part.is_packaging===false)return;   // (v23.90) marked as a real part
+ var _isPk=isNonRawSupplyItem(b.item_type,part.category,part.description,part.pn);
+ // a name that merely contains "box" (GEARBOX-MOUNT) is only offered as a shipping box when the part IS packaging
+ if(_isBoxCat(part.category)||(_isPk&&(pnl.includes('box')||pnl.includes('carton')||pnl.includes('pkg')||pnl.includes('-ship')))){
         seen[part.pn]=true;out.push(part);
       }
     });
@@ -12490,11 +12501,14 @@ async function bomMaxBuild(pn: string): Promise&lt;{ hasBOM: boolean, maxBuild: 
   }
   if (!(bomOf[pn] || []).length) return { hasBOM: false, maxBuild: 0 }
   const allChildren = [...childPns]
-  const partRec: Record&lt;string, { stock: number, cat: string, desc: string }&gt; = {}
+  const partRec: Record&lt;string, { stock: number, cat: string, desc: string, pk: boolean | null }&gt; = {}
   const asmRec: Record&lt;string, { oh: number }&gt; = {}
   if (allChildren.length) {
-    const { data: prows } = await db.from('parts').select('pn,total_unpckgd,category,description').in('pn', allChildren)
-    ;(prows || []).forEach((p: any) =&gt; { partRec[p.pn] = { stock: Number(p.total_unpckgd) || 0, cat: (p.category || '').toLowerCase(), desc: (p.description || '').toLowerCase() } })
+    // [v23.107] the part's own Packaging setting (parts.is_packaging: true / false / not set) wins over every guess, exactly as in the ERP.
+    // The column is optional: if it has not been added yet the read falls back and the category and keyword rules apply as before.
+    let { data: prows, error: perr } = await db.from('parts').select('pn,total_unpckgd,category,description,is_packaging').in('pn', allChildren)
+    if (perr) ({ data: prows } = await db.from('parts').select('pn,total_unpckgd,category,description').in('pn', allChildren))
+    ;(prows || []).forEach((p: any) =&gt; { partRec[p.pn] = { stock: Number(p.total_unpckgd) || 0, cat: (p.category || '').toLowerCase(), desc: (p.description || '').toLowerCase(), pk: p.is_packaging === true ? true : (p.is_packaging === false ? false : null) } })
     const { data: arows } = await db.from('assemblies').select('pn,total_on_hand').in('pn', allChildren)
     ;(arows || []).forEach((a: any) =&gt; { asmRec[a.pn] = { oh: Number(a.total_on_hand) || 0 } })
   }
@@ -12512,8 +12526,10 @@ async function bomMaxBuild(pn: string): Promise&lt;{ hasBOM: boolean, maxBuild: 
   const NONRAW_SUPPLY_CATS = ['box', 'boxes', 'packaging', 'packing', 'carton', 'cartons', 'label', 'labels', 'shipping', 'bulk pieces', 'sticker', 'stickers', 'decal', 'decals', 'rebate', 'rebate card', 'rebate cards', 'marketing', 'insert', 'inserts', 'literature', 'card', 'cards', 'flyer', 'flyers', 'brochure', 'brochures']
   const NONRAW_SUPPLY_KW = ['sticker', 'decal', 'rebate', 'flyer', 'brochure', 'mailer', 'pamphlet']
   const inc = (i: { child_pn: string, item_type: string }): boolean =&gt; {
-    if (i.item_type === 'packaging') return false
     const pr = partRec[i.child_pn]
+    if (pr &amp;&amp; pr.pk === true) return false    // marked as packaging on the part
+    if (pr &amp;&amp; pr.pk === false) return true    // marked as a real part on the part: no guess overrides it
+    if (i.item_type === 'packaging') return false
     if (pr) {
       const c = pr.cat
       if (c) {
@@ -12961,7 +12977,7 @@ async function voidSweep(): Promise&lt;any&gt; {
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.106'
+const EDGE_BUILD = 'v23.107'
 const _gateLogged: Record&lt;string, number&gt; = {}
 async function authGate(req: Request, fn: string, action: string): Promise&lt;Response | null&gt; {
   const mode = (Deno.env.get('EDGE_AUTH_MODE') || 'log').toLowerCase()
@@ -17950,7 +17966,8 @@ function openModal(type,data){
     ${partsHaveMsrp()?`<div class="form-row cols-2">${fi('m-pmsrp','MSRP (retail)',data.msrp||0,'type="number" step="0.01" title="Leave 0 to fall back to the calculated suggestion (unit cost x 1.6)"')}<div class="form-group"><label class="form-label">&nbsp;</label><div class="t3xs" style="padding-top:9px">Entered MSRP drives Profit in Master Lookup. 0 = use calculated.</div></div></div>`:''}
     <div class="form-row cols-2">${fi('m-lead','Lead Time (wks)',data.lead_time_weeks||1,'type="number" min="1"')} ${fi('m-avg','Avg Sales / Wk',data.avg_sales_wk||0,'type="number" step="0.01"')}</div>
     <div class="form-row cols-2">${fi('m-unpckgd','On Hand (Unpacked)',data.total_unpckgd||0,'type="number"')} ${fi('m-min','Min Stock (Reorder Point)',data.min_qty||0,'type="number" step="1"')}</div>
-    <div class="form-row cols-2">${fi('m-max','Max Stock Target',data.max_qty||0,'type="number" step="1" min="0" title="Target stock level. Used for suggested order quantity."')} ${fi('m-moq','Min Order Qty (MOQ)',data.moq||0,'type="number" step="1" min="0" title="Leave 0 to ignore. Prompts a warning when PO qty is below this."')}</div>
+    <div class="form-row cols-2">${fi('m-max','Max Stock Target',data.max_qty||0,'type="number" step="1" min="0" title="Target stock level. Used for suggested order quantity."')} ${fi('m-moq','Min Order Qty (MOQ)',data.moq||0,'type="number" step="1" min="0" title="The least you can order. Leave 0 to ignore."')}</div>
+ <div class="form-row cols-2">${fi('m-mult','Order in Multiples Of (pack size)',data.order_multiple||0,'type="number" step="1" min="0" title="Only for parts sold in fixed packs, such as boxes of 100. Leave 0 when any quantity above the minimum can be ordered."')}${fs('m-pkg','Packaging',[['','Auto (decided by category and name)'],['yes','Yes: packaging, never blocks a build'],['no','No: a real part']],data.is_packaging===true?'yes':(data.is_packaging===false?'no':''))}</div>
     <div class="form-row cols-2">${fi('m-loc','Bin Location',data.location||'')} ${fi('m-safety','Safety Stock',data.safety_stock||0,'type="number" step="1" min="0" title="Extra buffer stock to maintain above the reorder point"')}</div>
     <div class="form-row">
       <label style="display:flex;align-items:center;gap:8px;font-size:var(--t-md);color:var(--text2);cursor:pointer;padding:8px 10px;background:${data.build_to_order?'var(--orange-dim)':'var(--bg3)'};border:1px solid ${data.build_to_order?'rgba(234,88,12,.3)':'var(--border)'};border-radius:var(--r-md)">
@@ -18575,6 +18592,9 @@ async function _submitPartImpl(eid){
   // shipment went out and the shipped units came back. It now moves only if On Hand was actually edited,
   // and then as a delta through adjustStock (one stock rule, audited, Shopify synced).
   const _ohEl=$('m-unpckgd');const _ohChanged=!!(eid&&_ohEl&&String(_ohEl.value).trim()!==String(_ohEl.defaultValue).trim());const _ohTarget=payload.total_unpckgd;
+ // (v23.89) the pack multiple is only written when it is used or the column exists, so saving a part keeps working before part_order_multiple.sql is run
+ {const _mu=parseFloat(($('m-mult')||{}).value)||0,_pown=eid?S.parts.find(function(x){return x.id===eid;}):null;if(_mu>0||(_pown&&('order_multiple' in _pown)))payload.order_multiple=_mu>0?_mu:null;
+  const _pk=(($('m-pkg')||{}).value)||'';if(_pk==='yes'||_pk==='no'||(_pown&&('is_packaging' in _pown)))payload.is_packaging=_pk==='yes'?true:(_pk==='no'?false:null);}
   if(eid)delete payload.total_unpckgd;
   if(_isBoxCat(payload.category)){
     var _bl=document.getElementById('m-box-l'),_bw=document.getElementById('m-box-w'),_bh=document.getElementById('m-box-h');
@@ -22891,7 +22911,7 @@ function _mmInt(v){var n=(typeof v==='string')?parseFloat(v):v;return(typeof n==
 function _mmGuard(v,base){if(!(base>0))return v;var lo=Math.floor(base*0.5),hi=Math.ceil(base*2);return Math.min(hi,Math.max(lo,v));}
 function _mmFixMax(min,max,moq,gap){
   if(max<min)max=min+Math.max(1,gap||1);          // order-up-to can never sit below the reorder point
-  if(moq>0)max=Math.ceil(max/moq)*moq;            // and must be an orderable quantity
+  if(moq>0&&max<moq)max=moq;            // and must be an orderable quantity
   return max;
 }
 function _mmPrompt(chunk){
@@ -23363,7 +23383,7 @@ function renderPOBuilder(){
   let list=S.parts.filter(p=>!p.discontinued);
   if(q)list=list.filter(p=>p.pn.toLowerCase().includes(q)||(p.new_sku||'').toLowerCase().includes(q)||(p.description||'').toLowerCase().includes(q));
   if(sf.vendor)list=list.filter(p=>(p.vendor||'')===sf.vendor);
-  if(sf.reorder)list=list.filter(p=>Math.max(0,(p.total_unpckgd||0)-boReserved(p.pn))<=calcReorderPoint(p));
+  if(sf.reorder)list=list.filter(partNeedsReorder);
   list=list.slice(0,200);
   const pm={};S.parts.forEach(p=>pm[p.pn]=p);
   const cartTotal=S.poCart.reduce((t,c)=>t+c.qty*costForQty(pm[c.pn]||{},c.qty),0);
@@ -23484,8 +23504,15 @@ const NONRAW_SUPPLY_KW=['sticker','decal','rebate','flyer','brochure','mailer','
 // e.g. "Products/Drivetrain/DUMPBOXES" is a real tracked part, not packaging) - then a
 // description/pn keyword fallback for items like rebate cards or stickers that are not always
 // cleanly categorized.
+// (v23.90) ONE packaging rule for the whole ERP and the server: the build check, the re-check after a stock change, the packing shortage prompt and the box
+// picker all ask this. The part's own Packaging setting (parts.is_packaging) wins over every guess: Yes = packaging, No = a real part. With no setting, the
+// bill-of-materials line type, the category lists and the keywords decide, as before.
 function isNonRawSupplyItem(itemType,category,description,pn){
-  if(itemType==='packaging')return true;
+ var _pp=null;
+ if(pn){_pp=(S._partIdx&&S._partIdx[pn])||null;if(!_pp){try{_pp=partByPn(pn);}catch(e){_pp=null;}}}
+ if(_pp&&_pp.is_packaging===true)return true;
+ if(_pp&&_pp.is_packaging===false)return false;
+ if(itemType==='packaging')return true;
   var catFull=((category||'')+'').toLowerCase().trim();
   var listLower=NONRAW_SUPPLY_CATS.map(function(c){return c.toLowerCase();});
   if(catFull){
@@ -23841,6 +23868,120 @@ function openOrderedQty(pn) {
   return m[k]||0;
 }
 
+// (v23.89) ONE test for "this part needs reordering", used by the dashboard count, the Reorder Queue, the PO builder filter and the three create-PO actions.
+// They used three different formulas: two ignored stock reserved for backorders, none counted what is already on order, so a part with a PO placed still
+// showed as below its reorder point (with a suggested order of 0).
+// stockPosition = on hand - reserved for backorders - promised to open orders + already on order. A part needs reordering when that position is at or
+// below its reorder point AND there is something to order.
+function stockPosition(p){return (p.total_unpckgd||0)-boReserved(p.pn)-(openOrderDemand(p.pn)||0)+(openOrderedQty(p.pn)||0);}
+function partNeedsReorder(p){
+ if(!p||p.discontinued)return false;
+ if(p.build_to_order)return calcSuggestedQty(p)>0;
+ return stockPosition(p)<=calcReorderPoint(p)&&calcSuggestedQty(p)>0;
+}
+// (v23.90) Why the ERP thinks a part is packaging when nobody has said so, in words. null = it does not think so.
+function packagingGuess(p){
+ if(!p||p.is_packaging===true||p.is_packaging===false)return null;
+ if(p.item_type==='packaging')return 'its type is packaging';
+ var cat=String(p.category||'').toLowerCase().trim(),top=cat.split('/')[0].trim();
+ var list=NONRAW_SUPPLY_CATS.map(function(c){return c.toLowerCase();});
+ if(cat&&(list.indexOf(cat)!==-1||list.indexOf(top)!==-1))return 'category "'+(p.category||'')+'"';
+ var hay=(String(p.description||'')+' '+String(p.pn||'')).toLowerCase();
+ var kw=NONRAW_SUPPLY_KW.filter(function(k){return hay.indexOf(k)!==-1;})[0];
+ return kw?('the word "'+kw+'" in its name or description'):null;
+}
+function packagingToReview(){return (S.parts||[]).filter(function(p){return !p.discontinued&&('is_packaging' in p)&&packagingGuess(p);});}
+function openPackagingReview(){
+ var ov=document.getElementById('pkgrev-ov');if(ov)ov.remove();
+ var list=packagingToReview().sort(function(a,b){return String(a.pn).localeCompare(String(b.pn));});
+ ov=document.createElement('div');ov.id='pkgrev-ov';ov.className='ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9000;display:flex;align-items:flex-start;justify-content:center;padding:24px 12px;overflow:auto';
+ ov.onclick=function(e){if(e.target===ov)ov.remove();};
+ var rows=list.map(function(p){return '<tr data-pkg="'+escHtml(String(p.id))+'"><td style="padding:6px 10px;font-family:var(--mono);font-weight:700;white-space:nowrap">'+escHtml(dispPn(p))+'</td><td style="padding:6px 10px">'+escHtml(p.description||'')+'</td><td style="padding:6px 10px;color:var(--text2)">'+escHtml(packagingGuess(p))+'</td><td style="padding:6px 10px;white-space:nowrap;text-align:right"><button class="btn btn-sm" onclick="setPartPackaging(\''+escHtml(String(p.id))+'\',true)">Packaging</button> <button class="btn btn-sm" onclick="setPartPackaging(\''+escHtml(String(p.id))+'\',false)">Real part</button></td></tr>';}).join('');
+ ov.innerHTML='<div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);width:min(980px,100%);box-shadow:0 12px 40px rgba(0,0,0,.4)">'
+  +'<div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px"><b style="font-size:var(--t-lg)">Packaging review</b><span style="color:var(--text3)">'+list.length+' part'+(list.length===1?'':'s')+' to confirm</span><button class="btn btn-sm" style="margin-left:auto" onclick="document.getElementById(\'pkgrev-ov\').remove()">Close</button></div>'
+  +'<div style="padding:12px 18px;color:var(--text2);font-size:var(--t-sm)">These parts are being treated as packaging because of their category or a word in their name. Packaging never blocks a build, so a real part on this list would make a finished good look buildable when it is not. Confirm each one. Parts you mark leave the list.</div>'
+  +(list.length?('<div style="padding:0 18px 10px"><button class="btn btn-sm" onclick="setAllPackagingGuesses()">Confirm all '+list.length+' as packaging</button></div><div style="max-height:60vh;overflow:auto;border-top:1px solid var(--border)"><table style="width:100%;border-collapse:collapse;font-size:var(--t-sm)"><thead><tr><th style="padding:6px 10px;text-align:left">Part</th><th style="padding:6px 10px;text-align:left">Description</th><th style="padding:6px 10px;text-align:left">Why it is treated as packaging</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'):'<div style="padding:24px 18px;color:var(--text3)">Nothing to confirm. Every packaging part has been set by a person.</div>')
+  +'</div>';
+ document.body.appendChild(ov);
+}
+async function setPartPackaging(id,val,_quiet){
+ var p=S.parts.find(function(x){return String(x.id)===String(id);});if(!p)return false;
+ var r=await db.from('parts').update({is_packaging:val}).eq('id',p.id);
+ if(r&&r.error){toast('Not saved: '+r.error.message+(/is_packaging/.test(r.error.message||'')?' \u2014 run part_packaging.sql in Supabase first':''),9000);return false;}
+ S.parts=S.parts.map(function(x){return x.id===p.id?Object.assign({},x,{is_packaging:val}):x;});S._partIdx=null;
+ try{logAction((val?'Marked as packaging: ':'Marked as a real part: ')+p.pn,'parts',p.pn,{is_packaging:p.is_packaging==null?null:p.is_packaging},{is_packaging:val}).catch(function(){});}catch(e){}
+ if(!val){try{cascadeShopifySync(p.pn);}catch(e){}}   // a real part can change what is buildable: re-check the finished goods that use it
+ if(!_quiet){toast(dispPn(p)+(val?' is packaging':' is a real part'));openPackagingReview();render();}
+ return true;
+}
+async function setAllPackagingGuesses(){
+ var list=packagingToReview();if(!list.length)return;
+ if(!confirm('Mark all '+list.length+' as packaging?\n\nOnly do this if you have read the list: packaging never blocks a build.'))return;
+ var n=0;for(var i=0;i<list.length;i++){if(await setPartPackaging(list[i].id,true,true))n++;else break;}
+ toast(n+' part'+(n===1?'':'s')+' confirmed as packaging');openPackagingReview();render();
+}
+// (v23.91) COST ON RECEIPT. Receiving a PO line used to add stock and nothing else: the price paid was never compared with the part's cost, so a vendor
+// price rise only showed up when someone edited the part. Every receipt of a part now records what was paid (last cost), keeps a running average
+// weighted by what was on the shelf, and flags the part when the price paid is 10% or more above or below the cost on file. The cost on file is never
+// changed automatically: it feeds your margins and bills of materials, so a person accepts or rejects the new price in the Cost review.
+const COST_VARIANCE_PCT=10;
+function costVariance(p){
+ if(!p||p.discontinued)return null;
+ var lc=Number(p.last_cost)||0,uc=Number(p.unit_cost)||0;
+ if(!(lc>0))return null;
+ if(p.cost_ack!=null&&Number(p.cost_ack)===lc)return null;       // already reviewed at this price
+ if(!(uc>0))return {pct:100,last:lc,cur:0,noCost:true};           // no cost on file at all: the receipt is the first real number
+ var pct=(lc-uc)/uc*100;
+ return Math.abs(pct)>=COST_VARIANCE_PCT?{pct:pct,last:lc,cur:uc}:null;
+}
+function costsToReview(){return (S.parts||[]).filter(function(p){return ('last_cost' in p)&&costVariance(p);});}
+async function recordReceiptCost(pn,qty,lineId,poId){
+ var part=partByPn(pn);if(!part||!('last_cost' in part))return null;    // a finished good, or part_costs.sql has not been run: nothing to record
+ var line=((S.poLines&&S.poLines[poId])||[]).find(function(l){return l.id===lineId;});
+ var cost=Number(line&&line.unit_cost)||0;qty=Number(qty)||0;
+ if(!(cost>0)||!(qty>0))return null;
+ var after=Number(part.total_unpckgd)||0,before=Math.max(0,after-qty);
+ var base=Number(part.avg_cost)>0?Number(part.avg_cost):(Number(part.unit_cost)||0);
+ var avg=(before>0&&base>0)?((before*base+qty*cost)/(before+qty)):cost;
+ avg=Math.round(avg*10000)/10000;
+ var upd={last_cost:cost,last_cost_at:new Date().toISOString(),avg_cost:avg};
+ var r=await db.from('parts').update(upd).eq('id',part.id);
+ if(r&&r.error){console.warn('[TGK] receipt cost not recorded:',r.error.message);return null;}
+ S.parts=S.parts.map(function(x){return x.id===part.id?Object.assign({},x,upd):x;});S._partIdx=null;
+ var v=costVariance(Object.assign({},part,upd));
+ if(v)toast('<span class="ic ic-alert"></span>'+escHtml(dispSku(pn))+' was received at '+fc(cost)+(v.noCost?' and has no cost on file':(', '+Math.abs(v.pct).toFixed(0)+'% '+(v.pct>0?'above':'below')+' its cost of '+fc(part.unit_cost)))+'. Review it from the Dashboard.',9000);
+ return upd;
+}
+function openCostReview(){
+ var ov=document.getElementById('costrev-ov');if(ov)ov.remove();
+ var list=costsToReview().sort(function(a,b){return Math.abs(costVariance(b).pct)-Math.abs(costVariance(a).pct);});
+ ov=document.createElement('div');ov.id='costrev-ov';ov.className='ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9000;display:flex;align-items:flex-start;justify-content:center;padding:24px 12px;overflow:auto';
+ ov.onclick=function(e){if(e.target===ov)ov.remove();};
+ var rows=list.map(function(p){var v=costVariance(p),id=escHtml(String(p.id));
+  return '<tr><td style="padding:6px 10px;font-family:var(--mono);font-weight:700;white-space:nowrap">'+escHtml(dispPn(p))+'</td><td style="padding:6px 10px">'+escHtml(p.description||'')+'</td>'
+   +'<td style="padding:6px 10px;text-align:right;white-space:nowrap">'+(v.noCost?'<span style="color:var(--text3)">none</span>':fc(v.cur))+'</td><td style="padding:6px 10px;text-align:right;white-space:nowrap;font-weight:700">'+fc(v.last)+'</td>'
+   +'<td style="padding:6px 10px;text-align:right;white-space:nowrap;font-weight:700;color:'+(v.pct>0?'var(--red)':'var(--teal)')+'">'+(v.noCost?'new':((v.pct>0?'+':'')+v.pct.toFixed(0)+'%'))+'</td>'
+   +'<td style="padding:6px 10px;white-space:nowrap;color:var(--text3)">'+escHtml(String(p.last_cost_at||'').slice(0,10))+'</td>'
+   +'<td style="padding:6px 10px;white-space:nowrap;text-align:right"><button class="btn btn-sm" onclick="setPartCost(\''+id+'\',true)">Use '+fc(v.last)+'</button> <button class="btn btn-sm" onclick="setPartCost(\''+id+'\',false)">Keep '+(v.noCost?'none':fc(v.cur))+'</button></td></tr>';}).join('');
+ ov.innerHTML='<div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);width:min(1040px,100%);box-shadow:0 12px 40px rgba(0,0,0,.4)">'
+  +'<div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px"><b style="font-size:var(--t-lg)">Cost review</b><span style="color:var(--text3)">'+list.length+' part'+(list.length===1?'':'s')+' received at a different cost</span><button class="btn btn-sm" style="margin-left:auto" onclick="document.getElementById(\'costrev-ov\').remove()">Close</button></div>'
+  +'<div style="padding:12px 18px;color:var(--text2);font-size:var(--t-sm)">These parts were last received at a price '+COST_VARIANCE_PCT+'% or more away from the cost on file. The cost on file drives your stock value, bill of materials costs and margins, so it only changes when you choose "Use". "Keep" leaves it and stops asking until the price changes again.</div>'
+  +(list.length?('<div style="max-height:62vh;overflow:auto;border-top:1px solid var(--border)"><table style="width:100%;border-collapse:collapse;font-size:var(--t-sm)"><thead><tr><th style="padding:6px 10px;text-align:left">Part</th><th style="padding:6px 10px;text-align:left">Description</th><th style="padding:6px 10px;text-align:right">Cost on file</th><th style="padding:6px 10px;text-align:right">Last paid</th><th style="padding:6px 10px;text-align:right">Change</th><th style="padding:6px 10px;text-align:left">Received</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'):'<div style="padding:24px 18px;color:var(--text3)">Nothing to review. Every recent receipt was within '+COST_VARIANCE_PCT+'% of the cost on file.</div>')
+  +'</div>';
+ document.body.appendChild(ov);
+}
+async function setPartCost(id,useNew){
+ var p=S.parts.find(function(x){return String(x.id)===String(id);});if(!p)return false;
+ var lc=Number(p.last_cost)||0;if(!(lc>0))return false;
+ var upd=useNew?{unit_cost:lc,cost_ack:lc}:{cost_ack:lc};
+ var r=await db.from('parts').update(upd).eq('id',p.id);
+ if(r&&r.error){toast('Not saved: '+r.error.message,9000);return false;}
+ S.parts=S.parts.map(function(x){return x.id===p.id?Object.assign({},x,upd):x;});S._partIdx=null;
+ try{logAction(useNew?('Cost updated from the last receipt: '+p.pn+' '+fc(p.unit_cost||0)+' to '+fc(lc)):('Cost kept after a receipt at '+fc(lc)+': '+p.pn),'parts',p.pn,{unit_cost:p.unit_cost||0},{unit_cost:useNew?lc:(p.unit_cost||0)}).catch(function(){});}catch(e){}
+ toast(dispPn(p)+(useNew?(' now costs '+fc(lc)):' keeps its cost'));
+ openCostReview();render();
+ return true;
+}
 function calcReorderPoint(p) {
   if(p&&p.build_to_order)return 0; // build-to-order: ordered only when a finished good needs it, never buffered
   const demand = effectiveWkDemand(p);
@@ -23865,7 +24006,7 @@ function btoPullNeed(p){
     const fg=(S._asmIdx&&S._asmIdx[parent])||asmByPn(parent);
     if(!fg||fg.discontinued||fg.stage==='dev'||fg.build_to_order)continue;
     const st=liveStatus(fg);
-    if(st!=='low'&&st!=='critical')continue;      // finished good is fine -> component not needed yet
+    if(st!=='low'&&st!=='critical'&&st!=='build')continue;      // finished good is fine -> component not needed yet
     const wk=asmAvgWk(fg);
     const target=Math.max(1,_covUnitsWk(fg.pn,wk,cov));    // build back up to coverage weeks
     const short=Math.max(0, target-(fg.total_on_hand||0)-(openOrderedQty(fg.pn)||0));
@@ -23898,7 +24039,7 @@ function calcSuggestedQty(p) {
     // [HORIZON] The selected horizon defines target coverage. max_qty must NOT cap this branch:
     // max is an order-up-to level computed for one default cycle, so capping here froze the
     // suggestion at the same number across 4w..52w (the "horizon doesn't adapt" bug).
-    const needed = Math.ceil(wkDemand * (fw + lt) + evUplift(p.pn, fw + lt)); // [v23.46] + events
+    const needed = Math.ceil(wkDemand * (fw + lt) + evUplift(p.pn, fw + lt) + (p.safety_stock||0)); // [v23.46] + events; (v23.89) + safety stock, so the order does not arrive already inside the safety margin
     sq = Math.max(0, needed - available - onOrder);
   } else {
     if(max > 0) return Math.max(0, Math.ceil(max - available - onOrder));
@@ -23909,7 +24050,9 @@ function calcSuggestedQty(p) {
   const moq = p.moq || 0;
   const breaks = _getBreaks(p).filter(function(b){return b.qty>0&&b.price>0;}).sort(function(a,b){return a.qty-b.qty;});
   const effectiveMOQ = moq > 0 ? moq : (breaks.length > 0 ? breaks[0].qty : 0);
-  if(effectiveMOQ > 0) sq = Math.ceil(sq / effectiveMOQ) * effectiveMOQ; // round up to nearest MOQ multiple
+  if(effectiveMOQ > 0 && sq < effectiveMOQ) sq = effectiveMOQ; // (v23.89) a minimum is a floor: needing 101 with a minimum of 100 is 101, not 200
+ const _mult = Number(p.order_multiple)||0;
+ if(_mult > 0) sq = Math.ceil(sq / _mult) * _mult; // sold only in packs: round up to the pack size
   return sq;
 }
 
@@ -24534,7 +24677,7 @@ function renderPlanning() {
     const moq=p.moq||0;
     const _pb=_getBreaks(p).filter(function(b){return b.qty>0&&b.price>0;}).sort(function(a,b){return a.qty-b.qty;});
     const effectiveMOQ=moq>0?moq:(_pb.length>0?_pb[0].qty:0); // lowest break = implicit MOQ when no explicit MOQ
-    const orderQty=sq>0&&effectiveMOQ>0?Math.ceil(sq/effectiveMOQ)*effectiveMOQ:Math.max(sq,moq);
+    const orderQty=sq>0&&effectiveMOQ>0?Math.max(sq,effectiveMOQ):Math.max(sq,moq);
     const onOrder=openOrderedQty(p.pn);
     const effectiveStock=effectiveOh+onOrder;
     const wkd=effectiveWkDemand(p); // weighted/trending-aware demand rate
@@ -25215,7 +25358,7 @@ async function deduplicatePOs(){
 }
 
 async function createVendorPO(vendor){
-  let need=S.parts.filter(p=>!p.discontinued&&(p.vendor||'')===vendor&&(p.total_unpckgd||0)<=calcReorderPoint(p)).map(p=>{
+  let need=S.parts.filter(p=>!p.discontinued&&(p.vendor||'')===vendor&&partNeedsReorder(p)).map(p=>{
     const sq=calcSuggestedQty(p);const moq=p.moq||0;
     return {p,qty:Math.max(sq,moq),skip:(moq>0&&sq<moq)||Math.max(sq,moq)<=0};
   }).filter(x=>!x.skip);
@@ -25255,7 +25398,7 @@ async function createVendorPO(vendor){
 async function createSuggestedPOs(){
   const needsReorder=S.parts.filter(p=>{
     if(p.discontinued)return false;
-    return (p.total_unpckgd||0)<=calcReorderPoint(p)&&calcSuggestedQty(p)>0;
+    return partNeedsReorder(p)&&calcSuggestedQty(p)>0;
   });
   if(!needsReorder.length){toast('Nothing needs reordering');return;}
   const groups={};
@@ -25331,7 +25474,7 @@ async function createSuggestedPOs(){
 
 async function confirmCreateSuggestedPOs(){
   document.getElementById('create-po-review')?.remove();
-  const needsReorder=S.parts.filter(p=>{if(p.discontinued)return false;return (p.total_unpckgd||0)<=calcReorderPoint(p)&&calcSuggestedQty(p)>0;});
+  const needsReorder=S.parts.filter(p=>{if(p.discontinued)return false;return partNeedsReorder(p)&&calcSuggestedQty(p)>0;});
   const groups={};
   needsReorder.forEach(p=>{
     const sq=calcSuggestedQty(p);const moq=p.moq||0;
@@ -25883,7 +26026,8 @@ async function _checkInLineImpl(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived
     S.purchases = S.purchases.map(p=>p.id===poId?{...p,status:_doneSt}:p);
     S._onOrderMap=null;
   }
-  pushUndoMulti('Receive '+qty+'× '+pn+' on PO',undoOps);
+  try{await recordReceiptCost(pn,qty,lineId,poId);}catch(_ce){console.warn('[TGK] receipt cost:',_ce&&_ce.message);}   // (v23.91)
+ pushUndoMulti('Receive '+qty+'× '+pn+' on PO',undoOps);
   logAction('PO received: '+qty+' x '+pn,'purchases',pn,null,{qty,poId}).catch(()=>{});
   updateBadge();
   render();
@@ -25990,7 +26134,8 @@ async function checkInLineQuick(lineId, poId, pn, qtyOrdered, qtyAlreadyReceived
       await adjustStock('assembly',_rasm,qty,{reason:'PO Receipt \u2014 Bulk'+_poRef+lostRecvTag(poId),source:'po_receipt'});
     }
   }
-  if(S.poLines[poId]) S.poLines[poId]=S.poLines[poId].map(l=>l.id===lineId?{...l,qty_received:newReceived,status:'Complete'}:l);
+  try{await recordReceiptCost(pn,qty,lineId,poId);}catch(_ce){console.warn('[TGK] receipt cost:',_ce&&_ce.message);}   // (v23.91)
+ if(S.poLines[poId]) S.poLines[poId]=S.poLines[poId].map(l=>l.id===lineId?{...l,qty_received:newReceived,status:'Complete'}:l);
 }
 
 // ===================================================================================================
@@ -28085,7 +28230,7 @@ async function packUnits(pn, asmId, isUnpack, _qtyOverride) {
       const src=_as||_pt;
       const avail=src?(isSub?(src.total_on_hand||0):(src.total_unpckgd||0)):0;
       const need=item.qty*qty;
-      const isPkg=(item.item_type==='packaging'||item.item_type==='supply');
+      const isPkg=(item.item_type==='supply')||(!isSub&&isNonRawSupplyItem(item.item_type,(_pt&&_pt.category),(_pt&&_pt.description),item.child_pn)); // (v23.90) the shared packaging rule: a box in category Boxes is packaging here too, not "a real part is missing"
       if(avail<need)shortItems.push({pn:item.child_pn,need,avail,isSub,isPkg});
     }
     if(shortItems.length){
@@ -29833,7 +29978,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.88','shipstation-ship':'v23.106','ops-cron':'v1.3','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.3'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.88','shipstation-ship':'v23.107','ops-cron':'v1.3','customs-sync':'v1.0','customs-fill':'v1.4','po-email':'v1.3'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
