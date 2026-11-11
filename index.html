@@ -545,7 +545,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.91</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.92</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -610,7 +610,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.91';
+const TGK_ERP_VERSION = 'v23.92';
 const TGK_ERP_BUILD_DATE = '2026-11-09';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -18749,7 +18749,7 @@ async function confirmBulkDiscontinue(table){
   if(isParts){S.parts=S.parts.map(p=>ids.includes(p.id)?{...p,discontinued:true}:p);S.selectedParts=new Set();}
   else{S.assemblies=S.assemblies.map(a=>ids.includes(a.id)?{...a,discontinued:true}:a);S.selectedAsms=new Set();}
   render();
-  logAction('Bulk discontinued '+(count-failed)+' '+table+' items',table,null,null,null).catch(()=>{});
+  logAction('Bulk discontinued '+(ids.length-failed)+' '+table+' items',table,null,null,null).catch(()=>{});   // (v23.92) was (count-failed): count did not exist
   if(failed)toast('<span class="ic ic-alert"></span>'+failed+' items failed — check console',5000);
   else toast('<span class="ic ic-database"></span>'+ids.length+' '+(ids.length===1?noun+'y':noun+(isParts?'s':'ies'))+' discontinued.',4000);
 }
@@ -18820,7 +18820,6 @@ window.mergeDuplicateAssemblyPair=async function(legacyId,dupId,btnEl){
       ship_us:legacy.ship_us||dup.ship_us,
       ship_ca:legacy.ship_ca||dup.ship_ca,
       ship_intl:legacy.ship_intl||dup.ship_intl,
-      total_on_hand:(legacy.total_on_hand||0)+(dup.total_on_hand||0),
       updated_at:new Date().toISOString()
     };
     // [FIX] This used to add the duplicate's stock into the legacy row FIRST and delete the
@@ -18841,17 +18840,33 @@ window.mergeDuplicateAssemblyPair=async function(legacyId,dupId,btnEl){
     await _step('Removing duplicate BOM',db.from('bom_items').delete().eq('parent_pn',dup.pn));
     // Anything using the duplicate as a component now uses the legacy PN instead.
     await _step('Re-pointing BOM components',db.from('bom_items').update({child_pn:legacy.pn}).eq('child_pn',dup.pn));
-    const{error:updErr}=await db.from('assemblies').update(payload).eq('id',legacyId);
+    // (v23.92) open purchase orders for the duplicate follow the kept SKU, or they stop counting as on order and cannot be received
+ await _step('Re-pointing PO lines',db.from('po_lines').update({pn:legacy.pn}).eq('pn',dup.pn));
+ await _step('Re-pointing purchase orders',db.from('purchases').update({pn:legacy.pn}).eq('pn',dup.pn));
+ const{error:updErr}=await db.from('assemblies').update(payload).eq('id',legacyId);
     if(updErr)throw new Error('Update failed: '+updErr.message);
+ // (v23.92) The duplicate's stock used to be added to the kept item as a bare number change: no history line, so the daily stock check later
+ // reported it as unexplained drift. It now moves through the central stock routine, which writes the history line with the reason.
+ const _mq=Number(dup.total_on_hand)||0;let _newOh=Number(legacy.total_on_hand)||0;
+ if(_mq!==0){
+ const _n=await adjustStock('assembly',legacy,_mq,{reason:'Merged duplicate SKU '+dup.pn+' ('+_mq+' on hand moved in)',source:'merge',skipSync:true});
+ if(_n===null)throw new Error('Stock move failed - nothing was deleted, safe to retry');
+ _newOh=_n;
+ }
     const{error:delErr}=await db.from('assemblies').delete().eq('id',dupId);
     if(delErr){
       // Compensate: put the legacy row's stock back, so the duplicate (which still exists) is not
       // counted twice and a retry does not sum on top of an already-summed value.
-      const _rb=await db.from('assemblies').update({total_on_hand:legacy.total_on_hand||0,updated_at:new Date().toISOString()}).eq('id',legacyId);
-      if(_rb.error)throw new Error('Delete failed AND stock rollback failed - '+legacy.pn+' may be double-counting '+dup.pn+'\'s stock. Check both on hand values manually. ('+delErr.message+' / '+_rb.error.message+')');
+      if(_mq!==0){
+ const _back=await adjustStock('assembly',S.assemblies.find(function(a){return a.id===legacyId;})||legacy,-_mq,{reason:'Merge of '+dup.pn+' rolled back (the duplicate could not be deleted)',source:'merge',skipSync:true});
+ if(_back===null)throw new Error('Delete failed AND stock rollback failed - '+legacy.pn+' may be double-counting '+dup.pn+'\'s stock. Check both on hand values manually. ('+delErr.message+')');
+ }
       throw new Error('Delete failed ('+delErr.message+') - stock change was rolled back, safe to retry');
     }
-    S.assemblies=S.assemblies.map(function(a){return a.id===legacyId?Object.assign({},a,payload):a;}).filter(function(a){return a.id!==dupId;});
+    S.assemblies=S.assemblies.map(function(a){return a.id===legacyId?Object.assign({},a,payload,{total_on_hand:_newOh}):a;}).filter(function(a){return a.id!==dupId;});
+ Object.keys(S.poLines||{}).forEach(function(k){S.poLines[k]=(S.poLines[k]||[]).map(function(l){return l.pn===dup.pn?Object.assign({},l,{pn:legacy.pn}):l;});});
+ S.purchases=(S.purchases||[]).map(function(p){return p.pn===dup.pn?Object.assign({},p,{pn:legacy.pn}):p;});S._onOrderMap=null;S._asmIdx=null;
+ try{syncShopifyTemplate(legacy.pn,_newOh);}catch(_se){}   // the website follows the merged stock
     delete S.boms[dup.pn];
     logAction('Merged duplicate SKU '+dup.pn+' into '+legacy.pn,'assemblies',legacy.pn,dup,payload).catch(function(){});
     toast('\u2713 Merged '+dup.pn+' into '+legacy.pn);
