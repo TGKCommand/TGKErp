@@ -594,7 +594,7 @@ body.tgk-search-open .search-wrap input{width:100%}
       </div>
     </div>
     <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;padding:0 2px">
-      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.114</span>
+      <span style="font-size:var(--t-xs);font-family:var(--mono);color:var(--text3);font-weight:600;letter-spacing:.05em" id="erp-version-badge">v23.115</span>
       <span class="t3xxs" id="erp-build-date">2026-10-19</span>
     </div>
   </div>
@@ -659,7 +659,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.114';
+const TGK_ERP_VERSION = 'v23.115';
 const TGK_ERP_BUILD_DATE = '2026-11-09';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -5673,8 +5673,10 @@ function salesBuildPop(el){
  p.onmouseleave=function(){salesBuildClose();};
  p.innerHTML='<div style="font-weight:700;margin-bottom:2px">Package '+escHtml(dispSku(pn))+'</div>'
   +'<div style="color:var(--text3);margin-bottom:8px">This order needs '+need+'. You can build up to '+max+' from the shelf.</div>'
-  +'<div style="display:flex;gap:6px;align-items:center"><input id="sbp-qty" class="qty-input" type="number" min="1" max="'+max+'" value="'+def+'" style="width:60px" onkeydown="if(event.key===\'Enter\')salesBuildPack();if(event.key===\'Escape\')salesBuildClose(true)">'
-  +'<button class="btn btn-teal btn-sm" onclick="salesBuildPack()">Package + label</button><button class="action-btn" onclick="salesBuildClose(true)">Cancel</button></div>';
+  +'<div style="display:flex;gap:6px;align-items:center"><input id="sbp-qty" class="qty-input" type="number" min="1" max="'+max+'" value="'+def+'" style="width:60px" oninput="salesBuildBomRefresh()" onkeydown="if(event.key===\'Enter\')salesBuildPack();if(event.key===\'Escape\')salesBuildClose(true)">'
+  +'<button class="btn btn-teal btn-sm" onclick="salesBuildPack()">Package + label</button><button class="action-btn" onclick="salesBuildClose(true)">Cancel</button></div>'
+  +'<div style="display:flex;align-items:center;gap:12px;margin-top:9px;padding-top:8px;border-top:1px solid var(--border)"><span id="sbp-bom-t" style="color:var(--teal);font-weight:700" onmouseenter="salesBuildBom(true)" onclick="salesBuildBom()" title="What goes into this item, and whether it is on hand">BOM &#9662;</span><span style="flex:1"></span><button class="action-btn" onclick="printBOM(\''+escHtml(String(pn).replace(/[\\']/g,''))+'\')">Print BOM</button></div>'
+  +'<div id="sbp-bom" style="display:none;margin-top:6px;max-height:240px;overflow:auto"></div>';
  document.body.appendChild(p);clearTimeout(window._sbpT);
 }
 function salesBuildClose(now){
@@ -5688,7 +5690,55 @@ async function salesBuildPack(){
  if(q<1){toast('Enter a quantity of 1 or more');return;}
  if(q>max&&!confirm('The parts on the shelf can build '+max+', and you entered '+q+'.\n\nTry to package '+q+' anyway?'))return;
  p.remove();
+ var _ohBefore=(asmByPn(pn)||{}).total_on_hand;
+ S._lblShownFor=null;
  await packUnits(pn,null,false,q);   // the Production page's own routine: stock, batch and the label prompt; it redraws this page, so you stay on Sales Orders
+ salesBuildLabelCheck(pn,q,_ohBefore);
+}
+// (v23.115) THE LABEL AFTER PACKING FROM THIS POPUP. The pack routine opens the label prompt only when it finds label artwork under the exact part number
+// it was given, and says nothing when it does not, so "no artwork found" looked the same as "broken". After a pack from here this checks: if the
+// prompt did not open it looks for artwork under the item's other SKU as well and opens the prompt; if there is none, it says so.
+async function salesBuildLabelCheck(pn,q,ohBefore){
+ try{
+ var a=asmByPn(pn)||{};
+ if(ohBefore!==undefined&&Number(a.total_on_hand)===Number(ohBefore))return;   // nothing was packed (cancelled, or it failed): no label
+ await new Promise(function(r){setTimeout(r,1500);});                           // the pack routine looks the artwork up without waiting for it
+ if(S._lblShownFor===pn&&Date.now()-(S._lblShownAt||0)<15000)return;            // the prompt opened
+ var keys=[pn,a.new_sku,a.pn].filter(function(x,i,arr){return x&&arr.indexOf(x)===i;}),files=[];
+ for(var i=0;i<keys.length&&!files.length;i++){
+ files=(S.labelFiles&&S.labelFiles[keys[i]])||[];
+ if(!files.length){var r=await db.from('part_files').select('*').eq('entity_pn',keys[i]).eq('category','Label');if(r&&!r.error&&r.data&&r.data.length)files=r.data;}
+ }
+ if(files.length){if(!S.labelFiles)S.labelFiles={};S.labelFiles[pn]=files;showLabelPrintPrompt(pn,q,files);}
+ else toast('Packaged. No label was printed: there is no label artwork on file for '+escHtml(dispSku(pn))+'. Add one under the item\'s Files, in the Label category.',10000);
+ }catch(e){console.warn('[TGK] label check after pack:',e&&e.message);}
+}
+// (v23.115) BOM OVERVIEW IN THE POPUP. Hovering (or tapping) "BOM" lists what goes into the item: each part, how many this build needs, and how many are
+// on hand, with anything short in red. Packaging and sub-assemblies are marked. The numbers follow the quantity typed in the box.
+function salesBuildBomHtml(pn,qty){
+ var bom=(S.boms&&S.boms[pn])||[];qty=Math.max(1,parseInt(qty)||1);
+ if(!bom.length)return '<div style="color:var(--text3);padding:6px 0">No bill of materials on file for this item.</div>';
+ var rows=bom.map(function(it){
+ var per=Number(it.qty)||0,need=Math.round(per*qty*1000)/1000,a=asmByPn(it.child_pn),p=a?null:partByPn(it.child_pn),rec=a||p;
+ var oh=a?(Number(a.total_on_hand)||0):(p?(Number(p.total_unpckgd)||0):null);
+ var pk=!a&&isNonRawSupplyItem(it.item_type,(p&&p.category),(p&&p.description),it.child_pn);
+ var short=oh!==null&&oh<need&&!pk,tag=a?'sub-assembly':(pk?'packaging':''),desc=String((rec&&rec.description)||'');
+ return '<tr><td style="padding:3px 6px 3px 0;font-family:var(--mono);font-weight:700;white-space:nowrap">'+escHtml(dispSku(it.child_pn))+'</td>'
+  +'<td style="padding:3px 6px;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+escHtml(desc)+'">'+escHtml(desc)+(tag?' <span style="color:var(--text3)">('+tag+')</span>':'')+'</td>'
+  +'<td style="padding:3px 6px;text-align:right;white-space:nowrap">'+need+'</td>'
+  +'<td style="padding:3px 0 3px 6px;text-align:right;white-space:nowrap;font-weight:700;color:'+(short?'var(--red)':'var(--text2)')+'">'+(oh===null?'?':oh)+'</td></tr>';
+ }).join('');
+ return '<table style="width:100%;border-collapse:collapse;font-size:var(--t-xs)"><thead><tr style="color:var(--text3);text-align:left"><th style="padding:2px 6px 4px 0;font-weight:700">Part</th><th style="padding:2px 6px 4px;font-weight:700">Description</th><th style="padding:2px 6px 4px;text-align:right;font-weight:700">Need</th><th style="padding:2px 0 4px 6px;text-align:right;font-weight:700">On hand</th></tr></thead><tbody>'+rows+'</tbody></table>';
+}
+function salesBuildBom(show){
+ var p=document.getElementById('sbp'),b=document.getElementById('sbp-bom');if(!p||!b)return;
+ var open=(show===true)?true:(b.style.display==='none');
+ b.style.display=open?'block':'none';
+ if(open){p.style.width='380px';p.style.left=Math.max(8,Math.min((window.innerWidth||1200)-392,parseFloat(p.style.left)||8))+'px';salesBuildBomRefresh();}
+}
+function salesBuildBomRefresh(){
+ var p=document.getElementById('sbp'),b=document.getElementById('sbp-bom');if(!p||!b||b.style.display==='none')return;
+ b.innerHTML=salesBuildBomHtml(p.dataset.pn,(document.getElementById('sbp-qty')||{}).value);
 }
 // (v23.106) A PARTIAL REFUND SHOWS ON THE LIST. Refunding part of an order in Shopify (shipping only, or one item) leaves the order as it was, on purpose,
 // because the rest may still need to ship. It was only visible inside the order. The row now carries a small tag beside its status.
@@ -34589,6 +34639,7 @@ function warmLabelLot(pn){
 window.warmLabelLot=warmLabelLot;
 
 function showLabelPrintPrompt(pn,qty,labelFiles){
+ try{S._lblShownFor=pn;S._lblShownAt=Date.now();}catch(_e){}   // (v23.115) lets the Sales Orders popup tell whether the prompt opened
   var ov=$('modal-overlay'),bx=$('modal-box');
   if(!ov||!bx){_closeOrAdvanceLabel();return;}
 
