@@ -660,7 +660,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.123';
+const TGK_ERP_VERSION = 'v23.124';
 const TGK_ERP_BUILD_DATE = '2026-11-13';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -2057,7 +2057,7 @@ function setupRealtime(){
         S.sales=S.sales.filter(s=>s.id!==p.old.id);
       }
       // [PERF] Was two rtRender calls per event with overlapping view lists -- unioned into one.
-      updateBadge();rtRender(['sales','dashboard','planning','packqueue','lookup','warranty','reports','production']);
+      updateBadge();rtRender(['sales','dashboard','planning','packqueue','lookup','warranty','reports','production','dealerorders']);
     })
     // [FIX] S.currentBackorders (every backorder badge in the app, including Master Lookup's
     // header pill) was only ever built once at login from a one-time shopify_sync_log fetch --
@@ -33764,6 +33764,46 @@ function dsModalRender(){
 // ---------------------------------------------------------------- Sales > Dealer orders
 var DS_STATUS={new:['New','pill-teal'],sending:['Sending','pill-muted'],attention:['Needs attention','pill-red'],awaiting_payment:['Awaiting payment','pill-yellow'],sent:['In Shopify','pill-green'],rejected:['Rejected','pill-muted'],cancelled:['Cancelled','pill-muted']};
 function dsStatusPill(st){var x=DS_STATUS[st]||[st,'pill-muted'];return '<span class="pill '+x[1]+'">'+escHtml(x[0])+'</span>';}
+// [v23.124] Once a dealer order is in Shopify it is followed through the ERP's own sales rows: packed, shipped, with the tracking numbers. Before this the screen stopped at "In Shopify".
+var DS_SHIP={packed:['Packed','pill-yellow'],partial:['Partly shipped','pill-yellow'],shipped:['Shipped','pill-teal'],delivered:['Delivered','pill-green'],hold:['On hold','pill-muted'],cancelled:['Cancelled','pill-muted']};
+function dsNormOrd(x){return String(x==null?'':x).replace(/^#+/,'').trim().toLowerCase();}
+function dsLineShipped(s){var q=Number(s.qty)||0,st=String(s.fulfillment_status||'').toLowerCase();if(/^(shipped|delivered|fulfilled)$/.test(st))return q;if(st==='partial')return Math.max(0,Math.min(q,Number(s.qty_shipped)||0));if(s.shipped_at&&String(s.tracking_number||'').trim())return q;return 0;}
+function dsShip(r){
+  if(!r||r.status!=='sent')return null;
+  var nm=dsNormOrd(r.shopify_order_name),id=String(r.shopify_order_id||'');if(!nm&&!id)return null;
+  var rows=(S.sales||[]).filter(function(s){return (id&&String(s.shopify_order_id||'')===id)||(nm&&dsNormOrd(s.order_number)===nm);});
+  if(!rows.length)return null;   // the order has not reached the ERP's sales yet
+  var live=rows.filter(function(s){return !s.cancelled_at&&!/^(cancelled|canceled|refunded)$/i.test(String(s.fulfillment_status||''));});
+  if(!live.length)return {state:'cancelled',tracking:[],shipped:0,total:0};
+  var total=0,shipped=0,seen={},tr=[],held=false,packed=false,delivered=true;
+  live.forEach(function(s){var q=Number(s.qty)||0,sh=dsLineShipped(s),n=String(s.tracking_number||'').trim();total+=q;shipped+=sh;if(s.on_hold)held=true;
+    if(n){if(!seen[n]){seen[n]=1;tr.push({n:n,carrier:s.carrier||'',url:trackingUrl(s.carrier,n)});}if(sh===0)packed=true;}else if(/^packed$/i.test(String(s.fulfillment_status||'')))packed=true;
+    if(!/^delivered$/i.test(String(s.fulfillment_status||'')))delivered=false;});
+  var state=(total>0&&shipped>=total)?(delivered?'delivered':'shipped'):shipped>0?'partial':packed?'packed':held?'hold':'open';
+  return {state:state,tracking:tr,shipped:shipped,total:total};
+}
+function dsStatusPillFor(r){var s=dsShip(r),x=s&&DS_SHIP[s.state];return x?'<span class="pill '+x[1]+'">'+escHtml(x[0])+'</span>':dsStatusPill(r.status);}
+function dsTrackHtml(s,max){
+  if(!s||!s.tracking||!s.tracking.length)return '';
+  var shown=s.tracking.slice(0,max||1).map(function(t){var c=String(t.carrier||'').trim().split(/\s+/)[0];return '<a href="'+escHtml(t.url)+'" target="_blank" rel="noopener" onclick="dsStop(event)">'+escHtml((c?c+' ':'')+t.n)+'</a>';}).join('<br>');
+  return shown+(s.tracking.length>(max||1)?' <span class="t3xs">+'+(s.tracking.length-(max||1))+' more</span>':'');
+}
+// What the stock is NOW (the snapshot taken when the dealer ordered goes stale): on hand, plus what can be built from raw goods (packaging never counts), the ERP's own rule.
+function dsLineNow(l){
+  var a=dsFind(l.sku);if(!a)return null;
+  var q=Number(l.qty)||0,oh=Math.max(0,Number(a.total_on_hand)||0);if(oh>=q)return {short:0,build:0};
+  var cap=0;try{var b=buildabilityForBackorder(a.pn);cap=(b&&b.hasBOM)?(isFinite(b.maxBuild)?b.maxBuild:1):0;}catch(e){cap=0;}
+  var need=q-oh;return {short:Math.max(0,need-cap),build:Math.min(need,cap)};
+}
+function dsStockNow(r,ship){
+  var done=ship&&{packed:1,partial:1,shipped:1,delivered:1,cancelled:1}[ship.state];
+  var old=r.status==='sent'&&!ship&&(Date.now()-new Date(r.created_at).getTime())>45*864e5;
+  if(r.status==='rejected'||r.status==='cancelled'||done||old)return {t:'&mdash;',c:'var(--text3)'};
+  var sh=0,bd=0;(r.lines||[]).forEach(function(l){var n=dsLineNow(l);if(!n){var sc=(r.stock_check||[]).find(function(x){return x.sku===l.sku;})||{};sh+=sc.short||0;}else{sh+=n.short;bd+=n.build;}});
+  if(sh)return {t:sh+' short',c:'var(--red)'};
+  if(bd)return {t:'Build needed',c:'var(--orange)'};
+  return {t:'In stock',c:'var(--green)'};
+}
 function dsLive(){return DS.reqs.filter(function(r){return !r.archived_at;});}
 function dsRemovedList(){return DS.reqs.filter(function(r){return !!r.archived_at;});}
 function dsCounts(){
@@ -33896,19 +33936,19 @@ async function dsSaveLines(id){
 function dsDelLine(sku){if(!DS.edit)DS.edit={};DS.edit['__del__'+sku]=1;var r=DS.reqs.find(function(x){return String(x.id)===String(DS.sel);});if(r)dsSaveLines(r.id);}
 function dsShopifyLink(r){var st=(S.shopify&&S.shopify.store)||'';if(!st)return '';st=String(st).replace(/^https?:\/\//,'').replace(/\/+$/,'');if(r.shopify_order_id)return 'https://'+st+'/admin/orders/'+encodeURIComponent(r.shopify_order_id);if(r.shopify_draft_id)return 'https://'+st+'/admin/draft_orders/'+encodeURIComponent(r.shopify_draft_id);return '';}
 function dsReview(r){
-  var editable=(r.status==='new'||r.status==='attention'),ed=DS.edit||{},lines=r.lines||[],st=r.stock_check||[],floor=dsSettings().floor,d=(S.dealers||[]).find(function(x){return String(x.id)===String(r.dealer_id);})||{};
+  var ship=dsShip(r),noStock=(r.status==='rejected'||r.status==='cancelled'||!!(ship&&{packed:1,partial:1,shipped:1,delivered:1,cancelled:1}[ship.state])),editable=(r.status==='new'||r.status==='attention'),ed=DS.edit||{},lines=r.lines||[],st=r.stock_check||[],floor=dsSettings().floor,d=(S.dealers||[]).find(function(x){return String(x.id)===String(r.dealer_id);})||{};
   var rowsH=lines.map(function(l){
-    var a=dsFind(l.sku),mg=a?dsMargin(l.unit,a):null,bad=(mg!==null&&mg<floor),sc=st.find(function(x){return x.sku===l.sku;})||{},short=sc.short>0;
-    return '<tr><td class="pn" style="white-space:nowrap">'+escHtml(l.sku)+'</td><td>'+escHtml(l.desc||'')+(l.special?' <span class="pill pill-orange">special</span>':'')+'</td><td>'+(editable?'<input type="number" class="form-input" style="width:76px" min="1" value="'+(ed[l.sku]||l.qty)+'" onchange="dsEditQty(this.dataset.s,this.value)" data-s="'+escHtml(l.sku)+'">':l.qty)+'</td><td><b>'+dsMoney(l.unit)+'</b></td><td class="t3s">'+dsMoney(l.std)+'</td><td style="font-weight:800;color:'+(bad?'var(--red)':'var(--green)')+'">'+(mg===null?'&mdash;':mg+'%')+'</td><td style="color:'+(short?'var(--red)':'var(--green)')+';font-weight:700">'+(short?sc.short+' short':'in stock')+'</td>'+(editable?'<td><button type="button" class="action-btn del" data-s="'+escHtml(l.sku)+'" onclick="dsDelLine(this.dataset.s)" aria-label="Remove line">&times;</button></td>':'')+'</tr>';
+    var a=dsFind(l.sku),mg=a?dsMargin(l.unit,a):null,bad=(mg!==null&&mg<floor),sc=st.find(function(x){return x.sku===l.sku;})||{},nw=dsLineNow(l),shN=nw?nw.short:(sc.short||0),bdN=nw?nw.build:0;
+    return '<tr><td class="pn" style="white-space:nowrap">'+escHtml(l.sku)+'</td><td>'+escHtml(l.desc||'')+(l.special?' <span class="pill pill-orange">special</span>':'')+'</td><td>'+(editable?'<input type="number" class="form-input" style="width:76px" min="1" value="'+(ed[l.sku]||l.qty)+'" onchange="dsEditQty(this.dataset.s,this.value)" data-s="'+escHtml(l.sku)+'">':l.qty)+'</td><td><b>'+dsMoney(l.unit)+'</b></td><td class="t3s">'+dsMoney(l.std)+'</td><td style="font-weight:800;color:'+(bad?'var(--red)':'var(--green)')+'">'+(mg===null?'&mdash;':mg+'%')+'</td><td style="color:'+(noStock?'var(--text3)':shN?'var(--red)':bdN?'var(--orange)':'var(--green)')+';font-weight:700">'+(noStock?'&mdash;':shN?shN+' short':bdN?'build needed':'in stock')+'</td>'+(editable?'<td><button type="button" class="action-btn del" data-s="'+escHtml(l.sku)+'" onclick="dsDelLine(this.dataset.s)" aria-label="Remove line">&times;</button></td>':'')+'</tr>';
   }).join('');
   var sh=r.ship_to||{},tt=r.totals||{},link=dsShopifyLink(r);
-  return '<div class="panel" style="padding:0;margin-bottom:12px;border-left:3px solid var(--teal)"><div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap"><div><b style="font-size:var(--t-lg,16px)">'+(r.po_number?'PO '+escHtml(r.po_number):'Order with no PO')+'</b> &middot; '+escHtml(r.dealer_name||'')+' '+dsStatusPill(r.status)+dsOfferChip(r)+'</div><div class="t3s">Submitted '+escHtml(new Date(r.created_at).toLocaleString())+'</div></div>'
+  return '<div class="panel" style="padding:0;margin-bottom:12px;border-left:3px solid var(--teal)"><div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap"><div><b style="font-size:var(--t-lg,16px)">'+(r.po_number?'PO '+escHtml(r.po_number):'Order with no PO')+'</b> &middot; '+escHtml(r.dealer_name||'')+' '+dsStatusPillFor(r)+dsOfferChip(r)+'</div><div class="t3s">Submitted '+escHtml(new Date(r.created_at).toLocaleString())+'</div></div>'
    +(r.error?'<div style="padding:10px 16px;background:rgba(220,38,38,.07);color:var(--red);font-size:var(--t-sm);border-bottom:1px solid var(--border)"><b>Why it did not go through:</b> '+escHtml(r.error)+'</div>':'')
    +(r.status==='rejected'&&r.reject_reason?'<div style="padding:10px 16px" class="t3s">Rejected: '+escHtml(r.reject_reason)+'</div>':'')
    +'<div class="tbl-wrap"><table><thead><tr>'+dsTh([['SKU',130],['Item'],['Qty',90],['Dealer price',104],['Standard',90],['Margin',80],['Stock',90]].concat(editable?[['',36]]:[]))+'</tr></thead><tbody>'+rowsH+'</tbody></table></div>'
    +'<div style="padding:12px 16px;display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px 24px;font-size:var(--t-sm)"><div><b>Ship to</b><br>'+escHtml([sh.name,sh.address1,sh.address2,[sh.city,sh.province,sh.zip].filter(Boolean).join(', '),sh.country].filter(Boolean).join(' / '))+(r.drop_ship?' <span class="pill pill-muted">drop-ship</span>':'')+'</div>'
    +'<div><b>Payment</b><br>'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</div><div><b>Totals</b><br>'+dsMoney(tt.merchandise)+' merchandise &middot; shipping '+(tt.shipping===null||tt.shipping===undefined?'<b style="color:var(--red)">not set</b>':dsMoney(tt.shipping))+' &middot; <b>'+dsMoney(tt.total)+'</b></div>'
-   +'<div><b>Order code</b><br><span class="pn">'+escHtml(r.discount_code||((d.po_code_prefix||'')+(r.po_number?' '+r.po_number:'')))+'</span>'+(r.shopify_order_name?' &middot; Shopify '+escHtml(r.shopify_order_name):'')+'</div>'+(r.notes?'<div style="grid-column:1/-1"><b>Dealer note</b><br>'+escHtml(r.notes)+'</div>':'')+'</div>'
+   +'<div><b>Order code</b><br><span class="pn">'+escHtml(r.discount_code||((d.po_code_prefix||'')+(r.po_number?' '+r.po_number:'')))+'</span>'+(r.shopify_order_name?' &middot; Shopify '+escHtml(r.shopify_order_name):'')+'</div>'+(ship&&ship.total?'<div><b>Shipment</b><br>'+ship.shipped+' of '+ship.total+' unit'+(ship.total!==1?'s':'')+' shipped'+(ship.tracking.length?'<br>'+dsTrackHtml(ship,10):'')+'</div>':'')+(r.notes?'<div style="grid-column:1/-1"><b>Dealer note</b><br>'+escHtml(r.notes)+'</div>':'')+'</div>'
    +'<div style="padding:12px 16px;background:var(--bg3);border-top:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap">'
    +(editable?'<button type="button" class="btn btn-teal" onclick="dsSend(DS.sel)"'+(DS.busy?' disabled':'')+'>'+(DS.busy?'Sending&hellip;':(r.status==='attention'?'Retry: send to Shopify':'Send to Shopify'))+'</button>':'')
    +(editable&&DS.edit?'<button type="button" class="btn" onclick="dsSaveLines(DS.sel)">Save quantity changes</button>':'')
@@ -33946,8 +33986,8 @@ function renderDealerOrders(){
     +'<button type="button" class="btn btn-sm" onclick="DS.pick={};render()">Clear</button></div>':'';
   var colN=10;
   var tbl=rows.length?bulk+'<div class="panel" style="padding:0;overflow:hidden"><div class="tbl-wrap"><table><thead><tr><th style="width:34px"><input type="checkbox" aria-label="Select all" '+(allOn?'checked ':'')+'onchange="dsPickAll(this.checked)"></th>'+dsTh([['PO',100],['Dealer'],['Submitted',130],['Lines',110],['Total',100],['Payment',130],['Stock',90],['Status',140]])+'<th style="width:44px"></th></tr></thead><tbody>'
-    +rows.map(function(r){var st=r.stock_check||[],sh=st.reduce(function(s,x){return s+(x.short||0);},0),t=r.totals||{},on=String(DS.sel)===String(r.id);
-      return '<tr style="cursor:pointer'+(on?';background:var(--bg3)':'')+'" onclick="dsSelect(\''+escHtml(r.id)+'\')"><td onclick="dsStop(event)"><input type="checkbox" aria-label="Select this order" '+(DS.pick[String(r.id)]?'checked ':'')+'onchange="dsPick(\''+escHtml(r.id)+'\',this.checked)"></td><td><b>'+escHtml(r.po_number||'No PO')+'</b></td><td>'+escHtml(r.dealer_name||'')+'</td><td class="t3s">'+escHtml(new Date(r.created_at).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}))+'</td><td>'+(r.lines||[]).length+' &middot; '+(t.units||0)+' units</td><td><b>'+dsMoney(t.total)+'</b></td><td class="t3s">'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</td><td style="color:'+(sh?'var(--red)':'var(--green)')+';font-weight:700;font-size:var(--t-sm)">'+(sh?sh+' short':'In stock')+'</td><td>'+dsStatusPill(r.status)+dsOfferChip(r)+'</td>'
+    +rows.map(function(r){var ship=dsShip(r),sn=dsStockNow(r,ship),t=r.totals||{},on=String(DS.sel)===String(r.id);
+      return '<tr style="cursor:pointer'+(on?';background:var(--bg3)':'')+'" onclick="dsSelect(\''+escHtml(r.id)+'\')"><td onclick="dsStop(event)"><input type="checkbox" aria-label="Select this order" '+(DS.pick[String(r.id)]?'checked ':'')+'onchange="dsPick(\''+escHtml(r.id)+'\',this.checked)"></td><td><b>'+escHtml(r.po_number||'No PO')+'</b></td><td>'+escHtml(r.dealer_name||'')+'</td><td class="t3s">'+escHtml(new Date(r.created_at).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}))+'</td><td>'+(r.lines||[]).length+' &middot; '+(t.units||0)+' units</td><td><b>'+dsMoney(t.total)+'</b></td><td class="t3s">'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</td><td style="color:'+sn.c+';font-weight:700;font-size:var(--t-sm)">'+sn.t+'</td><td>'+dsStatusPillFor(r)+dsOfferChip(r)+(ship&&ship.tracking.length?'<div class="t3xs" style="margin-top:3px">'+dsTrackHtml(ship,1)+'</div>':'')+'</td>'
         +'<td onclick="dsStop(event)">'+(DS.showRemoved?'<button type="button" class="action-btn" title="Restore" aria-label="Restore this order" onclick="dsRestore([\''+escHtml(r.id)+'\'])">&#8634;</button>':'<button type="button" class="action-btn del" title="Remove this order" aria-label="Remove this order" onclick="dsRemove([\''+escHtml(r.id)+'\'])">&times;</button>')+'</td></tr>'
         +(on?'<tr><td colspan="'+colN+'" style="padding:10px 12px;background:var(--bg3)">'+dsReview(r)+'</td></tr>':'');}).join('')+'</tbody></table></div></div>'
     :'<div class="panel section-empty">'+(DS.loading?'Loading&hellip;':(DS.showRemoved?'Nothing has been removed.':(DS.filter?'Nothing here.':'No dealer orders yet. They appear here when a dealer submits a PO from their shop.')))+'</div>';
