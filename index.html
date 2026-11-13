@@ -659,8 +659,8 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.121';
-const TGK_ERP_BUILD_DATE = '2026-11-09';
+const TGK_ERP_VERSION = 'v23.122';
+const TGK_ERP_BUILD_DATE = '2026-11-13';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
 // functions can refuse anonymous callers (EDGE_AUTH_MODE=enforce). Done once here instead of at ~20 call sites:
@@ -17165,6 +17165,7 @@ async function startDealerPortal(dealerId){
     }
 
     try{var _nhD=await db.from('settings').select('value').eq('key','note_highlights').maybeSingle();if(_nhD&&_nhD.data&&_nhD.data.value)S.noteHL=_nhD.data.value;}catch(_e){}
+    try{await loadFitPages();}catch(_e){}
     const _dph=buildDealerPortalHTML(dealer,products,storeUrl,portalFitments,!!fitResult.error,dpSyncMap,window._dpNotices);
     window._dealerPortalHTML=_dph;
     wrap.innerHTML=_dph;
@@ -17298,12 +17299,15 @@ function buildDealerPortalHTML(dealer,products,storeUrl,fitments,fitError,dpSync
   const fitProducts=products.filter(p=>byPnF[p.pn]);
   const fitMakes=[...new Set(fitments.map(f=>f.make||'').filter(Boolean))].sort();
 
-  const fitCards=fitProducts.map(p=>{
+  const fitCards=fitProducts.flatMap(p0=>{
+    const _pgs=_fitPagesOf(byPnF[p0.pn]||[]);
+    return (_pgs.length>1?_pgs:[null]).map(pg=>{
+    const p=pg?Object.assign({},p0,{description:pg.title,product_url:pg.url}):p0;   // one card per website page for a SKU sold on two or more pages
     const sku=(p.use_new_sku&&p.new_sku)?p.new_sku:p.pn;
       const legacyNote=(p.use_new_sku&&p.new_sku&&p.pn&&p.pn!==sku)?'<div style="font-size:var(--t-xs);color:#9ca3af;font-weight:400;white-space:nowrap">Superseded: '+escHtml(p.pn)+'</div>':'';
     const sp=p.sales_price!=null?parseFloat(p.sales_price):null;
     const dp=sp!=null?sp:p.msrp*(1-disc);
-    const fits=byPnF[p.pn]||[];
+    const fits=pg?_fitRowsForPage(byPnF[p.pn]||[],pg.handle):(byPnF[p.pn]||[]);
     const modelGroups={};
     fits.forEach(f=>{const key=(f.make||'?')+'|'+(f.model||'?');if(!modelGroups[key])modelGroups[key]={make:f.make,model:f.model,rows:[]};modelGroups[key].rows.push(f);});
     const appRows=Object.values(modelGroups).sort((a,b)=>((a.make||'')+(a.model||'')).localeCompare((b.make||'')+(b.model||''))).map(g=>{
@@ -17340,6 +17344,7 @@ function buildDealerPortalHTML(dealer,products,storeUrl,fitments,fitError,dpSync
       +'<th style="padding:4px 10px;text-align:left;font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.08em;color:#9ca3af;font-weight:700">Year(s)</th>'
       +'</tr></thead><tbody>'+appRows+'</tbody></table>'
     +'</div>';
+    });
   }).join('');
 
   window._dpExportData={dname,priceRows,fitRows};
@@ -36828,6 +36833,27 @@ window._aomAddAll=function(){
   else toast('Nothing checked to order');
 };
 
+// [v23.122] A SKU sold on two or more website pages (e.g. one bushing kit sold as a Motor Mount kit and a Transmission Mount kit) is shown once PER PAGE:
+// each page keeps its own vehicles and its own link. Price and stock stay on the one SKU. Old rows with no page belong to every page of their SKU.
+async function loadFitPages(){
+  if(S.fitPages)return S.fitPages;
+  const m={};
+  try{
+    let rows;
+    try{rows=await fetchAll((f,t)=>db.from('fit_products').select('handle,title,sku').range(f,t));}
+    catch(e1){rows=await fetchAll((f,t)=>db.from('fit_products').select('handle,sku').range(f,t));}   // an older database without the title column
+    (rows||[]).forEach(r=>{if(r&&r.handle)m[r.handle]={title:String(r.title||'').trim(),sku:r.sku||''};});
+  }catch(e){console.warn('[TGK] website pages unavailable:',e&&e.message);}
+  S.fitPages=m;return m;
+}
+function _pgTitle(h){const t=S.fitPages&&S.fitPages[h]&&S.fitPages[h].title;return t||String(h||'').replace(/[-_]+/g,' ').replace(/\b[a-z]/g,c=>c.toUpperCase());}
+function _pgUrl(h){const b=String((S.settings&&S.settings.portal_store_url)||'').trim().replace(/\/+$/,'')||'https://tgkmotorsport.com';return b+'/products/'+encodeURIComponent(h);}
+function _fitPagesOf(rows){   // the fitment rows of ONE part number -> its website pages when there are two or more, otherwise []
+  const seen={},hs=[];(rows||[]).forEach(f=>{if(f&&f.handle&&!seen[f.handle]){seen[f.handle]=1;hs.push(f.handle);}});
+  if(hs.length<2)return [];
+  return hs.map(h=>({handle:h,title:_pgTitle(h),url:_pgUrl(h)})).sort((a,b)=>a.title.localeCompare(b.title,undefined,{numeric:true}));
+}
+function _fitRowsForPage(rows,handle){return (rows||[]).filter(f=>!f.handle||f.handle===handle);}
 async function loadFitments(){
   if(S.fitments!==null)return; // already loaded
   try{
@@ -36845,8 +36871,8 @@ async function loadFitments(){
 function _fitLocked(){toast('Fitment is edited in the Command Center (Fitment tool) - this ERP screen is read-only',6000);return true;}
 window._fitLocked=_fitLocked;
 function renderFitments() {
-  if(S.fitments===null){
-    loadFitments().then(()=>render());
+  if(S.fitments===null||!S.fitPages){
+    Promise.all([loadFitments(),loadFitPages()]).then(()=>render());
     return '<div class="section-empty" style="margin-top:60px">Loading fitment data…</div>';
   }
   const tab = S.fitmentTab || 'guide';
@@ -36890,8 +36916,11 @@ function renderFitmentsGuide() {
   const totalApps=S.fitments.length;
   const totalPns=Object.keys(byPn).length;
 
-  const cards=asmList.map(a=>{
-    const fitments=(byPn[a.pn]||[]);
+  const cards=asmList.flatMap(a0=>{
+    const _pgs=_fitPagesOf(byPn[a0.pn]||[]);
+    return (_pgs.length>1?_pgs:[null]).map(pg=>{
+    const a=pg?Object.assign({},a0,{description:pg.title,product_url:pg.url}):a0;   // a page card carries its own title and link; price and stock are still the SKU's
+    const fitments=pg?_fitRowsForPage(byPn[a0.pn]||[],pg.handle):(byPn[a0.pn]||[]);
     const fMakes=[...new Set(fitments.map(f=>f.make||'').filter(Boolean))].sort();
     const t1Price=(a.msrp||0)*(1-(S.pricingTiers?.[0]?.discount||0.2));
 
@@ -36924,6 +36953,7 @@ function renderFitmentsGuide() {
             ${a.category?`<span class="bomtag ${catBomClass(a.category)}">${escHtml(a.category)}</span>`:''}
           </div>
           <div style="font-size:var(--t-md);color:var(--text2)">${escHtml(a.description||'')}</div>
+          ${pg?`<div class="t3xs" style="margin-top:2px">Same part number as ${_pgs.filter(x=>x!==pg).map(x=>'<b>'+escHtml(x.title)+'</b>').join(', ')} &mdash; the same item, listed for different vehicles</div>`:''}
           <div style="font-size:var(--t-sm);color:var(--text3);margin-top:4px">${fitments.length} application${fitments.length!==1?'s':''} &middot; ${fMakes.join(', ')}</div>
         </div>
         <div style="text-align:right;flex-shrink:0">
@@ -36944,6 +36974,7 @@ function renderFitmentsGuide() {
         </table>
       </div>
     </div>`;
+    });
   }).join('');
 
   return `
@@ -37303,8 +37334,11 @@ window.printFitmentGuide=function(){
 
   const t1Disc=S.pricingTiers?.[0]?.discount||0.2;
 
-  const sections=asmList.map(a=>{
-    const fits=(byPn[a.pn]||[]);
+  const sections=asmList.flatMap(a0=>{
+    const _pgs=_fitPagesOf(byPn[a0.pn]||[]);
+    return (_pgs.length>1?_pgs:[null]).map(pg=>{
+    const a=pg?Object.assign({},a0,{description:pg.title,product_url:pg.url}):a0;
+    const fits=pg?_fitRowsForPage(byPn[a0.pn]||[],pg.handle):(byPn[a0.pn]||[]);
     const modelGroups={};
     fits.forEach(f=>{
       const key=(f.make||'?')+'|'+(f.model||'?');
@@ -37320,6 +37354,7 @@ window.printFitmentGuide=function(){
     }).join('');
     const t1=fc((a.msrp||0)*(1-t1Disc));
     return `<div class="part-section"><div class="part-header"><span class="pn">${escHtml(dispPn(a))}${a.use_new_sku&&a.new_sku?' <span style="font-size:var(--t-xs);color:#9ca3af;font-weight:400">(Superseded: '+escHtml(a.pn)+')</span>':''}</span><span class="desc">${a.description||''}</span><span class="price">Dealer: ${t1} &nbsp;&middot;&nbsp; MSRP: ${fc(a.msrp||0)}</span></div><table><thead><tr><th>Make</th><th>Model</th><th>Year(s)</th></tr></thead><tbody>${tableRows}</tbody></table></div>`;
+    });
   }).join('');
 
   const w=window.open('','_blank');
