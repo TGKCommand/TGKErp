@@ -660,8 +660,8 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.124';
-const TGK_ERP_BUILD_DATE = '2026-11-13';
+const TGK_ERP_VERSION = 'v23.126';
+const TGK_ERP_BUILD_DATE = '2026-11-16';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
 // functions can refuse anonymous callers (EDGE_AUTH_MODE=enforce). Done once here instead of at ~20 call sites:
@@ -16808,7 +16808,7 @@ async function masterTrackingSync(customRange){
   try{
     const res=await fetch(edgeUrl,{
       method:'POST',
-      headers:{'Content-Type':'application/json'},
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},
       body:JSON.stringify({action:'bulk_sync',since,until}),
       signal:controller.signal
     });
@@ -16820,8 +16820,11 @@ async function masterTrackingSync(customRange){
       return;
     }
     await refreshSales();
-    if(!isUserActivelyWorking())render();
-    toast('<span class="ic ic-check"></span>Tracking synced — '+(data.synced||0)+' shipment'+(data.synced!==1?'s':'')+' applied'+(data.notFound?', '+data.notFound+' order(s) not found in ERP':''),6000);
+    render();   // [v23.126] a button the user just pressed: always redraw. The old isUserActivelyWorking() guard counted that very click as "still working", so the data reloaded but the screen never changed.
+    var _ap=(data.applied!=null)?data.applied:null,_sy=data.synced||0;
+    toast(_ap===0
+      ?'<span class="ic ic-alert"></span>Tracking checked — '+_sy+' shipment'+(_sy!==1?'s':'')+' matched but no order lines changed (already marked shipped, or nothing new in ShipStation)'+(data.notFound?'; '+data.notFound+' not found in ERP':'')
+      :'<span class="ic ic-check"></span>Tracking synced — '+(_ap!=null?_ap+' order line'+(_ap!==1?'s':'')+' updated from ':'')+_sy+' shipment'+(_sy!==1?'s':'')+(data.notFound?', '+data.notFound+' order(s) not found in ERP':''),7000);
   }catch(e){
     if(e.name==='AbortError')toast('<span class="ic ic-clock"></span>Sync timed out after 90s — try a shorter range from Integrations → Bulk Sync',6000);
     else toast('Error: '+e.message,5000);
@@ -33497,7 +33500,7 @@ Object.assign(window,{diToggle:diToggle,diExplain:diExplain,diFilter:diFilter,di
 //   Sales > Dealer orders: every PO a dealer submits, where it went in Shopify, and anything that needs you.
 // Nothing here talks to Shopify directly: sending an order goes through the dealer-portal server function.
 // ===================================================================================================
-var DS={reqs:[],loaded:false,loading:false,err:'',sel:null,filter:'',busy:false,edit:null,_badgeAt:0,_syncAt:0,showRemoved:false,pick:{}};
+var DS={reqs:[],loaded:false,loading:false,err:'',sel:null,filter:'active',busy:false,edit:null,_badgeAt:0,_syncAt:0,showRemoved:false,pick:{}};
 var DM=null; // the open "Storefront" window for one dealer
 var DS_PAY=[['prepay','Pays up front: gets a secure Shopify payment link'],['billed_card','Billed by us: card on file, processed in QuickBooks (order is marked paid)'],['billed_invoice','Billed by us: QuickBooks invoice (order is marked paid)']];
 // Payment terms (v23.59): how long a billed dealer has to pay, counted from the day the LAST item on a PO ships.
@@ -33828,8 +33831,25 @@ async function dsSync(quiet){
   await dsLoadReqs();
 }
 function dsSelect(id){DS.sel=(String(DS.sel)===String(id)?null:id);DS.edit=null;render();}
-function dsFilter(f){DS.filter=(DS.filter===f?'':f);render();}
-function dsRows(){var f=DS.filter;if(DS.showRemoved)return dsRemovedList();return dsLive().filter(function(r){if(f==='attention')return r.status==='attention'||r.status==='new'||r.status==='sending';if(f==='awaiting')return r.status==='awaiting_payment';if(f==='sent')return r.status==='sent';return true;});}
+// [v23.125] Status filter bar. One order can be in more than one group (a part-shipped order is both Active and Shipped). Shipped only shows under Shipped and All.
+function dsKind(r){
+  var st=r.status;
+  if(st==='new'||st==='attention'||st==='sending')return {attention:1,active:1};
+  if(st==='awaiting_payment')return {awaiting:1,active:1};
+  if(st!=='sent')return {};   // rejected / cancelled: only under All
+  var ship=dsShip(r),s2=ship&&ship.state,o={};
+  if(s2==='cancelled')return o;
+  if(s2==='partial'||s2==='shipped'||s2==='delivered')o.shipped=1;
+  if(s2!=='shipped'&&s2!=='delivered'){o.active=1;var sn=dsStockNow(r,ship);if(sn&&sn.t==='Build needed')o.build=1;}
+  return o;
+}
+function dsTally(){
+  var c={attention:0,awaiting:0,build:0,shipped:0,active:0,all:0,sentToday:0},today=new Date().toISOString().slice(0,10);
+  dsLive().forEach(function(r){var k=dsKind(r);c.all++;if(k.attention)c.attention++;if(k.awaiting)c.awaiting++;if(k.build)c.build++;if(k.shipped)c.shipped++;if(k.active)c.active++;if(r.status==='sent'&&String(r.sent_at||'').slice(0,10)===today)c.sentToday++;});
+  return c;
+}
+function dsFilter(f){DS.filter=f;render();}
+function dsRows(){var f=DS.filter;if(DS.showRemoved)return dsRemovedList();return dsLive().filter(function(r){if(!f||f==='all')return true;return !!dsKind(r)[f];});}
 async function dsSend(id){
   if(DS.busy)return;DS.busy=true;render();
   try{var j=await _dsFn({action:'send_to_shopify',request_id:id});toast(j.status==='awaiting_payment'?'Sent to Shopify: the dealer has a payment link':'Sent to Shopify as '+(j.order_name||'an order'),6000);}
@@ -33978,8 +33998,8 @@ async function dsSaveSettings(){
 function renderDealerOrders(){
   if(!DS.loaded&&!DS.loading)dsLoadReqs();
   else if(DS.loaded&&!DS.loading&&(!DS._syncAt||Date.now()-DS._syncAt>120000)&&DS.reqs.some(function(r){return r.status==='awaiting_payment';})){DS._syncAt=Date.now();dsSync(true);}
-  var c=dsCounts(),rows=dsRows(),sel=DS.sel&&DS.reqs.find(function(r){return String(r.id)===String(DS.sel);});
-  var tile=function(key,label,n,cls,sub){var on=DS.filter===key;return '<div class="kpi '+cls+'" role="button" aria-pressed="'+(on?'true':'false')+'" style="cursor:pointer'+(on?';box-shadow:inset 0 0 0 2px #fff':'')+'" onclick="dsFilter(\''+key+'\')"><div class="kpi-label">'+label+'</div><div class="kpi-value">'+n+'</div><div class="kpi-sub">'+sub+'</div></div>';};
+  var c=dsTally(),rows=dsRows(),sel=DS.sel&&DS.reqs.find(function(r){return String(r.id)===String(DS.sel);});
+  var pill=function(key,label,n,col){var on=DS.filter===key,hot=(n>0&&col);return '<button type="button" class="filter-chip" aria-pressed="'+(on?'true':'false')+'" style="display:inline-flex;align-items:center;gap:8px;padding:8px 14px;border:1px solid '+(on?'var(--teal)':'var(--border2)')+';background:'+(on?'var(--teal-dim)':'var(--bg2)')+';color:'+(on?'var(--teal)':'var(--text2)')+';border-radius:var(--r);cursor:pointer;font-weight:600;font-size:var(--t-md)" onclick="dsFilter(\''+key+'\')">'+label+' <b style="font-family:var(--mono);font-size:var(--t-lg);color:'+(hot?col:(on?'var(--teal)':'var(--text)'))+'">'+n+'</b></button>';};
   var picked=dsPicked(),allOn=rows.length&&rows.every(function(r){return DS.pick[String(r.id)];});
   var bulk=picked.length?'<div class="panel" style="padding:8px 14px;margin-bottom:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;border-left:3px solid var(--teal)"><b>'+picked.length+' selected</b>'
     +(DS.showRemoved?'<button type="button" class="btn btn-sm" onclick="dsRestore(dsPicked())">Restore</button><button type="button" class="btn btn-sm btn-red" onclick="dsDeleteForever(dsPicked())">Delete for good</button>':'<button type="button" class="btn btn-sm btn-red" onclick="dsRemove(dsPicked())">Remove selected</button>')
@@ -33990,11 +34010,11 @@ function renderDealerOrders(){
       return '<tr style="cursor:pointer'+(on?';background:var(--bg3)':'')+'" onclick="dsSelect(\''+escHtml(r.id)+'\')"><td onclick="dsStop(event)"><input type="checkbox" aria-label="Select this order" '+(DS.pick[String(r.id)]?'checked ':'')+'onchange="dsPick(\''+escHtml(r.id)+'\',this.checked)"></td><td><b>'+escHtml(r.po_number||'No PO')+'</b></td><td>'+escHtml(r.dealer_name||'')+'</td><td class="t3s">'+escHtml(new Date(r.created_at).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}))+'</td><td>'+(r.lines||[]).length+' &middot; '+(t.units||0)+' units</td><td><b>'+dsMoney(t.total)+'</b></td><td class="t3s">'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</td><td style="color:'+sn.c+';font-weight:700;font-size:var(--t-sm)">'+sn.t+'</td><td>'+dsStatusPillFor(r)+dsOfferChip(r)+(ship&&ship.tracking.length?'<div class="t3xs" style="margin-top:3px">'+dsTrackHtml(ship,1)+'</div>':'')+'</td>'
         +'<td onclick="dsStop(event)">'+(DS.showRemoved?'<button type="button" class="action-btn" title="Restore" aria-label="Restore this order" onclick="dsRestore([\''+escHtml(r.id)+'\'])">&#8634;</button>':'<button type="button" class="action-btn del" title="Remove this order" aria-label="Remove this order" onclick="dsRemove([\''+escHtml(r.id)+'\'])">&times;</button>')+'</td></tr>'
         +(on?'<tr><td colspan="'+colN+'" style="padding:10px 12px;background:var(--bg3)">'+dsReview(r)+'</td></tr>':'');}).join('')+'</tbody></table></div></div>'
-    :'<div class="panel section-empty">'+(DS.loading?'Loading&hellip;':(DS.showRemoved?'Nothing has been removed.':(DS.filter?'Nothing here.':'No dealer orders yet. They appear here when a dealer submits a PO from their shop.')))+'</div>';
+    :'<div class="panel section-empty">'+(DS.loading?'Loading&hellip;':(DS.showRemoved?'Nothing has been removed.':(DS.filter&&DS.filter!=='all'&&DS.reqs.length?(DS.filter==='active'?'Nothing active right now. Shipped orders are under Shipped and All.':'Nothing here.'):'No dealer orders yet. They appear here when a dealer submits a PO from their shop.')))+'</div>';
   return '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:12px"><div class="t3s" style="max-width:720px">Every PO a dealer submits from their shop. Orders go straight to Shopify; anything that cannot is held here for you. '+(dsSettings().autoSend?'':'<b style="color:var(--orange)">Automatic sending is OFF: every order waits for you.</b>')+'</div><div style="display:flex;gap:8px"><button type="button" class="btn btn-sm" onclick="dsToggleRemoved()">'+(DS.showRemoved?'&larr; Back to orders':'Show removed ('+dsRemovedList().length+')')+'</button><button class="btn btn-sm" onclick="dsSync()">Check payments</button><button class="btn btn-sm" onclick="dsLoadReqs()">Refresh</button></div></div>'
    +(DS.showRemoved?'<div class="panel" style="padding:8px 14px;margin-bottom:12px;border-left:3px solid var(--orange);font-size:var(--t-sm)"><b>Removed orders.</b> Dealers cannot see these. Restore one to bring it back, or delete it for good (not possible for orders that exist in Shopify).</div>':'')
    +(DS.err?'<div class="panel" style="padding:10px 14px;border-left:3px solid var(--red);color:var(--red);margin-bottom:12px;font-size:var(--t-sm)">'+escHtml(DS.err)+'</div>':'')
-   +'<div class="kpi-grid kpi-grid-4" style="margin-bottom:12px">'+tile('attention','Needs attention',c.attention,'kpi-red','held for you, or sending')+tile('awaiting','Awaiting payment',c.awaiting,'kpi-yellow','pay-up-front dealers')+tile('sent','Sent to Shopify today',c.sentToday,'kpi-teal','orders created')+tile('all','All orders',c.all,'','last 300')+'</div>'
+   +'<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">'+pill('active','Active',c.active)+pill('attention','Needs attention',c.attention,'var(--red)')+pill('awaiting','Awaiting payment',c.awaiting,'var(--yellow)')+pill('build','Build needed',c.build,'var(--orange)')+pill('shipped','Shipped',c.shipped)+pill('all','All',c.all)+'<span class="t3s" style="margin-left:auto">'+c.sentToday+' sent to Shopify today</span></div>'
    +dsSettingsHtml()+tbl;
 }
 Object.assign(window,{dsUserSetupLink:dsUserSetupLink,dsLoadUsers:dsLoadUsers,dsUserAdd:dsUserAdd,dsUserRole:dsUserRole,dsUserRemove:dsUserRemove,openDealerStore:openDealerStore,dsClose:dsClose,dsTab:dsTab,dsEdit:dsEdit,dsRowDel:dsRowDel,dsSearchPick:dsSearchPick,dsCsvExport:dsCsvExport,dsCsvImport:dsCsvImport,dsCopyFrom:dsCopyFrom,dsSavePrices:dsSavePrices,dsShipField:dsShipField,dsSaveShip:dsSaveShip,
