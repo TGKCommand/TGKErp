@@ -660,7 +660,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.135';
+const TGK_ERP_VERSION = 'v23.136';
 const TGK_ERP_BUILD_DATE = '2026-11-17';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -9882,7 +9882,7 @@ function mfCarriers(pk){var seen={},out=[];pk.forEach(function(p){if(!seen[p.car
 
 function openManifest(){
  var ex=document.getElementById('mf-ov');if(ex)ex.remove();
- S._mf={day:centralDateOnly(),carrier:'all',loading:true,err:'',pk:[],noTracking:[]};
+ S._mf={day:centralDateOnly(),carrier:'all',flag:'',loading:true,err:'',pk:[],raw:[],off:[],noTracking:[]};
  var ov=document.createElement('div');ov.id='mf-ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
  ov.innerHTML='<div id="mf-box" style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(980px,96vw);max-height:92vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.25)"></div>';
  ov.addEventListener('mousedown',function(e){if(e.target===ov)mfClose();});
@@ -9890,9 +9890,80 @@ function openManifest(){
 }
 function mfClose(){var ov=document.getElementById('mf-ov');if(ov)ov.remove();S._mf=null;}
 
-function mfDay(v){if(!S._mf||!/^\d{4}-\d{2}-\d{2}$/.test(v||''))return;S._mf.day=v;S._mf.carrier='all';mfReload();}
+function mfDay(v){if(!S._mf||!/^\d{4}-\d{2}-\d{2}$/.test(v||''))return;S._mf.day=v;S._mf.carrier='all';S._mf.flag='';mfReload();}
 function mfCarrierPick(c){if(!S._mf)return;S._mf.carrier=c;mfRedraw();}
-function mfSelected(){var st=S._mf||{};return (st.pk||[]).filter(function(p){return st.carrier==='all'||p.carrier===st.carrier;});}
+function mfSelected(){var st=S._mf||{};return (st.pk||[]).filter(function(p){return (st.carrier==='all'||p.carrier===st.carrier)&&(!st.flag||(st.flag==='intl'?mfIntl(p):mfSvc(p).next));});}
+// ---- [v23.136] International / next-day flags, hand editing, and no drop-ship.
+function mfIntl(p){var c=String(p.country||'').trim();return !!c&&!/^(us|usa|united states|united states of america)$/i.test(c);}
+// The ERP does not store the shipping service on an order. UPS tracking numbers carry it: 1Z + 6-character shipper number + 2-digit service code.
+// Warranty and reship claims do store the service that was picked, so that label is used when present. Other carriers show no service.
+var MF_UPS_SVC={'01':'Next Day Air','13':'Next Day Air Saver','14':'Next Day Air Early','15':'Next Day Air Early','32':'Next Day Air Early','41':'Next Day Air Early (Sat)','44':'Next Day Air (Sat)','02':'2nd Day Air','07':'2nd Day Air A.M.','35':'2nd Day Air A.M.','12':'3 Day Select','03':'Ground','42':'Ground','90':'Ground'};
+function mfSvc(p){
+ var lbl=String(p.svcLabel||'').trim(),name=lbl,m=/^1Z[0-9A-Z]{6}([0-9A-Z]{2})/i.exec(String(p.tracking||''));
+ if(!name&&p.carrier==='UPS'&&m&&MF_UPS_SVC[m[1]])name=MF_UPS_SVC[m[1]];
+ return {name:name,next:/next\s*day|overnight|priority mail express|first overnight|priority overnight|standard overnight/i.test(name)};
+}
+function mfKey(p){return p.carrier+'|'+p.tracking;}
+// Hand edits are remembered per ship date on this device, so a reprint of the same day matches what the driver signed.
+function mfEditsAll(){try{return JSON.parse(localStorage.getItem('tgk_mf_edits')||'{}')||{};}catch(e){return {};}}
+function mfEdits(day){var all=mfEditsAll(),e=all[day]||{};return {rm:e.rm||{},keep:e.keep||{},add:e.add||[]};}
+function mfSaveEdits(day,e){
+ var all=mfEditsAll(),cut=new Date(Date.now()-60*86400e3).toISOString().slice(0,10);
+ Object.keys(all).forEach(function(d){if(d<cut)delete all[d];});
+ if(!Object.keys(e.rm).length&&!Object.keys(e.keep).length&&!e.add.length)delete all[day];else all[day]=e;
+ try{localStorage.setItem('tgk_mf_edits',JSON.stringify(all));}catch(err){toast('Could not save your manifest changes on this device');}
+}
+// What is on the sheet = what shipped that day, minus drop-ship boxes (unless added back), minus anything removed by hand, plus anything added by hand.
+function mfApply(){
+ var st=S._mf;if(!st)return;var e=mfEdits(st.day),have={},pk=[],off=[];
+ (st.raw||[]).forEach(function(p){var k=mfKey(p);have[k]=1;
+  if(e.rm[k])off.push({p:p,why:'removed by hand'});
+  else if(p.ds&&!e.keep[k])off.push({p:p,why:'drop-ship'});
+  else pk.push(p);});
+ e.add.forEach(function(p){var k=mfKey(p);if(!have[k]){have[k]=1;p.added=true;pk.push(p);}});
+ st.pk=pk;st.off=off;
+ if(st.carrier!=='all'&&!pk.some(function(p){return p.carrier===st.carrier;}))st.carrier='all';
+ if(st.flag&&!pk.some(function(p){return st.flag==='intl'?mfIntl(p):mfSvc(p).next;}))st.flag='';
+}
+function mfFlag(f){if(!S._mf)return;S._mf.flag=(S._mf.flag===f?'':f);mfRedraw();}
+function mfRemove(k){
+ var st=S._mf;if(!st)return;var e=mfEdits(st.day),i=e.add.findIndex(function(p){return mfKey(p)===k;});
+ if(i>=0)e.add.splice(i,1);else{e.rm[k]=1;delete e.keep[k];}
+ mfSaveEdits(st.day,e);mfApply();mfRedraw();
+}
+function mfRestore(k){
+ var st=S._mf;if(!st)return;var e=mfEdits(st.day),p=(st.raw||[]).find(function(x){return mfKey(x)===k;});
+ delete e.rm[k];if(p&&p.ds)e.keep[k]=1;
+ mfSaveEdits(st.day,e);mfApply();mfRedraw();
+}
+function mfSlim(p){return {carrier:p.carrier,tracking:p.tracking,orders:p.orders||[],refs:p.refs||[],kind:p.kind||'',customers:p.customers||[],units:p.units||1,city:p.city||'',state:p.state||'',country:p.country||'',first:p.first||new Date().toISOString(),svcLabel:p.svcLabel||'',added:true,manual:!!p.manual};}
+// Add a box that shipped on another day (a label made yesterday that missed pickup, say): type its order number or tracking number.
+async function mfAdd(){
+ var st=S._mf;if(!st)return;var el=document.getElementById('mf-add'),q=String((el&&el.value)||'').trim().replace(/^#/,'');
+ if(!q){toast('Type an order number or a tracking number first');return;}
+ var norm=function(v){return String(v||'').trim().replace(/^#/,'').toUpperCase();},Q=q.toUpperCase();
+ var rows=(S.sales||[]).filter(function(r){return norm(r.order_number)===Q||norm(r.tracking_number)===Q;});
+ if(!rows.length){try{
+   var a=await db.from('sales').select('*').in('order_number',[q,'#'+q]).limit(200),b=await db.from('sales').select('*').eq('tracking_number',q).limit(200);
+   rows=((a&&a.data)||[]).concat((b&&b.data)||[]);
+ }catch(err){toast('Could not look that up: '+((err&&err.message)||err),6000);return;}}
+ if(S._mf!==st)return;
+ var found=mfPackages(rows,null).packages;
+ if(!found.length){toast('No shipped package with tracking found for '+escHtml(q)+'. Use "Add by hand" to list a box anyway.',7000);return;}
+ var e=mfEdits(st.day),on={},n=0;(st.pk||[]).forEach(function(p){on[mfKey(p)]=1;});
+ found.forEach(function(p){var k=mfKey(p);if(on[k])return;n++;
+  if((st.raw||[]).some(function(x){return mfKey(x)===k;})){delete e.rm[k];if(p.ds)e.keep[k]=1;}else e.add.push(mfSlim(p));});
+ if(!n){toast('That is already on this manifest');return;}
+ mfSaveEdits(st.day,e);mfApply();mfRedraw();toast(n+' package'+(n===1?'':'s')+' added to this manifest');
+}
+function mfAddManual(){
+ var st=S._mf;if(!st)return;
+ var tr=String(prompt('Tracking number of the box to add:','')||'').trim().toUpperCase();if(!tr)return;
+ var ord=String(prompt('Order number or a note for this box (optional):','')||'').trim();
+ var p={carrier:mfCarrier('',tr),tracking:tr,orders:ord?[ord]:[],units:1,manual:true},k=mfKey(p);
+ if((st.pk||[]).some(function(x){return mfKey(x)===k;})){toast('That tracking number is already on this manifest');return;}
+ var e=mfEdits(st.day);delete e.rm[k];e.add.push(mfSlim(p));mfSaveEdits(st.day,e);mfApply();mfRedraw();
+}
 function mfRedraw(){var b=document.getElementById('mf-box');if(b)b.innerHTML=mfHtml();}
 function mfDayLabel(day){try{return new Date(day+'T12:00:00Z').toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric',timeZone:'UTC'});}catch(e){return day;}}
 
@@ -9910,26 +9981,30 @@ function mfResRows(list,kind){
  return (list||[]).filter(function(c){return c&&String(c.tracking_number||'').trim()&&c.shipped_at;}).map(function(c){
   var items=Array.isArray(c.claim_items)&&c.claim_items.length?c.claim_items:(Array.isArray(c.line_items)&&c.line_items.length?c.line_items:null);
   var units=items?items.filter(function(i){return i&&!i.own_unit;}).reduce(function(n,i){return n+(Number(i.qty)||1);},0):(Number(c.qty||c.expected_qty)||1);
-  return {id:(kind==='Warranty'?'wc':'se')+c.id,order_number:(kind==='Warranty'?'WARRANTY-':'SHERROR-')+c.id,_orig:String(c.order_number||'').trim(),customer_name:c.customer_name||'',tracking_number:c.tracking_number,carrier:c.carrier,fulfillment_status:'Shipped',shipped_at:c.shipped_at,qty:units||1,_kind:kind,_claim:true};
+  return {id:(kind==='Warranty'?'wc':'se')+c.id,order_number:(kind==='Warranty'?'WARRANTY-':'SHERROR-')+c.id,_orig:String(c.order_number||'').trim(),customer_name:c.customer_name||'',tracking_number:c.tracking_number,carrier:c.carrier,fulfillment_status:'Shipped',shipped_at:c.shipped_at,qty:units||1,_kind:kind,_claim:true,_svc:String((c.shipping_details||{}).service||''),shipping_city:(c.shipping_details||{}).city||'',shipping_province:(c.shipping_details||{}).state||'',shipping_country:(c.shipping_details||{}).country||''};
  });
 }
 function mfPackages(rows,day){
  var by={},order=[],noTrack={},list=(rows||[]).slice().sort(function(a,b){return (a._claim?1:0)-(b._claim?1:0);});
  list.forEach(function(s){
   if(!/^(shipped|delivered)$/i.test(String(s.fulfillment_status||'')))return;
-  if(!s.shipped_at)return;var d;try{d=centralDateOnly(s.shipped_at);}catch(e){return;}if(d!==day)return;
+  if(!s.shipped_at)return;var d;try{d=centralDateOnly(s.shipped_at);}catch(e){return;}if(day&&d!==day)return;   // day=null: any ship date (adding a box by hand)
   var kind=mfKindOf(s),tr=String(s.tracking_number||'').trim().toUpperCase(),raw=String(s.order_number||'');
   if(!tr){if(!kind)noTrack[s.order_number||('id'+s.id)]=1;return;}   // a resolution with no tracking shipped nothing (a refund, say)
   var car=mfCarrier(s.carrier,tr),k=car+'|'+tr,p=by[k];
   if(p&&s._claim&&p.raw.indexOf(raw)>=0)return;   // already counted through its own sales row: do not count the same box twice
-  if(!p){p=by[k]={carrier:car,tracking:tr,orders:[],refs:[],raw:[],kind:'',customers:[],units:0,lines:0,city:'',state:'',country:'',first:String(s.shipped_at)};order.push(p);}
+  if(!p){p=by[k]={carrier:car,tracking:tr,orders:[],refs:[],raw:[],kind:'',customers:[],units:0,lines:0,dsLines:0,svcLabel:'',city:'',state:'',country:'',first:String(s.shipped_at)};order.push(p);}
   if(p.raw.indexOf(raw)<0)p.raw.push(raw);
   if(kind){p.kind=kind;var ref=mfRef(kind,raw,s._orig);if(p.refs.indexOf(ref)<0)p.refs.push(ref);}
   else if(s.order_number&&p.orders.indexOf(s.order_number)<0)p.orders.push(s.order_number);
   var cn=String(s.customer_name||'').trim();if(cn&&p.customers.indexOf(cn)<0)p.customers.push(cn);
-  p.units+=Number(s.qty)||1;p.lines++;if(!p.city){p.city=String(s.shipping_city||'').trim();p.state=String(s.shipping_province||'').trim();p.country=String(s.shipping_country||'').trim();}
+  p.units+=Number(s.qty)||1;p.lines++;if(s._svc&&!p.svcLabel)p.svcLabel=s._svc;
+  // Drop-ship line: the same rule as the Drop-Ship Queue (a SKU that is neither an assembly nor a part), or one already marked ordered from a vendor.
+  if(!kind&&(s.dropship_order_ref||(!findAsm(s.pn)&&!partByPn(s.pn))))p.dsLines++;
+  if(!p.city){p.city=String(s.shipping_city||'').trim();p.state=String(s.shipping_province||'').trim();p.country=String(s.shipping_country||'').trim();}
   if(String(s.shipped_at)<p.first)p.first=String(s.shipped_at);
  });
+ order.forEach(function(p){p.ds=p.lines>0&&p.dsLines===p.lines;});   // every line in the box is drop-ship: it never left this warehouse
  var rank={UPS:0,USPS:1,FedEx:2,DHL:3};
  order.sort(function(a,b){return ((rank[a.carrier]===undefined?9:rank[a.carrier])-(rank[b.carrier]===undefined?9:rank[b.carrier]))||a.carrier.localeCompare(b.carrier)||String(a.first).localeCompare(String(b.first))||a.tracking.localeCompare(b.tracking);});
  return {packages:order,noTracking:Object.keys(noTrack)};
@@ -9950,25 +10025,30 @@ async function mfLoad(day){
 }
 async function mfReload(){
  var st=S._mf;if(!st)return;st.loading=true;st.err='';mfRedraw();
- try{var r=await mfLoad(st.day);if(S._mf!==st)return;st.pk=r.packages;st.noTracking=r.noTracking;st.warn=r.warn||'';if(st.carrier!=='all'&&!st.pk.some(function(p){return p.carrier===st.carrier;}))st.carrier='all';}
+ try{var r=await mfLoad(st.day);if(S._mf!==st)return;st.raw=r.packages;st.noTracking=r.noTracking;st.warn=r.warn||'';mfApply();}
  catch(e){if(S._mf===st)st.err=(e&&e.message)||String(e);}
  if(S._mf===st){st.loading=false;mfRedraw();}
 }
 function mfHtml(){
  var st=S._mf||{},sel=mfSelected(),cs=mfCarriers(st.pk||[]),today=centralDateOnly();
  var orders={},units=0,res=0;sel.forEach(function(p){p.orders.forEach(function(o){orders[o]=1;});units+=p.units;if(p.kind)res++;});
- var head='<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px"><div style="flex:1"><div style="font-size:var(--t-lg);font-weight:700">End of day manifest</div><div class="t3s">Every package that shipped on the day, by carrier, with a line for the driver to sign. Customer orders, warranty replacements and reships are all included. You can print any past day again.</div></div><button class="btn btn-sm" onclick="mfClose()">Close</button></div>';
+ var head='<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px"><div style="flex:1"><div style="font-size:var(--t-lg);font-weight:700">End of day manifest</div><div class="t3s">Every package that shipped on the day, by carrier, with a line for the driver to sign. Customer orders, warranty replacements and reships are included; drop-ship orders are left off. Remove a box with &times;, or add one that shipped another day. Your changes are kept for that date on this device.</div></div><button class="btn btn-sm" onclick="mfClose()">Close</button></div>';
  var tools='<div style="padding:12px 20px;border-bottom:1px solid var(--border);display:flex;gap:10px;align-items:center;flex-wrap:wrap"><input type="date" class="form-input" style="width:auto" max="'+today+'" value="'+escHtml(st.day)+'" onchange="mfDay(this.value)">'
   +(cs.length?'<span class="dl-chip'+(st.carrier==='all'?' on':'')+'" onclick="mfCarrierPick(\'all\')">All '+(st.pk||[]).length+'</span>':'')+cs.map(function(c){return '<span class="dl-chip'+(st.carrier===c.name?' on':'')+'" onclick="mfCarrierPick(\''+escHtml(c.name)+'\')">'+escHtml(c.name)+' '+c.n+'</span>';}).join('')
+  +(function(){var ni=(st.pk||[]).filter(mfIntl).length,nn=(st.pk||[]).filter(function(p){return mfSvc(p).next;}).length;
+    return (ni?'<span class="dl-chip'+(st.flag==='intl'?' on':'')+'" onclick="mfFlag(\'intl\')" title="Show only international packages">International '+ni+'</span>':'')+(nn?'<span class="dl-chip'+(st.flag==='next'?' on':'')+'" onclick="mfFlag(\'next\')" title="Show only next-day packages">Next day '+nn+'</span>':'');})()
   +'<span style="margin-left:auto;display:flex;gap:8px"><button class="btn btn-sm" onclick="mfReload()" title="Check again for shipments">&#8635; Reload</button><button class="btn btn-sm" onclick="mfCsv()"'+(sel.length?'':' disabled')+'>Download CSV</button><button class="btn btn-sm btn-primary" onclick="mfPrint()"'+(sel.length?'':' disabled')+'>&#128438; Print manifest</button></span></div>';
  if(st.loading)return head+tools+'<div style="padding:40px;text-align:center;color:var(--text3)">Loading what shipped&hellip;</div>';
  if(st.err)return head+tools+'<div style="padding:30px 20px;color:var(--red)">Could not load the shipments: '+escHtml(st.err)+'</div>';
  var warn=(st.warn?'<div style="margin:12px 20px 0;padding:9px 12px;background:var(--red-dim);color:var(--red);border-radius:var(--r-md);font-size:var(--t-sm)"><b>Check this list:</b> '+escHtml(st.warn)+'</div>':'')
   +((st.noTracking||[]).length?'<div style="margin:12px 20px 0;padding:9px 12px;background:var(--yellow-dim,rgba(217,119,6,.1));border-radius:var(--r-md);font-size:var(--t-sm)"><b>'+st.noTracking.length+' shipped order'+(st.noTracking.length===1?' has':'s have')+' no tracking number</b> (local pickup or hand delivery?), so '+(st.noTracking.length===1?'it is':'they are')+' not on the driver\'s sheet: '+escHtml(st.noTracking.slice(0,8).join(', '))+(st.noTracking.length>8?' and '+(st.noTracking.length-8)+' more':'')+'</div>':'');
- if(!(st.pk||[]).length)return head+tools+warn+'<div style="padding:40px;text-align:center;color:var(--text3)">Nothing has shipped on '+escHtml(mfDayLabel(st.day))+' yet.<div class="t3xs" style="margin-top:6px">Shipments appear here as ShipStation reports them. Press Reload to check again.</div></div>';
- var rows=sel.map(function(p,i){return '<tr><td class="t3s">'+(i+1)+'</td><td><b>'+escHtml(p.carrier)+'</b></td><td style="font-family:var(--mono)">'+escHtml(p.tracking)+'</td><td>'+escHtml(p.orders.join(', '))+p.refs.map(function(r){return (p.orders.length?' ':'')+'<span class="pill pill-purple" title="Customer resolution: not a customer order">'+escHtml(r)+'</span>';}).join('')+'</td><td>'+escHtml(p.customers[0]||'')+(p.customers.length>1?' +'+(p.customers.length-1):'')+'</td><td class="t2s">'+escHtml(mfShipTo(p))+'</td><td style="text-align:right">'+p.units+'</td></tr>';}).join('');
- return head+tools+warn+'<div style="padding:12px 20px 4px;font-size:var(--t-md)"><b>'+sel.length+' package'+(sel.length===1?'':'s')+'</b> &middot; '+Object.keys(orders).length+' order'+(Object.keys(orders).length===1?'':'s')+(res?' &middot; <span style="color:var(--purple);font-weight:600">'+res+' customer resolution'+(res===1?'':'s')+'</span>':'')+' &middot; '+units+' unit'+(units===1?'':'s')+' <span class="t3s">&middot; shipped '+escHtml(mfDayLabel(st.day))+'</span></div>'
-  +'<div style="overflow:auto;padding:0 20px 16px"><table style="width:100%"><thead><tr><th style="width:40px">#</th><th style="width:70px;text-align:left">Carrier</th><th style="text-align:left">Tracking number</th><th style="text-align:left">Order</th><th style="text-align:left">Customer</th><th style="text-align:left">Ship to</th><th style="text-align:right;width:60px">Units</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+ var addBar='<div style="padding:10px 20px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="t3s" style="font-weight:700">Add a box</span><input id="mf-add" class="form-input" style="width:230px" placeholder="Order # or tracking #" onkeydown="if(event.key===\'Enter\')mfAdd()"><button class="btn btn-sm" onclick="mfAdd()">Add</button><button class="btn btn-sm" onclick="mfAddManual()" title="List a box that the ERP has no shipment for">Add by hand</button></div>';
+ var offBox=(st.off||[]).length?'<div style="margin:10px 20px 14px;padding:9px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-md);font-size:var(--t-sm)"><b>Left off this manifest ('+st.off.length+')</b>'+st.off.map(function(o){return '<div style="display:flex;gap:10px;align-items:center;padding:4px 0;border-top:1px solid var(--border);margin-top:4px"><span style="font-family:var(--mono)">'+escHtml(o.p.tracking)+'</span><span>'+escHtml(mfRefs(o.p))+'</span><span class="t3s">'+escHtml(o.p.customers[0]||'')+'</span><span class="pill pill-muted">'+o.why+'</span><button class="btn btn-sm" style="margin-left:auto" data-k="'+escHtml(mfKey(o.p))+'" onclick="mfRestore(this.dataset.k)">Add back</button></div>';}).join('')+'</div>':'';
+ if(!(st.pk||[]).length)return head+tools+warn+addBar+offBox+'<div style="padding:40px;text-align:center;color:var(--text3)">Nothing has shipped on '+escHtml(mfDayLabel(st.day))+' yet.<div class="t3xs" style="margin-top:6px">Shipments appear here as ShipStation reports them. Press Reload to check again.</div></div>';
+ var rows=sel.map(function(p,i){return '<tr><td class="t3s">'+(i+1)+'</td><td><b>'+escHtml(p.carrier)+'</b></td><td style="font-family:var(--mono)">'+escHtml(p.tracking)+'</td><td>'+escHtml(p.orders.join(', '))+p.refs.map(function(r){return (p.orders.length?' ':'')+'<span class="pill pill-purple" title="Customer resolution: not a customer order">'+escHtml(r)+'</span>';}).join('')+'</td><td>'+escHtml(p.customers[0]||'')+(p.customers.length>1?' +'+(p.customers.length-1):'')+(p.added?' <span class="pill pill-muted" title="Added by hand">added</span>':'')+'</td><td class="t2s">'+escHtml(mfShipTo(p))+'</td><td>'+(mfIntl(p)?'<span class="pill pill-blue" style="margin-right:4px">INTL</span>':'')+(mfSvc(p).next?'<span class="pill pill-red" style="margin-right:4px">NEXT DAY</span>':'')+'<span class="t3s">'+escHtml(mfSvc(p).name)+'</span></td><td style="text-align:right">'+p.units+'</td><td style="text-align:right"><button class="action-btn" style="color:var(--red)" title="Take this box off the manifest" data-k="'+escHtml(mfKey(p))+'" onclick="mfRemove(this.dataset.k)">&#10005;</button></td></tr>';}).join('');
+ var nIntl=sel.filter(mfIntl).length,nNext=sel.filter(function(p){return mfSvc(p).next;}).length;
+ return head+tools+warn+addBar+'<div style="padding:12px 20px 4px;font-size:var(--t-md)"><b>'+sel.length+' package'+(sel.length===1?'':'s')+'</b> &middot; '+Object.keys(orders).length+' order'+(Object.keys(orders).length===1?'':'s')+(res?' &middot; <span style="color:var(--purple);font-weight:600">'+res+' customer resolution'+(res===1?'':'s')+'</span>':'')+(nIntl?' &middot; <span style="color:var(--blue);font-weight:600">'+nIntl+' international</span>':'')+(nNext?' &middot; <span style="color:var(--red);font-weight:600">'+nNext+' next day</span>':'')+' &middot; '+units+' unit'+(units===1?'':'s')+' <span class="t3s">&middot; shipped '+escHtml(mfDayLabel(st.day))+'</span></div>'
+  +'<div style="overflow:auto;padding:0 20px 16px"><table style="width:100%"><thead><tr><th style="width:40px">#</th><th style="width:70px;text-align:left">Carrier</th><th style="text-align:left">Tracking number</th><th style="text-align:left">Order</th><th style="text-align:left">Customer</th><th style="text-align:left">Ship to</th><th style="text-align:left">Service</th><th style="text-align:right;width:60px">Units</th><th style="width:36px"></th></tr></thead><tbody>'+rows+'</tbody></table></div>'+offBox;
 }
 function mfPrintHtml(pk,day,who){
  var esc=function(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');};
@@ -9977,15 +10057,15 @@ function mfPrintHtml(pk,day,who){
  var css='*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;color:#111;margin:0;font-size:12px}.pg{padding:30px 38px;page-break-after:always}.pg:last-child{page-break-after:auto}'
   +'.hd{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:3px solid #111;padding-bottom:8px;margin-bottom:12px}.hd h1{margin:0;font-size:22px;letter-spacing:.02em}.hd .co{font-size:11px;letter-spacing:.18em;font-weight:700;color:#555}'
   +'.meta{display:flex;gap:28px;margin-bottom:12px;font-size:13px}.meta b{display:block;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#666;font-weight:700}.big{font-size:20px;font-weight:700}'
-  +'table{width:100%;border-collapse:collapse}th{background:#111;color:#fff;text-align:left;font-size:10px;letter-spacing:.08em;text-transform:uppercase;padding:6px 7px}td{border-bottom:1px solid #ccc;padding:6px 7px;vertical-align:middle}thead{display:table-header-group}tr{page-break-inside:avoid}.m{font-family:Consolas,Menlo,monospace;font-size:12px}.r{text-align:right}.bx{width:15px;height:15px;border:1.5px solid #111;display:inline-block;vertical-align:middle}.rs{font-style:italic}'
+  +'table{width:100%;border-collapse:collapse}th{background:#111;color:#fff;text-align:left;font-size:10px;letter-spacing:.08em;text-transform:uppercase;padding:6px 7px}td{border-bottom:1px solid #ccc;padding:6px 7px;vertical-align:middle}thead{display:table-header-group}tr{page-break-inside:avoid}.m{font-family:Consolas,Menlo,monospace;font-size:12px}.r{text-align:right}.bx{width:15px;height:15px;border:1.5px solid #111;display:inline-block;vertical-align:middle}.rs{font-style:italic}.fl{font-weight:700;border:1.5px solid #111;padding:0 4px;margin-right:4px;font-size:10px;letter-spacing:.04em;white-space:nowrap}'
   +'.sig{margin-top:22px;border:2px solid #111;padding:14px 16px;page-break-inside:avoid}.sig p{margin:0 0 14px;font-size:11px;color:#333}.row{display:flex;gap:26px;margin-top:22px}.f{flex:1}.f .ln{border-bottom:1.5px solid #111;height:26px}.f label{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#555;font-weight:700;display:block;margin-top:4px}'
   +'.ft{margin-top:12px;font-size:10px;color:#666;display:flex;justify-content:space-between}@page{margin:10mm}';
  var pages=names.map(function(n){
-  var g=groups[n],ord={},u=0,rs=0;g.forEach(function(p){p.orders.forEach(function(o){ord[o]=1;});u+=p.units;if(p.kind)rs++;});
+  var g=groups[n],ord={},u=0,rs=0,ni=0,nn=0;g.forEach(function(p){p.orders.forEach(function(o){ord[o]=1;});u+=p.units;if(p.kind)rs++;if(mfIntl(p))ni++;if(mfSvc(p).next)nn++;});
   return '<div class="pg"><div class="hd"><div><div class="co">TGK MOTORSPORT</div><h1>Shipment manifest</h1></div><div style="text-align:right;font-size:11px;color:#444">Prepared by '+esc(who||'')+'<br>Printed '+esc(printed)+' (Central)</div></div>'
-   +'<div class="meta"><div><b>Carrier</b><span class="big">'+esc(n)+'</span></div><div><b>Ship date</b>'+esc(dl)+'</div><div><b>Packages</b><span class="big">'+g.length+'</span></div><div><b>Orders</b>'+Object.keys(ord).length+'</div>'+(rs?'<div><b>Customer resolutions</b>'+rs+'</div>':'')+'<div><b>Units</b>'+u+'</div></div>'
-   +'<table><thead><tr><th style="width:26px">#</th><th style="width:22px">&#10003;</th><th>Tracking number</th><th>Order</th><th>Customer</th><th>Ship to</th><th class="r" style="width:40px">Units</th></tr></thead><tbody>'
-   +g.map(function(p,i){return '<tr><td>'+(i+1)+'</td><td><span class="bx"></span></td><td class="m">'+esc(p.tracking)+'</td><td>'+esc(p.orders.join(', '))+(p.refs.length?(p.orders.length?' ':'')+'<span class="rs">'+esc(p.refs.join(', '))+'</span>':'')+'</td><td>'+esc(p.customers[0]||'')+(p.customers.length>1?' +'+(p.customers.length-1):'')+'</td><td>'+esc(mfShipTo(p))+'</td><td class="r">'+p.units+'</td></tr>';}).join('')
+   +'<div class="meta"><div><b>Carrier</b><span class="big">'+esc(n)+'</span></div><div><b>Ship date</b>'+esc(dl)+'</div><div><b>Packages</b><span class="big">'+g.length+'</span></div><div><b>Orders</b>'+Object.keys(ord).length+'</div>'+(rs?'<div><b>Customer resolutions</b>'+rs+'</div>':'')+(ni?'<div><b>International</b>'+ni+'</div>':'')+(nn?'<div><b>Next day</b>'+nn+'</div>':'')+'<div><b>Units</b>'+u+'</div></div>'
+   +'<table><thead><tr><th style="width:26px">#</th><th style="width:22px">&#10003;</th><th>Tracking number</th><th>Order</th><th>Customer</th><th>Ship to</th><th>Service</th><th class="r" style="width:40px">Units</th></tr></thead><tbody>'
+   +g.map(function(p,i){return '<tr><td>'+(i+1)+'</td><td><span class="bx"></span></td><td class="m">'+esc(p.tracking)+'</td><td>'+esc(p.orders.join(', '))+(p.refs.length?(p.orders.length?' ':'')+'<span class="rs">'+esc(p.refs.join(', '))+'</span>':'')+'</td><td>'+esc(p.customers[0]||'')+(p.customers.length>1?' +'+(p.customers.length-1):'')+'</td><td>'+esc(mfShipTo(p))+'</td><td>'+(mfIntl(p)?'<span class="fl">INTL</span>':'')+(mfSvc(p).next?'<span class="fl">NEXT DAY</span>':'')+esc(mfSvc(p).name)+'</td><td class="r">'+p.units+'</td></tr>';}).join('')
    +'</tbody></table>'
    +'<div class="sig"><p>The carrier acknowledges receipt of the <b>'+g.length+' package'+(g.length===1?'':'s')+'</b> listed above, in apparent good order, on the date and time below.</p>'
    +'<div class="row"><div class="f"><div class="ln"></div><label>Packages received by driver</label></div><div class="f"><div class="ln"></div><label>Driver name (print)</label></div></div>'
@@ -9997,8 +10077,8 @@ function mfPrintHtml(pk,day,who){
 }
 function mfCsv(){
  var st=S._mf;if(!st)return;var sel=mfSelected();if(!sel.length)return;
- var rows=[['Carrier','Tracking number','Type','Orders','Customer','Ship to','Units','Shipped (Central)']];
- sel.forEach(function(p){rows.push([p.carrier,p.tracking,p.kind?'Customer resolution ('+p.kind.toLowerCase()+')':'Order',mfRefs(p).replace(/, /g,' '),p.customers.join(' / '),mfShipTo(p),p.units,new Date(p.first).toLocaleString('en-US',{timeZone:'America/Chicago'})]);});
+ var rows=[['Carrier','Tracking number','Type','Orders','Customer','Ship to','Service','International','Next day','Units','Shipped (Central)']];
+ sel.forEach(function(p){rows.push([p.carrier,p.tracking,p.kind?'Customer resolution ('+p.kind.toLowerCase()+')':'Order',mfRefs(p).replace(/, /g,' '),p.customers.join(' / '),mfShipTo(p),mfSvc(p).name,mfIntl(p)?'Yes':'',mfSvc(p).next?'Yes':'',p.units,new Date(p.first).toLocaleString('en-US',{timeZone:'America/Chicago'})]);});
  dnDownload('manifest-'+st.day+(st.carrier==='all'?'':'-'+st.carrier)+'.csv',rows.map(function(r){return r.map(dnCsvCell).join(',');}).join('\r\n')+'\r\n');
 }
 function renderDealers(){
