@@ -660,7 +660,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.129';
+const TGK_ERP_VERSION = 'v23.131';
 const TGK_ERP_BUILD_DATE = '2026-11-16';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -2511,6 +2511,96 @@ function goToOrder(orderNum){
 }
 window.goToOrder=goToOrder;
 
+// [v23.130/131] New-order sound. Every sound is synthesized with Web Audio (no files to host). On/off, choice and volume are per device (localStorage); default on, Classic chime, 80%.
+var ORDER_SOUNDS=[['chime','Classic chime'],['bov','Blow-off valve'],['spool','Turbo spool + blow-off'],['flutter','Compressor surge (flutter)'],['wastegate','Wastegate chatter'],['pops','Pops & bangs']];
+var _chimeCtx=null;
+function _lsGet(k,d){try{var v=localStorage.getItem(k);return v===null?d:v;}catch(e){return d;}}
+function _lsSet(k,v){try{localStorage.setItem(k,v);}catch(e){}}
+function _chimeEnabled(){return _lsGet('tgk_order_chime','on')!=='off';}
+function orderSoundId(){var id=_lsGet('tgk_order_sound','chime');return ORDER_SOUNDS.some(function(x){return x[0]===id;})?id:'chime';}
+function orderSoundVol(){var v=parseInt(_lsGet('tgk_order_sound_vol','80'));return isNaN(v)?80:Math.max(0,Math.min(100,v));}
+function setOrderChime(on){_lsSet('tgk_order_chime',on?'on':'off');if(on)playOrderChime(true);}
+function setOrderSound(id){_lsSet('tgk_order_sound',id);playOrderChime(true);}
+function setOrderSoundVol(v){_lsSet('tgk_order_sound_vol',String(v));}
+function _chimeUnlock(){
+  // Browsers only allow sound after the person has touched the page once. Warm the audio engine on the first click, tap or keypress.
+  try{var AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
+    if(!_chimeCtx)_chimeCtx=new AC();
+    if(_chimeCtx.state==='suspended')_chimeCtx.resume();
+    if(_chimeCtx.state==='running'){['pointerdown','keydown','touchstart'].forEach(function(ev){document.removeEventListener(ev,_chimeUnlock,true);});}
+  }catch(e){}
+}
+['pointerdown','keydown','touchstart'].forEach(function(ev){document.addEventListener(ev,_chimeUnlock,{capture:true,passive:true});});
+function _noiseBuf(ctx){
+  if(!ctx._tgkNoise){var len=ctx.sampleRate*2,b=ctx.createBuffer(1,len,ctx.sampleRate),d=b.getChannelData(0);for(var i=0;i<len;i++)d[i]=Math.random()*2-1;ctx._tgkNoise=b;}
+  return ctx._tgkNoise;
+}
+// A shaped burst of filtered noise: the "air" in every valve sound.
+function _noise(ctx,out,t,dur,o){
+  var src=ctx.createBufferSource();src.buffer=_noiseBuf(ctx);
+  var f=ctx.createBiquadFilter();f.type=o.type||'bandpass';f.frequency.setValueAtTime(o.f0,t);if(o.f1)f.frequency.exponentialRampToValueAtTime(o.f1,t+dur);f.Q.value=o.q||0.7;
+  var g=ctx.createGain();g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(o.peak||0.5,t+(o.attack||0.01));g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  src.connect(f);f.connect(g);g.connect(out);src.start(t,Math.random()*0.5);src.stop(t+dur+0.05);
+}
+function _tone(ctx,out,t,type,f0,f1,dur,peak,attack){
+  var o=ctx.createOscillator(),g=ctx.createGain();
+  o.type=type;o.frequency.setValueAtTime(f0,t);if(f1)o.frequency.exponentialRampToValueAtTime(f1,t+dur);
+  g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(peak,t+(attack||0.02));g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  o.connect(g);g.connect(out);o.start(t);o.stop(t+dur+0.05);
+}
+function _bov(ctx,out,t,scale){
+  scale=scale||1;
+  _noise(ctx,out,t,0.8*scale,{type:'bandpass',f0:5200,f1:2100,q:0.9,peak:0.9,attack:0.008});   // the "pssshh"
+  _noise(ctx,out,t,0.55*scale,{type:'highpass',f0:3200,peak:0.35,attack:0.006});               // extra hiss on top
+  _tone(ctx,out,t,'sine',150,55,0.09,0.55,0.004);                                              // valve thump
+}
+var _ORDER_SND={
+  chime:function(ctx,out,t){[[880,0],[1318.5,0.16]].forEach(function(n){_tone(ctx,out,t+n[1],'sine',n[0],0,0.9,0.28,0.02);});},
+  bov:function(ctx,out,t){_bov(ctx,out,t,1);},
+  spool:function(ctx,out,t){
+    // Turbo whistle winding up (fundamental + octave + air rush), then the pedal lifts and the valve dumps.
+    var L=0.85;
+    [[700,4800,0.16],[1400,9600,0.05]].forEach(function(w){
+      var o=ctx.createOscillator(),g=ctx.createGain();
+      o.type='sine';o.frequency.setValueAtTime(w[0],t);o.frequency.exponentialRampToValueAtTime(w[1],t+L);
+      g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(w[2],t+L-0.03);g.gain.setValueAtTime(w[2],t+L);g.gain.exponentialRampToValueAtTime(0.0001,t+L+0.04);
+      o.connect(g);g.connect(out);o.start(t);o.stop(t+L+0.08);
+    });
+    _noise(ctx,out,t,L,{type:'bandpass',f0:1500,f1:4200,q:1.1,peak:0.1,attack:L-0.05});
+    _bov(ctx,out,t+L+0.03,1);
+  },
+  flutter:function(ctx,out,t){
+    // Compressor surge: noise chopped by a slowing LFO, the "ta-ta-ta-ta" of a loud flutter valve.
+    var src=ctx.createBufferSource();src.buffer=_noiseBuf(ctx);
+    var f=ctx.createBiquadFilter();f.type='bandpass';f.frequency.value=2800;f.Q.value=1.2;
+    var mod=ctx.createGain();mod.gain.value=0.5;
+    var lfo=ctx.createOscillator(),lg=ctx.createGain();lfo.type='square';lfo.frequency.setValueAtTime(24,t);lfo.frequency.exponentialRampToValueAtTime(8,t+0.9);lg.gain.value=0.5;lfo.connect(lg);lg.connect(mod.gain);
+    var env=ctx.createGain();env.gain.setValueAtTime(0.0001,t);env.gain.exponentialRampToValueAtTime(0.8,t+0.01);env.gain.exponentialRampToValueAtTime(0.0001,t+0.95);
+    src.connect(f);f.connect(mod);mod.connect(env);env.connect(out);
+    src.start(t,Math.random()*0.5);src.stop(t+1);lfo.start(t);lfo.stop(t+1);
+  },
+  wastegate:function(ctx,out,t){[[0,0.6],[0.07,0.5],[0.15,0.42],[0.26,0.34],[0.4,0.26]].forEach(function(b){
+    _noise(ctx,out,t+b[0],0.08,{type:'highpass',f0:2400,peak:b[1],attack:0.004});
+    _tone(ctx,out,t+b[0],'sine',900,300,0.05,b[1]*0.25,0.003);
+  });},
+  pops:function(ctx,out,t){[0,0.09,0.17,0.3,0.38,0.55,0.7].forEach(function(d,i){
+    var k=1-i*0.08;
+    _noise(ctx,out,t+d,0.1,{type:'lowpass',f0:1900,f1:400,q:0.6,peak:0.9*k,attack:0.003});
+    _tone(ctx,out,t+d,'sine',170,48,0.08,0.6*k,0.003);
+  });}
+};
+function playOrderChime(force){
+  if(!force&&!_chimeEnabled())return;
+  try{
+    var AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
+    if(!_chimeCtx)_chimeCtx=new AC();
+    var ctx=_chimeCtx;if(ctx.state==='suspended')ctx.resume();
+    var out=ctx.createGain();out.gain.value=orderSoundVol()/100;out.connect(ctx.destination);
+    (_ORDER_SND[orderSoundId()]||_ORDER_SND.chime)(ctx,out,ctx.currentTime);
+  }catch(e){console.warn('[order sound]',e);}
+}
+window.playOrderChime=playOrderChime;window.setOrderChime=setOrderChime;window.setOrderSound=setOrderSound;window.setOrderSoundVol=setOrderSoundVol;
+
 function showOrderAlert(orderNum, pn){
   const key=String(orderNum||'')||('__'+pn);
   const buf=window._orderAlertBuf;
@@ -2526,6 +2616,7 @@ function showOrderAlert(orderNum, pn){
     const rec=buf[key]; delete buf[key];
     if(!rec)return;
     const label=rec.items>1?(rec.items+' items'):rec.first;
+    playOrderChime();   // [v23.130] once per order, after the 2.5s settle window, so a multi-line order chimes one time
     toast('<span class="ic ic-cart"></span>New order #'+orderNum+' \u2014 '+label, 7000,
           function(){goToOrder(orderNum);});
     if(S.view!=='sales'){
@@ -10234,6 +10325,19 @@ function renderIntegrations(){
     </div>
   </div>`:''}
   ${t==='alerts'?`<div class="int-card">
+    <div class="int-header">
+      <div class="int-icon" style="background:var(--teal);font-size:var(--t-lg)"><span class="ic ic-bell"></span></div>
+      <div style="flex:1"><div class="int-title">New Order Sound</div><div class="int-sub">Plays a sound on this device whenever a new order comes in</div></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:var(--t-md)"><input type="checkbox" ${_chimeEnabled()?'checked':''} onchange="setOrderChime(this.checked)"> Sound on new orders</label>
+      <select class="form-input" style="width:230px" onchange="setOrderSound(this.value)" title="Pick a sound (it plays when you choose it)">${ORDER_SOUNDS.map(function(x){return '<option value="'+x[0]+'" '+(orderSoundId()===x[0]?'selected':'')+'>'+x[1]+'</option>';}).join('')}</select>
+      <label style="display:flex;align-items:center;gap:8px;font-size:var(--t-md)">Volume <input type="range" min="0" max="100" step="5" value="${orderSoundVol()}" style="width:120px" oninput="setOrderSoundVol(this.value)" onchange="playOrderChime(true)"></label>
+      <button type="button" class="btn btn-sm" onclick="playOrderChime(true)">Test sound</button>
+    </div>
+    <div class="t3s" style="margin-top:8px">These settings are per device. The ERP has to be open, and you need to have clicked somewhere on the page once since loading it for the browser to allow sound. The sounds are synthesized approximations of a blow-off valve, turbo and so on, not recordings.</div>
+  </div>
+  <div class="int-card">
     <div class="int-header">
       <div class="int-icon" style="background:var(--orange);font-size:var(--t-lg)"><span class="ic ic-bell"></span></div>
       <div style="flex:1"><div class="int-title">On Hold Order Alerts</div><div class="int-sub">Popup notification for your team when a new order goes On Hold</div></div>
