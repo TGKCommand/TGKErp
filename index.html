@@ -660,7 +660,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.138';
+const TGK_ERP_VERSION = 'v23.140';
 const TGK_ERP_BUILD_DATE = '2026-11-17';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -2678,8 +2678,15 @@ function _playRec(ctx,vol,layers){
     });
   });
 }
+var _chimeLastAuto=0,_chimeBlockedTold=false;
 function playOrderChime(force){
   if(!force&&!_chimeEnabled())return;
+  if(!force){
+    // [v23.140] A dealer PO raises its own pop-up and then, seconds later, the Shopify order it creates raises the regular one. One sound for the pair.
+    var _now=Date.now();if(_now-_chimeLastAuto<10000)return;_chimeLastAuto=_now;
+    // If the browser is refusing to play sound on this page, say so once instead of failing silently.
+    setTimeout(function(){try{if(_chimeCtx&&_chimeCtx.state!=='running'&&!_chimeBlockedTold){_chimeBlockedTold=true;toast('<span class="ic ic-alert"></span>The new-order sound was blocked by the browser. Click anywhere inside the ERP once and it will play from then on.',9000);}}catch(e){}},600);
+  }
   try{
     var AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
     if(!_chimeCtx)_chimeCtx=new AC();
@@ -34146,10 +34153,19 @@ function dsCounts(){
   dsLive().forEach(function(r){if(r.status==='attention'||r.status==='new'||r.status==='sending')c.attention++;if(r.status==='awaiting_payment')c.awaiting++;if(r.status==='sent'&&String(r.sent_at||'').slice(0,10)===today)c.sentToday++;});
   return c;
 }
-function dsBadge(){var el=typeof document!=='undefined'&&document.getElementById('dealerorders-badge');if(!el)return;var n=dsCounts().attention;el.textContent=n;el.style.display=n>0?'inline':'none';}
+// [v23.139] The menu count used to be only POs that need you (new / attention / sending). Dealer POs now go straight to Shopify, so they were never in
+// those states and the count never showed. It now also counts POs that came in since you last opened Dealer Orders on this device, like Sales Orders does.
+var DS_HOLD=['new','attention','sending'];
+function dsSeenAt(){var v='';try{v=localStorage.getItem('tgk_ds_seen_at')||'';}catch(e){}if(!v){v=new Date().toISOString();try{localStorage.setItem('tgk_ds_seen_at',v);}catch(e){}}return v;}
+function dsMarkSeen(){if(typeof document!=='undefined'&&document.visibilityState&&document.visibilityState!=='visible')return;try{localStorage.setItem('tgk_ds_seen_at',new Date().toISOString());}catch(e){}}
+function dsUnseen(){var at=dsSeenAt();return dsLive().filter(function(r){return DS_HOLD.indexOf(r.status)<0&&r.status!=='rejected'&&r.status!=='cancelled'&&String(r.created_at||'')>at;}).length;}
+function dsBadgeSet(n){var el=typeof document!=='undefined'&&document.getElementById('dealerorders-badge');if(!el)return;el.textContent=n;el.style.display=n>0?'inline':'none';el.title='New dealer POs since you last looked, plus any that need you';}
+function dsBadge(){dsBadgeSet(dsCounts().attention+dsUnseen());}
 async function dsBadgeKick(){
   var now=Date.now();if(DS._badgeAt&&now-DS._badgeAt<60000)return;DS._badgeAt=now;
-  try{var r=await db.from('dealer_order_requests').select('id',{count:'exact',head:true}).in('status',['new','attention','sending']);if(r&&!r.error&&typeof r.count==='number'){var el=document.getElementById('dealerorders-badge');if(el){el.textContent=r.count;el.style.display=r.count>0?'inline':'none';}}}catch(e){/* the table may not exist yet */}
+  try{var r=await db.from('dealer_order_requests').select('id',{count:'exact',head:true}).in('status',DS_HOLD);if(r&&!r.error&&typeof r.count==='number'){
+    var n2=0;try{var r2=await db.from('dealer_order_requests').select('id',{count:'exact',head:true}).gt('created_at',dsSeenAt()).is('archived_at',null).not('status','in','(new,attention,sending,rejected,cancelled)');if(r2&&!r2.error&&typeof r2.count==='number')n2=r2.count;}catch(e2){}
+    if(!DS.loaded)dsBadgeSet(r.count+n2);}}catch(e){/* the table may not exist yet */}
 }
 async function dsLoadReqs(){
   DS.loading=true;
@@ -34217,6 +34233,7 @@ function dsDealerOfCode(code){   // the dealer whose prefix this discount code s
 function dsLiveSale(p){dsReconcileSoon();var row=p&&(p.new||p.old);if(!row||!row.discount_code)return;var d=dsDealerOfCode(row.discount_code);if(d)dsPingDealer(d.id,'orders');}
 function dsLiveAlert(r){
   var lab=(r.po_number?'PO '+r.po_number:'an order with no PO')+' from '+(r.dealer_name||'a dealer')+' ('+dsMoney((r.totals||{}).total)+')';
+  try{playOrderChime();}catch(e){}   // [v23.140] dealer orders make the new-order sound too
   toast('<span class="ic ic-cart"></span>New dealer order \u2014 '+escHtml(lab),8000,function(){if(typeof nav==='function')nav('dealerorders');DS.sel=r.id;render();});
   try{if(typeof pushActivity==='function')pushActivity({icon:'<span class="ic ic-cart"></span>',type:'order',text:'Dealer order '+(r.po_number?'PO '+r.po_number:'(no PO)'),sub:(r.dealer_name||'')+' \u00b7 '+dsMoney((r.totals||{}).total),ts:r.created_at||new Date().toISOString()});}catch(e){}
   try{if(typeof Notification!=='undefined'&&Notification.permission==='granted'){var n=new Notification('TGK \u2014 New dealer order',{body:lab,tag:'dealer-order-'+r.id});n.onclick=function(){try{window.focus();}catch(e){}n.close();};}}catch(e){}
@@ -34328,6 +34345,8 @@ async function dsSaveSettings(){
   S.settings=S.settings||{};rows.forEach(function(x){S.settings[x.key]=x.value;});toast('Storefront settings saved');render();
 }
 function renderDealerOrders(){
+  // [v23.139] Looking at this page clears the "new since you last looked" part of the menu count.
+  dsMarkSeen();setTimeout(function(){try{dsBadge();}catch(e){}},0);
   if(!DS.loaded&&!DS.loading)dsLoadReqs();
   else if(DS.loaded&&!DS.loading&&(!DS._syncAt||Date.now()-DS._syncAt>120000)&&DS.reqs.some(function(r){return r.status==='awaiting_payment';})){DS._syncAt=Date.now();dsSync(true);}
   var c=dsTally(),rows=dsRows(),sel=DS.sel&&DS.reqs.find(function(r){return String(r.id)===String(DS.sel);});
