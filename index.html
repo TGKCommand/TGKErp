@@ -660,7 +660,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.140';
+const TGK_ERP_VERSION = 'v23.141';
 const TGK_ERP_BUILD_DATE = '2026-11-17';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -34153,19 +34153,15 @@ function dsCounts(){
   dsLive().forEach(function(r){if(r.status==='attention'||r.status==='new'||r.status==='sending')c.attention++;if(r.status==='awaiting_payment')c.awaiting++;if(r.status==='sent'&&String(r.sent_at||'').slice(0,10)===today)c.sentToday++;});
   return c;
 }
-// [v23.139] The menu count used to be only POs that need you (new / attention / sending). Dealer POs now go straight to Shopify, so they were never in
-// those states and the count never showed. It now also counts POs that came in since you last opened Dealer Orders on this device, like Sales Orders does.
-var DS_HOLD=['new','attention','sending'];
-function dsSeenAt(){var v='';try{v=localStorage.getItem('tgk_ds_seen_at')||'';}catch(e){}if(!v){v=new Date().toISOString();try{localStorage.setItem('tgk_ds_seen_at',v);}catch(e){}}return v;}
-function dsMarkSeen(){if(typeof document!=='undefined'&&document.visibilityState&&document.visibilityState!=='visible')return;try{localStorage.setItem('tgk_ds_seen_at',new Date().toISOString());}catch(e){}}
-function dsUnseen(){var at=dsSeenAt();return dsLive().filter(function(r){return DS_HOLD.indexOf(r.status)<0&&r.status!=='rejected'&&r.status!=='cancelled'&&String(r.created_at||'')>at;}).length;}
-function dsBadgeSet(n){var el=typeof document!=='undefined'&&document.getElementById('dealerorders-badge');if(!el)return;el.textContent=n;el.style.display=n>0?'inline':'none';el.title='New dealer POs since you last looked, plus any that need you';}
-function dsBadge(){dsBadgeSet(dsCounts().attention+dsUnseen());}
+// [v23.141] The menu count is the Active count: every dealer PO that has not shipped yet (held, awaiting payment, or in Shopify waiting to go out).
+// It matches the Active button on the page and stays until the order ships, the same way the Sales Orders count works.
+function dsBadgeSet(n){var el=typeof document!=='undefined'&&document.getElementById('dealerorders-badge');if(!el)return;el.textContent=n;el.style.display=n>0?'inline':'none';el.title='Dealer POs that have not shipped yet';}
+function dsBadge(){dsBadgeSet(dsTally().active);}
 async function dsBadgeKick(){
+  if(DS.loaded){dsBadge();return;}   // recount (sales may have just loaded or changed, which decides what has shipped)
+  if(DS.loading)return;
   var now=Date.now();if(DS._badgeAt&&now-DS._badgeAt<60000)return;DS._badgeAt=now;
-  try{var r=await db.from('dealer_order_requests').select('id',{count:'exact',head:true}).in('status',DS_HOLD);if(r&&!r.error&&typeof r.count==='number'){
-    var n2=0;try{var r2=await db.from('dealer_order_requests').select('id',{count:'exact',head:true}).gt('created_at',dsSeenAt()).is('archived_at',null).not('status','in','(new,attention,sending,rejected,cancelled)');if(r2&&!r2.error&&typeof r2.count==='number')n2=r2.count;}catch(e2){}
-    if(!DS.loaded)dsBadgeSet(r.count+n2);}}catch(e){/* the table may not exist yet */}
+  try{await dsLoadReqs();}catch(e){/* the table may not exist yet */}   // the count needs the orders themselves, so load them once up front
 }
 async function dsLoadReqs(){
   DS.loading=true;
@@ -34311,13 +34307,13 @@ function dsReview(r){
     return '<tr><td class="pn" style="white-space:nowrap">'+escHtml(l.sku)+'</td><td>'+escHtml(l.desc||'')+(l.special?' <span class="pill pill-orange">special</span>':'')+'</td><td>'+(editable?'<input type="number" class="form-input" style="width:76px" min="1" value="'+(ed[l.sku]||l.qty)+'" onchange="dsEditQty(this.dataset.s,this.value)" data-s="'+escHtml(l.sku)+'">':l.qty)+'</td><td><b>'+dsMoney(l.unit)+'</b></td><td class="t3s">'+dsMoney(l.std)+'</td><td style="font-weight:800;color:'+(bad?'var(--red)':'var(--green)')+'">'+(mg===null?'&mdash;':mg+'%')+'</td><td style="color:'+(noStock?'var(--text3)':shN?'var(--red)':bdN?'var(--orange)':'var(--green)')+';font-weight:700">'+(noStock?'&mdash;':shN?shN+' short':bdN?'build needed':'in stock')+'</td>'+(editable?'<td><button type="button" class="action-btn del" data-s="'+escHtml(l.sku)+'" onclick="dsDelLine(this.dataset.s)" aria-label="Remove line">&times;</button></td>':'')+'</tr>';
   }).join('');
   var sh=r.ship_to||{},tt=r.totals||{},link=dsShopifyLink(r);
-  return '<div class="panel" style="padding:0;margin-bottom:12px;border-left:3px solid var(--teal)"><div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap"><div><b style="font-size:var(--t-lg,16px)">'+(r.po_number?'PO '+escHtml(r.po_number):'Order with no PO')+'</b> &middot; '+escHtml(r.dealer_name||'')+' '+dsStatusPillFor(r)+dsOfferChip(r)+'</div><div class="t3s">Submitted '+escHtml(new Date(r.created_at).toLocaleString())+'</div></div>'
+  return '<div class="panel" style="padding:0;margin-bottom:12px;border-left:3px solid var(--teal);white-space:normal"><div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap"><div><b style="font-size:var(--t-lg,16px)">'+(r.po_number?'PO '+escHtml(r.po_number):'Order with no PO')+'</b> &middot; '+escHtml(r.dealer_name||'')+' '+dsStatusPillFor(r)+dsOfferChip(r)+'</div><div class="t3s">Submitted '+escHtml(new Date(r.created_at).toLocaleString())+'</div></div>'
    +(r.error?'<div style="padding:10px 16px;background:rgba(220,38,38,.07);color:var(--red);font-size:var(--t-sm);border-bottom:1px solid var(--border)"><b>Why it did not go through:</b> '+escHtml(r.error)+'</div>':'')
    +(r.status==='rejected'&&r.reject_reason?'<div style="padding:10px 16px" class="t3s">Rejected: '+escHtml(r.reject_reason)+'</div>':'')
    +'<div class="tbl-wrap"><table><thead><tr>'+dsTh([['SKU',130],['Item'],['Qty',90],['Dealer price',104],['Standard',90],['Margin',80],['Stock',90]].concat(editable?[['',36]]:[]))+'</tr></thead><tbody>'+rowsH+'</tbody></table></div>'
-   +'<div style="padding:12px 16px;display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px 24px;font-size:var(--t-sm)"><div><b>Ship to</b><br>'+escHtml([sh.name,sh.address1,sh.address2,[sh.city,sh.province,sh.zip].filter(Boolean).join(', '),sh.country].filter(Boolean).join(' / '))+(r.drop_ship?' <span class="pill pill-muted">drop-ship</span>':'')+'</div>'
+   +'<div style="padding:12px 16px;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px 24px;font-size:var(--t-sm);white-space:normal;overflow-wrap:anywhere;line-height:1.45"><div><b>Ship to</b>'+(r.drop_ship?' <span class="pill pill-muted" title="Ships to the dealer\'s customer, not to the dealer">drop-ship</span>':'')+'<br>'+[sh.name,sh.address1,sh.address2,[[sh.city,sh.province].filter(Boolean).join(', '),sh.zip].filter(Boolean).join(' '),sh.country].filter(Boolean).map(escHtml).join('<br>')+'</div>'
    +'<div><b>Payment</b><br>'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</div><div><b>Totals</b><br>'+dsMoney(tt.merchandise)+' merchandise &middot; shipping '+(tt.shipping===null||tt.shipping===undefined?'<b style="color:var(--red)">not set</b>':dsMoney(tt.shipping))+' &middot; <b>'+dsMoney(tt.total)+'</b></div>'
-   +'<div><b>Order code</b><br><span class="pn">'+escHtml(r.discount_code||((d.po_code_prefix||'')+(r.po_number?' '+r.po_number:'')))+'</span>'+(r.shopify_order_name?' &middot; Shopify '+escHtml(r.shopify_order_name):'')+'</div>'+(ship&&ship.total?'<div><b>Shipment</b><br>'+ship.shipped+' of '+ship.total+' unit'+(ship.total!==1?'s':'')+' shipped'+(ship.tracking.length?'<br>'+dsTrackHtml(ship,10):'')+'</div>':'')+(r.notes?'<div style="grid-column:1/-1"><b>Dealer note</b><br>'+escHtml(r.notes)+'</div>':'')+'</div>'
+   +'<div><b>Order code</b><br><span class="pn">'+escHtml(r.discount_code||((d.po_code_prefix||'')+(r.po_number?' '+r.po_number:'')))+'</span>'+(r.shopify_order_name?'<br>Shopify '+escHtml(r.shopify_order_name):'')+'</div>'+(ship&&ship.total?'<div><b>Shipment</b><br>'+ship.shipped+' of '+ship.total+' unit'+(ship.total!==1?'s':'')+' shipped'+(ship.tracking.length?'<br>'+dsTrackHtml(ship,10):'')+'</div>':'')+((r.notes&&String(r.notes).trim()!==String(r.po_number||'').trim())?'<div style="grid-column:1/-1"><b>Dealer note</b><br>'+escHtml(r.notes)+'</div>':'')+'</div>'
    +'<div style="padding:12px 16px;background:var(--bg3);border-top:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap">'
    +(editable?'<button type="button" class="btn btn-teal" onclick="dsSend(DS.sel)"'+(DS.busy?' disabled':'')+'>'+(DS.busy?'Sending&hellip;':(r.status==='attention'?'Retry: send to Shopify':'Send to Shopify'))+'</button>':'')
    +(editable&&DS.edit?'<button type="button" class="btn" onclick="dsSaveLines(DS.sel)">Save quantity changes</button>':'')
@@ -34345,8 +34341,7 @@ async function dsSaveSettings(){
   S.settings=S.settings||{};rows.forEach(function(x){S.settings[x.key]=x.value;});toast('Storefront settings saved');render();
 }
 function renderDealerOrders(){
-  // [v23.139] Looking at this page clears the "new since you last looked" part of the menu count.
-  dsMarkSeen();setTimeout(function(){try{dsBadge();}catch(e){}},0);
+  setTimeout(function(){try{dsBadge();}catch(e){}},0);   // keep the menu count in step with the Active button
   if(!DS.loaded&&!DS.loading)dsLoadReqs();
   else if(DS.loaded&&!DS.loading&&(!DS._syncAt||Date.now()-DS._syncAt>120000)&&DS.reqs.some(function(r){return r.status==='awaiting_payment';})){DS._syncAt=Date.now();dsSync(true);}
   var c=dsTally(),rows=dsRows(),sel=DS.sel&&DS.reqs.find(function(r){return String(r.id)===String(DS.sel);});
