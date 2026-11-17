@@ -660,7 +660,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.132';
+const TGK_ERP_VERSION = 'v23.133';
 const TGK_ERP_BUILD_DATE = '2026-11-16';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -2512,12 +2512,12 @@ function goToOrder(orderNum){
 window.goToOrder=goToOrder;
 
 // [v23.130/131] New-order sound. Every sound is synthesized with Web Audio (no files to host). On/off, choice and volume are per device (localStorage); default on, Classic chime, 80%.
-var ORDER_SOUNDS=[['chime','Classic chime'],['bov','Blow-off valve'],['spool','Turbo spool + blow-off'],['flutter','Compressor surge (flutter)'],['wastegate','Wastegate chatter'],['pops','Pops & bangs']];
+var ORDER_SOUNDS=[['chime','Classic chime'],['bov_hks','HKS SSQV blow-off'],['bov_ts','Turbosmart blow-off'],['supra_hks','Big single Supra pull + HKS blow-off'],['supra_ts','Big single Supra pull + Turbosmart blow-off'],['flutter','Compressor surge (flutter)'],['wastegate','Wastegate chatter'],['pops','Pops & bangs']];
 var _chimeCtx=null;
 function _lsGet(k,d){try{var v=localStorage.getItem(k);return v===null?d:v;}catch(e){return d;}}
 function _lsSet(k,v){try{localStorage.setItem(k,v);}catch(e){}}
 function _chimeEnabled(){return _lsGet('tgk_order_chime','on')!=='off';}
-function orderSoundId(){var id=_lsGet('tgk_order_sound','chime');return ORDER_SOUNDS.some(function(x){return x[0]===id;})?id:'chime';}
+function orderSoundId(){var id=_lsGet('tgk_order_sound','chime');if(id==='bov')id='bov_hks';if(id==='spool')id='supra_hks'; /* v23.131 ids */return ORDER_SOUNDS.some(function(x){return x[0]===id;})?id:'chime';}
 function orderSoundVol(){var v=parseInt(_lsGet('tgk_order_sound_vol','80'));return isNaN(v)?80:Math.max(0,Math.min(100,v));}
 function setOrderChime(on){_lsSet('tgk_order_chime',on?'on':'off');if(on)playOrderChime(true);}
 function setOrderSound(id){_lsSet('tgk_order_sound',id);playOrderChime(true);}
@@ -2569,40 +2569,76 @@ function _ring(ctx,out,t,f,q,peak,dur){
   s.connect(bp);bp.connect(g);g.connect(out);s.start(t,Math.random()*1);s.stop(t+0.008);
   g.gain.setValueAtTime(peak,t);
 }
-function _bov(ctx,out,t,k){
-  k=k||1;
-  // Pressure spike, quick fall to a hiss, long tail. Highs sweep down as the charge pipe empties.
-  _jet(ctx,out,t,[[6400,3000,1.2,0.5],[3700,1500,1.0,0.75],[1900,650,0.8,0.5],[650,240,0.7,0.3]],[[0.006,1],[0.07,0.55],[0.35,0.2],[0.8*k,0.0001]],0.95);
-  _tone(ctx,out,t,'sine',170,58,0.11,0.5,0.004);   // valve thump
+// Narrowband noise sweep: the "chirp" a valve makes as it seats, and the breathy core of a compressor whine.
+function _chirp(ctx,out,t,f0,f1,q,peak,dur){
+  var s=ctx.createBufferSource();s.buffer=_noiseBuf(ctx,'white');
+  var bp=ctx.createBiquadFilter();bp.type='bandpass';bp.Q.value=q;bp.frequency.setValueAtTime(f0,t);bp.frequency.exponentialRampToValueAtTime(f1,t+dur);
+  var g=ctx.createGain();g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(peak,t+dur*0.25);g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  s.connect(bp);bp.connect(g);g.connect(out);s.start(t,Math.random()*1);s.stop(t+dur+0.03);
 }
-function _whistle(ctx,out,t,L,tail){
-  // Turbo compressor: blade-pass whistle follows a spool curve (fast then levelling off); on lift it coasts down slowly while the BOV dumps.
-  var D=L+tail,N=220,fa=[],ga=[],i,x,tau,F0=900,F1=4600,TS=0.32;
+// HKS SSQV style: big vent, deep "whump", full mid-heavy body that holds for a while (sequential valve opens wide), soft chirp as it closes.
+function _bovHKS(ctx,out,t){
+  _jet(ctx,out,t,[[3600,1500,0.9,0.55],[2000,820,0.8,0.85],[1050,420,0.7,0.65],[430,210,0.7,0.4]],[[0.012,1],[0.09,0.72],[0.45,0.34],[0.85,0.12],[1.1,0.012],[1.3,0.0001]],1.0);
+  _jet(ctx,out,t,[[9000,4500,0.7,0.3]],[[0.004,1],[0.05,0.3],[0.3,0.0001]],0.45,'white');   // top-end air
+  _jet(ctx,out,t,[[2800,1800,0.6,1]],[[0.003,1],[0.012,0.0001]],0.8,'white');                // opening crack
+  _tone(ctx,out,t,'sine',115,48,0.16,0.7,0.005);                                              // whump
+  _chirp(ctx,out,t+0.9,1500,2700,40,2.2,0.13);                                                 // closing chirp
+}
+// Turbosmart Race Port style: sharper and brighter, shorter, with a metallic poppet/spring tick at the start and a quick high chirp at the end.
+function _bovTS(ctx,out,t){
+  _jet(ctx,out,t,[[7800,3800,1.3,0.55],[4300,2000,1.1,0.85],[2300,950,0.9,0.5],[820,340,0.7,0.25]],[[0.006,1],[0.05,0.62],[0.24,0.22],[0.5,0.07],[0.62,0.02],[0.8,0.0001]],0.95);
+  _jet(ctx,out,t,[[2800,1800,0.6,1]],[[0.003,1],[0.01,0.0001]],0.8,'white');
+  _ring(ctx,out,t,3300,18,2.4,0.06);_ring(ctx,out,t,5200,22,1.4,0.04);
+  _tone(ctx,out,t,'sine',170,68,0.09,0.42,0.004);
+  _chirp(ctx,out,t+0.52,4200,2900,35,1.8,0.08);
+}
+// Big single turbo on a 2JZ (T88 / GT45 class): slow, late spool; breathy low whine rather than a pure tone; heavy intake rush; inline-6 pull underneath.
+// After the lift the big wheel coasts down slowly and the engine drops off; the valve dump is added by the caller.
+function _supraPull(ctx,out,t,L,tail){
+  var D=L+tail,N=260,fa=[],ga=[],ra=[],i,tau,x,dt,F0=1100,F1=3800;
   for(i=0;i<N;i++){
     tau=D*i/(N-1);
-    if(tau<=L){fa.push(F0+(F1-F0)*(1-Math.exp(-tau/TS))/(1-Math.exp(-L/TS)));ga.push(Math.pow(tau/L,1.5));}
-    else{fa.push(F1*(0.3+0.7*Math.exp(-(tau-L)/0.3)));ga.push(Math.exp(-(tau-L)/0.35));}
+    var _tp=Math.min(1,Math.max(0,(D-tau)/0.35));   // fade everything out over the last 0.35s so the tail never clicks off
+    if(tau<=L){x=tau/L;fa.push(F0+(F1-F0)*Math.pow(x,0.75));ga.push(Math.pow(x,2.2));ra.push(2600+4200*Math.pow(x,0.9));}   // late boost, rpm climbing 2600 to 6800
+    else{dt=tau-L;fa.push(F1*(0.25+0.75*Math.exp(-dt/0.45)));ga.push(Math.exp(-dt/0.5)*_tp);ra.push(2000+4800*Math.exp(-dt/0.18));}
   }
-  [[1,0.15,'sine'],[2,0.055,'sine'],[0.5,0.05,'triangle'],[3,0.02,'sine']].forEach(function(p){
-    var o=ctx.createOscillator(),g=ctx.createGain(),lfo=ctx.createOscillator(),lg=ctx.createGain();
-    o.type=p[2];
-    o.frequency.setValueAtTime(fa[0]*p[0],t);
-    o.frequency.setValueCurveAtTime(Float32Array.from(fa,function(v){return v*p[0];}),t,D);
-    g.gain.setValueAtTime(0,t);
-    g.gain.setValueCurveAtTime(Float32Array.from(ga,function(v){return v*p[1];}),t,D);
-    lfo.frequency.value=6.5;lg.gain.value=14;lfo.connect(lg);lg.connect(o.detune);   // slight wobble in the whistle
-    o.connect(g);g.connect(out);o.start(t);o.stop(t+D+0.05);lfo.start(t);lfo.stop(t+D+0.05);
+  var arr=function(a,f){return Float32Array.from(a,f);};
+  var wob=function(param,amt){[[7.3,1],[11.7,0.8],[19.1,0.6]].forEach(function(w){var o=ctx.createOscillator(),g=ctx.createGain();o.frequency.value=w[0];g.gain.value=amt*w[1];o.connect(g);g.connect(param);o.start(t);o.stop(t+D+0.05);});};
+  // compressor whine: tone + its octave + breathy narrowband noise, all wandering in level like turbulent flow
+  [[1,0.07],[2,0.028]].forEach(function(p){
+    var o=ctx.createOscillator(),g=ctx.createGain();o.type='sine';
+    o.frequency.setValueAtTime(fa[0]*p[0],t);o.frequency.setValueCurveAtTime(arr(fa,function(v){return v*p[0];}),t,D);
+    g.gain.setValueAtTime(0,t);g.gain.setValueCurveAtTime(arr(ga,function(v){return v*p[1];}),t,D);
+    var wm=ctx.createGain();wm.gain.value=1;wob(wm.gain,0.3);   // wobble is a fraction of the level, never added on top of silence
+    o.connect(g);g.connect(wm);wm.connect(out);o.start(t);o.stop(t+D+0.05);
   });
-  var s=ctx.createBufferSource();s.buffer=_noiseBuf(ctx,'pink');
-  var bp=ctx.createBiquadFilter();bp.type='bandpass';bp.Q.value=1.3;
-  bp.frequency.setValueAtTime(fa[0]*1.2,t);bp.frequency.setValueCurveAtTime(Float32Array.from(fa,function(v){return v*1.2;}),t,D);
-  var ng=ctx.createGain();ng.gain.setValueAtTime(0,t);ng.gain.setValueCurveAtTime(Float32Array.from(ga,function(v){return v*0.13;}),t,D);   // air rush rises with boost
-  s.connect(bp);bp.connect(ng);ng.connect(out);s.start(t,Math.random()*0.5);s.stop(t+D+0.05);
+  var wn=ctx.createBufferSource();wn.buffer=_noiseBuf(ctx,'white');
+  var wb=ctx.createBiquadFilter();wb.type='bandpass';wb.Q.value=35;wb.frequency.setValueAtTime(fa[0],t);wb.frequency.setValueCurveAtTime(arr(fa,function(v){return v;}),t,D);
+  var wg=ctx.createGain();wg.gain.setValueAtTime(0,t);wg.gain.setValueCurveAtTime(arr(ga,function(v){return v*1.9;}),t,D);
+  var wm2=ctx.createGain();wm2.gain.value=1;wob(wm2.gain,0.45);
+  wn.connect(wb);wb.connect(wg);wg.connect(wm2);wm2.connect(out);wn.start(t,Math.random()*0.5);wn.stop(t+D+0.05);
+  // shaft growl: low rotor-order buzz
+  var sh=ctx.createOscillator(),sl=ctx.createBiquadFilter(),sg=ctx.createGain();sh.type='sawtooth';sl.type='lowpass';sl.frequency.value=900;
+  sh.frequency.setValueAtTime(fa[0]*0.22,t);sh.frequency.setValueCurveAtTime(arr(fa,function(v){return v*0.22;}),t,D);
+  sg.gain.setValueAtTime(0,t);sg.gain.setValueCurveAtTime(arr(ga,function(v){return v*0.05;}),t,D);
+  sh.connect(sl);sl.connect(sg);sg.connect(out);sh.start(t);sh.stop(t+D+0.05);
+  // intake / compressor rush: broad pink noise that swells with boost
+  var rn=ctx.createBufferSource();rn.buffer=_noiseBuf(ctx,'pink');
+  var rb=ctx.createBiquadFilter();rb.type='bandpass';rb.Q.value=0.55;rb.frequency.setValueAtTime(fa[0]*0.7,t);rb.frequency.setValueCurveAtTime(arr(fa,function(v){return v*0.7;}),t,D);
+  var rg=ctx.createGain();rg.gain.setValueAtTime(0,t);rg.gain.setValueCurveAtTime(arr(ga,function(v){return Math.pow(v,0.8)*0.5;}),t,D);
+  rn.connect(rb);rb.connect(rg);rg.connect(out);rn.start(t,Math.random()*0.5);rn.stop(t+D+0.05);
+  // inline-6 under it: firing frequency = rpm/60*3, sawtooth through a low-pass for the smooth 2JZ drone
+  var en=ctx.createOscillator(),el=ctx.createBiquadFilter(),eg=ctx.createGain();en.type='sawtooth';el.type='lowpass';el.frequency.value=650;
+  en.frequency.setValueAtTime(ra[0]/20,t);en.frequency.setValueCurveAtTime(arr(ra,function(v){return v/20;}),t,D);
+  eg.gain.setValueAtTime(0.0001,t);eg.gain.exponentialRampToValueAtTime(0.1,t+0.12);eg.gain.setValueAtTime(0.1,t+L);eg.gain.exponentialRampToValueAtTime(0.0001,t+L+0.85);
+  en.connect(el);el.connect(eg);eg.connect(out);en.start(t);en.stop(t+D+0.05);
 }
 var _ORDER_SND={
   chime:function(ctx,out,t){[[880,0],[1318.5,0.16]].forEach(function(n){_tone(ctx,out,t+n[1],'sine',n[0],0,1.0,0.26,0.012);_tone(ctx,out,t+n[1],'sine',n[0]*2.01,0,0.5,0.05,0.01);});},
-  bov:function(ctx,out,t){_bov(ctx,out,t,1);},
-  spool:function(ctx,out,t){var L=0.8;_whistle(ctx,out,t,L,1.2);_bov(ctx,out,t+L+0.02,1);},
+  bov_hks:function(ctx,out,t){_bovHKS(ctx,out,t);},
+  bov_ts:function(ctx,out,t){_bovTS(ctx,out,t);},
+  supra_hks:function(ctx,out,t){var L=1.25;_supraPull(ctx,out,t,L,1.4);_bovHKS(ctx,out,t+L+0.02);},
+  supra_ts:function(ctx,out,t){var L=1.25;_supraPull(ctx,out,t,L,1.4);_bovTS(ctx,out,t+L+0.02);},
   flutter:function(ctx,out,t){
     // Compressor surge: separate air pulses, fast at first and slowing as boost bleeds off. Each pulse is a short whoosh with a low chuff.
     var n=13,tt=0,i,rate,peak;
