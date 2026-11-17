@@ -660,7 +660,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.136';
+const TGK_ERP_VERSION = 'v23.137';
 const TGK_ERP_BUILD_DATE = '2026-11-17';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -9904,6 +9904,9 @@ function mfSvc(p){
  return {name:name,next:/next\s*day|overnight|priority mail express|first overnight|priority overnight|standard overnight/i.test(name)};
 }
 function mfKey(p){return p.carrier+'|'+p.tracking;}
+// [v23.137] Which manifest day a shipment belongs to. Check Tracking stores ShipStation's ship date, which is a bare date (saved as midnight UTC).
+// Converting that to Central time gave the evening BEFORE, so today's warranty and reship boxes landed on yesterday's sheet. A bare date is used as written.
+function mfShipDay(v){var t=String(v||'');if(/^\d{4}-\d{2}-\d{2}$/.test(t)||/^\d{4}-\d{2}-\d{2}[T ]00:00:00(\.0+)?(Z|[+-]00(:?00)?)?$/.test(t))return t.slice(0,10);return centralDateOnly(t);}
 // Hand edits are remembered per ship date on this device, so a reprint of the same day matches what the driver signed.
 function mfEditsAll(){try{return JSON.parse(localStorage.getItem('tgk_mf_edits')||'{}')||{};}catch(e){return {};}}
 function mfEdits(day){var all=mfEditsAll(),e=all[day]||{};return {rm:e.rm||{},keep:e.keep||{},add:e.add||[]};}
@@ -9978,17 +9981,17 @@ function mfPrint(){
 function mfRef(kind,raw,orig){var id=String(raw||'').replace(/^(WARRANTY|SHERROR)[-_]/i,'');return (kind==='Warranty'?'Warranty ':'Reship ')+id+(orig?' (for '+orig+')':'');}
 function mfKindOf(s){if(s._kind)return s._kind;var u=String(s.order_number||'').toUpperCase();return u.indexOf('WARRANTY')===0?'Warranty':u.indexOf('SHERROR')===0?'Reship':'';}
 function mfResRows(list,kind){
- return (list||[]).filter(function(c){return c&&String(c.tracking_number||'').trim()&&c.shipped_at;}).map(function(c){
+ return (list||[]).filter(function(c){return c&&String(c.tracking_number||'').trim()&&(c.shipped_at||c.updated_at);}).map(function(c){
   var items=Array.isArray(c.claim_items)&&c.claim_items.length?c.claim_items:(Array.isArray(c.line_items)&&c.line_items.length?c.line_items:null);
   var units=items?items.filter(function(i){return i&&!i.own_unit;}).reduce(function(n,i){return n+(Number(i.qty)||1);},0):(Number(c.qty||c.expected_qty)||1);
-  return {id:(kind==='Warranty'?'wc':'se')+c.id,order_number:(kind==='Warranty'?'WARRANTY-':'SHERROR-')+c.id,_orig:String(c.order_number||'').trim(),customer_name:c.customer_name||'',tracking_number:c.tracking_number,carrier:c.carrier,fulfillment_status:'Shipped',shipped_at:c.shipped_at,qty:units||1,_kind:kind,_claim:true,_svc:String((c.shipping_details||{}).service||''),shipping_city:(c.shipping_details||{}).city||'',shipping_province:(c.shipping_details||{}).state||'',shipping_country:(c.shipping_details||{}).country||''};
+  return {id:(kind==='Warranty'?'wc':'se')+c.id,order_number:(kind==='Warranty'?'WARRANTY-':'SHERROR-')+c.id,_orig:String(c.order_number||'').trim(),customer_name:c.customer_name||'',tracking_number:c.tracking_number,carrier:c.carrier,fulfillment_status:'Shipped',shipped_at:c.shipped_at||c.updated_at,_noDate:!c.shipped_at,qty:units||1,_kind:kind,_claim:true,_svc:String((c.shipping_details||{}).service||''),shipping_city:(c.shipping_details||{}).city||'',shipping_province:(c.shipping_details||{}).state||'',shipping_country:(c.shipping_details||{}).country||''};
  });
 }
 function mfPackages(rows,day){
  var by={},order=[],noTrack={},list=(rows||[]).slice().sort(function(a,b){return (a._claim?1:0)-(b._claim?1:0);});
  list.forEach(function(s){
   if(!/^(shipped|delivered)$/i.test(String(s.fulfillment_status||'')))return;
-  if(!s.shipped_at)return;var d;try{d=centralDateOnly(s.shipped_at);}catch(e){return;}if(day&&d!==day)return;   // day=null: any ship date (adding a box by hand)
+  if(!s.shipped_at)return;var d;try{d=mfShipDay(s.shipped_at);}catch(e){return;}if(day&&d!==day)return;   // day=null: any ship date (adding a box by hand)
   var kind=mfKindOf(s),tr=String(s.tracking_number||'').trim().toUpperCase(),raw=String(s.order_number||'');
   if(!tr){if(!kind)noTrack[s.order_number||('id'+s.id)]=1;return;}   // a resolution with no tracking shipped nothing (a refund, say)
   var car=mfCarrier(s.carrier,tr),k=car+'|'+tr,p=by[k];
@@ -9998,7 +10001,7 @@ function mfPackages(rows,day){
   if(kind){p.kind=kind;var ref=mfRef(kind,raw,s._orig);if(p.refs.indexOf(ref)<0)p.refs.push(ref);}
   else if(s.order_number&&p.orders.indexOf(s.order_number)<0)p.orders.push(s.order_number);
   var cn=String(s.customer_name||'').trim();if(cn&&p.customers.indexOf(cn)<0)p.customers.push(cn);
-  p.units+=Number(s.qty)||1;p.lines++;if(s._svc&&!p.svcLabel)p.svcLabel=s._svc;
+  p.units+=Number(s.qty)||1;p.lines++;if(s._svc&&!p.svcLabel)p.svcLabel=s._svc;if(s._noDate)p.noDate=true;
   // Drop-ship line: the same rule as the Drop-Ship Queue (a SKU that is neither an assembly nor a part), or one already marked ordered from a vendor.
   if(!kind&&(s.dropship_order_ref||(!findAsm(s.pn)&&!partByPn(s.pn))))p.dsLines++;
   if(!p.city){p.city=String(s.shipping_city||'').trim();p.state=String(s.shipping_province||'').trim();p.country=String(s.shipping_country||'').trim();}
@@ -10019,6 +10022,8 @@ async function mfLoad(day){
   var tb=tabs[i],list=[];
   try{var r=await db.from(tb[0]).select('*').gte('shipped_at',lo).lt('shipped_at',hi).limit(1000);if(r.error)throw r.error;list=r.data||[];}
   catch(e){warn+=(warn?' ':'')+'Could not read '+tb[3]+' ('+((e&&e.message)||e)+'), so those shipments may be missing from this list.';}
+  // [v23.137] also the ones that have tracking but were never given a ship date: found by when they were last updated
+  try{var r2=await db.from(tb[0]).select('*').is('shipped_at',null).not('tracking_number','is',null).gte('updated_at',lo).lt('updated_at',hi).limit(1000);if(r2&&!r2.error)list=list.concat(r2.data||[]);}catch(e2){}
   var sn={};list.concat(tb[2]||[]).forEach(function(c){if(c&&!sn[c.id]){sn[c.id]=1;all=all.concat(mfResRows([c],tb[1]));}});
  }
  var res=mfPackages(all,day);res.warn=warn;return res;
@@ -10045,7 +10050,7 @@ function mfHtml(){
  var addBar='<div style="padding:10px 20px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="t3s" style="font-weight:700">Add a box</span><input id="mf-add" class="form-input" style="width:230px" placeholder="Order # or tracking #" onkeydown="if(event.key===\'Enter\')mfAdd()"><button class="btn btn-sm" onclick="mfAdd()">Add</button><button class="btn btn-sm" onclick="mfAddManual()" title="List a box that the ERP has no shipment for">Add by hand</button></div>';
  var offBox=(st.off||[]).length?'<div style="margin:10px 20px 14px;padding:9px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-md);font-size:var(--t-sm)"><b>Left off this manifest ('+st.off.length+')</b>'+st.off.map(function(o){return '<div style="display:flex;gap:10px;align-items:center;padding:4px 0;border-top:1px solid var(--border);margin-top:4px"><span style="font-family:var(--mono)">'+escHtml(o.p.tracking)+'</span><span>'+escHtml(mfRefs(o.p))+'</span><span class="t3s">'+escHtml(o.p.customers[0]||'')+'</span><span class="pill pill-muted">'+o.why+'</span><button class="btn btn-sm" style="margin-left:auto" data-k="'+escHtml(mfKey(o.p))+'" onclick="mfRestore(this.dataset.k)">Add back</button></div>';}).join('')+'</div>':'';
  if(!(st.pk||[]).length)return head+tools+warn+addBar+offBox+'<div style="padding:40px;text-align:center;color:var(--text3)">Nothing has shipped on '+escHtml(mfDayLabel(st.day))+' yet.<div class="t3xs" style="margin-top:6px">Shipments appear here as ShipStation reports them. Press Reload to check again.</div></div>';
- var rows=sel.map(function(p,i){return '<tr><td class="t3s">'+(i+1)+'</td><td><b>'+escHtml(p.carrier)+'</b></td><td style="font-family:var(--mono)">'+escHtml(p.tracking)+'</td><td>'+escHtml(p.orders.join(', '))+p.refs.map(function(r){return (p.orders.length?' ':'')+'<span class="pill pill-purple" title="Customer resolution: not a customer order">'+escHtml(r)+'</span>';}).join('')+'</td><td>'+escHtml(p.customers[0]||'')+(p.customers.length>1?' +'+(p.customers.length-1):'')+(p.added?' <span class="pill pill-muted" title="Added by hand">added</span>':'')+'</td><td class="t2s">'+escHtml(mfShipTo(p))+'</td><td>'+(mfIntl(p)?'<span class="pill pill-blue" style="margin-right:4px">INTL</span>':'')+(mfSvc(p).next?'<span class="pill pill-red" style="margin-right:4px">NEXT DAY</span>':'')+'<span class="t3s">'+escHtml(mfSvc(p).name)+'</span></td><td style="text-align:right">'+p.units+'</td><td style="text-align:right"><button class="action-btn" style="color:var(--red)" title="Take this box off the manifest" data-k="'+escHtml(mfKey(p))+'" onclick="mfRemove(this.dataset.k)">&#10005;</button></td></tr>';}).join('');
+ var rows=sel.map(function(p,i){return '<tr><td class="t3s">'+(i+1)+'</td><td><b>'+escHtml(p.carrier)+'</b></td><td style="font-family:var(--mono)">'+escHtml(p.tracking)+'</td><td>'+escHtml(p.orders.join(', '))+p.refs.map(function(r){return (p.orders.length?' ':'')+'<span class="pill pill-purple" title="Customer resolution: not a customer order">'+escHtml(r)+'</span>';}).join('')+'</td><td>'+escHtml(p.customers[0]||'')+(p.customers.length>1?' +'+(p.customers.length-1):'')+(p.added?' <span class="pill pill-muted" title="Added by hand">added</span>':'')+(p.noDate?' <span class="pill pill-yellow" title="This box has tracking but no ship date was recorded, so it is listed on the day it was last updated. Remove it if it did not go out today.">no ship date</span>':'')+'</td><td class="t2s">'+escHtml(mfShipTo(p))+'</td><td>'+(mfIntl(p)?'<span class="pill pill-blue" style="margin-right:4px">INTL</span>':'')+(mfSvc(p).next?'<span class="pill pill-red" style="margin-right:4px">NEXT DAY</span>':'')+'<span class="t3s">'+escHtml(mfSvc(p).name)+'</span></td><td style="text-align:right">'+p.units+'</td><td style="text-align:right"><button class="action-btn" style="color:var(--red)" title="Take this box off the manifest" data-k="'+escHtml(mfKey(p))+'" onclick="mfRemove(this.dataset.k)">&#10005;</button></td></tr>';}).join('');
  var nIntl=sel.filter(mfIntl).length,nNext=sel.filter(function(p){return mfSvc(p).next;}).length;
  return head+tools+warn+addBar+'<div style="padding:12px 20px 4px;font-size:var(--t-md)"><b>'+sel.length+' package'+(sel.length===1?'':'s')+'</b> &middot; '+Object.keys(orders).length+' order'+(Object.keys(orders).length===1?'':'s')+(res?' &middot; <span style="color:var(--purple);font-weight:600">'+res+' customer resolution'+(res===1?'':'s')+'</span>':'')+(nIntl?' &middot; <span style="color:var(--blue);font-weight:600">'+nIntl+' international</span>':'')+(nNext?' &middot; <span style="color:var(--red);font-weight:600">'+nNext+' next day</span>':'')+' &middot; '+units+' unit'+(units===1?'':'s')+' <span class="t3s">&middot; shipped '+escHtml(mfDayLabel(st.day))+'</span></div>'
   +'<div style="overflow:auto;padding:0 20px 16px"><table style="width:100%"><thead><tr><th style="width:40px">#</th><th style="width:70px;text-align:left">Carrier</th><th style="text-align:left">Tracking number</th><th style="text-align:left">Order</th><th style="text-align:left">Customer</th><th style="text-align:left">Ship to</th><th style="text-align:left">Service</th><th style="text-align:right;width:60px">Units</th><th style="width:36px"></th></tr></thead><tbody>'+rows+'</tbody></table></div>'+offBox;
@@ -35962,9 +35967,9 @@ async function checkResolutionTracking(){
     if(!updated.length){toast('No new tracking found yet');return;}
     updated.forEach(function(r){
       if(r.type==='warranty'){
-        S.warrantyClaims=(S.warrantyClaims||[]).map(function(w){return w.id===r.id?{...w,tracking_number:r.tracking,carrier:r.carrier,status:'Shipped'}:w;});
+        S.warrantyClaims=(S.warrantyClaims||[]).map(function(w){return w.id===r.id?{...w,tracking_number:r.tracking,carrier:r.carrier,status:'Shipped',shipped_at:w.shipped_at||new Date().toISOString()}:w;});
       } else {
-        S.shipmentErrors=(S.shipmentErrors||[]).map(function(e){return e.id===r.id?{...e,tracking_number:r.tracking,carrier:r.carrier}:e;});
+        S.shipmentErrors=(S.shipmentErrors||[]).map(function(e){return e.id===r.id?{...e,tracking_number:r.tracking,carrier:r.carrier,shipped_at:e.shipped_at||new Date().toISOString()}:e;});
         // [v23.127] Tracking back from ShipStation means the replacement shipped, so the error resolves (same as the live webhook and the manual tracking save). The one exception is a reship that still owes a customer return: that stays Reshipping until the return is received.
         var _er=(S.shipmentErrors||[]).find(function(e){return e.id===r.id;});
         if(_er&&_er.resolution==='return_required'&&!_er.return_received_at){
