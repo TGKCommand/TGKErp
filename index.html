@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.150';
+const TGK_ERP_VERSION = 'v23.151';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -6310,7 +6310,7 @@ function renderSaleDetail(s){
       ${(S.syncLocked&&S.syncLocked.has((s.order_number||'').replace(/^#/,'')))?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="unlockOrderFromSync('${escHtml(s.order_number||'')}')">Unlock Sync</button>`:''}
       ${packedLines.length?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.3)" onclick="unpackSaleOrder('${s.id}','${s.pn==='Multiple'?'':s.pn}',${s.qty||1})">&#8617; Unpack</button>`:''}
       ${['Open','Packed','On Hold','Partial'].includes(detailOrderFs)?`<button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" onclick="cancelOrder('${s.id}')">Cancel</button>`:''}
-      ${(financial==='refunded'||financial==='partially_refunded'||detailOrderFs==='Refunded')&&allLines.some(l=>!l.return_status)?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.35);font-weight:700" data-sid="${s.id}" onclick="openProcessReturnModal(this.dataset.sid)">&#8617; Process Return</button>`:''}${allLines[0]?.return_status?`<span style="font-size:var(--t-xs);padding:3px 8px;border-radius:var(--r-sm);font-weight:600;${allLines[0].return_status==='returned'?'background:var(--teal-dim);color:var(--teal)':allLines[0].return_status==='corrected'?'background:var(--bg3);color:var(--text3)':'background:rgba(234,88,12,.12);color:var(--orange)'}">${allLines[0].return_status==='returned'?'&#10003; Restocked':allLines[0].return_status==='corrected'?'&#10003; Admin Closed':'&#9888; Logged as Damaged'}</span><button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" data-oid="${s.id}" onclick="reverseReturn(this.dataset.oid)" title="Undo this return — reverses inventory and resets order status">&#8634; Reverse Return</button>`:''}
+      ${(financial==='refunded'||financial==='partially_refunded'||detailOrderFs==='Refunded')&&allLines.some(l=>!l.return_status)?`<button class="btn btn-sm" style="color:var(--orange);border-color:rgba(234,88,12,.35);font-weight:700" data-sid="${s.id}" onclick="openProcessReturnModal(this.dataset.sid)">&#8617; Process Return</button>`:''}${allLines[0]?.return_status?`<span style="font-size:var(--t-xs);padding:3px 8px;border-radius:var(--r-sm);font-weight:600;${allLines[0].return_status==='returned'?'background:var(--teal-dim);color:var(--teal)':allLines[0].return_status==='corrected'?'background:var(--bg3);color:var(--text3)':'background:rgba(234,88,12,.12);color:var(--orange)'}">${allLines[0].return_status==='returned'?'&#10003; Restocked':allLines[0].return_status==='corrected'?'&#10003; Admin Closed':'&#9888; Logged as Damaged'}</span><button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" data-oid="${s.id}" onclick="verifyReturnRestock(this.dataset.oid)" title="Check the stock history to confirm this return really put the units back, and put back any that are missing">Verify restock</button><button class="btn btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.3)" data-oid="${s.id}" onclick="reverseReturn(this.dataset.oid)" title="Undo this return — reverses inventory and resets order status">&#8634; Reverse Return</button>`:''}
     </div>
   </div>
 
@@ -7262,7 +7262,7 @@ async function submitReturnV2(orderNum){
   // Never restock a line that has already been returned. Without this, a stale panel or a
   // double submit restocks the same physical unit twice and silently inflates on-hand.
   const _already=_picked.filter(s=>!!s.return_status);
-  const lines=_picked.filter(s=>!s.return_status);
+  let lines=_picked.filter(s=>!s.return_status);
   if(!lines.length){
     toast(_already.length
       ? 'Already processed - '+_already.length+' selected line'+(_already.length!==1?'s have':' has')+' been returned. Use Reverse Return first if you need to redo it.'
@@ -7289,6 +7289,7 @@ async function submitReturnV2(orderNum){
 
   const results=[];const errors=[];
   const lead=lines[0];
+  const _okIds=new Set();   // lines that were really returned; anything else is left exactly as it was so it can be tried again
 
   for(const l of lines){
     const pn=l.pn;const qty2=l.qty||1;
@@ -7296,14 +7297,19 @@ async function submitReturnV2(orderNum){
     // restock - never a value left over from an earlier line.
     let _restocked=null;
     if(condition==='Resellable'&&condition!=='PreERP'){
-      const asm=asmByPn(pn);
-      const prt=partByPn(pn);
-      if(asm){
-        const newOh=await adjustStock('assembly',asm,qty2,{reason:'Return \u2014 '+reason+' (order '+orderNum+')',source:'return'});
-        if(newOh!==null){results.push('+'+qty2+' '+pn);_restocked={kind:'assembly',rec:asm};}
-      } else if(prt){
-        const newOh=await adjustStock('part',prt,qty2,{reason:'Return \u2014 '+reason+' (order '+orderNum+')',source:'return'});
-        if(newOh!==null){results.push('+'+qty2+' '+pn);_restocked={kind:'part',rec:prt};}
+      // [v23.151] Same lookup the ship and un-ship paths use: it knows a SKU's renamed / new number. This used asmByPn/partByPn,
+      // which only match the ORIGINAL number, so a line carrying a new SKU found nothing to restock, no error was raised, and the line
+      // was still marked Returned. A restock that cannot happen now stops that line instead of pretending.
+      const tgt=resolveShipTarget(pn);
+      if(tgt.kind==='untracked'){
+        results.push(dispSku(pn)+' is not a stocked item \u2014 nothing to restock');
+      }else{
+        const rec=tgt.kind==='assembly'?tgt.asm:tgt.part;
+        const newOh=await adjustStock(tgt.kind,rec,qty2,{reason:'Return \u2014 '+reason+' (order '+orderNum+')',source:'return'});
+        if(newOh===null){errors.push(dispSku(pn)+': stock was NOT added, so this line was left unreturned. Fix the cause shown above and try again');continue;}
+        const _lr=adjustStock.lastResult||{},_toShelf=(_lr.newQty!=null&&_lr.prevQty!=null)?(_lr.newQty-_lr.prevQty):qty2,_paid=Math.max(0,qty2-_toShelf);
+        results.push('+'+qty2+' '+dispSku(pn)+' (on hand '+(_lr.prevQty!=null?_lr.prevQty:'?')+' \u2192 '+newOh+(_paid>0?': '+(_paid===qty2?'the returned unit':_paid+' of the returned units')+' settled '+(_paid===1?'a unit':'units')+' this SKU owed from earlier shipments, so on hand '+(_toShelf>0?'rose by '+_toShelf:'did not rise'):'')+')');
+        _restocked={kind:tgt.kind,rec:rec};
       }
     }
     const _newStatus=condition==='PreERP'?l.fulfillment_status||'Delivered':'Returned';
@@ -7317,7 +7323,12 @@ async function submitReturnV2(orderNum){
       continue;
     }
     S.sales=S.sales.map(s=>s.id===l.id?{...s,fulfillment_status:_newStatus,return_status:'returned'}:s);
+    _okIds.add(l.id);
   }
+  // Only the lines that were really returned go on to the refund, the return label and the log. If none were, stop here with the
+  // window still open (nothing was changed) instead of refunding and logging a return that did not happen.
+  lines=lines.filter(l=>_okIds.has(l.id));
+  if(!lines.length){toast('\u26a0 Nothing was returned. '+(errors.length?errors.join('; '):'See the message above.'),10000);return;}
 
   if(doShopify){
     try{
@@ -7383,8 +7394,9 @@ async function submitReturnV2(orderNum){
   closeModal();
   await refreshSales();
   render();
-  const msg=['<span class="ic ic-arrow-back"></span>Return processed',...results,...errors].join(' · ');
-  toast(msg+' | Use <span class="ic ic-arrow-back"></span>Reverse Return to undo',5000);
+  const _added=results.filter(r=>/^\+/.test(r)).length,_noStock=condition==='Resellable'&&!_added;
+  const msg=['<span class="ic ic-arrow-back"></span>Return processed',...results,...errors].join(' \u00b7 ');
+  toast((_noStock?'\u26a0 Marked returned, but NO stock was added. ':'')+msg+' | Use <span class="ic ic-arrow-back"></span>Reverse Return to undo',_noStock?9000:5000);
   if(errors.length)toast('<span class="ic ic-alert"></span>'+errors.join('; '),6000);
 }
 
@@ -7401,7 +7413,7 @@ async function unshipLine(saleId, pn, qty){
   )?'Open':'On Hold';
 
   const asm=findAsm(pn);
-  const prt=asm?null:partByPn(pn);
+  const prt=asm?null:((typeof _findPart==='function'&&_findPart(pn))||partByPn(pn));   // [v23.151] a part sold under its new SKU number is found too
   const undoOps=[];
 
   if(asm){
@@ -7666,7 +7678,7 @@ async function submitShipment(saleId,pn,qty){
   const tracking=document.getElementById('ship-tracking').value.trim();
   const carrier=document.getElementById('ship-carrier').value;
   const asm=findAsm(pn);
-  const prt=asm?null:partByPn(pn);
+  const prt=asm?null:((typeof _findPart==='function'&&_findPart(pn))||partByPn(pn));   // [v23.151] a part sold under its new SKU number still deducts
   const asmPrev=asm?{...asm}:null;
   const prtPrev=prt?{...prt}:null;
   // [FIX A2] Defense-in-depth: never deduct a line that is already Shipped/Delivered/Cancelled/Refunded.
@@ -42875,6 +42887,7 @@ async function processReturn(saleId,action){
         var noh2=await adjustStock('part',prt,qty,{reason:'Return to stock \u2014 order '+orderNum+(notes?' \u2014 '+notes:''),source:'return'});
         if(noh2!==null){invOk=true;results.push('+'+qty+' '+pn);undoOps.push({action:'update',table:'parts',data:{id:prt.id,total_unpckgd:noh2},prev:prt});}else errors.push(pn+': stock update failed');
       }
+      if(!asm&&!prt)results.push(dispSku(pn)+' (not a stocked item, nothing to restock)');
       if(invOk||!asm&&!prt){
         if(!await salesWrite(db.from('sales').update({return_status:'returned',updated_at:new Date().toISOString()}).eq('id',line.id),'return for '+pn)){
           // Left un-returned, this line stays in the queue and would be restocked again next time.
@@ -42913,7 +42926,7 @@ async function processReturn(saleId,action){
 
   document.getElementById('prm-overlay')?.remove();
   if(errors.length&&!results.length){toast('\u26a0 Failed: '+errors[0]);}
-  else if(action==='returned'){toast('\u2713 Restocked: '+results.join(', '));}
+  else if(action==='returned'){var _rs=results.some(function(r){return /^\+/.test(r);});toast((_rs?'\u2713 Restocked: ':'\u26a0 Marked returned, but NO stock was added: ')+results.join(', '),_rs?5000:9000);}
   else if(action==='corrected'){toast('\u2713 Admin closed \u2014 no inventory change: '+results.join(', '));}
   else{toast('\u2713 '+results.length+' warranty claim'+(results.length!==1?'s':'')+' logged');}
   render();
@@ -43412,6 +43425,46 @@ async function loadDealerPOPayments(){
   }
 }
 
+// [v23.151] How many units the stock history says a return of this SKU on this order put back, net of any reversal. Matches the order number whole
+// (11300 must not match 113001) and every number the SKU has (original and new), because history rows carry whichever one the line used.
+async function _returnNetFor(orderNum,pn){
+  try{
+    var num=String(orderNum||'').replace(/^#/,'');if(!num||!pn)return 0;
+    var it=(typeof _canonItem==='function')?_canonItem(pn):null,keys={};keys[pn]=1;if(it){keys[it.pn]=1;if(it.new_sku)keys[it.new_sku]=1;}
+    var r=await db.from('inv_corrections').select('adjustment,reason,source').in('pn',Object.keys(keys)).in('source',['return','reverse_return']).order('created_at',{ascending:false}).limit(500);
+    if(r.error||!r.data)return 0;
+    var re=new RegExp('order #?'+num.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'(?!\\d)','i'),net=0;
+    r.data.forEach(function(x){if(re.test(String(x.reason||'')))net+=Number(x.adjustment)||0;});
+    return net;
+  }catch(e){console.warn('[return] stock-history check failed',e);return 0;}
+}
+// A return can be marked done without the stock actually going back (the old Return window did exactly that for a SKU with a renamed number).
+// This checks every returned line on the order against the stock history and offers to put back whatever is missing.
+async function verifyReturnRestock(saleId){
+  var sale=S.sales.find(function(s){return s.id===saleId;});if(!sale){toast('Order not found');return;}
+  var orderNum=sale.order_number||saleId;
+  var lines=S.sales.filter(function(s){return s.order_number===sale.order_number&&s.return_status==='returned'&&s.pn;});
+  if(!lines.length){toast('No returned lines on this order');return;}
+  var missing=[],fine=[];
+  for(var i=0;i<lines.length;i++){
+    var l=lines[i],tgt=resolveShipTarget(l.pn),q=l.qty||1;
+    if(tgt.kind==='untracked'){fine.push(dispSku(l.pn)+' (not a stocked item)');continue;}
+    var got=await _returnNetFor(orderNum,l.pn);
+    if(got>=q)fine.push(dispSku(l.pn)+' (+'+got+' on record)');
+    else missing.push({line:l,tgt:tgt,rec:tgt.kind==='assembly'?tgt.asm:tgt.part,need:q-Math.max(0,got)});
+  }
+  if(!missing.length){toast('\u2713 Stock is already back for every returned line on '+orderNum+': '+fine.join(', '),7000);return;}
+  if(!confirm('These returned lines on '+orderNum+' have no restock in the stock history:\n\n'+missing.map(function(m){return '  \u2022 '+dispSku(m.line.pn)+' \u00d7 '+m.need;}).join('\n')+'\n\nPut them back into stock now?'))return;
+  var done=[],failed=[];
+  for(var j=0;j<missing.length;j++){
+    var m=missing[j],n=await adjustStock(m.tgt.kind,m.rec,m.need,{reason:'Return restock (repair) \u2014 order '+orderNum,source:'return'});
+    if(n===null)failed.push(dispSku(m.line.pn));else{var lr=adjustStock.lastResult||{};done.push('+'+m.need+' '+dispSku(m.line.pn)+' (on hand '+lr.prevQty+' \u2192 '+n+')');}
+  }
+  render();
+  toast((failed.length?'\u26a0 Not restocked: '+failed.join(', ')+(done.length?' \u00b7 ':''):'')+(done.length?'\u2713 '+done.join(', '):''),failed.length?9000:6000);
+}
+window.verifyReturnRestock=verifyReturnRestock;
+
 async function reverseReturn(saleId){
   var sale=S.sales.find(function(s){return s.id===saleId;});
   if(!sale){toast('Order not found');return;}
@@ -43430,7 +43483,10 @@ async function reverseReturn(saleId){
     var pn=line.pn;var qty=line.qty||1;
 
     var _revTaken=null; // per-line; what was deducted, so it can be put back if the status fails
-    if(line.return_status==='returned'){
+    var _wasRestocked=line.return_status==='returned'?await _returnNetFor(orderNum,pn):0;   // [v23.151] what the stock history says this return put back
+    if(line.return_status==='returned'&&_wasRestocked<=0){
+      results.push(pn+': no restock was on record, so no stock was taken back');
+    }else if(line.return_status==='returned'){
       var asm=findAsm(pn); // [FIX B] new_sku-aware (line.pn may be a new_sku)
       var prt=asm?null:S.parts.find(function(p){return p.pn===pn||(p.new_sku&&p.new_sku===pn);});
       if(asm){
