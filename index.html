@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.152';
+const TGK_ERP_VERSION = 'v23.153';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -5547,6 +5547,122 @@ function renderInventory(){
   </tbody></table></div>`;
 }
 
+// ================= [v23.153] SKU SEARCH SHOWS THE OPEN LINES =================
+// Searching a SKU in an open Purchase Orders view lists every open LINE for it across all POs (oldest PO first) with the ordered / in / open counts,
+// so a box can be checked in against whichever PO has room without opening each one. Checking in goes through checkInLine, the same path as the
+// Receive button inside a PO: one saved change for line + stock + history, a guard against receiving the same line twice, and the PO moves to
+// Received when its last line is in. Drafts cannot be received (not ordered yet) and finished POs are not listed.
+function poLineHit(l,q){
+  var it=partByPn(l.pn)||asmByPn(l.pn)||(typeof _findPart==='function'?_findPart(l.pn):null)||(typeof findAsm==='function'?findAsm(l.pn):null);   // also finds a SKU by its new number
+  return (l.pn||'').toLowerCase().includes(q)||(l.description||'').toLowerCase().includes(q)||!!(it&&((it.new_sku||'').toLowerCase().includes(q)||String(dispPn(it)||'').toLowerCase().includes(q)));
+}
+function poSkuLines(q,status){
+  var CLOSED=['Received','Recovered','Cancelled','Lost'],groups={},keys=[],drafts=0,finished=0,any=false,totalOpen=0,totalLines=0;
+  (S.purchases||[]).forEach(function(p){
+    var hits=(S.poLines[p.id]||[]).filter(function(l){return !isShippingLine(l)&&poLineHit(l,q);});
+    if(!hits.length)return;any=true;
+    var open=hits.filter(function(l){return poLineRem(l)>0;});
+    if(p.status==='Draft'){if(open.length)drafts++;return;}
+    if(CLOSED.indexOf(p.status)>=0||!open.length){finished++;return;}
+    if(status&&p.status!==status)return;
+    open.forEach(function(l){
+      var it=partByPn(l.pn)||asmByPn(l.pn)||(typeof _findPart==='function'?_findPart(l.pn):null)||(typeof findAsm==='function'?findAsm(l.pn):null),key=it?it.pn:l.pn;
+      if(!groups[key]){groups[key]={key:key,disp:it?dispPn(it):l.pn,desc:(it&&it.description)||l.description||'',onHand:it?(('total_unpckgd' in it&&partByPn(it.pn))?(it.total_unpckgd||0):(it.total_on_hand||0)):null,lines:[],open:0};keys.push(key);}
+      groups[key].lines.push({l:l,p:p,rem:poLineRem(l)});groups[key].open+=poLineRem(l);totalOpen+=poLineRem(l);totalLines++;
+    });
+  });
+  keys.sort(function(a,b){return String(groups[a].disp).localeCompare(String(groups[b].disp));});
+  keys.forEach(function(k){groups[k].lines.sort(function(a,b){return String(a.p.order_date||'').localeCompare(String(b.p.order_date||''))||String(a.p.id).localeCompare(String(b.p.id));});});
+  return {groups:keys.map(function(k){return groups[k];}),drafts:drafts,finished:finished,any:any,totalOpen:totalOpen,totalLines:totalLines};
+}
+function _plvState(){return S._plv||(S._plv={draft:{},box:{},msg:{},err:{}});}
+function _plvFind(id){
+  var ps=S.purchases||[];
+  for(var i=0;i<ps.length;i++){var ls=S.poLines[ps[i].id]||[];for(var j=0;j<ls.length;j++){if(String(ls[j].id)===String(id))return {l:ls[j],p:ps[i]};}}
+  return null;
+}
+function poSkuLinesHtml(plv,q){
+  var st=_plvState(),nG=plv.groups.length;
+  var metric=function(lab,val){return '<div style="background:var(--bg3);border-radius:var(--r-md);padding:8px 14px"><div class="t3xs">'+lab+'</div><div style="font-size:var(--t-lg);font-weight:700">'+val+'</div></div>';};
+  var note=(plv.drafts||plv.finished)?'<div class="t3s" style="margin-top:8px;line-height:1.6">'
+    +(plv.drafts?plv.drafts+' draft PO'+(plv.drafts!==1?'s':'')+' also '+(plv.drafts!==1?'have':'has')+' this (cannot be checked in until approved). ':'')
+    +(plv.finished?plv.finished+' finished order'+(plv.finished!==1?'s':'')+' hide'+(plv.finished===1?'s':'')+' here: <a href="#" onclick="setFilter(\'po\',\'status\',\'Received\');return false">see Received</a>':'')+'</div>':'';
+  if(!nG)return '<div class="panel section-empty">Nothing left to check in for &ldquo;'+escHtml(q)+'&rdquo;.</div>'+note;
+  var head='<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">'
+    +metric('Still to check in',fn(plv.totalOpen)+' unit'+(plv.totalOpen!==1?'s':''))+metric('Open lines',plv.totalLines)+(nG>1?metric('SKUs',nG):'')
+    +(nG>1?'<button type="button" class="btn btn-teal btn-sm" style="margin-left:auto" onclick="plvAll()" title="Check in every line that has a count typed in">Receive all filled</button>':'')+'</div>';
+  var body=plv.groups.map(function(g){
+    var rows=g.lines.map(function(r){
+      var id=r.l.id,tr=S.poTracking[r.p.id]||[],chips=tr.slice(0,2).map(function(t){return '<a href="'+trackingUrl(t.carrier||'',t.tracking_number)+'" target="_blank" onclick="event.stopPropagation()" style="font-size:var(--t-xs);font-family:var(--mono);color:var(--teal);margin-left:6px">'+escHtml(t.tracking_number)+'</a>';}).join('')+(tr.length>2?'<span class="t3xxs"> +'+(tr.length-2)+'</span>':'');
+      var d=st.draft[id];
+      return '<tr><td style="white-space:nowrap"><a href="#" data-p="'+escHtml(r.p.id)+'" onclick="openPODetail(this.dataset.p);return false" title="Open this PO" style="font-family:var(--mono);font-size:var(--t-xs)">'+escHtml(r.p.order_date||'')+'</a></td>'
+        +'<td>'+escHtml(r.p.vendor||'')+'</td><td style="white-space:nowrap">'+poStatusBadge(r.p)+chips+'</td>'
+        +'<td class="money-neutral">'+fn(r.l.qty_ordered||0)+'</td><td class="money-neutral">'+fn(r.l.qty_received||0)+'</td><td style="font-weight:700">'+fn(r.rem)+'</td>'
+        +'<td><input class="qty-input" id="checkin-'+escHtml(id)+'" type="number" min="1" step="1" style="width:70px" placeholder="Qty" value="'+(d!==undefined?escHtml(String(d)):'')+'" oninput="plvDraft(\''+escHtml(id)+'\',this.value)" onkeydown="if(event.key===\'Enter\'){event.preventDefault();plvReceive(\''+escHtml(id)+'\');}">'
+        +(st.err[id]?'<div id="plv-err-'+escHtml(id)+'" style="font-size:var(--t-xs);color:var(--red);margin-top:2px">'+escHtml(st.err[id])+'</div>':'')+'</td>'
+        +'<td><button type="button" class="btn btn-teal btn-sm" data-i="'+escHtml(id)+'" onclick="plvReceive(this.dataset.i)">Receive</button></td></tr>';
+    }).join('');
+    var m=st.msg[g.key];
+    return '<div class="panel" style="padding:0;margin-bottom:12px;overflow:hidden"><div style="padding:10px 14px;display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;border-bottom:1px solid var(--border)"><b style="font-size:var(--t-lg)">'+escHtml(g.disp)+'</b><span class="t3s">'+escHtml(g.desc)+'</span><span style="flex:1"></span>'+(g.onHand!==null?'<span class="t3s">On hand <b>'+fn(g.onHand)+'</b></span>':'')+'<span class="t3s">Open <b>'+fn(g.open)+'</b></span></div>'
+      +'<div class="tbl-wrap"><table class="plv-t"><thead><tr><th style="text-align:left">PO date</th><th style="text-align:left">Vendor</th><th style="text-align:left">Status &amp; tracking</th><th>Ordered</th><th>In</th><th>Open</th><th style="text-align:left">Check in</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+      +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 14px;border-top:1px solid var(--border);background:var(--bg3)"><span class="t3s">Count in the box</span><input class="qty-input" type="number" min="1" step="1" style="width:76px" data-k="'+escHtml(g.key)+'" value="'+(st.box[g.key]!==undefined?escHtml(String(st.box[g.key])):'')+'" oninput="plvBox(this.dataset.k,this.value)" aria-label="Count in the box"><button type="button" class="btn btn-sm" data-k="'+escHtml(g.key)+'" onclick="plvFill(this.dataset.k)" title="Spread this count over the open lines, oldest PO first. Nothing is saved until you check in.">Fill oldest first</button>'
+      +(m?'<span class="t3s" style="'+(m.bad?'color:var(--red)':'')+'">'+escHtml(m.t)+'</span>':'')
+      +'<button type="button" class="btn btn-teal btn-sm" style="margin-left:auto" data-k="'+escHtml(g.key)+'" onclick="plvAll(this.dataset.k)">Receive all filled</button></div></div>';
+  }).join('');
+  return head+body+note;
+}
+function plvDraft(id,v){var st=_plvState();st.draft[id]=v;if(st.err[id]){delete st.err[id];var e=document.getElementById('plv-err-'+id);if(e)e.remove();}}
+function plvBox(k,v){_plvState().box[k]=v;}
+function plvFill(k){
+  var st=_plvState(),g=((S._plvLast||{}).groups||[]).find(function(x){return x.key===k;});if(!g)return;
+  var b=parseFloat(st.box[k]);
+  if(!(b>0)){st.msg[k]={t:'Enter the box count first',bad:1};render();return;}
+  var left=b;
+  g.lines.forEach(function(r){delete st.draft[r.l.id];delete st.err[r.l.id];});
+  g.lines.forEach(function(r){if(left>0&&r.rem>0){var t=Math.min(r.rem,left);st.draft[r.l.id]=String(t);left-=t;}});   // oldest PO first
+  st.msg[k]=left>0?{t:left+' left over: more than the open lines',bad:1}:{t:'Filled. Review the counts, then check in'};
+  render();
+}
+async function plvReceive(id){return plvCommit([id]);}
+async function plvAll(k){
+  var st=_plvState(),groups=((S._plvLast||{}).groups||[]).filter(function(g){return !k||g.key===k;}),ids=[];
+  groups.forEach(function(g){g.lines.forEach(function(r){if(st.draft[r.l.id]!==undefined&&String(st.draft[r.l.id]).trim()!=='')ids.push(r.l.id);});});
+  if(!ids.length){toast('Type a count on at least one line first');return;}
+  return plvCommit(ids);
+}
+async function plvCommit(ids){
+  if(S._plvBusy)return;
+  var st=_plvState(),items=[],over=[],bad=false,units=0;
+  ids.forEach(function(id){
+    var f=_plvFind(id);if(!f)return;var q=parseFloat(st.draft[id]),rem=poLineRem(f.l);
+    if(!(q>0)){st.err[id]='Enter a count first';bad=true;return;}
+    items.push({id:id,f:f,q:q});units+=q;
+    if(q>rem)over.push(dispSku(f.l.pn)+' on '+(f.p.order_date||'')+': '+q+' typed, '+rem+' open');
+  });
+  if(bad){render();return;}
+  if(!items.length)return;
+  if(over.length&&!confirm('More than is open on:\n\n'+over.join('\n')+'\n\nThe extra is recorded as surplus. Continue?'))return;
+  if(items.length>1&&!confirm('Check in '+items.length+' lines ('+units+' units) into stock?'))return;
+  S._plvBusy=true;var failed=[];
+  try{
+    for(var i=0;i<items.length;i++){
+      var it=items[i],cur=_plvFind(it.id);if(!cur){failed.push(it.id);continue;}
+      var before=Number(cur.l.qty_received)||0,inp=document.getElementById('checkin-'+it.id);
+      if(!inp){inp=document.createElement('input');inp.type='hidden';inp.id='checkin-'+it.id;inp.setAttribute('data-plv','1');document.body.appendChild(inp);}   // the row may have been redrawn away
+      inp.value=String(it.q);
+      await checkInLine(it.id,cur.p.id,cur.l.pn,cur.l.qty_ordered,cur.l.qty_received||0);
+      var after=_plvFind(it.id);
+      if(after&&(Number(after.l.qty_received)||0)>before){delete st.draft[it.id];delete st.err[it.id];}else failed.push(it.id);
+    }
+  }finally{
+    S._plvBusy=false;
+    document.querySelectorAll('input[data-plv]').forEach(function(e){e.remove();});
+  }
+  render();
+  if(failed.length)toast('\u26a0 '+failed.length+' line'+(failed.length!==1?'s were':' was')+' not checked in. Their counts are still typed so you can try again.',8000);
+}
+window.plvDraft=plvDraft;window.plvBox=plvBox;window.plvFill=plvFill;window.plvReceive=plvReceive;window.plvAll=plvAll;
+
 function renderPurchases(){
   function poDisplayData(p){
     const _allPoLines=S.poLines[p.id]||[];
@@ -5589,10 +5705,12 @@ function renderPurchases(){
   // other lines are still open does not show up for a SKU that is already fully received on it. The finished chips are unchanged and show everything in them.
   const _CLOSED_PO=['Received','Recovered','Cancelled','Lost'];
   const _closedView=_CLOSED_PO.indexOf(sf.status)>=0;
-  const _lineHit=function(l){
-    var it=partByPn(l.pn)||asmByPn(l.pn)||(typeof _findPart==='function'?_findPart(l.pn):null)||(typeof findAsm==='function'?findAsm(l.pn):null);   // also finds a SKU by its new number
-    return (l.pn||'').toLowerCase().includes(q)||(l.description||'').toLowerCase().includes(q)||(it&&((it.new_sku||'').toLowerCase().includes(q)||String(dispPn(it)||'').toLowerCase().includes(q)));
-  };
+  // The lines view is offered in the open views when the search matches a line item (a vendor-name search keeps the PO list); the Orders chip switches back.
+  const _plvAvail=!!q&&!_closedView&&!_isFollow&&sf.status!=='Draft'&&((S.poLines&&S.purchases)?S.purchases.some(function(p){return (S.poLines[p.id]||[]).some(function(l){return !isShippingLine(l)&&poLineHit(l,q);});}):false);
+  const _plvOn=_plvAvail&&sf.view!=='orders';
+  const _plv=_plvOn?poSkuLines(q,sf.status):null;
+  S._plvLast=_plv;
+  const _lineHit=function(l){return poLineHit(l,q);};
   let _matches=list.map(function(p){
     if(!q)return {p:p,hit:true,open:true};
     const d=poDisplayData(p),lines=S.poLines[p.id]||[],hits=lines.filter(_lineHit);
@@ -5607,7 +5725,7 @@ function renderPurchases(){
   list=_shown.map(function(m){return m.p;});
   const _hiddenN=_inScope.length-_shown.length;
 
-  const _poHint=(q&&_hiddenN>0&&!_closedView)?`<div class="t3s" style="margin:-4px 0 10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">Showing only orders that still have units of &ldquo;${escHtml(q)}&rdquo; to check in. <b>${_hiddenN}</b> other order${_hiddenN!==1?'s':''} match${_hiddenN===1?'es':''} but ${_hiddenN!==1?'are':'is'} received, closed, or already checked in for it.${sf.status?'':' <a href="#" onclick="setFilter(\'po\',\'status\',\'Received\');return false">See Received</a>'}</div>`:'';
+  const _poHint=(q&&_hiddenN>0&&!_closedView&&!_plvOn)?`<div class="t3s" style="margin:-4px 0 10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">Showing only orders that still have units of &ldquo;${escHtml(q)}&rdquo; to check in. <b>${_hiddenN}</b> other order${_hiddenN!==1?'s':''} match${_hiddenN===1?'es':''} but ${_hiddenN!==1?'are':'is'} received, closed, or already checked in for it.${sf.status?'':' <a href="#" onclick="setFilter(\'po\',\'status\',\'Received\');return false">See Received</a>'}</div>`:'';
   const filteredValue=list.reduce((s,p)=>s+poExtended(p),0);
   const filteredVendors=new Set(list.map(p=>p.vendor)).size;
   const filterLabel=_isFollow?'Follow-up':(sf.status||'All');
@@ -5653,13 +5771,14 @@ function renderPurchases(){
     <div class="search-wrap"><span class="search-icon"><span class="ic ic-search"></span></span>
       <input placeholder="Vendor or part…" value="${sf.search||''}" oninput="setFilter('po','search',this.value)">
     </div>
+    ${_plvAvail?`<button class="filter-chip ${_plvOn?'on-teal':''}" onclick="setFilter('po','view','lines')" title="One row per open PO line for this search, so you can check in against any PO">Open lines</button><button class="filter-chip ${_plvOn?'':'on-teal'}" onclick="setFilter('po','view','orders')" title="The list of purchase orders">Orders</button>`:''}
     ${(function(){var c=poFollowCounts(),n=c.due+c.overdue;return `<button class="filter-chip ${_isFollow?'on-teal':''}" style="${_isFollow?'':(c.overdue?'color:var(--red);border-color:var(--red)':(n?'color:var(--orange);border-color:var(--orange)':''))}" title="POs to check on with the vendor: overdue, due for a check-in, or coming up this week" onclick="setFilter('po','status','followup')">Follow-ups${n?` <b>(${n})</b>`:''}</button>`;})()}
     ${['','Draft','On Order','In Transit','Partial','Received','Lost','Recovered','Cancelled'].map(s=>`<button class="filter-chip ${sf.status===s&&s?'on-teal':(!sf.status)&&s===''?'on-teal':''}" onclick="setFilter('po','status','${s}')" title="${s?'':'Every purchase order that is still open: Draft, On Order, In Transit and Partial. Received, Recovered, Lost and Cancelled orders are under their own chips.'}">${s||'All open'}</button>`).join('')}
     <button class="btn btn-sm" style="margin-left:auto" title="Remove duplicate POs (same vendor + date)" onclick="deduplicatePOs()"><span class="ic ic-trash"></span>Dedupe</button>
     <button class="btn btn-primary btn-sm" onclick="nav('pobuilder')">+ New PO</button>
   </div>
   ${_poHint}
-  ${_isFollow?poFollowPanel(true):`<div class="tbl-wrap">
+  ${_isFollow?poFollowPanel(true):_plvOn?poSkuLinesHtml(_plv,q):`<div class="tbl-wrap">
   <table data-tid="purchases"><thead><tr>
   <th style="cursor:pointer;white-space:nowrap;user-select:none" onclick="(()=>{var d=S.filters.po&&S.filters.po.sort==='date'&&S.filters.po.dir==='asc'?'desc':'asc';setFilter('po','sort','date');setFilter('po','dir',d)})()">Date ${_poSF==='date'?(_poSD==='asc'?'&uarr;':'&darr;'):'&darr;'}</th>
   <th style="cursor:pointer;user-select:none" onclick="(()=>{var d=S.filters.po&&S.filters.po.sort==='vendor'&&S.filters.po.dir==='asc'?'desc':'asc';setFilter('po','sort','vendor');setFilter('po','dir',d)})()">Vendor ${_poSF==='vendor'?(_poSD==='asc'?'&uarr;':'&darr;'):''}</th>
