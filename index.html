@@ -660,7 +660,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.143';
+const TGK_ERP_VERSION = 'v23.144';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -27118,7 +27118,7 @@ async function submitEditPOHeader(poId){
    - Matching: part number (text before " rev "), on that vendor's open PO lines; the PO's order date breaks ties.
    - Receiving uses checkInLineQuick, the same path as the Receive button on a PO.
    - Shipments are saved in settings under 'po_shipments', shared by every device. */
-var SHP={tab:null,busy:false,msg:''};
+var SHP={tab:null,busy:false,msg:'',q:'',draft:{}};   // q: search text; draft: counts typed but not received yet, kept across redraws
 function shpStore(){var v=(S.settings||{}).po_shipments;if(typeof v==='string'){try{v=JSON.parse(v);}catch(e){v=null;}}if(!v||typeof v!=='object')v={};if(!v.ships)v.ships={};return v;}
 async function shpSave(st){
   var r=await db.from('settings').upsert({key:'po_shipments',value:st},{onConflict:'key'});
@@ -27229,7 +27229,10 @@ async function shpSyncTracking(){
   if(flip.length){var u=await db.from('purchases').update({status:'In Transit',updated_at:new Date().toISOString()}).in('id',flip);if(!(u&&u.error))S.purchases=S.purchases.map(function(p){return flip.indexOf(p.id)>=0?Object.assign({},p,{status:'In Transit'}):p;});}
   if(S.view==='purchases'||S.poShipView)render();
 }
-function shpOpen(){S.poShipView=true;S.activePO=null;render();}
+function shpOpen(){S.poShipView=true;S.activePO=null;render();setTimeout(function(){var e=document.getElementById('shp-search');if(e)e.focus();},60);}   // cursor in the search box, ready for a scanned label
+function shpNorm(x){return String(x==null?'':x).toUpperCase().replace(/[^A-Z0-9]/g,'');}
+function shpSearch(v){SHP.q=v;var el=document.getElementById('shp-body');if(el)el.innerHTML=shpBodyHtml();else render();}   // only the list is redrawn, so the box keeps focus
+function shpDraft(el){SHP.draft[el.dataset.d]=el.value;}
 function shpClose(){S.poShipView=false;render();}
 function shpTab(t){SHP.tab=t;render();}
 async function shpVendor(v){var st=shpStore();Object.keys(st.ships).forEach(function(t){var s=st.ships[t];if(shpShipState(s)!=='done'){s.vendor=v;(s.rows||[]).forEach(function(r){if(!(r.got>0))r.lineId=null;});}});if(await shpSave(st)){render();shpSyncTracking().catch(function(){});}}
@@ -27242,27 +27245,29 @@ async function shpRemove(t){
   if(!confirm('Remove shipment '+t+' from this list? Nothing already received is undone, and the POs are not changed.'))return;
   delete st.ships[t];if(await shpSave(st)){SHP.tab=null;render();}
 }
-async function shpReceive(t){
+async function shpReceive(t,only){   // only = row number for a single-line check-in; left out = every line with a count
   if(SHP.busy)return;
+  var one=(only!==undefined&&only!==null&&!isNaN(only));
   var st=shpStore(),s=st.ships[t];if(!s)return;
   var pool=shpOpenLines(s.vendor),todo=[],noLine=[],over=[];
   (s.rows||[]).forEach(function(r,i){   // read every count box first, before any saving starts
+    if(one&&i!==only)return;
     var el=document.getElementById('shp-q-'+i),q=el?parseFloat(el.value):0;if(!(q>0))return;
     var m=shpMatch(s.vendor,r,pool);
     if(!m.line||!m.po){noLine.push(r.pn);return;}
     var open=poLineRem(m.line);if(q>open)over.push(r.pn+' ('+q+' counted, '+open+' open)');
     todo.push({r:r,q:q,line:m.line,po:m.po});
   });
-  if(!todo.length){toast(noLine.length?'Those lines are not matched to a PO yet: pick a PO line first':'Type the count for at least one line first',6000);return;}
+  if(!todo.length){toast(noLine.length?(one?'That line is not matched to a PO yet: pick a PO line first':'Those lines are not matched to a PO yet: pick a PO line first'):(one?'Type the count for that line first':'Type the count for at least one line first'),6000);return;}
   var units=todo.reduce(function(a,x){return a+x.q;},0);
-  if(!confirm('Receive '+todo.length+' line'+(todo.length===1?'':'s')+' ('+units+' units) from shipment '+t+' into stock?'+(over.length?'\n\nMORE than the PO has open:\n'+over.join('\n'):'')+(noLine.length?'\n\nSkipped, not matched to a PO: '+noLine.join(', '):'')))return;
+  if(!(one&&!over.length)&&!confirm('Receive '+todo.length+' line'+(todo.length===1?'':'s')+' ('+units+' units) from shipment '+t+' into stock?'+(over.length?'\n\nMORE than the PO has open:\n'+over.join('\n'):'')+(noLine.length?'\n\nSkipped, not matched to a PO: '+noLine.join(', '):'')))return;
   SHP.busy=true;render();
   var ok=0,failed=[],pos={};
   for(var i=0;i<todo.length;i++){var x=todo[i];
     try{await checkInLineQuick(x.line.id,x.po.id,x.line.pn,x.line.qty_ordered,x.line.qty_received||0,x.q);
       ok++;pos[x.po.id]=1;
       Object.keys(st.ships).forEach(function(tt){(st.ships[tt].rows||[]).forEach(function(r){if(r.k===x.r.k)r.lineId=x.line.id;});});   // remember which PO line this row belongs to
-      x.r.got=(x.r.got||0)+x.q;
+      x.r.got=(x.r.got||0)+x.q;delete SHP.draft[t+'|'+x.r.k];
     }catch(e){console.error('[shipments] receive failed',x.r.pn,e);failed.push(x.r.pn+': '+((e&&e.message)||'error'));}
   }
   var ids=Object.keys(pos);
@@ -27280,29 +27285,44 @@ function shpEntryBar(){
     +'<label class="btn btn-sm" style="cursor:pointer;margin:0">Upload vendor file<input type="file" accept=".csv,text/csv" style="display:none" onchange="shpUpload(this)"></label></div>';
 }
 function renderPOShipments(){
-  var list=shpList(),vendors=[];(S.purchases||[]).forEach(function(p){var v=String(p.vendor||'');if(v&&vendors.indexOf(v)<0&&p.status!=='Draft'&&p.status!=='Cancelled'&&p.status!=='Received')vendors.push(v);});vendors.sort();
-  var head='<style>.shp-t>tbody>tr>td{height:30px;padding:0 8px}.shp-t>thead>tr>th{padding:6px 8px}.shp-t>tbody>tr.shp-box>td{height:24px;background:var(--bg3);font-size:var(--t-xs);font-weight:700;letter-spacing:.06em;color:var(--text3)}</style>'
-    +'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px"><button type="button" class="btn btn-sm" onclick="shpClose()"><span class="ic ic-arrow-back"></span>Purchase orders</button><b style="font-size:var(--t-lg)">Receive by shipment</b><span style="flex:1"></span>'
-    +'<label class="btn btn-sm" style="cursor:pointer;margin:0">Upload vendor file<input type="file" accept=".csv,text/csv" style="display:none" onchange="shpUpload(this)"></label></div>';
+  var list=shpList();
+  try{if(document.activeElement&&document.activeElement.id==='shp-search')setTimeout(function(){var e=document.getElementById('shp-search');if(e){e.focus();var n=e.value.length;try{e.setSelectionRange(n,n);}catch(_e){}}},0);}catch(e){}
+  var head='<style>.shp-t>tbody>tr>td{height:32px;padding:0 8px}.shp-t>thead>tr>th{padding:6px 8px}.shp-t>tbody>tr.shp-box>td{height:24px;background:var(--bg3);font-size:var(--t-xs);font-weight:700;letter-spacing:.06em;color:var(--text3)}</style>'
+    +'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px"><button type="button" class="btn btn-sm" onclick="shpClose()"><span class="ic ic-arrow-back"></span>Purchase orders</button><b style="font-size:var(--t-lg)">Receive by shipment</b>'
+    +(list.length?'<input id="shp-search" type="search" class="form-input" style="flex:1;min-width:240px;max-width:460px;height:32px" placeholder="Search or scan a tracking number, packing slip or part" value="'+escHtml(SHP.q||'')+'" oninput="shpSearch(this.value)" onkeydown="if(event.key===\'Enter\')this.select()" autocomplete="off">':'')
+    +'<span style="flex:1"></span><label class="btn btn-sm" style="cursor:pointer;margin:0">Upload vendor file<input type="file" accept=".csv,text/csv" style="display:none" onchange="shpUpload(this)"></label></div>';
   if(!list.length)return head+'<div class="panel section-empty">No shipments yet. Upload the vendor\'s in-transit file (CSV) and each tracking number becomes a shipment here, with its lines matched to your open POs.</div>';
-  var cur=list.find(function(s){return s.tracking===SHP.tab;})||list.find(function(s){return shpShipState(s)!=='done';})||list[0];
-  var vendor=cur.vendor||'',pool=shpOpenLines(vendor);
+  return head+'<div id="shp-body">'+shpBodyHtml()+'</div>';
+}
+function shpBodyHtml(){
+  var list=shpList(),vendors=[];(S.purchases||[]).forEach(function(p){var v=String(p.vendor||'');if(v&&vendors.indexOf(v)<0&&p.status!=='Draft'&&p.status!=='Cancelled'&&p.status!=='Received')vendors.push(v);});vendors.sort();
+  // [v23.144] search: a tracking number (typed, pasted or scanned; a scan that carries extra digits around the number still matches), a packing slip, or a part
+  var q=shpNorm(SHP.q),ql=String(SHP.q||'').trim().toLowerCase();
+  var shipHit=function(s){var t=shpNorm(s.tracking);return !q||t.indexOf(q)>=0||(q.length>=8&&q.indexOf(t)>=0)||shpNorm(s.slip).indexOf(q)>=0;};
+  var rowHit=function(r){return shpNorm(r.pn).indexOf(q)>=0||String(r.desc||'').toLowerCase().indexOf(ql)>=0;};
+  var vis=q?list.filter(function(s){return shipHit(s)||(s.rows||[]).some(rowHit);}):list;
+  var cur=(!q&&list.find(function(s){return s.tracking===SHP.tab;}))||vis.find(function(s){return s.tracking===SHP.tab;})||vis.find(function(s){return shpShipState(s)!=='done';})||vis[0];
   // totals across every shipment
   var seen={},tot={lines:0,ok:0,pick:0,none:0};
   list.forEach(function(s){var pl=shpOpenLines(s.vendor);(s.rows||[]).forEach(function(r){if(seen[r.k])return;seen[r.k]=1;tot.lines++;var m=shpMatch(s.vendor,r,pl);if(m.state==='pick')tot.pick++;else if(m.state==='none')tot.none++;else tot.ok++;});});
+  var vendor=(cur&&cur.vendor)||(list[0]&&list[0].vendor)||'';
   var sum='<div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;margin-bottom:8px;font-size:var(--t-sm)"><span><b>'+tot.lines+'</b> lines</span><span><b>'+list.length+'</b> shipments</span><span style="color:var(--green)"><b>'+tot.ok+'</b> matched</span>'
     +(tot.pick?'<span style="color:var(--orange)"><b>'+tot.pick+'</b> need a pick</span>':'')+(tot.none?'<span style="color:var(--red)"><b>'+tot.none+'</b> not found</span>':'')
     +'<span style="margin-left:auto" class="t3s">Vendor <select class="form-input" style="width:auto;padding:3px 8px;font-size:var(--t-sm)" onchange="shpVendor(this.value)" title="Whose POs these shipments are matched against"><option value="">Any vendor</option>'+vendors.map(function(v){return '<option value="'+escHtml(v)+'"'+(v===vendor?' selected':'')+'>'+escHtml(v)+'</option>';}).join('')+'</select></span></div>';
-  var tabs='<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">'+list.map(function(s){var on=s.tracking===cur.tracking,stt=shpShipState(s);
-    return '<button type="button" class="filter-chip" style="padding:4px 10px;border:1px solid '+(on?'var(--teal)':'var(--border2)')+';background:'+(on?'var(--teal-dim)':'var(--bg2)')+';color:'+(on?'var(--teal)':'var(--text2)')+';border-radius:var(--r);cursor:pointer;font-weight:600;font-size:var(--t-sm);font-family:var(--mono)" data-t="'+escHtml(s.tracking)+'" onclick="shpTab(this.dataset.t)">'+escHtml(s.tracking)+' <span style="font-family:inherit;font-weight:400">&middot; '+(s.rows||[]).length+(stt==='done'?' &middot; checked in':stt==='part'?' &middot; part in':'')+'</span></button>';}).join('')+'</div>';
-  // rows of the current shipment, grouped by their first box
+  if(!cur)return sum+'<div class="panel section-empty">No shipment, packing slip or part matches &ldquo;'+escHtml(SHP.q)+'&rdquo;.</div>';
+  var pool=shpOpenLines(cur.vendor||'');vendor=cur.vendor||'';
+  var tabs='<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">'+vis.map(function(s){var on=s.tracking===cur.tracking,stt=shpShipState(s);
+    return '<button type="button" class="filter-chip" style="padding:4px 10px;border:1px solid '+(on?'var(--teal)':'var(--border2)')+';background:'+(on?'var(--teal-dim)':'var(--bg2)')+';color:'+(on?'var(--teal)':'var(--text2)')+';border-radius:var(--r);cursor:pointer;font-weight:600;font-size:var(--t-sm);font-family:var(--mono)" data-t="'+escHtml(s.tracking)+'" onclick="shpTab(this.dataset.t)">'+escHtml(s.tracking)+' <span style="font-family:inherit;font-weight:400">&middot; '+(s.rows||[]).length+(stt==='done'?' &middot; checked in':stt==='part'?' &middot; part in':'')+'</span></button>';}).join('')
+    +(q&&vis.length<list.length?'<span class="t3s" style="align-self:center">'+vis.length+' of '+list.length+' shipments match</span>':'')+'</div>';
+  // rows of the current shipment, grouped by their first box. Searching for a part shows only that part's lines.
+  var onlyRows=q&&!shipHit(cur);
   var boxes=[],byBox={},poIds={};
-  (cur.rows||[]).forEach(function(r,i){var b=(r.boxes&&r.boxes[0])||'';if(!byBox[b]){byBox[b]=[];boxes.push(b);}byBox[b].push({r:r,i:i});});
+  (cur.rows||[]).forEach(function(r,i){if(onlyRows&&!rowHit(r))return;var b=(r.boxes&&r.boxes[0])||'';if(!byBox[b]){byBox[b]=[];boxes.push(b);}byBox[b].push({r:r,i:i});});
   boxes.sort(function(a,b){return (parseFloat(a)||0)-(parseFloat(b)||0)||String(a).localeCompare(String(b));});
   var body=boxes.map(function(b){
     return '<tr class="shp-box"><td colspan="6">'+(b?'BOX '+escHtml(b):'NO BOX NUMBER')+'</td></tr>'+byBox[b].map(function(o){var r=o.r,m=shpMatch(vendor,r,pool),open=m.line?poLineRem(m.line):0,got=r.got||0;
       if(m.po)poIds[m.po.id]=1;
-      var also=(r.boxes||[]).slice(1),left=Math.max(0,(r.inTransit||0)-got),def=(!r.split&&m.line)?Math.min(left,open):0;
+      var also=(r.boxes||[]).slice(1),left=Math.max(0,(r.inTransit||0)-got),def=(!r.split&&m.line)?Math.min(left,open):0,dk=cur.tracking+'|'+r.k,val=(SHP.draft[dk]!==undefined?SHP.draft[dk]:(def>0?def:''));
       var cell;
       if(m.state==='ok'||m.state==='set')cell='<span class="pill pill-green">Matched</span>';
       else if(m.state==='pick')cell='<select class="form-input" style="width:auto;max-width:170px;padding:2px 6px;font-size:var(--t-xs)" data-k="'+escHtml(r.k)+'" onchange="shpPick(this.dataset.k,this.value)"><option value="">Pick PO&hellip;</option>'+m.cands.map(function(c){return '<option value="'+escHtml(c.line.id)+'">PO '+escHtml(String(c.po.order_date||'').slice(0,10))+' &middot; '+c.open+' open</option>';}).join('')+'</select>';
@@ -27311,18 +27331,20 @@ function renderPOShipments(){
         +'<td class="t3s">'+(m.po?'<a href="#" data-p="'+escHtml(m.po.id)+'" onclick="openPODetail(this.dataset.p);return false" title="Open this PO">'+escHtml(String(m.po.order_date||'').slice(0,10))+'</a>':escHtml(r.odate||''))+'</td>'
         +'<td style="max-width:none">'+cell+(m.state==='set'&&!got?' <a href="#" class="t3xs" data-k="'+escHtml(r.k)+'" onclick="shpPick(this.dataset.k,\'\');return false">change</a>':'')+'</td>'
         +'<td style="text-align:right">'+(m.line?open:'&mdash;')+'</td><td style="text-align:right;color:'+(got?'var(--green)':'var(--text3)')+';font-weight:'+(got?700:400)+'">'+(got||'&mdash;')+'</td>'
-        +'<td style="text-align:right"><input id="shp-q-'+o.i+'" type="number" min="0" step="1" class="inline-edit" style="width:74px;text-align:right" placeholder="qty" value="'+(def>0?def:'')+'"'+(m.line?'':' disabled title="Match this line to a PO first"')+'></td></tr>';}).join('');}).join('');
+        +'<td style="text-align:right;max-width:none;white-space:nowrap"><input id="shp-q-'+o.i+'" type="number" min="0" step="1" class="inline-edit" style="width:74px;text-align:right" placeholder="qty" value="'+escHtml(val)+'" data-d="'+escHtml(dk)+'" data-t="'+escHtml(cur.tracking)+'" data-i="'+o.i+'" oninput="shpDraft(this)" onkeydown="if(event.key===\'Enter\'){event.preventDefault();shpReceive(this.dataset.t,+this.dataset.i);}"'+(m.line?'':' disabled title="Match this line to a PO first"')+'>'
+        +' <button type="button" class="btn btn-sm btn-teal" style="padding:3px 9px" data-t="'+escHtml(cur.tracking)+'" data-i="'+o.i+'" onclick="shpReceive(this.dataset.t,+this.dataset.i)" title="Check in just this line"'+((m.line&&!SHP.busy)?'':' disabled')+'><span class="ic ic-check"></span>Receive</button></td></tr>';}).join('');}).join('');
   var nPo=Object.keys(poIds).length,stt=shpShipState(cur),url='';try{url=trackingUrl(cur.carrier,cur.tracking);}catch(e){}
+  var allBoxes=[];(cur.rows||[]).forEach(function(r){(r.boxes||[]).forEach(function(b){if(allBoxes.indexOf(b)<0)allBoxes.push(b);});});allBoxes.sort(function(a,b){return (parseFloat(a)||0)-(parseFloat(b)||0);});
   var card='<div class="panel" style="padding:0;overflow:hidden"><div style="padding:10px 14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--border)"><b>'+escHtml(cur.carrier)+' '+(url?'<a href="'+escHtml(url)+'" target="_blank" rel="noopener" style="font-family:var(--mono)">'+escHtml(cur.tracking)+'</a>':'<span style="font-family:var(--mono)">'+escHtml(cur.tracking)+'</span>')+'</b>'
-    +'<span class="t3s">'+(cur.slip?'Packing slip '+escHtml(cur.slip):'')+(cur.date?' &middot; '+escHtml(cur.date):'')+' &middot; '+(boxes.filter(Boolean).length?'boxes '+escHtml(boxes.filter(Boolean).join(', ')):'no box numbers')+' &middot; from '+nPo+' PO'+(nPo===1?'':'s')+'</span>'
+    +'<span class="t3s">'+(cur.slip?'Packing slip '+escHtml(cur.slip):'')+(cur.date?' &middot; '+escHtml(cur.date):'')+' &middot; '+(allBoxes.length?'boxes '+escHtml(allBoxes.join(', ')):'no box numbers')+(onlyRows?' &middot; showing only lines that match your search':' &middot; from '+nPo+' PO'+(nPo===1?'':'s'))+'</span>'
     +(stt==='done'?'<span class="pill pill-green">Checked in</span>':'')+'<span style="flex:1"></span>'
-    +'<button type="button" class="btn btn-sm btn-teal" data-t="'+escHtml(cur.tracking)+'" onclick="shpReceive(this.dataset.t)"'+(SHP.busy?' disabled':'')+'>'+(SHP.busy?'Receiving&hellip;':'Receive shipment')+'</button>'
+    +'<button type="button" class="btn btn-sm btn-teal" data-t="'+escHtml(cur.tracking)+'" onclick="shpReceive(this.dataset.t)" title="Check in every line that has a count filled in"'+(SHP.busy?' disabled':'')+'>'+(SHP.busy?'Receiving&hellip;':'Receive all filled')+'</button>'
     +'<button type="button" class="btn btn-sm" data-t="'+escHtml(cur.tracking)+'" onclick="shpRemove(this.dataset.t)" title="Take this shipment off the list">Remove</button></div>'
-    +'<div class="tbl-wrap"><table class="shp-t"><thead><tr><th style="text-align:left">Part</th><th style="text-align:left;width:96px">PO date</th><th style="text-align:left;width:190px">Match</th><th style="text-align:right;width:70px">Open on PO</th><th style="text-align:right;width:80px">Received here</th><th style="text-align:right;width:90px">Receive</th></tr></thead><tbody>'+body+'</tbody></table></div></div>'
-    +'<div class="t3s" style="margin-top:8px">Counts are filled in when a line is in this shipment only. Lines marked split are left blank: count what is in the box. Receiving adds stock and credits each line to its own PO. To undo a receipt, open the PO and reverse that line.</div>';
-  return head+sum+tabs+card;
+    +'<div class="tbl-wrap"><table class="shp-t"><thead><tr><th style="text-align:left">Part</th><th style="text-align:left;width:96px">PO date</th><th style="text-align:left;width:190px">Match</th><th style="text-align:right;width:70px">Open on PO</th><th style="text-align:right;width:80px">Received here</th><th style="text-align:right;width:190px">Check in</th></tr></thead><tbody>'+(body||'<tr><td colspan="6" class="t3s">No lines.</td></tr>')+'</tbody></table></div></div>'
+    +'<div class="t3s" style="margin-top:8px">Check in one line at a time with its Receive button (or press Enter in the count box), or fill in several counts and use Receive all filled. Counts are filled in when a line is in this shipment only; lines marked split are left blank, so count what is in the box. To undo a receipt, open the PO and reverse that line.</div>';
+  return sum+tabs+card;
 }
-Object.assign(window,{shpUpload:shpUpload,shpOpen:shpOpen,shpClose:shpClose,shpTab:shpTab,shpVendor:shpVendor,shpPick:shpPick,shpRemove:shpRemove,shpReceive:shpReceive,renderPOShipments:renderPOShipments});
+Object.assign(window,{shpUpload:shpUpload,shpOpen:shpOpen,shpClose:shpClose,shpTab:shpTab,shpVendor:shpVendor,shpPick:shpPick,shpRemove:shpRemove,shpReceive:shpReceive,renderPOShipments:renderPOShipments,shpSearch:shpSearch,shpDraft:shpDraft,shpBodyHtml:shpBodyHtml});
 
 const _origRenderPurchases = renderPurchases;
 function renderPurchasesEnhanced() {
