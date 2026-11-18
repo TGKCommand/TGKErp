@@ -660,8 +660,8 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.141';
-const TGK_ERP_BUILD_DATE = '2026-11-17';
+const TGK_ERP_VERSION = 'v23.142';
+const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
 // functions can refuse anonymous callers (EDGE_AUTH_MODE=enforce). Done once here instead of at ~20 call sites:
@@ -34127,7 +34127,7 @@ function dsShip(r){
 function dsStatusPillFor(r){var s=dsShip(r),x=s&&DS_SHIP[s.state];return x?'<span class="pill '+x[1]+'">'+escHtml(x[0])+'</span>':dsStatusPill(r.status);}
 function dsTrackHtml(s,max){
   if(!s||!s.tracking||!s.tracking.length)return '';
-  var shown=s.tracking.slice(0,max||1).map(function(t){var c=String(t.carrier||'').trim().split(/\s+/)[0];return '<a href="'+escHtml(t.url)+'" target="_blank" rel="noopener" onclick="dsStop(event)">'+escHtml((c?c+' ':'')+t.n)+'</a>';}).join('<br>');
+  var shown=s.tracking.slice(0,max||1).map(function(t){var c=String(t.carrier||'').trim().split(/[\s_]+/)[0].toUpperCase();return '<a href="'+escHtml(t.url)+'" target="_blank" rel="noopener" onclick="dsStop(event)">'+escHtml((c?c+' ':'')+t.n)+'</a>';}).join('<br>');
   return shown+(s.tracking.length>(max||1)?' <span class="t3xs">+'+(s.tracking.length-(max||1))+' more</span>':'');
 }
 // What the stock is NOW (the snapshot taken when the dealer ordered goes stale): on hand, plus what can be built from raw goods (packaging never counts), the ERP's own rule.
@@ -34192,8 +34192,22 @@ function dsTally(){
   dsLive().forEach(function(r){var k=dsKind(r);c.all++;if(k.attention)c.attention++;if(k.awaiting)c.awaiting++;if(k.build)c.build++;if(k.shipped)c.shipped++;if(k.active)c.active++;if(r.status==='sent'&&String(r.sent_at||'').slice(0,10)===today)c.sentToday++;});
   return c;
 }
-function dsFilter(f){DS.filter=f;render();}
-function dsRows(){var f=DS.filter;if(DS.showRemoved)return dsRemovedList();return dsLive().filter(function(r){if(!f||f==='all')return true;return !!dsKind(r)[f];});}
+function dsFilter(f){DS.filter=f;DS.q='';render();}   // picking a status button leaves search
+// [v23.142] Search. Typing looks through every order whatever its status (so a shipped PO is found while the Active button is on):
+// PO number, dealer, Shopify order number, order code, tracking numbers, ship-to name/city/ZIP, SKUs and item names, dealer note. Every word typed must match.
+function dsHay(r){
+  var sh=r.ship_to||{},ship=null;try{ship=dsShip(r);}catch(e){}
+  return [r.po_number,r.dealer_name,r.shopify_order_name,r.discount_code,r.notes,sh.name,sh.address1,sh.city,sh.province,sh.zip,
+    (ship&&ship.tracking||[]).map(function(t){return t.n;}).join(' '),
+    (r.lines||[]).map(function(l){return [l.sku,l.title,l.name].filter(Boolean).join(' ');}).join(' ')].filter(Boolean).join(' ').toLowerCase();
+}
+function dsRows(){
+  var f=DS.filter,q=String(DS.q||'').trim().toLowerCase(),base=DS.showRemoved?dsRemovedList():dsLive();
+  if(q){var words=q.split(/\s+/);return base.filter(function(r){var h=dsHay(r);return words.every(function(w){return h.indexOf(w)>=0;});});}
+  if(DS.showRemoved)return base;
+  return base.filter(function(r){if(!f||f==='all')return true;return !!dsKind(r)[f];});
+}
+function dsSearch(v){DS.q=v;var el=document.getElementById('ds-tbl');if(el)el.innerHTML=dsTableHtml();else render();}   // only the table is redrawn, so the box keeps focus while you type
 async function dsSend(id){
   if(DS.busy)return;DS.busy=true;render();
   try{var j=await _dsFn({action:'send_to_shopify',request_id:id});toast(j.status==='awaiting_payment'?'Sent to Shopify: the dealer has a payment link':'Sent to Shopify as '+(j.order_name||'an order'),6000);}
@@ -34340,31 +34354,42 @@ async function dsSaveSettings(){
   var r=await db.from('settings').upsert(rows,{onConflict:'key'});if(r.error){toast('Not saved: '+r.error.message,7000);return;}
   S.settings=S.settings||{};rows.forEach(function(x){S.settings[x.key]=x.value;});toast('Storefront settings saved');render();
 }
-function renderDealerOrders(){
-  setTimeout(function(){try{dsBadge();}catch(e){}},0);   // keep the menu count in step with the Active button
-  if(!DS.loaded&&!DS.loading)dsLoadReqs();
-  else if(DS.loaded&&!DS.loading&&(!DS._syncAt||Date.now()-DS._syncAt>120000)&&DS.reqs.some(function(r){return r.status==='awaiting_payment';})){DS._syncAt=Date.now();dsSync(true);}
-  var c=dsTally(),rows=dsRows(),sel=DS.sel&&DS.reqs.find(function(r){return String(r.id)===String(DS.sel);});
-  var pill=function(key,label,n,col){var on=DS.filter===key,hot=(n>0&&col);return '<button type="button" class="filter-chip" aria-pressed="'+(on?'true':'false')+'" style="display:inline-flex;align-items:center;gap:8px;padding:8px 14px;border:1px solid '+(on?'var(--teal)':'var(--border2)')+';background:'+(on?'var(--teal-dim)':'var(--bg2)')+';color:'+(on?'var(--teal)':'var(--text2)')+';border-radius:var(--r);cursor:pointer;font-weight:600;font-size:var(--t-md)" onclick="dsFilter(\''+key+'\')">'+label+' <b style="font-family:var(--mono);font-size:var(--t-lg);color:'+(hot?col:(on?'var(--teal)':'var(--text)'))+'">'+n+'</b></button>';};
+// [v23.142] Condensed Dealer Orders: one toolbar with a search box, smaller status buttons, one 30px line per order with the tracking link beside the status.
+function dsTableHtml(){
+  var rows=dsRows(),q=String(DS.q||'').trim();
   var picked=dsPicked(),allOn=rows.length&&rows.every(function(r){return DS.pick[String(r.id)];});
-  var bulk=picked.length?'<div class="panel" style="padding:8px 14px;margin-bottom:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;border-left:3px solid var(--teal)"><b>'+picked.length+' selected</b>'
+  var bulk=picked.length?'<div class="panel" style="padding:6px 12px;margin-bottom:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;border-left:3px solid var(--teal)"><b>'+picked.length+' selected</b>'
     +(DS.showRemoved?'<button type="button" class="btn btn-sm" onclick="dsRestore(dsPicked())">Restore</button><button type="button" class="btn btn-sm btn-red" onclick="dsDeleteForever(dsPicked())">Delete for good</button>':'<button type="button" class="btn btn-sm btn-red" onclick="dsRemove(dsPicked())">Remove selected</button>')
     +'<button type="button" class="btn btn-sm" onclick="DS.pick={};render()">Clear</button></div>':'';
+  var note=q?'<div class="t3s" style="margin:0 0 6px">'+rows.length+' order'+(rows.length===1?'':'s')+' found for &ldquo;'+escHtml(q)+'&rdquo;, searching every status. <a href="#" onclick="DS.q=\'\';render();return false">Clear search</a></div>':'';
   var colN=10;
-  var tbl=rows.length?bulk+'<div class="panel" style="padding:0;overflow:hidden"><div class="tbl-wrap"><table><thead><tr><th style="width:34px"><input type="checkbox" aria-label="Select all" '+(allOn?'checked ':'')+'onchange="dsPickAll(this.checked)"></th>'+dsTh([['PO',100],['Dealer'],['Submitted',130],['Lines',110],['Total',100],['Payment',130],['Stock',90],['Status',140]])+'<th style="width:44px"></th></tr></thead><tbody>'
-    +rows.map(function(r){var ship=dsShip(r),sn=dsStockNow(r,ship),t=r.totals||{},on=String(DS.sel)===String(r.id);
-      return '<tr style="cursor:pointer'+(on?';background:var(--bg3)':'')+'" onclick="dsSelect(\''+escHtml(r.id)+'\')"><td onclick="dsStop(event)"><input type="checkbox" aria-label="Select this order" '+(DS.pick[String(r.id)]?'checked ':'')+'onchange="dsPick(\''+escHtml(r.id)+'\',this.checked)"></td><td><b>'+escHtml(r.po_number||'No PO')+'</b></td><td>'+escHtml(r.dealer_name||'')+'</td><td class="t3s">'+escHtml(new Date(r.created_at).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}))+'</td><td>'+(r.lines||[]).length+' &middot; '+(t.units||0)+' units</td><td><b>'+dsMoney(t.total)+'</b></td><td class="t3s">'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</td><td style="color:'+sn.c+';font-weight:700;font-size:var(--t-sm)">'+sn.t+'</td><td>'+dsStatusPillFor(r)+dsOfferChip(r)+(ship&&ship.tracking.length?'<div class="t3xs" style="margin-top:3px">'+dsTrackHtml(ship,1)+'</div>':'')+'</td>'
+  if(!rows.length)return note+'<div class="panel section-empty">'+(DS.loading?'Loading&hellip;':(q?'No dealer orders match that search.':(DS.showRemoved?'Nothing has been removed.':(DS.filter&&DS.filter!=='all'&&DS.reqs.length?(DS.filter==='active'?'Nothing active right now. Shipped orders are under Shipped and All.':'Nothing here.'):'No dealer orders yet. They appear here when a dealer submits a PO from their shop.'))))+'</div>';
+  return note+bulk+'<div class="panel" style="padding:0;overflow:hidden"><div class="tbl-wrap"><table class="ds-tight"><thead><tr><th style="width:30px"><input type="checkbox" aria-label="Select all" '+(allOn?'checked ':'')+'onchange="dsPickAll(this.checked)"></th>'+dsTh([['PO',132],['Dealer',190],['Submitted',122],['Units',62],['Total',84],['Payment',122],['Stock',104],['Status']])+'<th style="width:36px"></th></tr></thead><tbody>'
+    +rows.map(function(r){var ship=dsShip(r),sn=dsStockNow(r,ship),t=r.totals||{},on=String(DS.sel)===String(r.id),nl=(r.lines||[]).length;
+      return '<tr style="cursor:pointer'+(on?';background:var(--bg3)':'')+'" onclick="dsSelect(\''+escHtml(r.id)+'\')"><td onclick="dsStop(event)"><input type="checkbox" aria-label="Select this order" '+(DS.pick[String(r.id)]?'checked ':'')+'onchange="dsPick(\''+escHtml(r.id)+'\',this.checked)"></td><td><b>'+escHtml(r.po_number||'No PO')+'</b></td><td>'+escHtml(r.dealer_name||'')+'</td><td class="t3s">'+escHtml(new Date(r.created_at).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}))+'</td><td title="'+nl+' line'+(nl===1?'':'s')+'">'+(t.units||0)+(nl>1?' <span class="t3xs">/ '+nl+' lines</span>':'')+'</td><td><b>'+dsMoney(t.total)+'</b></td><td class="t3s">'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</td><td style="color:'+sn.c+';font-weight:700;font-size:var(--t-sm)">'+sn.t+'</td><td style="max-width:none">'+dsStatusPillFor(r)+dsOfferChip(r)+(ship&&ship.tracking.length?'<span class="t3xs" style="margin-left:8px">'+dsTrackHtml(ship,1).replace(/<br>/g,' ')+'</span>':'')+'</td>'
         +'<td onclick="dsStop(event)">'+(DS.showRemoved?'<button type="button" class="action-btn" title="Restore" aria-label="Restore this order" onclick="dsRestore([\''+escHtml(r.id)+'\'])">&#8634;</button>':'<button type="button" class="action-btn del" title="Remove this order" aria-label="Remove this order" onclick="dsRemove([\''+escHtml(r.id)+'\'])">&times;</button>')+'</td></tr>'
-        +(on?'<tr><td colspan="'+colN+'" style="padding:10px 12px;background:var(--bg3)">'+dsReview(r)+'</td></tr>':'');}).join('')+'</tbody></table></div></div>'
-    :'<div class="panel section-empty">'+(DS.loading?'Loading&hellip;':(DS.showRemoved?'Nothing has been removed.':(DS.filter&&DS.filter!=='all'&&DS.reqs.length?(DS.filter==='active'?'Nothing active right now. Shipped orders are under Shipped and All.':'Nothing here.'):'No dealer orders yet. They appear here when a dealer submits a PO from their shop.')))+'</div>';
-  return '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:12px"><div class="t3s" style="max-width:720px">Every PO a dealer submits from their shop. Orders go straight to Shopify; anything that cannot is held here for you. '+(dsSettings().autoSend?'':'<b style="color:var(--orange)">Automatic sending is OFF: every order waits for you.</b>')+'</div><div style="display:flex;gap:8px"><button type="button" class="btn btn-sm" onclick="dsToggleRemoved()">'+(DS.showRemoved?'&larr; Back to orders':'Show removed ('+dsRemovedList().length+')')+'</button><button class="btn btn-sm" onclick="dsSync()">Check payments</button><button class="btn btn-sm" onclick="dsLoadReqs()">Refresh</button></div></div>'
-   +(DS.showRemoved?'<div class="panel" style="padding:8px 14px;margin-bottom:12px;border-left:3px solid var(--orange);font-size:var(--t-sm)"><b>Removed orders.</b> Dealers cannot see these. Restore one to bring it back, or delete it for good (not possible for orders that exist in Shopify).</div>':'')
-   +(DS.err?'<div class="panel" style="padding:10px 14px;border-left:3px solid var(--red);color:var(--red);margin-bottom:12px;font-size:var(--t-sm)">'+escHtml(DS.err)+'</div>':'')
-   +'<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">'+pill('active','Active',c.active)+pill('attention','Needs attention',c.attention,'var(--red)')+pill('awaiting','Awaiting payment',c.awaiting,'var(--yellow)')+pill('build','Build needed',c.build,'var(--orange)')+pill('shipped','Shipped',c.shipped)+pill('all','All',c.all)+'<span class="t3s" style="margin-left:auto">'+c.sentToday+' sent to Shopify today</span></div>'
-   +dsSettingsHtml()+tbl;
+        +(on?'<tr class="ds-open"><td colspan="'+colN+'" style="padding:10px 12px;background:var(--bg3);height:auto;max-width:none">'+dsReview(r)+'</td></tr>':'');}).join('')+'</tbody></table></div></div>';
+}
+function renderDealerOrders(){
+  setTimeout(function(){try{dsBadge();}catch(e){}},0);   // keep the menu count in step with the Active button
+  // a live update can redraw the page while you are typing in the search box: put the cursor back
+  try{if(document.activeElement&&document.activeElement.id==='ds-q')setTimeout(function(){var e=document.getElementById('ds-q');if(e){e.focus();var n=e.value.length;try{e.setSelectionRange(n,n);}catch(_e){}}},0);}catch(e){}
+  if(!DS.loaded&&!DS.loading)dsLoadReqs();
+  else if(DS.loaded&&!DS.loading&&(!DS._syncAt||Date.now()-DS._syncAt>120000)&&DS.reqs.some(function(r){return r.status==='awaiting_payment';})){DS._syncAt=Date.now();dsSync(true);}
+  var c=dsTally();
+  var pill=function(key,label,n,col){var on=DS.filter===key,hot=(n>0&&col);return '<button type="button" class="filter-chip" aria-pressed="'+(on?'true':'false')+'" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid '+(on?'var(--teal)':'var(--border2)')+';background:'+(on?'var(--teal-dim)':'var(--bg2)')+';color:'+(on?'var(--teal)':'var(--text2)')+';border-radius:var(--r);cursor:pointer;font-weight:600;font-size:var(--t-sm)" onclick="dsFilter(\''+key+'\')">'+label+' <b style="font-family:var(--mono);font-size:var(--t-md);color:'+(hot?col:(on?'var(--teal)':'var(--text)'))+'">'+n+'</b></button>';};
+  return '<style>.ds-tight>tbody>tr>td{height:30px;padding:0 8px}.ds-tight>thead>tr>th{padding-top:6px;padding-bottom:6px;padding-left:8px;padding-right:8px}.ds-tight>tbody>tr.ds-open>td{height:auto}</style>'
+   +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px"><input id="ds-q" type="search" class="form-input" style="flex:1;min-width:240px;max-width:520px;height:32px" placeholder="Search PO, dealer, Shopify order, tracking, SKU or ship-to" value="'+escHtml(DS.q||'')+'" oninput="dsSearch(this.value)" autocomplete="off">'
+   +'<span class="t3s" style="margin-left:auto">'+c.sentToday+' sent to Shopify today</span><button type="button" class="btn btn-sm" onclick="dsToggleRemoved()">'+(DS.showRemoved?'&larr; Back to orders':'Show removed ('+dsRemovedList().length+')')+'</button><button class="btn btn-sm" onclick="dsSync()">Check payments</button><button class="btn btn-sm" onclick="dsLoadReqs()">Refresh</button></div>'
+   +(dsSettings().autoSend?'':'<div class="panel" style="padding:6px 12px;margin-bottom:8px;border-left:3px solid var(--orange);font-size:var(--t-sm)"><b style="color:var(--orange)">Automatic sending is OFF: every order waits for you.</b></div>')
+   +(DS.showRemoved?'<div class="panel" style="padding:6px 12px;margin-bottom:8px;border-left:3px solid var(--orange);font-size:var(--t-sm)"><b>Removed orders.</b> Dealers cannot see these. Restore one to bring it back, or delete it for good (not possible for orders that exist in Shopify).</div>':'')
+   +(DS.err?'<div class="panel" style="padding:8px 12px;border-left:3px solid var(--red);color:var(--red);margin-bottom:8px;font-size:var(--t-sm)">'+escHtml(DS.err)+'</div>':'')
+   +'<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px">'+pill('active','Active',c.active)+pill('attention','Needs attention',c.attention,'var(--red)')+pill('awaiting','Awaiting payment',c.awaiting,'var(--yellow)')+pill('build','Build needed',c.build,'var(--orange)')+pill('shipped','Shipped',c.shipped)+pill('all','All',c.all)+'</div>'
+   +'<div id="ds-tbl">'+dsTableHtml()+'</div>'
+   +'<div style="margin-top:12px">'+dsSettingsHtml()+'</div>';
 }
 Object.assign(window,{dsUserSetupLink:dsUserSetupLink,dsLoadUsers:dsLoadUsers,dsUserAdd:dsUserAdd,dsUserRole:dsUserRole,dsUserRemove:dsUserRemove,openDealerStore:openDealerStore,dsClose:dsClose,dsTab:dsTab,dsEdit:dsEdit,dsRowDel:dsRowDel,dsSearchPick:dsSearchPick,dsCsvExport:dsCsvExport,dsCsvImport:dsCsvImport,dsCopyFrom:dsCopyFrom,dsSavePrices:dsSavePrices,dsShipField:dsShipField,dsSaveShip:dsSaveShip,
-  dsLiveChange:dsLiveChange,dsLiveSale:dsLiveSale,dsLiveAlert:dsLiveAlert,dsPingDealer:dsPingDealer,dsDealerOfCode:dsDealerOfCode,dsLiveTopic:dsLiveTopic,dsStop:dsStop,dsTermsFromDealer:dsTermsFromDealer,dsRemove:dsRemove,dsRestore:dsRestore,dsDeleteForever:dsDeleteForever,dsPick:dsPick,dsPickAll:dsPickAll,dsPicked:dsPicked,dsToggleRemoved:dsToggleRemoved,dsRows:dsRows,dsSelect:dsSelect,dsFilter:dsFilter,dsSend:dsSend,dsReject:dsReject,dsEditQty:dsEditQty,dsSaveLines:dsSaveLines,dsDelLine:dsDelLine,dsSync:dsSync,dsLoadReqs:dsLoadReqs,dsSaveSettings:dsSaveSettings});
+  dsLiveChange:dsLiveChange,dsLiveSale:dsLiveSale,dsLiveAlert:dsLiveAlert,dsPingDealer:dsPingDealer,dsDealerOfCode:dsDealerOfCode,dsLiveTopic:dsLiveTopic,dsStop:dsStop,dsTermsFromDealer:dsTermsFromDealer,dsRemove:dsRemove,dsRestore:dsRestore,dsDeleteForever:dsDeleteForever,dsPick:dsPick,dsPickAll:dsPickAll,dsPicked:dsPicked,dsToggleRemoved:dsToggleRemoved,dsRows:dsRows,dsSelect:dsSelect,dsFilter:dsFilter,dsSend:dsSend,dsReject:dsReject,dsEditQty:dsEditQty,dsSaveLines:dsSaveLines,dsDelLine:dsDelLine,dsSync:dsSync,dsLoadReqs:dsLoadReqs,dsSaveSettings:dsSaveSettings,dsSearch:dsSearch,dsTableHtml:dsTableHtml});
 
 
 /* [STAGE7] Ledger-based integrity helpers (v20.67) — pure functions so they are testable in isolation. */
