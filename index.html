@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.151';
+const TGK_ERP_VERSION = 'v23.152';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -5583,19 +5583,31 @@ function renderPurchases(){
     return 0;
   });
   const q=(sf.search||S.searchQ||'').toLowerCase();
-  if(q){
-    list=list.filter(p=>{
-      const d=poDisplayData(p);
-      if(d.pn.toLowerCase().includes(q)) return true;
-      if((p.vendor||'').toLowerCase().includes(q)) return true;
-      if(d.desc.toLowerCase().includes(q)) return true;
-      return (S.poLines[p.id]||[]).some(l=>(l.pn||'').toLowerCase().includes(q)||(l.description||'').toLowerCase().includes(q));
-    });
-  }
   const _isFollow=sf.status==='followup';
-  if(_isFollow){const _fu=new Set(poFollowList().filter(f=>f.state!=='ok').map(f=>f.p.id));list=list.filter(p=>_fu.has(p.id));}
-  else if(sf.status)list=list.filter(p=>p.status===sf.status);
+  // [v23.152] "All" now means every OPEN purchase order. A PO that is Received (or Recovered, Cancelled or Lost) lives only under its own chip, so it can no
+  // longer turn up in the default list. When a SKU is searched in any open view, an order counts only if THAT SKU still has units not checked in: a PO whose
+  // other lines are still open does not show up for a SKU that is already fully received on it. The finished chips are unchanged and show everything in them.
+  const _CLOSED_PO=['Received','Recovered','Cancelled','Lost'];
+  const _closedView=_CLOSED_PO.indexOf(sf.status)>=0;
+  const _lineHit=function(l){
+    var it=partByPn(l.pn)||asmByPn(l.pn)||(typeof _findPart==='function'?_findPart(l.pn):null)||(typeof findAsm==='function'?findAsm(l.pn):null);   // also finds a SKU by its new number
+    return (l.pn||'').toLowerCase().includes(q)||(l.description||'').toLowerCase().includes(q)||(it&&((it.new_sku||'').toLowerCase().includes(q)||String(dispPn(it)||'').toLowerCase().includes(q)));
+  };
+  let _matches=list.map(function(p){
+    if(!q)return {p:p,hit:true,open:true};
+    const d=poDisplayData(p),lines=S.poLines[p.id]||[],hits=lines.filter(_lineHit);
+    if(hits.length)return {p:p,hit:true,open:hits.some(function(l){return !isShippingLine(l)&&poLineRem(l)>0;})};
+    return {p:p,hit:(d.pn.toLowerCase().includes(q)||(p.vendor||'').toLowerCase().includes(q)||d.desc.toLowerCase().includes(q)),open:true};   // matched on vendor / header text: nothing line-specific to test
+  }).filter(function(m){return m.hit;});
+  let _fuSet=null;
+  if(_isFollow)_fuSet=new Set(poFollowList().filter(f=>f.state!=='ok').map(f=>f.p.id));
+  const _inView=function(m){return _isFollow?_fuSet.has(m.p.id):(sf.status?m.p.status===sf.status:true);};
+  const _inScope=_matches.filter(_inView);                                   // what this chip would show before the "still open" rule
+  const _shown=_inScope.filter(function(m){return _closedView?true:(!sf.status&&!_isFollow?_CLOSED_PO.indexOf(m.p.status)<0:true)&&m.open;});
+  list=_shown.map(function(m){return m.p;});
+  const _hiddenN=_inScope.length-_shown.length;
 
+  const _poHint=(q&&_hiddenN>0&&!_closedView)?`<div class="t3s" style="margin:-4px 0 10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">Showing only orders that still have units of &ldquo;${escHtml(q)}&rdquo; to check in. <b>${_hiddenN}</b> other order${_hiddenN!==1?'s':''} match${_hiddenN===1?'es':''} but ${_hiddenN!==1?'are':'is'} received, closed, or already checked in for it.${sf.status?'':' <a href="#" onclick="setFilter(\'po\',\'status\',\'Received\');return false">See Received</a>'}</div>`:'';
   const filteredValue=list.reduce((s,p)=>s+poExtended(p),0);
   const filteredVendors=new Set(list.map(p=>p.vendor)).size;
   const filterLabel=_isFollow?'Follow-up':(sf.status||'All');
@@ -5618,7 +5630,7 @@ function renderPurchases(){
   ${draftBanner}
   <div class="kpi-grid kpi-grid-4" style="margin-bottom:14px">
     <div class="kpi" style="cursor:pointer" onclick="setFilter('po','status','')">
-      <div class="kpi-label">${filterLabel==='All'?'Total POs':filterLabel+' POs'}</div>
+      <div class="kpi-label">${filterLabel==='All'?'Open POs':filterLabel+' POs'}</div>
       <div class="kpi-value">${list.length}</div>
       <div class="kpi-sub">${S.purchases.length} total all time</div>
     </div>
@@ -5642,10 +5654,11 @@ function renderPurchases(){
       <input placeholder="Vendor or part…" value="${sf.search||''}" oninput="setFilter('po','search',this.value)">
     </div>
     ${(function(){var c=poFollowCounts(),n=c.due+c.overdue;return `<button class="filter-chip ${_isFollow?'on-teal':''}" style="${_isFollow?'':(c.overdue?'color:var(--red);border-color:var(--red)':(n?'color:var(--orange);border-color:var(--orange)':''))}" title="POs to check on with the vendor: overdue, due for a check-in, or coming up this week" onclick="setFilter('po','status','followup')">Follow-ups${n?` <b>(${n})</b>`:''}</button>`;})()}
-    ${['','Draft','On Order','In Transit','Partial','Received','Lost','Recovered','Cancelled'].map(s=>`<button class="filter-chip ${sf.status===s&&s?'on-teal':(!sf.status)&&s===''?'on-teal':''}" onclick="setFilter('po','status','${s}')">${s||'All'}</button>`).join('')}
+    ${['','Draft','On Order','In Transit','Partial','Received','Lost','Recovered','Cancelled'].map(s=>`<button class="filter-chip ${sf.status===s&&s?'on-teal':(!sf.status)&&s===''?'on-teal':''}" onclick="setFilter('po','status','${s}')" title="${s?'':'Every purchase order that is still open: Draft, On Order, In Transit and Partial. Received, Recovered, Lost and Cancelled orders are under their own chips.'}">${s||'All open'}</button>`).join('')}
     <button class="btn btn-sm" style="margin-left:auto" title="Remove duplicate POs (same vendor + date)" onclick="deduplicatePOs()"><span class="ic ic-trash"></span>Dedupe</button>
     <button class="btn btn-primary btn-sm" onclick="nav('pobuilder')">+ New PO</button>
   </div>
+  ${_poHint}
   ${_isFollow?poFollowPanel(true):`<div class="tbl-wrap">
   <table data-tid="purchases"><thead><tr>
   <th style="cursor:pointer;white-space:nowrap;user-select:none" onclick="(()=>{var d=S.filters.po&&S.filters.po.sort==='date'&&S.filters.po.dir==='asc'?'desc':'asc';setFilter('po','sort','date');setFilter('po','dir',d)})()">Date ${_poSF==='date'?(_poSD==='asc'?'&uarr;':'&darr;'):'&darr;'}</th>
