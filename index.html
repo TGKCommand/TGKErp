@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.164';
+const TGK_ERP_VERSION = 'v23.165';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -2285,7 +2285,7 @@ function _liveRowsOf(t){
   if(t==='po_lines')return Object.keys(S.poLines||{}).reduce(function(a,k){return a.concat(S.poLines[k]);},[]);
   return [];
 }
-function _liveSig(t){return _liveRowsOf(t).map(function(r){return [r.id,r.updated_at||'',r.qty,r.qty_ordered,r.qty_received,r.child_pn,r.sort_order,r.parent_pn,r.status,r.fulfillment_status,r.total_on_hand,r.total_unpckgd].join(':');}).sort().join('|');}
+function _liveSig(t){return _liveRowsOf(t).map(function(r){return [r.id,r.updated_at||'',r.qty,r.qty_ordered,r.qty_received,r.child_pn,r.sort_order,r.parent_pn,r.status,r.fulfillment_status,r.total_on_hand,r.total_unpckgd,r.installs_on,r.install_required].join(':');}).sort().join('|');}
 function _liveLocal(t){var rows=_liveRowsOf(t),max='',hasU=false;rows.forEach(function(r){if('updated_at' in r){hasU=true;var u=r.updated_at||'';if(Date.parse(u)>Date.parse(max||0)||!max)max=u||max;}});return {count:rows.length,max:max,hasU:hasU};}
 function _liveAhead(srv,loc){var a=Date.parse(srv),b=Date.parse(loc);if(!isFinite(a))return false;if(!isFinite(b))return true;return a>b+5;}
 async function _liveServer(t,hasU){
@@ -18918,7 +18918,10 @@ async function delBOMItem(id,parentPn){
   const item=S.boms[parentPn]?.find(i=>i.id===id);
   const{error}=await db.from('bom_items').delete().eq('id',id);
   if(error){toast('Error: '+error.message);return;}
-  if(item&&S.boms[parentPn]&&bomLinkReady(item)){var _kids=bomLinkedTo(item,S.boms[parentPn]).filter(function(k){return k.installs_on!=null&&k.installs_on!=='';});if(_kids.length){try{await db.from('bom_items').update({installs_on:null}).in('id',_kids.map(function(k){return k.id;}));_kids.forEach(function(k){k.installs_on=null;});}catch(_e){}}}   // [v23.162] parts that were installed on it are no longer linked
+  if(item&&S.boms[parentPn]&&bomLinkReady(item)){   // [v23.165] a line that was installed on this part loses just that link, and keeps any others
+    var _kids=(S.boms[parentPn]||[]).filter(function(k){return bomTargets(k).some(function(t){return String(t.id)===String(id);});});
+    for(var _ki=0;_ki<_kids.length;_ki++){var _k=_kids[_ki],_keep=bomTargets(_k).filter(function(t){return String(t.id)!==String(id);}),_nv=bomTargetsToDb(_keep);try{var _kr=await db.from('bom_items').update({installs_on:_nv}).eq('id',_k.id);if(!_kr.error)_k.installs_on=_nv;}catch(_e){}}
+  }
   if(item) pushUndo('bom_delete','bom_items',item,null,'Remove BOM item: '+dispSku(item.child_pn)+' from '+parentPn);
   if(S.boms[parentPn])S.boms[parentPn]=S.boms[parentPn].filter(i=>i.id!==id);
   _clearBomCostCache();
@@ -18937,8 +18940,21 @@ alter table public.bom_items add column if not exists install_required boolean n
 `;
 function bomLinkReady(line){return !!(line&&('installs_on' in line));}
 function bomLineLabel(line){var src=(typeof _findPart==='function'?_findPart(line.child_pn):null)||(typeof _findAsm2==='function'?_findAsm2(line.child_pn):null);return src?dispPn(src):line.child_pn;}
-// [v23.164] A link belongs to the two PARTS, not to one BOM. Any BOM line that was linked in any BOM (installs_on) defines the rule "this part installs on that part", and the rule
-// applies in every BOM that contains both parts: the ones that exist now (saved on their lines when you link) and any BOM or line added later (resolved here, on reading).
+// [v23.165] A line can be installed on SEVERAL parts, with a quantity for each (3 O-rings: 2 on one fitting, 1 on another). installs_on holds either a single line id (all of it goes on that
+// part: how links were saved before) or a JSON list [{"id":"<line id>","qty":2},...]. Across BOMs the rule is kept as a ratio: "2 per Fitting A, 1 per Fitting B".
+function bomTargets(line){
+  var v=line&&line.installs_on;if(v==null||v==='')return [];
+  if(typeof v==='string'&&v.charAt(0)==='['){
+    try{var a=JSON.parse(v);if(Array.isArray(a))return a.filter(function(t){return t&&t.id!=null&&t.id!=='';}).map(function(t){return {id:String(t.id),qty:(t.qty==null||t.qty==='')?null:Number(t.qty)};});}catch(e){}
+    return [];
+  }
+  return [{id:String(v),qty:null}];
+}
+function bomTargetsToDb(ts){
+  if(!ts||!ts.length)return null;
+  if(ts.length===1&&ts[0].qty==null)return String(ts[0].id);
+  return JSON.stringify(ts.map(function(t){return {id:String(t.id),qty:t.qty==null?null:Number(t.qty)};}));
+}
 function _bomCanon(pn){var ci=(typeof _canonItem==='function')?_canonItem(pn):null;return String((ci&&ci.pn)||pn||'').trim().toLowerCase();}
 var _bomRuleCache=null;
 function bomRulesReset(){_bomRuleCache=null;}
@@ -18949,68 +18965,83 @@ function _bomRules(){
   Object.keys(S.boms||{}).forEach(function(k){
     var items=S.boms[k]||[];
     items.forEach(function(l){
-      if(l.installs_on==null||l.installs_on==='')return;
-      var h=items.find(function(x){return String(x.id)===String(l.installs_on)&&String(x.id)!==String(l.id);});if(!h)return;
-      var c=_bomCanon(l.child_pn),hc=_bomCanon(h.child_pn);if(!c||!hc||c===hc)return;
-      var arr=by[c]=by[c]||[],e=arr.find(function(r){return r.host===hc;});
-      if(!e)arr.push({host:hc,required:l.install_required!==false});else if(l.install_required!==false)e.required=true;
-      hosts[hc]=true;
+      var ts=bomTargets(l);if(!ts.length)return;
+      var c=_bomCanon(l.child_pn);
+      ts.forEach(function(t){
+        var h=items.find(function(x){return String(x.id)===String(t.id)&&String(x.id)!==String(l.id);});if(!h)return;
+        var hc=_bomCanon(h.child_pn);if(!c||!hc||c===hc)return;
+        var per=(t.qty!=null&&Number(h.qty)>0)?t.qty/Number(h.qty):null;
+        var arr=by[c]=by[c]||[],e=arr.find(function(r){return r.host===hc;});
+        if(!e)arr.push({host:hc,per:per,required:l.install_required!==false});else if(l.install_required!==false)e.required=true;
+        hosts[hc]=true;
+      });
     });
   });
   _bomRuleCache={ref:S.boms,t:now,idx:{by:by,hosts:hosts}};
   return _bomRuleCache.idx;
 }
-// {host, required, derived} for a line, or null. Saved on the line itself, else taken from the part-to-part rule.
+// {host (the first), hosts:[{host,qty}], required, derived} for a line, or null. Saved on the line itself, else taken from the part-to-part rule.
 function bomLinkInfo(item,items){
   if(!item)return null;
-  var arr=items||[];
-  if(item.installs_on!=null&&item.installs_on!==''){
-    var h=arr.find(function(x){return String(x.id)===String(item.installs_on)&&String(x.id)!==String(item.id);});
-    if(h)return {host:h,required:item.install_required!==false,derived:false};
-  }
-  var R=_bomRules(),rs=R.by[_bomCanon(item.child_pn)];
-  if(!rs||R.hosts[_bomCanon(item.child_pn)])return null;
-  for(var i=0;i<rs.length;i++){
-    var cand=arr.find(function(x){return String(x.id)!==String(item.id)&&_bomCanon(x.child_pn)===rs[i].host&&!(x.installs_on!=null&&x.installs_on!=='')&&!R.by[_bomCanon(x.child_pn)];});
-    if(cand)return {host:cand,required:rs[i].required,derived:true};
-  }
-  return null;
+  var arr=items||[],hs=[];
+  bomTargets(item).forEach(function(t){var h=arr.find(function(x){return String(x.id)===String(t.id)&&String(x.id)!==String(item.id);});if(h)hs.push({host:h,qty:t.qty});});
+  if(hs.length)return {host:hs[0].host,hosts:hs,required:item.install_required!==false,derived:false};
+  var R=_bomRules(),c=_bomCanon(item.child_pn),rs=R.by[c];
+  if(!rs||R.hosts[c])return null;
+  if(arr.filter(function(x){return _bomCanon(x.child_pn)===c;}).length!==1)return null;   // two lines of this part in one BOM: which one is meant is not guessed
+  var req=false;
+  rs.forEach(function(r){
+    var cand=arr.find(function(x){return String(x.id)!==String(item.id)&&_bomCanon(x.child_pn)===r.host&&bomTargets(x).length===0&&!R.by[_bomCanon(x.child_pn)];});
+    if(cand){hs.push({host:cand,qty:r.per!=null?Math.round(r.per*(Number(cand.qty)||1)*1000)/1000:null});if(r.required)req=true;}
+  });
+  return hs.length?{host:hs[0].host,hosts:hs,required:req,derived:true}:null;
 }
 function bomHostOf(item,items){var i=bomLinkInfo(item,items);return i?i.host:null;}
 function bomRequiredOf(item,items){var i=bomLinkInfo(item,items);return i?i.required:true;}
-function bomLinkedTo(host,items){return (items||[]).filter(function(x){var h=bomHostOf(x,items);return h&&String(h.id)===String(host.id);});}
+function bomLinkedTo(host,items){return (items||[]).filter(function(x){var i=bomLinkInfo(x,items);return i&&i.hosts.some(function(h){return String(h.host.id)===String(host.id);});});}
+function bomHostsText(info){return info.hosts.map(function(h){return bomLineLabel(h.host)+(h.qty!=null?' \u00d7'+h.qty:'');}).join(', ');}
 function bomLinkTag(item,items){
   var info=bomLinkInfo(item,items),kids=bomLinkedTo(item,items),st='font-size:var(--t-xs);border-radius:var(--r-sm);padding:1px 7px;margin-left:6px;white-space:nowrap;background:rgba(13,148,136,.12);color:var(--teal)';
-  if(info)return '<span title="Installed on '+escHtml(bomLineLabel(info.host))+(info.required?' (must be confirmed at build)':' (reminder only at build)')+'. This link applies in every BOM that has both parts." style="'+st+'">installs on '+escHtml(bomLineLabel(info.host))+(info.required?'':' &middot; reminder')+'</span>';
+  if(info)return '<span title="Installed on '+escHtml(bomHostsText(info))+(info.required?' (must be confirmed at build)':' (reminder only at build)')+'. This link applies in every BOM that has these parts." style="'+st+'">installs on '+escHtml(bomHostsText(info))+(info.required?'':' &middot; reminder')+'</span>';
   if(kids.length)return '<span title="'+escHtml(kids.map(bomLineLabel).join(', '))+' goes on this part" style="'+st+'">+'+kids.length+' linked</span>';
   return '';
 }
 function bomLinksFor(bom){
-  var out=[];(bom||[]).forEach(function(l){var i=bomLinkInfo(l,bom);if(i)out.push({child:l,host:i.host,required:i.required});});
+  var out=[];
+  (bom||[]).forEach(function(l){var i=bomLinkInfo(l,bom);if(!i)return;i.hosts.forEach(function(h){out.push({child:l,host:h.host,qty:h.qty,required:i.required});});});
   return out;
 }
 function bomPrintTag(item,items){
   var i=bomLinkInfo(item,items),k=bomLinkedTo(item,items),st='font-size:8px;color:#0b7285;font-weight:700';
-  if(i)return '<div style="'+st+'">&#8627; install on '+escHtml(bomLineLabel(i.host))+(i.required?'':' (reminder)')+'</div>';
+  if(i)return '<div style="'+st+'">&#8627; install on '+escHtml(bomHostsText(i))+(i.required?'':' (reminder)')+'</div>';
   if(k.length)return '<div style="'+st+'">takes: '+k.map(bomLineLabel).map(escHtml).join(', ')+'</div>';
   return '';
 }
-// Carry a link (or its removal) to every OTHER BOM that has both parts. o = {childPn, oldHostPn, newHostPn, required, lineId}
+// Carry a link (or its removal) to every OTHER BOM that has these parts. o = {childPn, oldHostPns, newTargets:[{hostPn,per}], required, lineId, parentPn}
 async function bomPropagateLink(o){
   bomRulesReset();
-  var cc=_bomCanon(o.childPn),oc=o.oldHostPn?_bomCanon(o.oldHostPn):'',nc=o.newHostPn?_bomCanon(o.newHostPn):'',plan=[],skipped=[];
+  var cc=_bomCanon(o.childPn),olds=(o.oldHostPns||[]).map(_bomCanon),news=(o.newTargets||[]).map(function(t){return {c:_bomCanon(t.hostPn),per:t.per};}),plan=[],skipped=0,ambiguous=0;
   Object.keys(S.boms||{}).forEach(function(parent){
-    var items=S.boms[parent]||[];
-    items.forEach(function(l){
-      if(_bomCanon(l.child_pn)!==cc||String(l.id)===String(o.lineId))return;
-      var cur=(l.installs_on!=null&&l.installs_on!=='')?items.find(function(x){return String(x.id)===String(l.installs_on);}):null,curC=cur?_bomCanon(cur.child_pn):'';
-      var hostLine=nc?items.find(function(x){return String(x.id)!==String(l.id)&&_bomCanon(x.child_pn)===nc;}):null;
-      if(hostLine){
-        if(hostLine.installs_on!=null&&hostLine.installs_on!==''){skipped.push(parent);return;}
-        if(items.some(function(k){return String(k.installs_on)===String(l.id);})){skipped.push(parent);return;}
-        if(String(l.installs_on)!==String(hostLine.id)||(l.install_required!==false)!==o.required)plan.push({parent:parent,line:l,set:{installs_on:hostLine.id,install_required:o.required},place:true});
-      }else if(oc&&curC===oc){plan.push({parent:parent,line:l,set:{installs_on:null}});}
+    if(parent===o.parentPn)return;   // the BOM being edited is saved already; a second line of the same part in it keeps its own links
+    var items=S.boms[parent]||[],lines=items.filter(function(l){return _bomCanon(l.child_pn)===cc;});
+    if(!lines.length)return;
+    var concern=items.some(function(x){var xc=_bomCanon(x.child_pn);return news.some(function(n){return n.c===xc;})||olds.indexOf(xc)>=0;});
+    if(!concern)return;
+    if(lines.length>1){ambiguous++;return;}
+    var l=lines[0],cur=bomTargets(l);
+    var keep=cur.filter(function(t){var h=items.find(function(x){return String(x.id)===String(t.id);});return !(h&&olds.indexOf(_bomCanon(h.child_pn))>=0);});
+    var add=[],blocked=false;
+    news.forEach(function(n){
+      var hl=items.find(function(x){return String(x.id)!==String(l.id)&&_bomCanon(x.child_pn)===n.c;});
+      if(!hl)return;
+      if(bomTargets(hl).length){blocked=true;return;}
+      add.push({id:String(hl.id),qty:n.per!=null?Math.round(n.per*(Number(hl.qty)||1)*1000)/1000:null});
     });
+    if(blocked&&!add.length){skipped++;return;}
+    if(items.some(function(k){return bomTargets(k).some(function(t){return String(t.id)===String(l.id);});})){skipped++;return;}   // something is installed on this line there
+    var merged=keep.slice();add.forEach(function(t){if(!merged.some(function(m){return String(m.id)===String(t.id);}))merged.push(t);});
+    var want=bomTargetsToDb(merged),curDb=bomTargetsToDb(cur),reqChange=news.length&&((l.install_required!==false)!==o.required);
+    if(String(want||'')!==String(curDb||'')||reqChange)plan.push({parent:parent,line:l,set:Object.assign({installs_on:want},news.length?{install_required:o.required}:{}),place:!!want});
   });
   var undo=[],boms={},done=0;
   for(var i=0;i<plan.length;i++){
@@ -19021,7 +19052,25 @@ async function bomPropagateLink(o){
   }
   for(var j=0;j<plan.length;j++){if(plan[j].place)await bomPlaceAfterHost(plan[j].parent,plan[j].line);}
   bomRulesReset();
-  return {changed:done,boms:Object.keys(boms).length,skipped:skipped.length,undo:undo};
+  return {changed:done,boms:Object.keys(boms).length,skipped:skipped,ambiguous:ambiguous,undo:undo};
+}
+// the small controls inside the line editor (they run from the editor's own listener: an inline onclick there never fires)
+function bomLinkSum(el){
+  var box=el&&el.closest?el.closest('[data-bomef]'):null;if(!box)return;
+  var out=box.querySelector('.bom-ef-lsum');if(!out)return;
+  var q=parseFloat((box.querySelector('.bom-ef-qty')||{}).value)||0,sum=0,n=0,all=false;
+  box.querySelectorAll('.bom-ef-lrow').forEach(function(r){if(!r.querySelector('.bom-ef-link').value)return;n++;var v=r.querySelector('.bom-ef-lqty').value;if(v==='')all=true;else sum+=parseFloat(v)||0;});
+  if(n<2||all){out.textContent='';return;}
+  out.textContent=sum+' of '+q+(sum>q?' (more than this line has)':' accounted for');out.style.color=sum>q?'var(--red)':(sum===q?'var(--teal)':'var(--orange)');
+}
+function bomLinkAddRow(btn){
+  var box=btn.closest('[data-bomef]'),c=box&&box.querySelector('.bom-ef-links'),r=c&&c.querySelector('.bom-ef-lrow');if(!r)return;
+  var n=r.cloneNode(true);n.querySelector('.bom-ef-link').value='';n.querySelector('.bom-ef-lqty').value='';c.appendChild(n);bomLinkSum(c);
+}
+function bomLinkRmRow(btn){
+  var r=btn.closest('.bom-ef-lrow'),c=r&&r.parentNode;if(!r)return;
+  if(c.querySelectorAll('.bom-ef-lrow').length>1)r.remove();else{r.querySelector('.bom-ef-link').value='';r.querySelector('.bom-ef-lqty').value='';}
+  bomLinkSum(c);
 }
 // After linking, the part sits right under the one it goes on (renumbering only the lines that moved).
 async function bomPlaceAfterHost(parentPn,line){
@@ -19030,7 +19079,7 @@ async function bomPlaceAfterHost(parentPn,line){
     if(!host)return;
     var rest=arr.filter(function(x){return String(x.id)!==String(line.id);}),at=rest.findIndex(function(x){return String(x.id)===String(host.id);});
     if(at<0)return;
-    while(rest[at+1]&&String(rest[at+1].installs_on)===String(host.id))at++;
+    while(rest[at+1]&&(function(){var h2=bomHostOf(rest[at+1],rest);return h2&&String(h2.id)===String(host.id);})())at++;
     rest.splice(at+1,0,line);
     for(var i=0;i<rest.length;i++){var so=i+1;if((Number(rest[i].sort_order)||0)!==so){var r=await db.from('bom_items').update({sort_order:so}).eq('id',rest[i].id);if(!r.error)rest[i].sort_order=so;}}
     S.boms[parentPn]=rest;
@@ -19048,7 +19097,7 @@ function bomInstallCheck(groups){
       html+='<div style="font-weight:700;font-size:var(--t-sm);margin:10px 0 6px">Build '+w.qty+' &times; '+escHtml(dispSku(w.pn))+'</div>';
       w.links.forEach(function(l){
         var k='bchk-'+(n++);l.key=k;
-        var cq=(Number(l.child.qty)||1)*w.qty,hq=(Number(l.host.qty)||1)*w.qty;
+        var cq=(l.qty!=null?Number(l.qty):(Number(l.child.qty)||1))*w.qty,hq=(Number(l.host.qty)||1)*w.qty;
         html+='<label style="display:flex;gap:10px;align-items:flex-start;padding:9px 11px;border:1px solid var(--border);border-radius:var(--r-md);margin-bottom:6px;cursor:pointer"><input type="checkbox" id="'+k+'" style="margin-top:3px"><span style="flex:1;font-size:var(--t-md)">'+escHtml(bomLineLabel(l.child))+' is installed on '+escHtml(bomLineLabel(l.host))+'<br><span class="t3xs">'+cq+' &times; '+escHtml(bomLineLabel(l.child))+' on '+hq+' &times; '+escHtml(bomLineLabel(l.host))+'</span></span><span class="t3xs" style="white-space:nowrap;color:'+(l.required?'var(--teal)':'var(--text3)')+'">'+(l.required?'Required':'Reminder')+'</span></label>';
       });
     });
@@ -19064,7 +19113,7 @@ function bomInstallCheck(groups){
       var who=(typeof packedByUser==='function'&&packedByUser())||'',byPn={},all=[];
       work.forEach(function(w){
         var ok=[],no=[];
-        w.links.forEach(function(l){var t=bomLineLabel(l.child)+' on '+bomLineLabel(l.host)+' ('+((Number(l.child.qty)||1)*w.qty)+' on '+((Number(l.host.qty)||1)*w.qty)+')';(document.getElementById(l.key).checked?ok:no).push(t);});
+        w.links.forEach(function(l){var t=bomLineLabel(l.child)+' on '+bomLineLabel(l.host)+' ('+((l.qty!=null?Number(l.qty):(Number(l.child.qty)||1))*w.qty)+' on '+((Number(l.host.qty)||1)*w.qty)+')';(document.getElementById(l.key).checked?ok:no).push(t);});
         var note='install check'+(who?' by '+who:'')+': '+(ok.length?'confirmed '+ok.join('; '):'')+(no.length?(ok.length?'; ':'')+'NOT confirmed (reminder) '+no.join('; '):'');
         byPn[w.pn]=note;all.push(note);
       });
@@ -19118,10 +19167,19 @@ function bomLinkEditorHTML(line){
   var items=S.boms[line.parent_pn]||[],kids=bomLinkedTo(line,items);
   if(kids.length)return '<span class="t3xs" style="flex-basis:100%">'+kids.map(bomLineLabel).map(escHtml).join(', ')+' is installed on this part, in every BOM that has both.</span>';
   var info=bomLinkInfo(line,items);
-  var sibs=items.filter(function(x){return String(x.id)!==String(line.id)&&!bomHostOf(x,items)&&!(x.installs_on!=null&&x.installs_on!=='');});   // a part that is itself installed on another cannot be a host
-  return '<label>Installs on<select class="form-input bom-ef-link"><option value="">Not linked</option>'+sibs.map(function(x){return '<option value="'+escHtml(x.id)+'"'+(info&&String(x.id)===String(info.host.id)?' selected':'')+'>'+escHtml(bomLineLabel(x))+'</option>';}).join('')+'</select></label>'
-    +'<label style="flex-direction:row;align-items:center;gap:6px;white-space:nowrap"><input type="checkbox" class="bom-ef-req"'+((info?info.required:true)?' checked':'')+'> Confirm at build</label>'
-    +'<span class="t3xs" style="flex-basis:100%">Applies to every BOM that has both parts, including ones you add later.</span>';
+  var sibs=items.filter(function(x){return String(x.id)!==String(line.id)&&!bomHostOf(x,items)&&bomTargets(x).length===0;});   // a part that is itself installed on another cannot be a host
+  var rows=info?info.hosts:[{host:null,qty:null}];
+  var rowHtml=function(h){
+    return '<span class="bom-ef-lrow" style="display:flex;gap:6px;align-items:center"><select class="form-input bom-ef-link" onchange="bomLinkSum(this)"><option value="">Not linked</option>'
+      +sibs.map(function(x){return '<option value="'+escHtml(x.id)+'"'+(h.host&&String(h.host.id)===String(x.id)?' selected':'')+'>'+escHtml(bomLineLabel(x))+'</option>';}).join('')
+      +'</select><input type="number" min="0" step="any" class="form-input bom-ef-lqty" style="width:82px" placeholder="all" title="How many of this part go on it. Leave empty when all of them do." value="'+(h.qty!=null?h.qty:'')+'" oninput="bomLinkSum(this)">'
+      +'<button type="button" class="btn btn-sm" data-bomact="rmlink" title="Remove this link">&times;</button></span>';
+  };
+  return '<span class="bom-ef-lbox" style="flex-basis:100%;display:flex;flex-direction:column;gap:6px"><span class="t3xs">Installs on &mdash; and how many of this part go on each</span>'
+    +'<span class="bom-ef-links" style="display:flex;flex-direction:column;gap:6px">'+rows.map(rowHtml).join('')+'</span>'
+    +'<span style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-sm" data-bomact="addlink">+ Another part</button>'
+    +'<label style="flex-direction:row;align-items:center;gap:6px;white-space:nowrap"><input type="checkbox" class="bom-ef-req"'+((info?info.required:true)?' checked':'')+'> Confirm at build</label><span class="t3xs bom-ef-lsum"></span></span>'
+    +'<span class="t3xs">Applies to every BOM that has these parts, including ones you add later.</span></span>';
 }
 function _bomEditorHTML(line,surface){
   var inner='<div class="bom-ef" data-bomef="1">'
@@ -19191,21 +19249,37 @@ async function bomLineSave(){
   var prevRow=Object.assign({},line);
   var upd={child_pn:canonPn,qty:q,item_type:ty,unit_cost:cost};
   // [v23.162] linked part: which line this one is installed on, and whether the build must confirm it
-  var lkEl=row.querySelector('.bom-ef-link'),rqEl=row.querySelector('.bom-ef-req'),linkChanged=false,prevInfo=null,newHostLine=null,newReq=true;
-  if(lkEl&&bomLinkReady(line)){
-    var _its=S.boms[a.parentPn]||[];
+  var lkEls=row.querySelectorAll('.bom-ef-link'),rqEl=row.querySelector('.bom-ef-req'),linkChanged=false,prevInfo=null,newTargets=[],newReq=true,_its=S.boms[a.parentPn]||[];
+  if(lkEls.length&&bomLinkReady(line)){
     prevInfo=bomLinkInfo(line,_its);
-    var newHost=lkEl.value||null;newReq=rqEl?!!rqEl.checked:true;
-    if(newHost&&String(newHost)===String(line.id)){toast('A line cannot be installed on itself');return false;}
-    newHostLine=newHost?_its.find(function(x){return String(x.id)===String(newHost);}):null;
-    var prevHostId=prevInfo?String(prevInfo.host.id):'';
-    linkChanged=newHost?(!prevInfo||prevHostId!==String(newHost)||prevInfo.required!==newReq):!!prevInfo;
-    if(linkChanged&&newHostLine){
-      var R=_bomRules(),hc=_bomCanon(newHostLine.child_pn),cc=_bomCanon(canonPn);
-      if(R.by[hc]){toast(bomLineLabel(newHostLine)+' is itself installed on another part, so nothing else can be installed on it.',7000);return false;}
-      if(R.hosts[cc]&&!(prevInfo&&_bomCanon(prevInfo.host.child_pn)===hc)){toast('Something is installed on '+bomLineLabel(line)+' in another BOM, so it cannot be installed on a part.',7000);return false;}
+    newReq=rqEl?!!rqEl.checked:true;
+    var seen={},bad='';
+    Array.prototype.forEach.call(row.querySelectorAll('.bom-ef-lrow'),function(r){
+      var hid=r.querySelector('.bom-ef-link').value;if(!hid)return;
+      if(String(hid)===String(line.id)){bad='A line cannot be installed on itself';return;}
+      if(seen[hid]){bad='The same part is listed twice. Put the quantities together in one row.';return;}
+      seen[hid]=1;
+      var qv=r.querySelector('.bom-ef-lqty').value,qn=qv===''?null:parseFloat(qv);
+      if(qn!=null&&!(qn>0)){bad='Quantities must be greater than zero';return;}
+      newTargets.push({id:String(hid),qty:qn});
+    });
+    if(bad){toast(bad);return false;}
+    if(newTargets.length>1&&newTargets.some(function(t){return t.qty==null;})){toast('Say how many go on each part when there is more than one');return false;}
+    var _tot=newTargets.reduce(function(n,t){return n+(t.qty||0);},0);
+    if(_tot>q+1e-9){toast('That puts '+_tot+' on parts but this line only has '+q,7000);return false;}
+    if(newTargets.length===1&&newTargets[0].qty!=null&&Math.abs(newTargets[0].qty-q)<1e-9)newTargets[0].qty=null;   // all of it goes on that one part
+    var newKey=newTargets.map(function(t){return t.id+':'+(t.qty==null?'':t.qty);}).sort().join('|');
+    var prevKey=prevInfo?prevInfo.hosts.map(function(h){return String(h.host.id)+':'+(h.qty==null?'':h.qty);}).sort().join('|'):'';
+    linkChanged=newKey!==prevKey||(newTargets.length>0&&(!prevInfo||prevInfo.required!==newReq));
+    if(linkChanged){
+      var R=_bomRules(),cc=_bomCanon(canonPn),prevHostIds=prevInfo?prevInfo.hosts.map(function(h){return String(h.host.id);}):[];
+      for(var ti=0;ti<newTargets.length;ti++){
+        var hl=_its.find(function(x){return String(x.id)===String(newTargets[ti].id);});if(!hl)continue;
+        if(R.by[_bomCanon(hl.child_pn)]){toast(bomLineLabel(hl)+' is itself installed on another part, so nothing else can be installed on it.',7000);return false;}
+        if(R.hosts[cc]&&prevHostIds.indexOf(String(hl.id))<0){toast('Something is installed on '+bomLineLabel(line)+' in another BOM, so it cannot be installed on a part.',7000);return false;}
+      }
+      upd.installs_on=bomTargetsToDb(newTargets);upd.install_required=newReq;
     }
-    if(linkChanged){upd.installs_on=newHost;upd.install_required=newReq;}
   }
   if(prevRow.child_pn===upd.child_pn&&Number(prevRow.qty)===upd.qty
      &&(prevRow.item_type||'')===upd.item_type&&!linkChanged
@@ -19221,13 +19295,15 @@ async function bomLineSave(){
     if(linkChanged){
       bomRulesReset();
       if(upd.installs_on)await bomPlaceAfterHost(a.parentPn,line);
-      try{_propag=await bomPropagateLink({childPn:canonPn,oldHostPn:prevInfo?prevInfo.host.child_pn:null,newHostPn:newHostLine?newHostLine.child_pn:null,required:newReq,lineId:a.id});}
+      try{_propag=await bomPropagateLink({childPn:canonPn,parentPn:a.parentPn,lineId:a.id,required:newReq,
+          oldHostPns:prevInfo?prevInfo.hosts.map(function(h){return h.host.child_pn;}):[],
+          newTargets:newTargets.map(function(t){var hl=_its.find(function(x){return String(x.id)===String(t.id);});return {hostPn:hl?hl.child_pn:'',per:(hl&&t.qty!=null&&Number(hl.qty)>0)?t.qty/Number(hl.qty):null};})});}
       catch(_pe){toast('Saved here, but the other BOMs could not be updated: '+(_pe&&_pe.message||_pe),9000);}
     }
     var _undoMsg='Edit BOM line '+dispSku(prevRow.child_pn)+' in '+a.parentPn+(prevRow.child_pn!==canonPn?(' -> '+canonPn):'')+' (qty '+prevRow.qty+' -> '+q+')';
     if(_propag&&_propag.undo.length)pushUndoMulti(_undoMsg+' + link in '+_propag.boms+' other BOM'+(_propag.boms===1?'':'s'),[{action:'update',table:'bom_items',data:{id:a.id},prev:prevRow}].concat(_propag.undo));
     else pushUndo('update','bom_items',{id:a.id},prevRow,_undoMsg);
-    if(_propag&&(_propag.boms||_propag.skipped))setTimeout(function(){toast((upd.installs_on?'Linked':'Unlinked')+' in '+_propag.boms+' other BOM'+(_propag.boms===1?'':'s')+(_propag.skipped?' ('+_propag.skipped+' skipped: the parts are already linked differently there)':''),7000);},300);
+    if(_propag&&(_propag.boms||_propag.skipped))setTimeout(function(){toast((upd.installs_on?'Linked':'Unlinked')+' in '+_propag.boms+' other BOM'+(_propag.boms===1?'':'s')+((_propag.skipped||_propag.ambiguous)?' ('+((_propag.skipped||0)+(_propag.ambiguous||0))+' skipped: '+(_propag.ambiguous?'a BOM has this part on two lines, set that one by hand':'the parts are already linked differently there')+')':''),7000);},300);
     _clearBomCostCache();
     if(S._buildabilityCache)S._buildabilityCache={};
     var surface=a.surface,parentPn=a.parentPn;
@@ -19251,7 +19327,7 @@ document.addEventListener('click',function(ev){
   if(act){
     ev.preventDefault();ev.stopPropagation();
     var _bact=act.getAttribute('data-bomact');
-    if(_bact==='save')bomLineSave();else if(_bact==='copysql')copyText(ERP_BOMLINK_SQL,act);else bomLineCancel();   // [v23.163] Copy the SQL used to be swallowed here
+    if(_bact==='save')bomLineSave();else if(_bact==='copysql')copyText(ERP_BOMLINK_SQL,act);else if(_bact==='addlink')bomLinkAddRow(act);else if(_bact==='rmlink')bomLinkRmRow(act);else bomLineCancel();   // [v23.163] Copy the SQL used to be swallowed here
     return;
   }
   var del=t.closest('[data-bomdel]');
@@ -29779,8 +29855,8 @@ function printWorkOrder(){
       const short=Math.max(0,need-have);
       const childDisp=(part||sub)?dispPn(part||sub):line.child_pn;
       const isPkg=(line.item_type==='packaging'||line.item_type==='supply');
-      const _wi=bomLinkInfo(line,bom),_wh=_wi?_wi.host:null,_wk=bomLinkedTo(line,bom);   // [v23.162] linked parts
-      return{pn:line.child_pn,dispPn:childDisp,desc:item.description||'',bin:part?.location||'',need,have,short,perUnit:line.qty,isPkg,lineId:line.id,hostId:_wh?_wh.id:null,installOn:_wh?bomLineLabel(_wh):'',reqd:_wi?_wi.required:true,takes:_wk.map(bomLineLabel)};
+      const _wi=bomLinkInfo(line,bom),_wh=_wi?_wi.host:null,_wk=bomLinkedTo(line,bom),_wt=_wi?bomHostsText(_wi):'';   // [v23.162] linked parts
+      return{pn:line.child_pn,dispPn:childDisp,desc:item.description||'',bin:part?.location||'',need,have,short,perUnit:line.qty,isPkg,lineId:line.id,hostId:_wh?_wh.id:null,installOn:_wt,reqd:_wi?_wi.required:true,takes:_wk.map(bomLineLabel)};
     }).sort((a,b)=>{
       if(a.isPkg!==b.isPkg)return a.isPkg?1:-1;     // packaging always last
       if(b.perUnit!==a.perUnit)return b.perUnit-a.perUnit;  // otherwise highest qty-per-unit first
