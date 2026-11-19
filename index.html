@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.156';
+const TGK_ERP_VERSION = 'v23.157';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -6168,6 +6168,7 @@ function renderSales(){
 
   return `
   ${shippedShortBanner()}
+  <div style="text-align:right;margin:-2px 0 6px"><a href="#" class="t3xs" onclick="shippedShortScan();return false" title="Find shipped lines where fewer units were recorded or taken out of stock than the line says">Check shipped quantities</a></div>
   <div class="kpi-grid kpi-grid-5 sales-kpis">
     <div class="kpi kpi-red" style="cursor:pointer" onclick="setFilter('sales','fstatus','${needsActionStatuses}')" title="Show Open + Partial orders">
       <div class="kpi-label">Awaiting Fulfillment</div>
@@ -7559,6 +7560,41 @@ function shippedShortPill(l){
   var q=Number(l.qty)||1,sh=Number(l.qty_shipped)||0;
   return (sh>0&&sh<q)?' <span class="pill pill-orange" title="The shipped quantity recorded for this line ('+sh+') is less than the line ('+q+'). Use Shipped fewer? to put it right.">only '+sh+' of '+q+' recorded</span>':'';
 }
+// Finds shipped lines whose record does not add up: either fewer units recorded than the line has (above), or the line says everything shipped while the stock history shows fewer
+// units taken out for it (the repeated-label flip records 25 of 25 but only 16 ever left stock). It reads the last 90 days of shipment deductions, which carry a short marker of
+// the line they belong to. A line that shipped more than was on hand is also listed (stock is floored at 0), so it is worth a look but not always wrong.
+async function shippedShortScan(){
+  var old=document.getElementById('ssc-ov');if(old)old.remove();
+  var ov=document.createElement('div');ov.id='ssc-ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
+  ov.innerHTML='<div id="ssc-box" style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(900px,96vw);max-height:90vh;overflow:auto;padding:16px 20px"><div class="t3s">Checking the stock history for the last 90 days&hellip;</div></div>';
+  document.body.appendChild(ov);
+  var box=document.getElementById('ssc-box');
+  var close='<button class="btn btn-sm" onclick="document.getElementById(\'ssc-ov\').remove()">Close</button>';
+  try{
+    var since=new Date(Date.now()-90*86400000).toISOString(),sum={},from=0,n=0;
+    while(from<30000){
+      var r=await db.from('inv_corrections').select('reason,adjustment').eq('source','shipment').gte('created_at',since).ilike('reason','%[line %').range(from,from+999);
+      if(r.error)throw new Error(r.error.message);
+      var d=r.data||[];n+=d.length;
+      d.forEach(function(x){var m=/\[line ([0-9a-f]{8})\]/i.exec(x.reason||'');if(m){var k=m[1].toLowerCase();sum[k]=(sum[k]||0)+Math.abs(Number(x.adjustment)||0);}});
+      if(d.length<1000)break;from+=1000;
+    }
+    var seen={},hits=[];
+    shippedShortLines().forEach(function(l){seen[l.id]=1;hits.push({l:l,why:'Only '+Number(l.qty_shipped)+' of '+Number(l.qty)+' recorded as shipped',ded:sum[String(l.id).slice(0,8).toLowerCase()]});});
+    (S.sales||[]).forEach(function(l){
+      if(seen[l.id])return;var st=String(l.fulfillment_status||'');if(st!=='Shipped'&&st!=='Delivered')return;
+      var q=Number(l.qty)||1;if(q<2||!l.shipped_at||String(l.shipped_at)<since)return;
+      var ded=sum[String(l.id).slice(0,8).toLowerCase()];
+      if(ded!=null&&ded>0&&ded<q)hits.push({l:l,why:'Marked all '+q+' shipped, but stock history shows only '+ded+' taken out',ded:ded});
+    });
+    hits.sort(function(a,b){return String(b.l.shipped_at||'').localeCompare(String(a.l.shipped_at||''));});
+    box.innerHTML='<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px"><div style="font-size:var(--t-lg);font-weight:700;flex:1">Shipped quantities to check</div>'+close+'</div>'
+      +'<div class="t3s" style="margin-bottom:10px;line-height:1.55">Looked at '+n+' shipment deductions from the last 90 days. '+(hits.length?hits.length+' line'+(hits.length===1?'':'s')+' do not add up. Press <b>Fix</b> to say how many really shipped.':'Every shipped line adds up.')+'</div>'
+      +(hits.length?'<table style="width:100%"><thead><tr><th style="text-align:left">Order</th><th style="text-align:left">SKU</th><th>Line</th><th>Recorded</th><th>Stock taken</th><th style="text-align:left">What looks wrong</th><th></th></tr></thead><tbody>'+hits.map(function(h){var l=h.l;return '<tr><td>'+escHtml(String(l.order_number||''))+'</td><td style="font-family:var(--mono)">'+escHtml(dispSku(l.pn))+'</td><td style="text-align:center">'+Number(l.qty)+'</td><td style="text-align:center">'+(Number(l.qty_shipped)||'')+'</td><td style="text-align:center">'+(h.ded!=null?h.ded:'')+'</td><td class="t3s">'+escHtml(h.why)+'</td><td style="white-space:nowrap;text-align:right"><button class="btn btn-sm btn-teal" data-i="'+escHtml(l.id)+'" onclick="correctShippedQty(this.dataset.i).then(function(){shippedShortScan();})">Fix</button></td></tr>';}).join('')+'</tbody></table>':'');
+  }catch(e){box.innerHTML='<div style="color:var(--red);margin-bottom:10px">Could not check: '+escHtml((e&&e.message)||String(e))+'</div>'+close;}
+}
+window.shippedShortScan=shippedShortScan;
+
 async function correctShippedQty(saleId){
   return _onceAtATime('shipfix'+saleId,async function(){
     var line=(S.sales||[]).find(function(x){return String(x.id)===String(saleId);});if(!line)return;
