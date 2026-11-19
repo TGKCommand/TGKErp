@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.153';
+const TGK_ERP_VERSION = 'v23.155';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -8527,9 +8527,81 @@ function _dblastToggleAll(cb){
   document.querySelectorAll('.dblast-recip').forEach(function(x){x.checked=cb.checked;});
   _dblastCount();
 }
-// ---- (v23.62) DEALER PROMOTIONS AND STOCKING ORDERS. Both are a TOTAL percentage off MSRP that only ever lowers a dealer's price (their own discount or special price
-// stays if it is already lower), and only the best single offer applies: they never stack. The dealer portal reads these two settings; nothing else needs changing.
+// ---- (v23.62) DEALER PROMOTIONS AND STOCKING ORDERS. A promotion is a TOTAL percentage off MSRP that only ever lowers a dealer's price (their own discount or special price
+// stays if it is already lower), and only the best single offer applies. The dealer portal reads the dealer_promos and dealer_stocking settings; nothing else needs changing.
+// ---- (v23.154) STACKING PROMOTIONS. A promotion can instead be an EXTRA % on top of each dealer's own discount. The portal only understands "total % off MSRP", so each stacking
+// promotion (kept in the dealer_promo_stacks setting) is turned into ordinary promotions, one per group of dealers on the same %, with that group's total worked out here
+// (flagged from_stack). They are rebuilt whenever a dealer's % or status changes, so the portal always has the current totals and needs no change.
 function promoList(){var p=S.settings&&S.settings.dealer_promos;return Array.isArray(p)?p:[];}
+function stackList(){var p=S.settings&&S.settings.dealer_promo_stacks;return Array.isArray(p)?p:[];}
+function stackDealerPct(d){var v=d&&d.discount_pct;return Math.round((typeof v==='number'&&isFinite(v)?v:0.20)*10000)/100;}   // in % points; 20% when none is set, the same default the dealer list uses
+function stackTotal(dealerPct,extra,mode){var t=mode==='add'?dealerPct+extra:100-(100-dealerPct)*(100-extra)/100;return Math.round(t*100)/100;}
+function stackDealers(p){var ids=(p.dealer_ids||[]).map(String);return (S.dealers||[]).filter(function(d){return d.status==='Active'&&(!ids.length||ids.indexOf(String(d.id))>=0);});}
+function stackGroups(p){
+  var extra=parseFloat(p.extra_pct),mode=p.mode==='add'?'add':'compound',g={},keys=[];
+  if(!(extra>0))return [];
+  stackDealers(p).forEach(function(d){var dp=stackDealerPct(d),k=String(dp);if(!g[k]){g[k]={dealerPct:dp,total:stackTotal(dp,extra,mode),dealers:[]};keys.push(k);}g[k].dealers.push(d);});
+  keys.sort(function(a,b){return parseFloat(a)-parseFloat(b);});
+  return keys.map(function(k){return g[k];});
+}
+function stackChildren(){
+  var out=[];
+  stackList().forEach(function(p){
+    stackGroups(p).forEach(function(g){
+      if(!(g.total>0&&g.total<100))return;
+      var how=p.mode==='add'?('Your '+g.dealerPct+'% dealer discount plus '+p.extra_pct+'% extra'):('Your '+g.dealerPct+'% dealer discount, then '+p.extra_pct+'% off that');
+      out.push({id:'s'+p.id+'_'+String(g.dealerPct).replace('.','_'),name:p.name,active:p.active!==false,starts_on:p.starts_on||'',ends_on:p.ends_on||'',discount_pct:g.total,min_order:p.min_order||0,dealer_ids:g.dealers.map(function(d){return String(d.id);}),note:[p.note,how].filter(Boolean).join(' \u00b7 '),from_stack:p.id});
+    });
+  });
+  return out;
+}
+// Rebuild the generated promotions from the stacking promotions and the dealers' current %. Returns 'same' (nothing to change), 'saved' or 'failed'.
+// It never runs before the dealers have loaded: with no dealers it would "work out" no groups and delete live promotions.
+async function promoSyncStacks(opts){
+  opts=opts||{};
+  if(!stackList().length&&!promoList().some(function(x){return x.from_stack;}))return 'same';
+  if(!(S.dealers&&S.dealers.length))return 'same';
+  var cur=promoList(),drop=opts.dropId?String(opts.dropId):null;
+  var keep=cur.filter(function(x){return !x.from_stack&&String(x.id)!==drop;}),have=cur.filter(function(x){return x.from_stack;}),want=stackChildren();
+  var sig=function(a){return JSON.stringify(a.slice().sort(function(x,y){return String(x.id).localeCompare(String(y.id));}));};
+  if(!drop&&sig(have)===sig(want))return 'same';
+  var next=keep.concat(want);
+  if(opts.quiet){
+    try{var r=await db.from('settings').upsert({key:'dealer_promos',value:next},{onConflict:'key'});if(r&&r.error){console.warn('[promos] could not refresh stacked promotions:',r.error.message);return 'failed';}S.settings=Object.assign({},S.settings,{dealer_promos:next});return 'saved';}
+    catch(e){return 'failed';}
+  }
+  return (await promoPersist('dealer_promos',next))?'saved':'failed';
+}
+function promoMaxPct(p){var m=0;stackGroups(p).forEach(function(g){if(g.total>m)m=g.total;});return m;}
+function promoStackSummary(p){
+  var gs=stackGroups(p);if(!gs.length)return '<span class="t3xs">no active dealers</span>';
+  return gs.map(function(g){return g.dealerPct+'% dealers pay <b>'+g.total+'%</b> <span class="t3xs">('+g.dealers.length+')</span>';}).join('<br>');
+}
+function promoStackPreviewHtml(d){
+  var extra=parseFloat(d.extra_pct);
+  if(!(extra>0&&extra<100))return '<div class="t3s">Enter the extra % to see what each dealer would pay.</div>';
+  var gs=stackGroups(d);
+  if(!gs.length)return '<div class="t3s" style="color:var(--red)">No active dealers are selected, so nobody would get this.</div>';
+  var bad=gs.some(function(g){return g.total>=100;});
+  return '<table style="width:100%;max-width:640px"><thead><tr><th style="text-align:left">Dealers on</th><th>How many</th><th>Total off MSRP</th><th style="text-align:right">On a $100 MSRP part</th></tr></thead><tbody>'+gs.map(function(g){
+    var usual=Math.round((100-g.dealerPct)*100)/100,now=Math.round((100-g.total)*100)/100;
+    return '<tr><td>'+g.dealerPct+'% usual</td><td>'+g.dealers.length+'</td><td><b'+(g.total>=100?' style="color:var(--red)"':'')+'>'+g.total+'%</b></td><td style="text-align:right">$'+usual.toFixed(2)+' &rarr; <b>$'+now.toFixed(2)+'</b></td></tr>';}).join('')+'</tbody></table>'
+    +(bad?'<div style="color:var(--red);font-size:var(--t-sm);margin-top:6px">For some dealers the total would reach 100% off MSRP. Lower the extra %.</div>':'')
+    +'<div class="t3xs" style="margin-top:6px">Dealers see the usual discount and the extra in the promotion\'s note. Inactive dealers are left out. A special price lower than these still wins. The existing &ldquo;best offer wins&rdquo; rule still applies against stocking orders and other promotions.</div>';
+}
+function promoStackPreview(){var e=document.getElementById('pm-preview');if(e&&S._promo&&S._promo.draft&&S._promo.draft.stack)e.innerHTML=promoStackPreviewHtml(S._promo.draft);}
+function promoCleanStack(d){
+  var name=String(d.name||'').trim(),extra=parseFloat(d.extra_pct),min=parseFloat(d.min_order)||0,mode=d.mode==='add'?'add':'compound',err='';
+  if(!name)err='Give the promotion a name (dealers see it).';
+  else if(!(extra>0&&extra<100))err='The extra discount must be more than 0% and less than 100%.';
+  else if(min<0)err='The minimum order cannot be negative.';
+  else if(d.starts_on&&d.ends_on&&String(d.ends_on)<String(d.starts_on))err='The end date is before the start date.';
+  var promo={id:d.id,name:name,active:d.active!==false,starts_on:d.starts_on||'',ends_on:d.ends_on||'',extra_pct:Math.round(extra*100)/100,mode:mode,min_order:min,dealer_ids:(d.dealer_ids||[]).map(String),note:String(d.note||'').trim(),stack:true};
+  if(!err){var gs=stackGroups(promo);if(!gs.length)err='No active dealers are selected, so nobody would get this promotion.';else if(gs.some(function(g){return g.total>=100;}))err='For at least one dealer the total would reach 100% off MSRP. Lower the extra %.';}
+  return err?{err:err}:{promo:promo};
+}
+function promoType(v){var d=S._promo&&S._promo.draft;if(!d)return;if(v==='stack'){d.stack=true;if(!d.mode)d.mode='compound';}else d.stack=false;promoRedraw();}
+
 function promoStocking(){var s=S.settings&&S.settings.dealer_stocking;return (s&&typeof s==='object')?s:{enabled:false,discount_pct:'',min_order:'',note:''};}
 function promoStatus(p,today){
  today=today||centralDateOnly();
@@ -8559,7 +8631,7 @@ function dsOfferChip(r){
 function promoHtml(){
  var st=promoStocking(),list=promoList(),today=centralDateOnly(),ed=S._promo&&S._promo.draft,dealers=(S.dealers||[]).filter(function(d){return d.status==='Active';});
  var lab='font-size:var(--t-xs);font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--text3)',inp='padding:6px 8px;font-size:var(--t-md);background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);color:var(--text)';
- var h='<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px"><div style="flex:1"><div style="font-size:var(--t-lg);font-weight:700">Dealer promotions &amp; stocking orders</div><div class="t3s">Each is a TOTAL % off MSRP. It can only lower a dealer\'s price, never raise it, and only the best one applies (they do not stack).</div></div><button class="btn btn-sm" onclick="promoClose()">Close</button></div><div style="padding:16px 20px;overflow:auto">';
+ var h='<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px"><div style="flex:1"><div style="font-size:var(--t-lg);font-weight:700">Dealer promotions &amp; stocking orders</div><div class="t3s">A promotion is either an EXTRA % on top of each dealer\'s own discount (it stacks) or a TOTAL % off MSRP (only the best one applies). It can only lower a dealer\'s price, never raise it.</div></div><button class="btn btn-sm" onclick="promoClose()">Close</button></div><div style="padding:16px 20px;overflow:auto">';
  h+='<div style="border:1px solid var(--border);border-radius:var(--r-md);padding:14px 16px;margin-bottom:16px"><div style="font-weight:700;margin-bottom:8px">Stocking orders</div><div class="t3s" style="margin-bottom:10px">A dealer ticks &ldquo;This is a stocking order&rdquo; at checkout. If the order reaches the minimum (at their usual prices) they get this discount, or a live promotion if that is better.</div>'
   +'<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end"><label style="display:flex;align-items:center;gap:6px;font-weight:600"><input type="checkbox" id="pm-sk-en" '+(st.enabled===true?'checked ':'')+'> Stocking orders are on</label>'
   +'<label style="display:flex;flex-direction:column;gap:3px;'+lab+'">Discount (off MSRP)<span style="display:flex;gap:4px;align-items:center"><input type="number" id="pm-sk-pct" min="1" max="99" step="0.5" value="'+escHtml(st.discount_pct===undefined?'':st.discount_pct)+'" style="width:80px;'+inp+'">%</span></label>'
@@ -8567,21 +8639,24 @@ function promoHtml(){
   +'<label style="display:flex;flex-direction:column;gap:3px;flex:1;min-width:200px;'+lab+'">Note shown to dealers (optional)<input type="text" id="pm-sk-note" value="'+escHtml(st.note||'')+'" style="'+inp+'"></label>'
   +'<button class="btn btn-teal btn-sm" onclick="promoSaveStocking()">Save</button>'+(parseFloat(st.discount_pct)>0?'<button class="btn btn-sm" onclick="promoSeeMargins('+parseFloat(st.discount_pct)+')" title="Open the Margin &amp; Promo Calculator at this discount">What do we make?</button>':'')+'</div></div>';
  h+='<div style="display:flex;align-items:center;margin-bottom:8px"><div style="font-weight:700;flex:1">Promotions</div><button class="btn btn-teal btn-sm" onclick="promoEdit(\'new\')">+ Add promotion</button></div>';
- if(!list.length)h+='<div class="t3s" style="padding:14px;border:1px dashed var(--border);border-radius:var(--r-md)">No promotions yet. Add one for Black Friday, a slow season, or a push on one product line.</div>';
- else h+='<table style="width:100%"><thead><tr><th>Promotion</th><th>Dates</th><th>% off MSRP</th><th>Minimum</th><th>Dealers</th><th>Status</th><th></th></tr></thead><tbody>'+list.map(function(p){var s=promoStatus(p,today);return '<tr><td><b>'+escHtml(p.name||'')+'</b>'+(p.note?'<div class="t3xs">'+escHtml(p.note)+'</div>':'')+'</td><td class="t3s">'+(p.starts_on||'now')+' &rarr; '+(p.ends_on||'until switched off')+'</td><td>'+escHtml(p.discount_pct)+'%</td><td>'+(p.min_order>0?'$'+Number(p.min_order).toLocaleString():'none')+'</td><td class="t3s">'+((p.dealer_ids||[]).length?(p.dealer_ids.length+' chosen'):'All dealers')+'</td><td><span style="font-weight:700;color:'+s.color+'">'+s.label+'</span></td><td style="white-space:nowrap;text-align:right"><button class="btn btn-sm" onclick="promoSeeMargins('+parseFloat(p.discount_pct)+')" title="Margin &amp; Promo Calculator at this discount">Margins</button> <button class="btn btn-sm" onclick="promoToggle(\''+escHtml(p.id)+'\')">'+(p.active===false?'Switch on':'Switch off')+'</button> <button class="btn btn-sm" onclick="promoEdit(\''+escHtml(p.id)+'\')">Edit</button> <button class="btn btn-sm" onclick="promoDelete(\''+escHtml(p.id)+'\')">Delete</button></td></tr>';}).join('')+'</tbody></table>';
+   var rows=list.filter(function(x){return !x.from_stack;}).map(function(x){return Object.assign({},x,{_stack:false});}).concat(stackList().map(function(x){return Object.assign({},x,{_stack:true});}));
+  if(!rows.length)h+='<div class="t3s" style="padding:14px;border:1px dashed var(--border);border-radius:var(--r-md)">No promotions yet. Add one for Black Friday, a slow season, or a push on one product line.</div>';
+  else h+='<table style="width:100%"><thead><tr><th>Promotion</th><th>Dates</th><th>Discount</th><th>Minimum</th><th>Dealers</th><th>Status</th><th></th></tr></thead><tbody>'+rows.map(function(p){var s=promoStatus(p,today),mp=p._stack?promoMaxPct(p):parseFloat(p.discount_pct);return '<tr><td><b>'+escHtml(p.name||'')+'</b>'+(p._stack?' <span class="pill pill-green" title="Added on top of each dealer\'s own discount">STACKS</span>':'')+(p.note?'<div class="t3xs">'+escHtml(p.note)+'</div>':'')+'</td><td class="t3s">'+(p.starts_on||'now')+' &rarr; '+(p.ends_on||'until switched off')+'</td><td>'+(p._stack?'<b>+'+escHtml(p.extra_pct)+'%</b> '+(p.mode==='add'?'added to':'off')+' their price<div class="t3xs" style="line-height:1.5">'+promoStackSummary(p)+'</div>':escHtml(p.discount_pct)+'% off MSRP')+'</td><td>'+(p.min_order>0?'$'+Number(p.min_order).toLocaleString():'none')+'</td><td class="t3s">'+(p._stack?(stackDealers(p).length+' dealer'+(stackDealers(p).length===1?'':'s')):((p.dealer_ids||[]).length?(p.dealer_ids.length+' chosen'):'All dealers'))+'</td><td><span style="font-weight:700;color:'+s.color+'">'+s.label+'</span></td><td style="white-space:nowrap;text-align:right">'+(mp>0?'<button class="btn btn-sm" onclick="promoSeeMargins('+mp+')" title="Margin &amp; Promo Calculator at '+(p._stack?'the highest total, ':'')+mp+'%">Margins</button> ':'')+'<button class="btn btn-sm" onclick="promoToggle(\''+escHtml(p.id)+'\')">'+(p.active===false?'Switch on':'Switch off')+'</button> <button class="btn btn-sm" onclick="promoEdit(\''+escHtml(p.id)+'\')">Edit</button> <button class="btn btn-sm" onclick="promoDelete(\''+escHtml(p.id)+'\')">Delete</button></td></tr>';}).join('')+'</tbody></table>';
  if(ed){
   var sel=function(id){return (ed.dealer_ids||[]).indexOf(String(id))>=0;};
   h+='<div id="pm-form" style="margin-top:16px;border:1px solid var(--teal);border-radius:var(--r-md);padding:14px 16px;background:var(--bg1)"><div style="font-weight:700;margin-bottom:10px">'+(ed.id?'Edit promotion':'New promotion')+'</div><div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">'
+   +'<label style="display:flex;flex-direction:column;gap:3px;'+lab+'">Type<select onchange="promoType(this.value)" style="'+inp+'"><option value="stack"'+(ed.stack?' selected':'')+'>Extra on top of the dealer discount (stacks)</option><option value="total"'+(ed.stack?'':' selected')+'>Total % off MSRP (best offer wins)</option></select></label>'
    +'<label style="display:flex;flex-direction:column;gap:3px;flex:1;min-width:200px;'+lab+'">Name (dealers see this)<input type="text" value="'+escHtml(ed.name||'')+'" onchange="promoField(\'name\',this.value)" placeholder="Black Friday" style="'+inp+'"></label>'
    +'<label style="display:flex;flex-direction:column;gap:3px;'+lab+'">Starts<input type="date" value="'+escHtml(ed.starts_on||'')+'" onchange="promoField(\'starts_on\',this.value)" style="'+inp+'"></label>'
    +'<label style="display:flex;flex-direction:column;gap:3px;'+lab+'">Ends (last day)<input type="date" value="'+escHtml(ed.ends_on||'')+'" onchange="promoField(\'ends_on\',this.value)" style="'+inp+'"></label>'
-   +'<label style="display:flex;flex-direction:column;gap:3px;'+lab+'">% off MSRP<input type="number" min="1" max="99" step="0.5" value="'+escHtml(ed.discount_pct===undefined?'':ed.discount_pct)+'" onchange="promoField(\'discount_pct\',this.value)" style="width:90px;'+inp+'"></label>'
+   +(ed.stack?'<label style="display:flex;flex-direction:column;gap:3px;'+lab+'">Extra %<input type="number" min="1" max="99" step="0.5" value="'+escHtml(ed.extra_pct===undefined?'':ed.extra_pct)+'" onchange="promoField(\'extra_pct\',this.value)" style="width:90px;'+inp+'"></label><label style="display:flex;flex-direction:column;gap:3px;'+lab+'">How it adds up<select onchange="promoField(\'mode\',this.value)" style="'+inp+'"><option value="compound"'+(ed.mode==='add'?'':' selected')+'>Off their price (25% then 10% off that = 32.5%)</option><option value="add"'+(ed.mode==='add'?' selected':'')+'>Added to their % (25% + 10% = 35%)</option></select></label>':'<label style="display:flex;flex-direction:column;gap:3px;'+lab+'">% off MSRP<input type="number" min="1" max="99" step="0.5" value="'+escHtml(ed.discount_pct===undefined?'':ed.discount_pct)+'" onchange="promoField(\'discount_pct\',this.value)" style="width:90px;'+inp+'"></label>')
    +'<label style="display:flex;flex-direction:column;gap:3px;'+lab+'">Minimum order ($)<input type="number" min="0" step="50" value="'+escHtml(ed.min_order===undefined?'':ed.min_order)+'" onchange="promoField(\'min_order\',this.value)" style="width:110px;'+inp+'"></label>'
    +'<label style="display:flex;flex-direction:column;gap:3px;flex:1;min-width:200px;'+lab+'">Note (optional)<input type="text" value="'+escHtml(ed.note||'')+'" onchange="promoField(\'note\',this.value)" style="'+inp+'"></label></div>'
    +'<div style="margin-top:12px"><div style="'+lab+';margin-bottom:6px">Which dealers (none ticked = all dealers)</div><div style="display:flex;flex-wrap:wrap;gap:4px 16px;max-height:140px;overflow:auto">'+dealers.map(function(d){return '<label style="display:flex;align-items:center;gap:6px;font-size:var(--t-md)"><input type="checkbox" '+(sel(d.id)?'checked ':'')+'onchange="promoDealer(\''+escHtml(d.id)+'\',this.checked)">'+escHtml(d.name||'')+'</label>';}).join('')+'</div></div>'
+   +(ed.stack?'<div style="margin-top:12px"><div style="'+lab+';margin-bottom:6px">What each dealer pays</div><div id="pm-preview">'+promoStackPreviewHtml(ed)+'</div></div>':'')
    +'<div id="pm-err" style="color:var(--red);font-size:var(--t-sm);margin-top:8px;min-height:16px"></div><div style="display:flex;gap:8px"><button class="btn btn-teal" onclick="promoSave()">Save promotion</button><button class="btn" onclick="promoEdit(null)">Cancel</button></div></div>';
  }
- return h+'</div>';
+ return h+dcxHtml()+'</div>';
 }
 function openPromos(){
  var ex=document.getElementById('promo-ov');if(ex)ex.remove();
@@ -8589,29 +8664,190 @@ function openPromos(){
  var ov=document.createElement('div');ov.id='promo-ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
  ov.innerHTML='<div id="promo-box" style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(920px,96vw);max-height:92vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.25)"></div>';
  document.body.appendChild(ov);promoRedraw();
+  promoSyncStacks({quiet:true}).then(function(r){if(r==='saved'){toast('Stacked promotions updated to match the dealers\' current discounts');promoRedraw();}});   // a dealer's % may have changed since this was last opened
 }
+
+
+// ================= [v23.155] SHOPIFY DEALER CODES =================
+// A dealer's own fixed Shopify code (like ELITISTMOTORSPORTS) can follow a live promotion: while it runs, the CODE's % is raised to that dealer's promotion total, and
+// afterwards it is put back. The work is done by the shopify-discounts function (it holds the Shopify key); this screen links dealers to codes, shows exactly what would
+// change, and applies it. Per-PO codes (ecs 1427546) are only labels, not Shopify discounts: those orders get the promotion in the Support Center instead.
+// Settings used: dealer_shopify_codes {dealerId:{code,base_pct}}, dealer_code_state {code:{base_pct,applied_pct,...}} (written by the function), dealer_codes_auto, dealer_code_log.
+function dcxLinks(){var v=S.settings&&S.settings.dealer_shopify_codes;return (v&&typeof v==='object'&&!Array.isArray(v))?v:{};}
+function dcxState(){var v=S.settings&&S.settings.dealer_code_state;return (v&&typeof v==='object'&&!Array.isArray(v))?v:{};}
+function dcxLog(){var v=S.settings&&S.settings.dealer_code_log;return Array.isArray(v)?v:[];}
+function dcxX(){return S._dcx||(S._dcx={codes:null,plan:null,busy:'',err:'',planAt:''});}
+async function dcxFn(body){
+  var tok=SUPA_KEY;try{var ss=await db.auth.getSession();if(ss&&ss.data&&ss.data.session&&ss.data.session.access_token)tok=ss.data.session.access_token;}catch(e){}
+  var r=await fetch(SUPA_URL+'/functions/v1/shopify-discounts',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+tok,'apikey':SUPA_KEY},body:JSON.stringify(body)});
+  var j={};try{j=await r.json();}catch(e){}
+  if(r.status===404)throw new Error('The shopify-discounts function is not deployed yet. Add it in Supabase (Edge Functions) first.');
+  if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+  return j;
+}
+function dcxName(id){var d=(S.dealers||[]).find(function(x){return String(x.id)===String(id);});return d?d.name:'(removed dealer)';}
+function dcxBadge(a){
+  var m={raise:['Raise','var(--teal)'],restore:['Put back','var(--orange)'],ok:['No change','var(--text3)'],mismatch:['Changed by hand','var(--red)'],missing:['Not in Shopify','var(--red)'],unsupported:['Cannot change','var(--red)'],error:['Error','var(--red)'],skip:['Skipped','var(--text3)']}[a]||[a,'var(--text3)'];
+  return '<span style="font-weight:700;color:'+m[1]+'">'+m[0]+'</span>';
+}
+function dcxHtml(){
+  var admin=S.currentRole==='admin',x=dcxX(),links=dcxLinks(),state=dcxState(),log=dcxLog(),ids=Object.keys(links);
+  var lab='font-size:var(--t-xs);font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--text3)',inp='padding:6px 8px;font-size:var(--t-md);background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);color:var(--text)';
+  var h='<div id="dcx-box" style="margin-top:22px;border-top:1px solid var(--border);padding-top:16px"><div style="display:flex;align-items:center;gap:10px;margin-bottom:6px"><div style="font-weight:700;flex:1">Shopify dealer codes</div><span class="pill pill-muted">'+ids.length+' linked</span></div>'
+   +'<div class="t3s" style="margin-bottom:12px;line-height:1.55">A dealer\'s own fixed code in Shopify (like <code>ELITISTMOTORSPORTS</code>) can follow a live promotion: while it runs, the code\'s % is raised to that dealer\'s promotion total, and afterwards it is put back. Only the percentage is changed. Dealer portal orders and Support Center orders already get promotions without this.</div>';
+  if(!admin)return h+'<div class="t3s">Only admins can link or change Shopify codes.</div></div>';
+  var busy=!!x.busy,dis=busy?' disabled':'';
+  h+='<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px"><button class="btn btn-sm" onclick="dcxPing()"'+dis+'>Check connection</button><button class="btn btn-sm" onclick="dcxLoadCodes()"'+dis+'>Load Shopify codes'+(x.codes?' ('+x.codes.length+')':'')+'</button>'
+   +'<button class="btn btn-sm btn-teal" onclick="dcxPreview()"'+dis+'>Preview changes</button><button class="btn btn-sm btn-teal" onclick="dcxApply()"'+dis+' title="Change every linked code that needs it, after showing you the list">Apply to Shopify</button>'
+   +'<label style="display:flex;align-items:center;gap:6px;margin-left:auto;font-size:var(--t-sm)" title="When on, a scheduled job keeps the codes in step by itself. It needs the schedule set up in Supabase (see below)."><input type="checkbox" '+(S.settings&&S.settings.dealer_codes_auto===true?'checked ':'')+'onchange="dcxAuto(this.checked)"> Automatic</label></div>';
+  if(x.busy)h+='<div class="t3s" style="margin-bottom:8px">'+escHtml(x.busy)+'&hellip;</div>';
+  if(x.err)h+='<div style="color:var(--red);font-size:var(--t-sm);margin-bottom:10px;line-height:1.5">'+escHtml(x.err)+'</div>';
+  // linked dealers
+  if(ids.length){
+    h+='<table style="width:100%;margin-bottom:12px"><thead><tr><th style="text-align:left">Dealer</th><th>Usual %</th><th style="text-align:left">Shopify code</th><th style="text-align:left">Now</th><th></th></tr></thead><tbody>'+ids.map(function(id){
+      var l=links[id],st=state[l.code],row=x.plan&&x.plan.find(function(r){return String(r.dealerId)===String(id);});
+      var now=st?('<b style="color:var(--teal)">Raised to '+st.applied_pct+'%</b> <span class="t3xs">by '+escHtml(st.promo||'a promotion')+' since '+escHtml(String(st.since||'').slice(0,10))+'</span>'):(row&&row.from!=null?(row.from+'%'):'<span class="t3xs">not checked</span>');
+      return '<tr><td><b>'+escHtml(dcxName(id))+'</b></td><td style="text-align:center">'+(l.base_pct!=null?l.base_pct+'%':'')+'</td><td style="font-family:var(--mono)">'+escHtml(l.code)+'</td><td>'+now+'</td><td style="white-space:nowrap;text-align:right"><button class="btn btn-sm" data-i="'+escHtml(id)+'" onclick="dcxApply(this.dataset.i)"'+dis+' title="Apply to this dealer only: a safe way to try it first">Apply to this one</button> <button class="btn btn-sm" data-i="'+escHtml(id)+'" onclick="dcxUnlink(this.dataset.i)"'+dis+'>Unlink</button></td></tr>';}).join('')+'</tbody></table>';
+  }
+  // link a dealer
+  var free=(S.dealers||[]).filter(function(d){return d.status==='Active'&&!links[d.id];}).sort(function(a,b){return String(a.name).localeCompare(String(b.name));});
+  h+='<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px"><label style="display:flex;flex-direction:column;gap:3px;'+lab+'">Dealer<select id="dcx-dealer" onchange="dcxSuggest()" style="'+inp+'"><option value="">Choose&hellip;</option>'+free.map(function(d){return '<option value="'+escHtml(d.id)+'">'+escHtml(d.name)+'</option>';}).join('')+'</select></label>'
+   +'<label style="display:flex;flex-direction:column;gap:3px;flex:1;min-width:200px;'+lab+'">Their Shopify code<input id="dcx-code" list="dcx-codes" placeholder="Type, or load the codes first" style="'+inp+'"></label><datalist id="dcx-codes">'+((x.codes||[]).map(function(c){return '<option value="'+escHtml(c.code)+'">'+escHtml(c.percentage+'% \u00b7 '+(c.items||''))+'</option>';}).join(''))+'</datalist>'
+   +'<button class="btn btn-teal" onclick="dcxLink()"'+dis+'>Link</button></div>';
+  // what would change
+  if(x.plan){
+    var n=x.plan.filter(function(r){return r.action==='raise'||r.action==='restore';}).length;
+    h+='<div style="font-weight:700;margin:6px 0">'+(x.planDry===false?'What was just done':'What would change')+' <span class="t3xs" style="font-weight:400">'+(n?n+' code'+(n===1?'':'s'):'nothing to change')+(x.planAt?' &middot; '+escHtml(x.planAt):'')+'</span></div>'
+     +(x.plan.length?'<table style="width:100%;margin-bottom:12px"><thead><tr><th style="text-align:left">Dealer</th><th style="text-align:left">Code</th><th>Shopify now</th><th>Becomes</th><th style="text-align:left">What</th><th style="text-align:left">Why</th></tr></thead><tbody>'+x.plan.map(function(r){return '<tr><td>'+escHtml(r.dealer||'')+'</td><td style="font-family:var(--mono)">'+escHtml(r.code||'')+'</td><td style="text-align:center">'+(r.from!=null?r.from+'%':'')+'</td><td style="text-align:center">'+(r.to!=null?'<b>'+r.to+'%</b>':'')+'</td><td>'+dcxBadge(r.action)+'</td><td class="t3s">'+escHtml(r.reason||'')+'</td></tr>';}).join('')+'</tbody></table>':'<div class="t3s" style="margin-bottom:12px">No dealers are linked yet.</div>');
+  }
+  if(log.length)h+='<details style="margin-bottom:10px"><summary class="t3s" style="cursor:pointer">Recent changes made in Shopify ('+log.length+')</summary><table style="width:100%;margin-top:6px"><tbody>'+log.slice(-12).reverse().map(function(e){return '<tr><td class="t3s">'+escHtml(String(e.at||'').replace('T',' ').slice(0,16))+'</td><td>'+escHtml(e.dealer||'')+'</td><td style="font-family:var(--mono)">'+escHtml(e.code||'')+'</td><td>'+e.from+'% &rarr; '+e.to+'%</td><td class="t3s">'+escHtml(e.by||'')+'</td></tr>';}).join('')+'</tbody></table></details>';
+  h+='<details><summary class="t3s" style="cursor:pointer">Set up the function and the schedule</summary><div class="t3s" style="line-height:1.6;margin-top:6px">1. In Supabase, add an Edge Function named <code>shopify-discounts</code> and paste in the file you were given. It uses the same secrets as your other Shopify functions.<br>2. In the Shopify app, add the <code>read_discounts</code> and <code>write_discounts</code> permissions (Shopify may issue a new token: update <code>SHOPIFY_KEY</code> if so).<br>3. Press <b>Check connection</b>.<br>4. Link one dealer, press <b>Apply to this one</b>, and check the code in Shopify admin before applying to everyone.<br>5. For <b>Automatic</b>, run this once in the Supabase SQL editor (replace the key with your service-role key) so codes switch on and off on the right day even if nobody has the ERP open:<pre style="white-space:pre-wrap;background:var(--bg3);padding:8px;border-radius:var(--r-md);margin-top:6px;user-select:all">select cron.schedule(\'tgk-dealer-codes\', \'*/15 * * * *\', $$ select net.http_post(url := \''+escHtml(SUPA_URL)+'/functions/v1/shopify-discounts\', headers := \'{"Content-Type":"application/json","Authorization":"Bearer YOUR-SERVICE-ROLE-KEY"}\'::jsonb, body := \'{"action":"sync"}\'::jsonb) $$);</pre></div></details>';
+  return h+'</div>';
+}
+function dcxRedraw(){if(typeof promoRedraw==='function'&&document.getElementById('promo-box'))promoRedraw();}
+async function dcxRun(label,fn){
+  var x=dcxX();if(x.busy)return;x.busy=label;x.err='';dcxRedraw();
+  try{return await fn();}catch(e){x.err=(e&&e.message)||String(e);}finally{x.busy='';dcxRedraw();}
+}
+function dcxPing(){return dcxRun('Checking the connection',async function(){var r=await dcxFn({action:'ping'});toast('Connected to Shopify (function '+r.version+')',4000);});}
+function dcxLoadCodes(){return dcxRun('Loading the codes from Shopify',async function(){var r=await dcxFn({action:'list'});dcxX().codes=(r.codes||[]).filter(function(c){return c.supported;}).sort(function(a,b){return String(a.code).localeCompare(String(b.code));});toast(dcxX().codes.length+' percentage-off codes loaded',4000);});}
+function dcxSuggest(){
+  var id=(document.getElementById('dcx-dealer')||{}).value,x=dcxX(),el=document.getElementById('dcx-code');if(!id||!el||!x.codes)return;
+  var d=(S.dealers||[]).find(function(y){return String(y.id)===String(id);});if(!d)return;
+  var toks=[String(d.po_code_prefix||''),String(d.name||'')].join(' ').toLowerCase().split(/[^a-z0-9]+/).filter(function(t){return t.length>=3&&['llc','inc','the','and','motorsports','tuning','performance','automotive','racing'].indexOf(t)<0;});
+  var hit=x.codes.find(function(c){var k=String(c.code).toLowerCase();return toks.some(function(t){return k.indexOf(t)>=0;});});
+  if(hit&&!el.value)el.value=hit.code;
+}
+async function dcxLink(){
+  var id=(document.getElementById('dcx-dealer')||{}).value,code=String((document.getElementById('dcx-code')||{}).value||'').trim();
+  if(!id){toast('Choose a dealer first');return;}if(!code){toast('Enter their Shopify code');return;}
+  return dcxRun('Checking the code in Shopify',async function(){
+    var r=await dcxFn({action:'lookup',codes:[code]}),c=(r.codes||[])[0]||{};
+    if(c.error)throw new Error(c.error);
+    if(c.notFound)throw new Error('There is no code called "'+code+'" in Shopify.');
+    if(!c.supported)throw new Error('"'+(c.code||code)+'" cannot be managed here: '+(c.reason||'unsupported')+'.');
+    var links=dcxLinks(),dup=Object.keys(links).find(function(k){return String(links[k].code).toLowerCase()===String(c.code).toLowerCase();});
+    if(dup)throw new Error('"'+c.code+'" is already linked to '+dcxName(dup)+'.');
+    var d=(S.dealers||[]).find(function(y){return String(y.id)===String(id);}),usual=typeof stackDealerPct==='function'?stackDealerPct(d):null;
+    var msg='Link '+(d?d.name:'this dealer')+' to the code '+c.code+'?\n\nIn Shopify it gives '+c.percentage+'% off '+c.items+(c.minSubtotal?' with a $'+c.minSubtotal+' minimum':'')+', for '+c.customers+'.'
+      +(usual!=null&&Math.abs(usual-c.percentage)>0.01?'\n\nNote: in the ERP this dealer is at '+usual+'%. The ERP will treat the code\'s '+c.percentage+'% as the usual and put it back to that after a promotion.':'')
+      +'\n\nIt only changes while a promotion is live for them, and only the percentage.';
+    if(!confirm(msg))return;
+    var next=Object.assign({},links);next[id]={code:c.code,base_pct:c.percentage,linked_at:new Date().toISOString()};
+    if(!(await promoPersist('dealer_shopify_codes',next)))throw new Error('Could not save the link.');
+    toast('Linked '+(d?d.name:'dealer')+' to '+c.code);
+  });
+}
+async function dcxUnlink(id){
+  var links=dcxLinks(),l=links[id];if(!l)return;
+  if(dcxState()[l.code]){toast('This code is raised for a promotion right now. Press Apply to put it back (or end the promotion first), then unlink.',8000);return;}
+  if(!confirm('Unlink '+dcxName(id)+' from '+l.code+'? The code in Shopify is left as it is.'))return;
+  var next=Object.assign({},links);delete next[id];
+  if(await promoPersist('dealer_shopify_codes',next)){toast('Unlinked');dcxRedraw();}
+}
+function dcxPreview(quiet){
+  return dcxRun('Working out what would change',async function(){
+    var r=await dcxFn({action:'sync',dry_run:true}),x=dcxX();x.plan=r.plan||[];x.planDry=true;x.planAt='checked '+new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+    if(r.state)S.settings=Object.assign({},S.settings,{dealer_code_state:r.state});
+    if(r.log)S.settings=Object.assign({},S.settings,{dealer_code_log:r.log});
+  });
+}
+function dcxApply(onlyId){
+  var x=dcxX();
+  return dcxRun('Checking before changing anything',async function(){
+    var pre=await dcxFn({action:'sync',dry_run:true,only_dealer_id:onlyId||''});
+    var todo=(pre.plan||[]).filter(function(r){return r.action==='raise'||r.action==='restore';});
+    x.plan=pre.plan||[];x.planDry=true;
+    if(!todo.length){toast('Nothing needs changing'+(onlyId?' for this dealer':''),5000);return;}
+    if(!confirm('Change '+todo.length+' code'+(todo.length===1?'':'s')+' in Shopify now?\n\n'+todo.map(function(r){return '  \u2022 '+r.dealer+'  '+r.code+':  '+r.from+'% \u2192 '+r.to+'%';}).join('\n')+'\n\nOnly the percentage changes. Each change is checked afterwards and undone if anything else moved.'))return;
+    x.busy='Changing the codes in Shopify';dcxRedraw();
+    var r=await dcxFn({action:'sync',dry_run:false,only_dealer_id:onlyId||''});
+    x.plan=(r.plan||[]).map(function(row){var res=(r.results||[]).find(function(q){return String(q.dealerId)===String(row.dealerId);});return res?Object.assign({},row,{action:res.ok?(res.unchanged?'ok':row.action):'error',reason:res.ok?row.reason:res.error}):row;});
+    x.planDry=false;x.planAt='done '+new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+    if(r.state)S.settings=Object.assign({},S.settings,{dealer_code_state:r.state});
+    if(r.log)S.settings=Object.assign({},S.settings,{dealer_code_log:r.log});
+    var okN=(r.results||[]).filter(function(q){return q.ok;}).length,bad=(r.results||[]).filter(function(q){return !q.ok;});
+    toast((bad.length?'\u26a0 '+bad.length+' failed: '+bad.map(function(q){return q.code+' ('+q.error+')';}).join('; ')+(okN?' \u00b7 ':''):'')+(okN?'\u2713 '+okN+' code'+(okN===1?'':'s')+' updated in Shopify':''),bad.length?12000:6000);
+  });
+}
+async function dcxAuto(on){
+  if(on&&!confirm('Turn on Automatic?\n\nThe scheduled job will then raise and put back dealers\' Shopify codes by itself as promotions start and end. It needs the schedule from "Set up the function and the schedule" to be installed in Supabase. You can switch it off here at any time.')){dcxRedraw();return;}
+  if(await promoPersist('dealer_codes_auto',!!on))toast(on?'Automatic is on':'Automatic is off');
+  dcxRedraw();
+}
+// after any promotion is saved, switched or deleted: if dealers are linked, show straight away which codes now need to change
+function dcxAfterPromoChange(){
+  if(S.currentRole!=='admin'||!Object.keys(dcxLinks()).length)return;
+  dcxFn({action:'sync',dry_run:true}).then(function(r){var x=dcxX();x.plan=r.plan||[];x.planDry=true;x.planAt='checked '+new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});var n=x.plan.filter(function(q){return q.action==='raise'||q.action==='restore';}).length;if(n)toast(n+' Shopify dealer code'+(n===1?'':'s')+' now need updating: see Shopify dealer codes below',8000);dcxRedraw();}).catch(function(){});
+}
+window.dcxPing=dcxPing;window.dcxLoadCodes=dcxLoadCodes;window.dcxSuggest=dcxSuggest;window.dcxLink=dcxLink;window.dcxUnlink=dcxUnlink;window.dcxPreview=dcxPreview;window.dcxApply=dcxApply;window.dcxAuto=dcxAuto;
+
 function promoRedraw(){var b=document.getElementById('promo-box');if(b)b.innerHTML=promoHtml();}
 function promoClose(){var ov=document.getElementById('promo-ov');if(ov)ov.remove();S._promo=null;}
 function promoEdit(id){
  if(id===null){S._promo={draft:null};promoRedraw();return;}
- if(id==='new'){S._promo={draft:{id:'p'+Date.now().toString(36),name:'',active:true,starts_on:'',ends_on:'',discount_pct:'',min_order:0,dealer_ids:[],note:'',_new:true}};}
- else{var p=promoList().find(function(x){return String(x.id)===String(id);});if(!p)return;S._promo={draft:Object.assign({},p,{dealer_ids:(p.dealer_ids||[]).slice()})};}
+ if(id==='new'){S._promo={draft:{id:'p'+Date.now().toString(36),name:'',active:true,starts_on:'',ends_on:'',stack:true,extra_pct:'',mode:'compound',discount_pct:'',min_order:0,dealer_ids:[],note:'',_new:true}};}
+ else{var p=stackList().find(function(x){return String(x.id)===String(id);})||promoList().find(function(x){return String(x.id)===String(id)&&!x.from_stack;});if(!p)return;S._promo={draft:Object.assign({},p,{dealer_ids:(p.dealer_ids||[]).slice()})};}
  promoRedraw();
 }
-function promoField(k,v){if(S._promo&&S._promo.draft)S._promo.draft[k]=v;}
-function promoDealer(id,on){var d=S._promo&&S._promo.draft;if(!d)return;var a=(d.dealer_ids||[]).map(String).filter(function(x){return x!==String(id);});if(on)a.push(String(id));d.dealer_ids=a;}
+function promoField(k,v){if(S._promo&&S._promo.draft){S._promo.draft[k]=v;if(S._promo.draft.stack)promoStackPreview();}}
+function promoDealer(id,on){var d=S._promo&&S._promo.draft;if(!d)return;var a=(d.dealer_ids||[]).map(String).filter(function(x){return x!==String(id);});if(on)a.push(String(id));d.dealer_ids=a;if(d.stack)promoStackPreview();}
 async function promoSave(){
- var d=S._promo&&S._promo.draft;if(!d)return;
- var c=promoClean(d);if(c.err){var e=document.getElementById('pm-err');if(e)e.textContent=c.err;return;}
- var list=promoList().filter(function(x){return String(x.id)!==String(c.promo.id);});list.push(c.promo);
- if(!(await promoPersist('dealer_promos',list)))return;
- toast('Promotion saved');S._promo={draft:null};promoRedraw();
+  var d=S._promo&&S._promo.draft;if(!d)return;
+  var showErr=function(m){var e=document.getElementById('pm-err');if(e)e.textContent=m;};
+  if(d.stack){
+    var cs=promoCleanStack(d);if(cs.err){showErr(cs.err);return;}
+    var sl=stackList().filter(function(x){return String(x.id)!==String(cs.promo.id);});sl.push(cs.promo);
+    if(!(await promoPersist('dealer_promo_stacks',sl)))return;
+    var r=await promoSyncStacks({dropId:cs.promo.id});   // also removes the same promotion if it used to be a plain one
+    if(r==='failed'){toast('The promotion was saved, but dealers will not see it until the dealer promotions can be updated. Open Promotions and try again.',9000);return;}
+    var n=stackGroups(cs.promo).length;toast('Promotion saved \u2014 '+n+' dealer group'+(n===1?'':'s')+' updated');S._promo={draft:null};promoRedraw();dcxAfterPromoChange();return;
+  }
+  var c=promoClean(d);if(c.err){showErr(c.err);return;}
+  var wasStack=stackList().some(function(x){return String(x.id)===String(c.promo.id);});
+  if(wasStack&&!(await promoPersist('dealer_promo_stacks',stackList().filter(function(x){return String(x.id)!==String(c.promo.id);}))))return;
+  var list=promoList().filter(function(x){return String(x.id)!==String(c.promo.id)&&x.from_stack!==c.promo.id;});list.push(c.promo);
+  if(!(await promoPersist('dealer_promos',list)))return;
+  toast('Promotion saved');S._promo={draft:null};promoRedraw();dcxAfterPromoChange();
 }
-async function promoToggle(id){var list=promoList().map(function(p){return String(p.id)===String(id)?Object.assign({},p,{active:p.active===false}):p;});if(await promoPersist('dealer_promos',list)){toast('Promotion updated');promoRedraw();}}
+async function promoToggle(id){
+  var st=stackList().find(function(x){return String(x.id)===String(id);});
+  if(st){
+    if(!(await promoPersist('dealer_promo_stacks',stackList().map(function(x){return String(x.id)===String(id)?Object.assign({},x,{active:x.active===false}):x;}))))return;
+    if(await promoSyncStacks()!=='failed'){toast('Promotion updated');promoRedraw();dcxAfterPromoChange();}return;
+  }
+  var list=promoList().map(function(p){return String(p.id)===String(id)?Object.assign({},p,{active:p.active===false}):p;});if(await promoPersist('dealer_promos',list)){toast('Promotion updated');promoRedraw();dcxAfterPromoChange();}
+}
 async function promoDelete(id){
- var p=promoList().find(function(x){return String(x.id)===String(id);});if(!p)return;
- if(!confirm('Delete the promotion "'+(p.name||'')+'"? Dealers will stop seeing it straight away.'))return;
- if(await promoPersist('dealer_promos',promoList().filter(function(x){return String(x.id)!==String(id);}))){toast('Promotion deleted');promoRedraw();}
+  var st=stackList().find(function(x){return String(x.id)===String(id);});
+  if(st){
+    if(!confirm('Delete the promotion "'+(st.name||'')+'"? Dealers will stop seeing it straight away.'))return;
+    if(!(await promoPersist('dealer_promo_stacks',stackList().filter(function(x){return String(x.id)!==String(id);}))))return;
+    if(await promoSyncStacks()!=='failed'){toast('Promotion deleted');promoRedraw();dcxAfterPromoChange();}return;
+  }
+  var p=promoList().find(function(x){return String(x.id)===String(id);});if(!p)return;
+  if(!confirm('Delete the promotion "'+(p.name||'')+'"? Dealers will stop seeing it straight away.'))return;
+  if(await promoPersist('dealer_promos',promoList().filter(function(x){return String(x.id)!==String(id);}))){toast('Promotion deleted');promoRedraw();dcxAfterPromoChange();}
 }
 async function promoSaveStocking(){
  var g=function(id){var e=document.getElementById(id);return e?e.value:'';},on=!!(document.getElementById('pm-sk-en')||{}).checked,pct=parseFloat(g('pm-sk-pct')),min=parseFloat(g('pm-sk-min'))||0;
@@ -9651,6 +9887,7 @@ async function dlBulkTier(pct){
  try{var r=await db.from('dealers').update({discount_pct:pct/100}).in('id',ids);if(r&&r.error)throw new Error(r.error.message);}
  catch(e){toast('Not changed: '+((e&&e.message)||e),8000);return;}
  ds.forEach(function(d){d.discount_pct=pct/100;});S.dealers=[].concat(S.dealers);S._dlSig='';
+ try{promoSyncStacks({quiet:true});}catch(e){}   // [v23.154] stacked promotions follow the dealers' new %
  toast(ds.length+' dealer'+(ds.length===1?'':'s')+' set to '+pct+'% off');dlClearSel();
 }
 // ---- the side panel
@@ -19211,6 +19448,7 @@ async function submitDealer(eid){
   if(data)S.dealers=[...S.dealers,data].sort((a,b)=>a.name.localeCompare(b.name));
   else S.dealers=S.dealers.map(d=>d.id===eid?{...d,...payload}:d);
   closeModal();toast('Dealer saved');render();
+  try{promoSyncStacks({quiet:true});}catch(e){}   // [v23.154] stacked promotions follow a dealer's new % or status
 }
 // [FIX] Duplicate "manual_edit" rows in Stock Movement History. Nothing stopped a save from running
 // twice when Save was double-clicked (or Enter pressed alongside a click). Both runs read `prev`
