@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.183';
+const TGK_ERP_VERSION = 'v23.184';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -11090,7 +11090,7 @@ function mfCarriers(pk){var seen={},out=[];pk.forEach(function(p){if(!seen[p.car
 
 function openManifest(){
  var ex=document.getElementById('mf-ov');if(ex)ex.remove();
- S._mf={day:centralDateOnly(),carrier:'all',flag:'',loading:true,err:'',pk:[],raw:[],off:[],noTracking:[]};
+ S._mf={day:centralDateOnly(),carrier:'all',flag:'',loading:true,err:'',pk:[],raw:[],off:[],away:[],pickEdit:null,noTracking:[]};
  var ov=document.createElement('div');ov.id='mf-ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
  ov.innerHTML='<div id="mf-box" style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(980px,96vw);max-height:92vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.25)"></div>';
  ov.addEventListener('mousedown',function(e){if(e.target===ov)mfClose();});
@@ -11112,6 +11112,78 @@ function mfSvc(p){
  return {name:name,next:/next\s*day|overnight|priority mail express|first overnight|priority overnight|standard overnight/i.test(name)};
 }
 function mfKey(p){return p.carrier+'|'+p.tracking;}
+/* ---- [v23.184] PICKUP CUTOFF. A manifest lists the boxes that shipped on a day, but UPS usually collects before the day is over: a box shipped AFTER the pickup was not collected and belongs on the NEXT manifest.
+   "UPS picked up" records the time (Central) per carrier; any box of that carrier shipped after it (when its ship time is known) moves to the next business day's manifest. A single box can also be moved by hand
+   ("Next" / "Back"). Both are saved in the database (setting manifest_pickups), so every device and everyone sees the same manifests. A box whose ship date has no time (ShipStation reports a bare date) cannot be
+   placed by time: it stays on its ship day, and can be moved by hand. Hand moves win over the pickup rule. */
+function mfCfg(){var v=S.settings&&S.settings.manifest_pickups;if(typeof v==='string'){try{v=JSON.parse(v);}catch(e){v=null;}}v=(v&&typeof v==='object'&&!Array.isArray(v))?v:{};return {pickups:(v.pickups&&typeof v.pickups==='object')?v.pickups:{},moves:(v.moves&&typeof v.moves==='object')?v.moves:{}};}
+function mfIsBare(v){var t=String(v||'');return /^\d{4}-\d{2}-\d{2}$/.test(t)||/^\d{4}-\d{2}-\d{2}[T ]00:00:00(\.0+)?(Z|[+-]00(:?00)?)?$/.test(t);}
+function mfMs(v){return Date.parse(String(v||'').replace(' ','T'));}
+function mfNextBiz(day){var d=new Date(day+'T12:00:00Z');do{d=new Date(d.getTime()+864e5);}while(d.getUTCDay()===0||d.getUTCDay()===6);return d.toISOString().slice(0,10);}
+function mfManifestDay(iso,car,key){
+  var d=mfShipDay(iso),cfg=mfCfg(),mv=cfg.moves[key];
+  if(mv&&/^\d{4}-\d{2}-\d{2}$/.test(mv))return {day:mv,ship:d,why:mv===d?'':'moved'};
+  var pk=cfg.pickups[d]&&cfg.pickups[d][car];
+  if(pk&&!mfIsBare(iso)&&mfMs(iso)>mfMs(pk))return {day:mfNextBiz(d),ship:d,why:'pickup'};
+  return {day:d,ship:d,why:''};
+}
+function mfHM(iso){return new Date(mfMs(iso)).toLocaleTimeString('en-US',{timeZone:'America/Chicago',hour:'numeric',minute:'2-digit'});}
+function mfNowHM(){return new Date(Date.now()).toLocaleTimeString('en-GB',{timeZone:'America/Chicago',hour:'2-digit',minute:'2-digit',hour12:false});}
+function mfDayShort(day){try{return new Date(day+'T12:00:00Z').toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',timeZone:'UTC'});}catch(e){return day;}}
+// "15:00" on a Central day -> the exact moment (handles standard and daylight time)
+function mfCentralIso(day,hm){
+  var m=/^(\d{2}):(\d{2})$/.exec(hm||'');if(!m)return '';var y=+day.slice(0,4),mo=+day.slice(5,7)-1,d=+day.slice(8,10);
+  for(var off=5;off<=6;off++){var t=Date.UTC(y,mo,d,+m[1]+off,+m[2]),iso=new Date(t).toISOString();
+    if(centralDateOnly(iso)===day&&new Date(t).toLocaleTimeString('en-GB',{timeZone:'America/Chicago',hour:'2-digit',minute:'2-digit',hour12:false})===hm)return iso;}
+  return '';
+}
+async function mfFreshCfg(){try{var r=await db.from('settings').select('value').eq('key','manifest_pickups').limit(1),v=r&&r.data&&r.data[0]&&r.data[0].value;if(v!==undefined)S.settings=Object.assign({},S.settings,{manifest_pickups:v});}catch(e){}return JSON.parse(JSON.stringify(mfCfg()));}   // a COPY: an edit that fails to save must not change what the manifest shows
+async function mfSaveCfg(cfg){
+  var cut=new Date(Date.now()-90*864e5).toISOString().slice(0,10);
+  Object.keys(cfg.pickups).forEach(function(d){if(d<cut)delete cfg.pickups[d];});
+  Object.keys(cfg.moves).forEach(function(k){if(String(cfg.moves[k])<cut)delete cfg.moves[k];});
+  return await promoPersist('manifest_pickups',cfg);
+}
+function mfPickEdit(c){var st=S._mf;if(!st)return;st.pickEdit=c;mfRedraw();}
+function mfPickCancel(){var st=S._mf;if(!st)return;st.pickEdit=null;mfRedraw();}
+async function mfPickSave(c){
+  var st=S._mf;if(!st)return;var el=document.getElementById('mf-pt'),iso=mfCentralIso(st.day,String((el&&el.value)||''));
+  if(!iso){toast('Enter the pickup time');return;}
+  if(mfMs(iso)>Date.now()+5*60e3){toast('That time has not happened yet');return;}
+  var cfg=await mfFreshCfg();cfg.pickups[st.day]=cfg.pickups[st.day]||{};cfg.pickups[st.day][c]=iso;
+  if(!(await mfSaveCfg(cfg)))return;
+  st.pickEdit=null;await mfReload();
+  var n=(st.away||[]).filter(function(p){return p.carrier===c&&p.why==='pickup';}).length;
+  toast('<span class="ic ic-check"></span>'+c+' marked picked up at '+mfHM(iso)+'. '+(n?n+' box'+(n===1?'':'es')+' shipped after that moved to the next manifest ('+mfDayShort(mfNextBiz(st.day))+').':'Anything you ship after this goes on the next manifest ('+mfDayShort(mfNextBiz(st.day))+').'),8000);
+}
+async function mfPickUndo(c){
+  var st=S._mf;if(!st)return;var cfg=await mfFreshCfg();
+  if(cfg.pickups[st.day]){delete cfg.pickups[st.day][c];if(!Object.keys(cfg.pickups[st.day]).length)delete cfg.pickups[st.day];}
+  if(!(await mfSaveCfg(cfg)))return;st.pickEdit=null;await mfReload();toast(c+' pickup removed: everything that shipped that day is back on this manifest',6000);
+}
+async function mfMove(k,dir){
+  var st=S._mf;if(!st)return;var cfg=await mfFreshCfg(),p=(st.raw||[]).concat(st.away||[]).find(function(x){return mfKey(x)===k;}),ship=(p&&p.shipDay)||st.day;
+  if(dir==='next')cfg.moves[k]=mfNextBiz(st.day);
+  else{cfg.moves[k]=ship;if(!(p&&p.why==='pickup'))delete cfg.moves[k];}   // "back": it stays on its ship day, even after a pickup (a plain "moved" box just loses its move)
+  if(!(await mfSaveCfg(cfg)))return;await mfReload();
+  toast(dir==='next'?'Box moved to the next manifest ('+mfDayShort(mfNextBiz(st.day))+')':'Box put back on this manifest',5000);
+}
+function mfPickupHtml(){
+  var st=S._mf||{},cfg=mfCfg(),day=st.day,names=['UPS'];
+  (st.raw||[]).concat(st.away||[]).forEach(function(p){if(names.indexOf(p.carrier)<0)names.push(p.carrier);});
+  var cells=names.map(function(c){
+    var at=cfg.pickups[day]&&cfg.pickups[day][c],e=escHtml(c);
+    if(st.pickEdit===c){
+      // the boxes of this carrier with a ship TIME, so the pickup time can be set between the last box it took and the first it did not
+      var tm=(st.raw||[]).concat(st.away||[]).filter(function(p){return p.carrier===c&&p.first&&!mfIsBare(p.first);}).sort(function(a,b){return mfMs(a.first)-mfMs(b.first);});
+      return '<span style="display:inline-flex;flex-direction:column;gap:5px"><span style="display:inline-flex;gap:6px;align-items:center"><b>'+e+' picked up at</b><input type="time" id="mf-pt" class="form-input" style="width:118px" value="'+escHtml(at?new Date(mfMs(at)).toLocaleTimeString('en-GB',{timeZone:'America/Chicago',hour:'2-digit',minute:'2-digit',hour12:false}):mfNowHM())+'"><span class="t3xs">Central</span><button class="btn btn-sm btn-teal" data-c="'+e+'" onclick="mfPickSave(this.dataset.c)">Save</button><button class="btn btn-sm" onclick="mfPickCancel()">Cancel</button></span>'
+        +'<span class="t3xs" style="max-width:760px;line-height:1.5">Set it to when '+e+' left, not now. Boxes shipped after this time go on the next manifest.'+(tm.length?' Shipped today: '+tm.slice(0,12).map(function(p){return escHtml((p.orders[0]||p.refs[0]||'box')+' '+mfHM(p.first));}).join(' &middot; ')+(tm.length>12?' &hellip;':'')+'.':'')+'</span></span>';
+    }
+    if(at)return '<span>'+e+' picked up <b>'+escHtml(mfHM(at))+'</b> <a style="cursor:pointer;color:var(--teal)" data-c="'+e+'" onclick="mfPickEdit(this.dataset.c)">change</a> &middot; <a style="cursor:pointer;color:var(--teal)" data-c="'+e+'" onclick="mfPickUndo(this.dataset.c)">undo</a></span>';
+    return '<button class="btn btn-sm" data-c="'+e+'" onclick="mfPickEdit(this.dataset.c)" title="Record when '+e+' collected. Anything shipped after that moves to the next manifest.">'+e+' picked up&hellip;</button>';
+  });
+  return '<div style="padding:8px 20px 0;display:flex;gap:14px;flex-wrap:wrap;align-items:center;font-size:var(--t-sm)"><span class="t3s" style="font-weight:700">Pickup</span>'+cells.join('')+'<span class="t3xs">Boxes shipped after a pickup go on the next manifest ('+escHtml(mfDayShort(mfNextBiz(day)))+').</span></div>';
+}
 // [v23.137] Which manifest day a shipment belongs to. Check Tracking stores ShipStation's ship date, which is a bare date (saved as midnight UTC).
 // Converting that to Central time gave the evening BEFORE, so today's warranty and reship boxes landed on yesterday's sheet. A bare date is used as written.
 function mfShipDay(v){var t=String(v||'');if(/^\d{4}-\d{2}-\d{2}$/.test(t)||/^\d{4}-\d{2}-\d{2}[T ]00:00:00(\.0+)?(Z|[+-]00(:?00)?)?$/.test(t))return t.slice(0,10);return centralDateOnly(t);}
@@ -11199,15 +11271,20 @@ function mfResRows(list,kind){
  });
 }
 function mfPackages(rows,day){
- var by={},order=[],noTrack={},list=(rows||[]).slice().sort(function(a,b){return (a._claim?1:0)-(b._claim?1:0);});
+ var by={},order=[],noTrack={},away={},list=(rows||[]).slice().sort(function(a,b){return (a._claim?1:0)-(b._claim?1:0);});
  list.forEach(function(s){
   if(!/^(shipped|delivered)$/i.test(String(s.fulfillment_status||'')))return;
-  if(!s.shipped_at)return;var d;try{d=mfShipDay(s.shipped_at);}catch(e){return;}if(day&&d!==day)return;   // day=null: any ship date (adding a box by hand)
-  var kind=mfKindOf(s),tr=String(s.tracking_number||'').trim().toUpperCase(),raw=String(s.order_number||'');
-  if(!tr){if(!kind)noTrack[s.order_number||('id'+s.id)]=1;return;}   // a resolution with no tracking shipped nothing (a refund, say)
-  var car=mfCarrier(s.carrier,tr),k=car+'|'+tr,p=by[k];
+   if(!s.shipped_at)return;var d;try{d=mfShipDay(s.shipped_at);}catch(e){return;}
+   var kind=mfKindOf(s),tr=String(s.tracking_number||'').trim().toUpperCase(),raw=String(s.order_number||'');
+   if(!tr){if(day&&d!==day)return;if(!kind)noTrack[s.order_number||('id'+s.id)]=1;return;}   // a resolution with no tracking shipped nothing (a refund, say)
+   var car=mfCarrier(s.carrier,tr),k=car+'|'+tr,md=mfManifestDay(s.shipped_at,car,k);
+   if(day&&md.day!==day){   // [v23.184] shipped this day but belongs to a LATER manifest (after the pickup, or moved by hand): listed under "Moved to a later manifest"
+     if(d===day){var a=away[k]||(away[k]={carrier:car,tracking:tr,orders:[],refs:[],customers:[],units:0,shipDay:d,to:md.day,why:md.why,first:String(s.shipped_at)});if(String(s.shipped_at)<a.first)a.first=String(s.shipped_at);var an=String(s.order_number||'');if(kind){var rf=mfRef(kind,raw,s._orig);if(a.refs.indexOf(rf)<0)a.refs.push(rf);}else if(an&&a.orders.indexOf(an)<0)a.orders.push(an);var cn2=String(s.customer_name||'').trim();if(cn2&&a.customers.indexOf(cn2)<0)a.customers.push(cn2);a.units+=Number(s.qty)||1;}
+     return;
+   }
+   var p=by[k];
   if(p&&s._claim&&p.raw.indexOf(raw)>=0)return;   // already counted through its own sales row: do not count the same box twice
-  if(!p){p=by[k]={carrier:car,tracking:tr,orders:[],refs:[],raw:[],kind:'',customers:[],units:0,lines:0,dsLines:0,svcLabel:'',city:'',state:'',country:'',first:String(s.shipped_at)};order.push(p);}
+  if(!p){p=by[k]={carrier:car,tracking:tr,orders:[],refs:[],raw:[],kind:'',customers:[],units:0,lines:0,dsLines:0,svcLabel:'',city:'',state:'',country:'',first:String(s.shipped_at),shipDay:d,why:md.why};order.push(p);}
   if(p.raw.indexOf(raw)<0)p.raw.push(raw);
   if(kind){p.kind=kind;var ref=mfRef(kind,raw,s._orig);if(p.refs.indexOf(ref)<0)p.refs.push(ref);}
   else if(s.order_number&&p.orders.indexOf(s.order_number)<0)p.orders.push(s.order_number);
@@ -11221,11 +11298,11 @@ function mfPackages(rows,day){
  order.forEach(function(p){p.ds=p.lines>0&&p.dsLines===p.lines;});   // every line in the box is drop-ship: it never left this warehouse
  var rank={UPS:0,USPS:1,FedEx:2,DHL:3};
  order.sort(function(a,b){return ((rank[a.carrier]===undefined?9:rank[a.carrier])-(rank[b.carrier]===undefined?9:rank[b.carrier]))||a.carrier.localeCompare(b.carrier)||String(a.first).localeCompare(String(b.first))||a.tracking.localeCompare(b.tracking);});
- return {packages:order,noTracking:Object.keys(noTrack)};
+ return {packages:order,noTracking:Object.keys(noTrack),away:Object.keys(away).map(function(k){return away[k];})};
 }
 function mfRefs(p){return p.orders.concat(p.refs).join(', ');}
 async function mfLoad(day){
- var d=new Date(day+'T12:00:00Z'),lo=new Date(d.getTime()-36*3600e3).toISOString(),hi=new Date(d.getTime()+36*3600e3).toISOString();
+ var d=new Date(day+'T12:00:00Z'),lo=new Date(d.getTime()-100*3600e3).toISOString(),hi=new Date(d.getTime()+36*3600e3).toISOString();
  var rows=await fetchAll(function(a,b){return db.from('sales').select('*').gte('shipped_at',lo).lt('shipped_at',hi).order('shipped_at',{ascending:true}).range(a,b);});
  var seen={},all=[];(rows||[]).concat(S.sales||[]).forEach(function(r){if(r&&!seen[r.id]){seen[r.id]=1;all.push(r);}});   // the database for the whole day, plus anything newer the ERP already holds
  var warn='',tabs=[['warranty_claims','Warranty',S.warrantyClaims,'warranty replacements'],['shipment_errors','Reship',S.shipmentErrors,'shipment-error reships']];
@@ -11241,29 +11318,32 @@ async function mfLoad(day){
 }
 async function mfReload(){
  var st=S._mf;if(!st)return;st.loading=true;st.err='';mfRedraw();
- try{var r=await mfLoad(st.day);if(S._mf!==st)return;st.raw=r.packages;st.noTracking=r.noTracking;st.warn=r.warn||'';mfApply();}
+ try{await mfFreshCfg();var r=await mfLoad(st.day);if(S._mf!==st)return;st.raw=r.packages;st.away=r.away||[];st.noTracking=r.noTracking;st.warn=r.warn||'';mfApply();}
  catch(e){if(S._mf===st)st.err=(e&&e.message)||String(e);}
  if(S._mf===st){st.loading=false;mfRedraw();}
 }
 function mfHtml(){
  var st=S._mf||{},sel=mfSelected(),cs=mfCarriers(st.pk||[]),today=centralDateOnly();
  var orders={},units=0,res=0;sel.forEach(function(p){p.orders.forEach(function(o){orders[o]=1;});units+=p.units;if(p.kind)res++;});
- var head='<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px"><div style="flex:1"><div style="font-size:var(--t-lg);font-weight:700">End of day manifest</div><div class="t3s">Every package that shipped on the day, by carrier, with a line for the driver to sign. Customer orders, warranty replacements and reships are included; drop-ship orders are left off. Remove a box with &times;, or add one that shipped another day. Your changes are kept for that date on this device.</div></div><button class="btn btn-sm" onclick="mfClose()">Close</button></div>';
+ var head='<div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px"><div style="flex:1"><div style="font-size:var(--t-lg);font-weight:700">End of day manifest</div><div class="t3s">Every package that shipped on the day, by carrier, with a line for the driver to sign. Customer orders, warranty replacements and reships are included; drop-ship orders are left off. Remove a box with &times;, or add one that shipped another day (those changes are kept for that date on this device). When a carrier has been, press <b>picked up</b>: boxes shipped after that go on the next manifest, and a single box can be moved with &rarr;.</div></div><button class="btn btn-sm" onclick="mfClose()">Close</button></div>';
  var tools='<div style="padding:12px 20px;border-bottom:1px solid var(--border);display:flex;gap:10px;align-items:center;flex-wrap:wrap"><input type="date" class="form-input" style="width:auto" max="'+today+'" value="'+escHtml(st.day)+'" onchange="mfDay(this.value)">'
   +(cs.length?'<span class="dl-chip'+(st.carrier==='all'?' on':'')+'" onclick="mfCarrierPick(\'all\')">All '+(st.pk||[]).length+'</span>':'')+cs.map(function(c){return '<span class="dl-chip'+(st.carrier===c.name?' on':'')+'" onclick="mfCarrierPick(\''+escHtml(c.name)+'\')">'+escHtml(c.name)+' '+c.n+'</span>';}).join('')
   +(function(){var ni=(st.pk||[]).filter(mfIntl).length,nn=(st.pk||[]).filter(function(p){return mfSvc(p).next;}).length;
     return (ni?'<span class="dl-chip'+(st.flag==='intl'?' on':'')+'" onclick="mfFlag(\'intl\')" title="Show only international packages">International '+ni+'</span>':'')+(nn?'<span class="dl-chip'+(st.flag==='next'?' on':'')+'" onclick="mfFlag(\'next\')" title="Show only next-day packages">Next day '+nn+'</span>':'');})()
   +'<span style="margin-left:auto;display:flex;gap:8px"><button class="btn btn-sm" onclick="mfReload()" title="Check again for shipments">&#8635; Reload</button><button class="btn btn-sm" onclick="mfCsv()"'+(sel.length?'':' disabled')+'>Download CSV</button><button class="btn btn-sm btn-primary" onclick="mfPrint()"'+(sel.length?'':' disabled')+'>&#128438; Print manifest</button></span></div>';
- if(st.loading)return head+tools+'<div style="padding:40px;text-align:center;color:var(--text3)">Loading what shipped&hellip;</div>';
- if(st.err)return head+tools+'<div style="padding:30px 20px;color:var(--red)">Could not load the shipments: '+escHtml(st.err)+'</div>';
+ var pickRow=mfPickupHtml();
+if(st.loading)return head+tools+pickRow+'<div style="padding:40px;text-align:center;color:var(--text3)">Loading what shipped&hellip;</div>';
+ if(st.err)return head+tools+pickRow+'<div style="padding:30px 20px;color:var(--red)">Could not load the shipments: '+escHtml(st.err)+'</div>';
  var warn=(st.warn?'<div style="margin:12px 20px 0;padding:9px 12px;background:var(--red-dim);color:var(--red);border-radius:var(--r-md);font-size:var(--t-sm)"><b>Check this list:</b> '+escHtml(st.warn)+'</div>':'')
   +((st.noTracking||[]).length?'<div style="margin:12px 20px 0;padding:9px 12px;background:var(--yellow-dim,rgba(217,119,6,.1));border-radius:var(--r-md);font-size:var(--t-sm)"><b>'+st.noTracking.length+' shipped order'+(st.noTracking.length===1?' has':'s have')+' no tracking number</b> (local pickup or hand delivery?), so '+(st.noTracking.length===1?'it is':'they are')+' not on the driver\'s sheet: '+escHtml(st.noTracking.slice(0,8).join(', '))+(st.noTracking.length>8?' and '+(st.noTracking.length-8)+' more':'')+'</div>':'');
  var addBar='<div style="padding:10px 20px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="t3s" style="font-weight:700">Add a box</span><input id="mf-add" class="form-input" style="width:230px" placeholder="Order # or tracking #" onkeydown="if(event.key===\'Enter\')mfAdd()"><button class="btn btn-sm" onclick="mfAdd()">Add</button><button class="btn btn-sm" onclick="mfAddManual()" title="List a box that the ERP has no shipment for">Add by hand</button></div>';
- var offBox=(st.off||[]).length?'<div style="margin:10px 20px 14px;padding:9px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-md);font-size:var(--t-sm)"><b>Left off this manifest ('+st.off.length+')</b>'+st.off.map(function(o){return '<div style="display:flex;gap:10px;align-items:center;padding:4px 0;border-top:1px solid var(--border);margin-top:4px"><span style="font-family:var(--mono)">'+escHtml(o.p.tracking)+'</span><span>'+escHtml(mfRefs(o.p))+'</span><span class="t3s">'+escHtml(o.p.customers[0]||'')+'</span><span class="pill pill-muted">'+o.why+'</span><button class="btn btn-sm" style="margin-left:auto" data-k="'+escHtml(mfKey(o.p))+'" onclick="mfRestore(this.dataset.k)">Add back</button></div>';}).join('')+'</div>':'';
- if(!(st.pk||[]).length)return head+tools+warn+addBar+offBox+'<div style="padding:40px;text-align:center;color:var(--text3)">Nothing has shipped on '+escHtml(mfDayLabel(st.day))+' yet.<div class="t3xs" style="margin-top:6px">Shipments appear here as ShipStation reports them. Press Reload to check again.</div></div>';
- var rows=sel.map(function(p,i){return '<tr><td class="t3s">'+(i+1)+'</td><td><b>'+escHtml(p.carrier)+'</b></td><td style="font-family:var(--mono)">'+escHtml(p.tracking)+'</td><td>'+escHtml(p.orders.join(', '))+p.refs.map(function(r){return (p.orders.length?' ':'')+'<span class="pill pill-purple" title="Customer resolution: not a customer order">'+escHtml(r)+'</span>';}).join('')+'</td><td>'+escHtml(p.customers[0]||'')+(p.customers.length>1?' +'+(p.customers.length-1):'')+(p.added?' <span class="pill pill-muted" title="Added by hand">added</span>':'')+(p.noDate?' <span class="pill pill-yellow" title="This box has tracking but no ship date was recorded, so it is listed on the day it was last updated. Remove it if it did not go out today.">no ship date</span>':'')+'</td><td class="t2s">'+escHtml(mfShipTo(p))+'</td><td>'+(mfIntl(p)?'<span class="pill pill-blue" style="margin-right:4px">INTL</span>':'')+(mfSvc(p).next?'<span class="pill pill-red" style="margin-right:4px">NEXT DAY</span>':'')+'<span class="t3s">'+escHtml(mfSvc(p).name)+'</span></td><td style="text-align:right">'+p.units+'</td><td style="text-align:right"><button class="action-btn" style="color:var(--red)" title="Take this box off the manifest" data-k="'+escHtml(mfKey(p))+'" onclick="mfRemove(this.dataset.k)">&#10005;</button></td></tr>';}).join('');
+ var offBox0=(st.off||[]).length?'<div style="margin:10px 20px 14px;padding:9px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-md);font-size:var(--t-sm)"><b>Left off this manifest ('+st.off.length+')</b>'+st.off.map(function(o){return '<div style="display:flex;gap:10px;align-items:center;padding:4px 0;border-top:1px solid var(--border);margin-top:4px"><span style="font-family:var(--mono)">'+escHtml(o.p.tracking)+'</span><span>'+escHtml(mfRefs(o.p))+'</span><span class="t3s">'+escHtml(o.p.customers[0]||'')+'</span><span class="pill pill-muted">'+o.why+'</span><button class="btn btn-sm" style="margin-left:auto" data-k="'+escHtml(mfKey(o.p))+'" onclick="mfRestore(this.dataset.k)">Add back</button></div>';}).join('')+'</div>':'';
+ var awayBox=(st.away||[]).length?'<div style="margin:10px 20px 14px;padding:9px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-md);font-size:var(--t-sm)"><b>Moved to a later manifest ('+st.away.length+')</b>'+st.away.map(function(a){return '<div style="display:flex;gap:10px;align-items:center;padding:4px 0;border-top:1px solid var(--border);margin-top:4px"><span style="font-family:var(--mono)">'+escHtml(a.tracking)+'</span><span>'+escHtml(a.orders.concat(a.refs).join(', '))+'</span><span class="t3s">'+escHtml(a.customers[0]||'')+'</span><span class="pill pill-muted">'+(a.why==='pickup'?'shipped after the '+escHtml(a.carrier)+' pickup':'moved by hand')+' &rarr; '+escHtml(mfDayShort(a.to))+'</span><button class="btn btn-sm" style="margin-left:auto" data-k="'+escHtml(mfKey(a))+'" onclick="mfMove(this.dataset.k,\'back\')">Put back on this manifest</button></div>';}).join('')+'</div>':'';
+var offBox=offBox0+awayBox;
+if(!(st.pk||[]).length)return head+tools+pickRow+warn+addBar+offBox+'<div style="padding:40px;text-align:center;color:var(--text3)">Nothing has shipped on '+escHtml(mfDayLabel(st.day))+' yet.<div class="t3xs" style="margin-top:6px">Shipments appear here as ShipStation reports them. Press Reload to check again.</div></div>';
+ var rows=sel.map(function(p,i){return '<tr><td class="t3s">'+(i+1)+'</td><td><b>'+escHtml(p.carrier)+'</b></td><td style="font-family:var(--mono)">'+escHtml(p.tracking)+'</td><td>'+escHtml(p.orders.join(', '))+p.refs.map(function(r){return (p.orders.length?' ':'')+'<span class="pill pill-purple" title="Customer resolution: not a customer order">'+escHtml(r)+'</span>';}).join('')+'</td><td>'+escHtml(p.customers[0]||'')+(p.customers.length>1?' +'+(p.customers.length-1):'')+(p.added?' <span class="pill pill-muted" title="Added by hand">added</span>':'')+(p.why==='pickup'?' <span class="pill pill-orange" title="This box shipped on '+escHtml(mfDayShort(p.shipDay))+' after the pickup, so it is on this manifest">after pickup</span>':'')+(p.why==='moved'?' <span class="pill pill-muted" title="This box shipped on '+escHtml(mfDayShort(p.shipDay))+' and was moved here by hand">moved here</span>':'')+(p.noDate?' <span class="pill pill-yellow" title="This box has tracking but no ship date was recorded, so it is listed on the day it was last updated. Remove it if it did not go out today.">no ship date</span>':'')+'</td><td class="t2s">'+escHtml(mfShipTo(p))+'</td><td>'+(mfIntl(p)?'<span class="pill pill-blue" style="margin-right:4px">INTL</span>':'')+(mfSvc(p).next?'<span class="pill pill-red" style="margin-right:4px">NEXT DAY</span>':'')+'<span class="t3s">'+escHtml(mfSvc(p).name)+'</span></td><td style="text-align:right">'+p.units+'</td><td style="text-align:right;white-space:nowrap">'+(p.why?'<button class="action-btn" title="Put this box back on the day it shipped ('+escHtml(mfDayShort(p.shipDay))+')" data-k="'+escHtml(mfKey(p))+'" onclick="mfMove(this.dataset.k,\'back\')">&larr;</button> ':'<button class="action-btn" title="Move this box to the next manifest ('+escHtml(mfDayShort(mfNextBiz(st.day)))+')" data-k="'+escHtml(mfKey(p))+'" onclick="mfMove(this.dataset.k,\'next\')">&rarr;</button> ')+'<button class="action-btn" style="color:var(--red)" title="Take this box off the manifest" data-k="'+escHtml(mfKey(p))+'" onclick="mfRemove(this.dataset.k)">&#10005;</button></td></tr>';}).join('');
  var nIntl=sel.filter(mfIntl).length,nNext=sel.filter(function(p){return mfSvc(p).next;}).length;
- return head+tools+warn+addBar+'<div style="padding:12px 20px 4px;font-size:var(--t-md)"><b>'+sel.length+' package'+(sel.length===1?'':'s')+'</b> &middot; '+Object.keys(orders).length+' order'+(Object.keys(orders).length===1?'':'s')+(res?' &middot; <span style="color:var(--purple);font-weight:600">'+res+' customer resolution'+(res===1?'':'s')+'</span>':'')+(nIntl?' &middot; <span style="color:var(--blue);font-weight:600">'+nIntl+' international</span>':'')+(nNext?' &middot; <span style="color:var(--red);font-weight:600">'+nNext+' next day</span>':'')+' &middot; '+units+' unit'+(units===1?'':'s')+' <span class="t3s">&middot; shipped '+escHtml(mfDayLabel(st.day))+'</span></div>'
+ return head+tools+pickRow+warn+addBar+'<div style="padding:12px 20px 4px;font-size:var(--t-md)"><b>'+sel.length+' package'+(sel.length===1?'':'s')+'</b> &middot; '+Object.keys(orders).length+' order'+(Object.keys(orders).length===1?'':'s')+(res?' &middot; <span style="color:var(--purple);font-weight:600">'+res+' customer resolution'+(res===1?'':'s')+'</span>':'')+(nIntl?' &middot; <span style="color:var(--blue);font-weight:600">'+nIntl+' international</span>':'')+(nNext?' &middot; <span style="color:var(--red);font-weight:600">'+nNext+' next day</span>':'')+' &middot; '+units+' unit'+(units===1?'':'s')+' <span class="t3s">&middot; shipped '+escHtml(mfDayLabel(st.day))+'</span></div>'
   +'<div style="overflow:auto;padding:0 20px 16px"><table style="width:100%"><thead><tr><th style="width:40px">#</th><th style="width:70px;text-align:left">Carrier</th><th style="text-align:left">Tracking number</th><th style="text-align:left">Order</th><th style="text-align:left">Customer</th><th style="text-align:left">Ship to</th><th style="text-align:left">Service</th><th style="text-align:right;width:60px">Units</th><th style="width:36px"></th></tr></thead><tbody>'+rows+'</tbody></table></div>'+offBox;
 }
 function mfPrintHtml(pk,day,who){
