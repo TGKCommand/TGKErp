@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.176';
+const TGK_ERP_VERSION = 'v23.177';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -7963,105 +7963,123 @@ async function unshipLine(saleId, pn, qty){
 }
 
 async function dedupeOrders(){
-  const el=document.getElementById('shopify-import-status');
   function prog(t){toast(t,2000);}
-
-  prog('<span class="ic ic-search"></span>Scanning full database for duplicates…');
-  let allRows=[], from=0, batchSize=1000, keepFetching=true;
+  // [v23.177] Finds the same order line saved twice, including an order saved both as "#1234" (Shopify) and "1234" (the ShipStation import), and discount codes that an import saved as if they were
+  // products. Before any row is deleted, whatever the row being KEPT is missing (tracking, dealer code, Shopify order id, price paid, customer, ship-to) is copied onto it from the duplicates.
+  prog('<span class="ic ic-search"></span>Scanning full database for duplicates\u2026');
+  var BASE='id,order_number,pn,fulfillment_status,tracking_number,carrier,shipped_at,sale_date,qty,source,created_at';
+  var EXTRA=',discount_code,shopify_order_id,shopify_line_item_id,financial_status,unit_price,price_source,customer_name,customer_email,shipping_city,shipping_province';
+  var cols=BASE+EXTRA,hasExtra=true,allRows=[],from=0,batchSize=1000,keepFetching=true;
   while(keepFetching){
-    const{data,error}=await db.from('sales')
-      .select('id,order_number,pn,fulfillment_status,tracking_number,carrier,shipped_at,sale_date,qty,source,created_at')
-      .not('order_number','is',null)
-      .order('created_at',{ascending:true})
-      .range(from,from+batchSize-1);
-    if(error){toast('Error scanning: '+error.message);return;}
+    var q=await db.from('sales').select(cols).not('order_number','is',null).order('created_at',{ascending:true}).range(from,from+batchSize-1);
+    if(q.error&&hasExtra&&from===0&&!allRows.length){hasExtra=false;cols=BASE;continue;}   // an older database that lacks some optional columns: scan with the basics
+    if(q.error){toast('Error scanning: '+q.error.message);return;}
+    var data=q.data;
     if(!data||data.length===0)break;
-    allRows=[...allRows,...data];
+    for(var di=0;di<data.length;di++)allRows.push(data[di]);
     if(data.length<batchSize)keepFetching=false;
     else from+=batchSize;
-    if(allRows.length%5000===0)prog(`Scanned ${allRows.length} rows…`);
+    if(allRows.length%5000===0)prog('Scanned '+allRows.length+' rows\u2026');
   }
-  prog(`Scanned ${allRows.length} total rows`);
+  prog('Scanned '+allRows.length+' total rows');
 
-  const rank={'Delivered':6,'Shipped':5,'Packed':4,'Partial':3,'On Hold':2,'Open':1,'Refunded':0,'Cancelled':0};
-  const groups={};
-  allRows.forEach(s=>{
-    const k=(s.order_number||'')+'||'+(s.pn||'');
+  var norm=function(n){return String(n==null?'':n).replace(/^#+/,'').trim().toLowerCase();};
+  var canon=function(pn){return ((typeof _canonItem==='function'&&_canonItem(pn))||{}).pn?String(_canonItem(pn).pn).toUpperCase():String(pn||'').toUpperCase();};
+  var isCatalog=function(pn){return typeof _canonItem==='function'&&!!_canonItem(pn);};
+  // discount codes saved as products: not in the catalog, and either the order's own discount code or a dealer's order code. Only when the order has at least one real line besides.
+  var codesBy={};allRows.forEach(function(r){var c=String(r.discount_code||'').trim().toUpperCase();if(c)(codesBy[norm(r.order_number)]=codesBy[norm(r.order_number)]||{})[c]=1;});
+  var looksLikeCode=function(r){
+    var u=String(r.pn||'').trim().toUpperCase();if(!u||isCatalog(r.pn))return false;
+    var set=codesBy[norm(r.order_number)];if(set&&set[u])return true;
+    return !!(typeof dlMatchDealer==='function'&&dlMatchDealer(String(r.pn).trim(),S.dealers||[]));
+  };
+  var realCount={};allRows.forEach(function(r){if(!looksLikeCode(r))realCount[norm(r.order_number)]=(realCount[norm(r.order_number)]||0)+1;});
+  var codeLineIds=[],rest=[];
+  allRows.forEach(function(r){if(looksLikeCode(r)&&realCount[norm(r.order_number)]>0)codeLineIds.push(r.id);else rest.push(r);});
+
+  var rank={'Delivered':6,'Shipped':5,'Packed':4,'Partial':3,'On Hold':2,'Open':1,'Refunded':0,'Cancelled':0};
+  var groups={};
+  rest.forEach(function(s){
+    var k=norm(s.order_number)+'||'+canon(s.pn);
     (groups[k]=groups[k]||[]).push(s);
   });
-  const dupes=Object.values(groups).filter(g=>g.length>1);
+  var dupes=Object.values(groups).filter(function(g){return g.length>1;});
 
-  if(!dupes.length){toast('<span class="ic ic-check"></span>No duplicates found — all order lines are unique');return;}
+  if(!dupes.length&&!codeLineIds.length){toast('<span class="ic ic-check"></span>No duplicates found \u2014 all order lines are unique');return;}
 
-  const totalExtra=dupes.reduce((t,g)=>t+g.length-1,0);
-  const trackingGroups=dupes.filter(g=>g.some(r=>r.tracking_number)).length;
+  var totalExtra=dupes.reduce(function(t,g){return t+g.length-1;},0);
+  var mixed=dupes.filter(function(g){return new Set(g.map(function(r){return String(r.order_number||'').charAt(0)==='#';})).size>1;}).length;
+  var trackingGroups=dupes.filter(function(g){return g.some(function(r){return r.tracking_number;});}).length;
+  var totalDelete=totalExtra+codeLineIds.length;
 
   if(!confirm(
-    `Found ${totalExtra} duplicate line${totalExtra>1?'s':''} across ${dupes.length} order+SKU combinations.\n\n`+
-    (trackingGroups?`<span class="ic ic-box"></span>Tracking numbers will be rescued to the surviving row.\n\n`:'')+
-    `The row with the highest fulfillment status (or tracking number) is kept.\nAll others are deleted.\n\n`+
-    `Proceed? This will delete ${totalExtra} rows.`
+    (totalExtra?'Found '+totalExtra+' duplicate line'+(totalExtra>1?'s':'')+' across '+dupes.length+' order+SKU combinations'+(mixed?' ('+mixed+' of them the same order saved both as #1234 and 1234)':'')+'.\n\n':'')+
+    (codeLineIds.length?'Found '+codeLineIds.length+' line'+(codeLineIds.length>1?'s':'')+' that are only a discount code saved as if it were a product.\n\n':'')+
+    'The row with the highest fulfillment status (or tracking number) is kept. Anything the kept row is missing (tracking, dealer code, Shopify order id, price paid, customer, ship-to) is copied onto it first, then the others are deleted.\n\n'+
+    (trackingGroups?'Tracking numbers will be rescued to the surviving row.\n\n':'')+
+    'Proceed? This will delete '+totalDelete+' rows.'
   ))return;
 
-  const idsToDelete=[];
-  const trackingPatches=[]; // [{id, tracking_number, carrier, shipped_at}]
+  var idsToDelete=codeLineIds.slice();
+  var patches=[]; // [{id, fields, tracking}]
+  var MERGE=['discount_code','shopify_order_id','shopify_line_item_id','financial_status','customer_name','customer_email','shipping_city','shipping_province'];
+  var empty=function(v){return v===null||v===undefined||String(v).trim()==='';};
 
-  for(const g of dupes){
-    g.sort((a,b)=>{
-      const ta=a.tracking_number?1:0, tb=b.tracking_number?1:0;
+  dupes.forEach(function(g){
+    g.sort(function(a,b){
+      var ta=a.tracking_number?1:0, tb=b.tracking_number?1:0;
       if(tb!==ta)return tb-ta;
-      const ra=rank[a.fulfillment_status||'Open']||0, rb=rank[b.fulfillment_status||'Open']||0;
+      var ra=rank[a.fulfillment_status||'Open']||0, rb=rank[b.fulfillment_status||'Open']||0;
       if(rb!==ra)return rb-ra;
       return new Date(a.created_at)-new Date(b.created_at); // oldest wins (original record)
     });
-    const winner=g[0];
-    const losers=g.slice(1);
-
+    var winner=g[0],losers=g.slice(1),fields={},tracking=false;
     if(!winner.tracking_number){
-      const donor=losers.find(l=>l.tracking_number);
-      if(donor)trackingPatches.push({id:winner.id,tracking_number:donor.tracking_number,carrier:donor.carrier||null,shipped_at:donor.shipped_at||winner.shipped_at,fulfillment_status:donor.fulfillment_status||winner.fulfillment_status});
+      var donor=losers.find(function(l){return l.tracking_number;});
+      if(donor){fields.tracking_number=donor.tracking_number;fields.carrier=donor.carrier||null;fields.shipped_at=donor.shipped_at||winner.shipped_at;fields.fulfillment_status=donor.fulfillment_status||winner.fulfillment_status;tracking=true;}
     }
-    losers.forEach(l=>idsToDelete.push(l.id));
-  }
+    if(hasExtra){
+      MERGE.forEach(function(f){if(empty(winner[f])){var d=losers.find(function(l){return !empty(l[f]);});if(d)fields[f]=d[f];}});
+      if(empty(winner.unit_price)){var dp=losers.find(function(l){return !empty(l.unit_price);});if(dp){fields.unit_price=dp.unit_price;fields.price_source=dp.price_source||'shopify';}}
+    }
+    if(Object.keys(fields).length)patches.push({id:winner.id,fields:fields,tracking:tracking});
+    losers.forEach(function(l){idsToDelete.push(l.id);});
+  });
 
-  // [FIX] This copies tracking from a duplicate onto the row being kept, then deletes the
-  // duplicates. The copy was unchecked and counted as rescued regardless, and the deletion below
-  // ran unconditionally - so when a copy failed, the duplicate still got deleted, and it was the
-  // ONLY row holding that tracking number. Permanent data loss, reported as "rescued". Any failed
-  // rescue now stops the run before a single row is deleted: dedupe is a maintenance action that is
-  // trivially re-run once the cause is fixed, and not deleting is always recoverable.
-  let rescued=0;
-  const rescueFails=[];
-  for(const patch of trackingPatches){
-    const{id,...fields}=patch;
-    const r=await db.from('sales').update(fields).eq('id',id);
-    if(r.error){rescueFails.push(id+': '+r.error.message);continue;}
-    rescued++;
+  // [FIX] This copies information from a duplicate onto the row being kept, then deletes the duplicates. Any failed copy stops the run before a single row is deleted: dedupe is a
+  // maintenance action that is trivially re-run once the cause is fixed, and not deleting is always recoverable.
+  var rescued=0,merged=0;
+  var rescueFails=[];
+  for(var pi=0;pi<patches.length;pi++){
+    var pt=patches[pi];
+    var r=await db.from('sales').update(pt.fields).eq('id',pt.id);
+    if(r.error){rescueFails.push(pt.id+': '+r.error.message);continue;}
+    if(pt.tracking)rescued++;
+    if(Object.keys(pt.fields).some(function(k){return k!=='tracking_number'&&k!=='carrier'&&k!=='shipped_at'&&k!=='fulfillment_status';}))merged++;
   }
-  if(rescued)prog(`Rescued tracking on ${rescued} rows`);
+  if(rescued)prog('Rescued tracking on '+rescued+' rows');
   if(rescueFails.length){
-    console.warn('[dedupe] tracking rescue failed, deletion aborted:',rescueFails);
+    console.warn('[dedupe] copying onto the kept row failed, deletion aborted:',rescueFails);
     await refreshSales();render();
-    toast('\u26a0 Dedupe stopped before deleting anything: '+rescueFails.length+' tracking number'
-      +(rescueFails.length!==1?'s':'')+' could not be copied to the kept row, and deleting now would lose '
-      +(rescueFails.length!==1?'them':'it')+'. No rows were removed. ('+rescueFails[0]+')',12000);
+    toast('\u26a0 Dedupe stopped before deleting anything: '+rescueFails.length+' row'
+      +(rescueFails.length!==1?'s':'')+' could not be updated with the information from its duplicate, and deleting now would lose it. No rows were removed. ('+rescueFails[0]+')',12000);
     return;
   }
 
-  prog(`Deleting ${idsToDelete.length} duplicate rows…`);
-  const CHUNK=200;
-  let deleted=0;
-  for(let i=0;i<idsToDelete.length;i+=CHUNK){
-    const batch=idsToDelete.slice(i,i+CHUNK);
-    const{error}=await db.from('sales').delete().in('id',batch);
-    if(error){toast('Delete error: '+error.message);break;}
+  prog('Deleting '+idsToDelete.length+' duplicate rows\u2026');
+  var CHUNK=200;
+  var deleted=0;
+  for(var i=0;i<idsToDelete.length;i+=CHUNK){
+    var batch=idsToDelete.slice(i,i+CHUNK);
+    var dr=await db.from('sales').delete().in('id',batch);
+    if(dr.error){toast('Delete error: '+dr.error.message);break;}
     deleted+=batch.length;
-    if(idsToDelete.length>500)prog(`Deleted ${deleted} of ${idsToDelete.length}…`);
+    if(idsToDelete.length>500)prog('Deleted '+deleted+' of '+idsToDelete.length+'\u2026');
   }
 
   await refreshSales();
   render();
-  toast(`<span class="ic ic-check"></span>Cleaned up ${deleted} duplicate${deleted!==1?'s':''}${rescued?' · rescued tracking on '+rescued+' orders':''}`);
+  toast('<span class="ic ic-check"></span>Cleaned up '+deleted+' duplicate'+(deleted!==1?'s':'')+(codeLineIds.length?' (including '+codeLineIds.length+' discount-code line'+(codeLineIds.length!==1?'s':'')+')':'')+(rescued?' \u00b7 rescued tracking on '+rescued+' orders':'')+(merged?' \u00b7 copied the dealer code, Shopify id, price or customer onto '+merged+' kept row'+(merged!==1?'s':''):''));
 }
 
 async function closeHistoricalOrders(){
@@ -14683,7 +14701,7 @@ async function voidSweep(): Promise&lt;any&gt; {
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.109'
+const EDGE_BUILD = 'v23.110'
 const _gateLogged: Record&lt;string, number&gt; = {}
 async function authGate(req: Request, fn: string, action: string): Promise&lt;Response | null&gt; {
   const mode = (Deno.env.get('EDGE_AUTH_MODE') || 'log').toLowerCase()
@@ -15465,6 +15483,7 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
       for (const order of missing) {
         const fs = fsMap[order.orderStatus] || 'Open'
         for (const item of (order.items || [])) {
+          if (item.adjustment) { console.log('[SS] ss_order_audit: skipping discount/adjustment line', order.orderNumber, (item.name || '')); continue }   // v23.110: a discount code is not a product
           const pn = item.sku ? item.sku.trim().toUpperCase() : (item.name || '').trim()
           if (!pn) continue
           const _auditQty = ssItemQty(item)
@@ -32779,7 +32798,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.88','shipstation-ship':'v23.109','ops-cron':'v1.4','customs-sync':'v1.0','customs-fill':'v1.5','po-email':'v1.3'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.88','shipstation-ship':'v23.110','ops-cron':'v1.4','customs-sync':'v1.0','customs-fill':'v1.5','po-email':'v1.3'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
@@ -43684,11 +43703,14 @@ async function hpInsertHistory(rows){
   var canon=function(pn){return ((_canonItem(pn)||{}).pn||pn||'').toUpperCase();};
   for(var i=0;i<rows.length;i+=200){
     var batch=rows.slice(i,i+200);
-    var names=[...new Set(batch.map(function(r){return r.order_number;}))];
+    // [v23.177] An order can be saved as "#1234" (Shopify) or "1234" (the ShipStation import saves it without the #). Look for both, and skip an order that is already here under the other spelling.
+    var names=[...new Set(batch.reduce(function(a,r){var n=String(r.order_number||'');a.push(n,n.replace(/^#+/,''),'#'+n.replace(/^#+/,''));return a;},[]))];
     var ex=await db.from('sales').select('order_number,pn').in('order_number',names);
     if(ex.error)throw new Error('duplicate check failed: '+ex.error.message);
     var have=new Set((ex.data||[]).map(function(r){return r.order_number+'|'+canon(r.pn);}));
-    var ins=batch.filter(function(r){var k=r.order_number+'|'+canon(r.pn);if(have.has(k)){out.dupes++;return false;}have.add(k);return true;});
+    var existingNames=new Set((ex.data||[]).map(function(r){return r.order_number;}));
+    var altOf=function(n){n=String(n||'');return n.charAt(0)==='#'?n.replace(/^#+/,''):'#'+n;};
+    var ins=batch.filter(function(r){if(existingNames.has(altOf(r.order_number))){out.dupes++;out.altSpelling=(out.altSpelling||0)+1;return false;}var k=r.order_number+'|'+canon(r.pn);if(have.has(k)){out.dupes++;return false;}have.add(k);return true;});
     if(!ins.length)continue;
     var res=await db.from('sales').insert(ins);
     if(res.error)throw new Error('insert failed: '+res.error.message);
@@ -43837,7 +43859,7 @@ async function _hpFillApply(byCode,st){
   for(var i=0;i<codes.length;i++){
     var names=byCode[codes[i]];
     for(var j=0;j<names.length;j+=40){
-      var r=await db.from('sales').update({discount_code:codes[i]}).in('order_number',names.slice(j,j+40)).is('discount_code',null).select('id');
+      var r=await db.from('sales').update({discount_code:codes[i]}).in('order_number',_hpBothSpellings(names.slice(j,j+40))).is('discount_code',null).select('id');
       if(r.error)throw new Error('update failed: '+r.error.message);
       st.updated+=(r.data||[]).length;
     }
@@ -43846,29 +43868,31 @@ async function _hpFillApply(byCode,st){
 // [v23.175] The dealer portal shows what a dealer was charged by reading the Shopify order, which it finds by the order's Shopify order id. History imports used to save the order number but not that id,
 // so those orders could only say "pricing...". New imports save it, and this repair (Fill in from Shopify) now fills it in on lines already imported: only history lines with NO id are touched, and only the id is added.
 // [v23.176] Any order line, whatever brought it in (the history importer, a CSV, a ShipStation import, an older bulk sync), that has no Shopify order id, or no recorded price, from the chosen date on.
+function _hpBare(n){return String(n==null?'':n).replace(/^#+/,'');}
+function _hpBothSpellings(list){var o={};(list||[]).forEach(function(n){n=String(n||'');if(!n)return;o[n]=1;o[_hpBare(n)]=1;o['#'+_hpBare(n)]=1;});return Object.keys(o);}   // [v23.177] 9375 and #9375 are the same order
 async function _hpNeedIds(from){
   var set={};
-  try{var rows=await fetchAll(function(a,b){return db.from('sales').select('order_number').is('shopify_order_id',null).gte('sale_date',from).range(a,b);});(rows||[]).forEach(function(r){if(r.order_number)set[r.order_number]=1;});}catch(e){}
+  try{var rows=await fetchAll(function(a,b){return db.from('sales').select('order_number').is('shopify_order_id',null).gte('sale_date',from).range(a,b);});(rows||[]).forEach(function(r){if(r.order_number)set[_hpBare(r.order_number)]=1;});}catch(e){}
   return set;
 }
 async function _hpNeedPrices(from){
   var set={};
-  try{var rows=await fetchAll(function(a,b){return db.from('sales').select('order_number').is('unit_price',null).is('price_source',null).gte('sale_date',from).range(a,b);});(rows||[]).forEach(function(r){if(r.order_number)set[r.order_number]=1;});}catch(e){}   // no unit_price column yet: nothing to fill
+  try{var rows=await fetchAll(function(a,b){return db.from('sales').select('order_number').is('unit_price',null).is('price_source',null).gte('sale_date',from).range(a,b);});(rows||[]).forEach(function(r){if(r.order_number)set[_hpBare(r.order_number)]=1;});}catch(e){}   // no unit_price column yet: nothing to fill
   return set;
 }
 // The price ACTUALLY PAID per unit (what the dealer was charged, net of discounts) from the Shopify order, put on lines that have none. Only lines with no price yet, and only the price.
 // The dealer portal uses it to show an order's amount when it cannot read the Shopify order itself.
 async function _hpFillPrices(orders,need,st){
-  var todo=(orders||[]).filter(function(o){return o&&!o.cancelled_at&&need[o.name];});if(!todo.length)return;
+  var todo=(orders||[]).filter(function(o){return o&&!o.cancelled_at&&need[_hpBare(o.name)];});if(!todo.length)return;
   var canon=function(pn){return ((_canonItem(pn)||{}).pn||pn||'').toUpperCase();};
   for(var i=0;i<todo.length;i+=100){
-    var chunk=todo.slice(i,i+100),names=chunk.map(function(o){return o.name;});
+    var chunk=todo.slice(i,i+100),names=_hpBothSpellings(chunk.map(function(o){return o.name;}));
     var ex=await db.from('sales').select('id,order_number,pn').in('order_number',names).is('unit_price',null).is('price_source',null);
     if(ex.error)throw new Error('price lookup failed: '+ex.error.message);
-    var by={};(ex.data||[]).forEach(function(r){(by[r.order_number]=by[r.order_number]||[]).push(r);});
+    var by={};(ex.data||[]).forEach(function(r){var bk=_hpBare(r.order_number);(by[bk]=by[bk]||[]).push(r);});
     var jobs=[];
     chunk.forEach(function(o){
-      var rows=by[o.name];if(!rows||!rows.length)return;
+      var rows=by[_hpBare(o.name)];if(!rows||!rows.length)return;
       var unit={};(o.line_items||[]).forEach(function(li){var sku=String(li.sku||'').trim();if(!sku||li.gift_card)return;var k=canon(sku);if(k in unit)return;var u=shopifyLineUnitPrice(li);if(u!=null)unit[k]=u;});   // the first line of a SKU, like the importer
       rows.forEach(function(r){var u=unit[canon(r.pn)];if(u!==undefined)jobs.push({id:r.id,u:u});});
     });
@@ -43879,9 +43903,9 @@ async function _hpFillPrices(orders,need,st){
   }
 }
 async function _hpFillIds(orders,need,st){
-  var todo=(orders||[]).filter(function(o){return o&&o.id!=null&&!o.cancelled_at&&need[o.name];});
+  var todo=(orders||[]).filter(function(o){return o&&o.id!=null&&!o.cancelled_at&&need[_hpBare(o.name)];});
   for(var i=0;i<todo.length;i+=8){
-    var rs=await Promise.all(todo.slice(i,i+8).map(function(o){return db.from('sales').update({shopify_order_id:String(o.id)}).eq('order_number',o.name).is('shopify_order_id',null).select('id');}));
+    var rs=await Promise.all(todo.slice(i,i+8).map(function(o){return db.from('sales').update({shopify_order_id:String(o.id)}).in('order_number',_hpBothSpellings([o.name])).is('shopify_order_id',null).select('id');}));
     rs.forEach(function(r){if(r.error)throw new Error('update failed: '+r.error.message);st.ids+=(r.data||[]).length;});
   }
 }
