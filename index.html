@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.182';
+const TGK_ERP_VERSION = 'v23.183';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -9026,6 +9026,80 @@ async function promoPersist(key,value){
 }
 // [v23.174] an order a staff member placed FOR the dealer in the dealer portal (server v1.27+)
 function dsStaffChip(r){var by=r&&r.totals&&r.totals.placed_by_staff;return by?' <span class="pill pill-muted" title="'+escHtml('Placed for the dealer by '+by+' in the dealer portal')+'">STAFF</span>':'';}
+/* ================= [v23.183] EXPRESS SHIPPING (dealer portal) =================
+   Dealers can choose UPS Next Day Air or 2nd Day Air at checkout, priced by ShipStation (exactly its quote) for their cart and address, instead of their flat rate. This is where staff switch it on, say where orders ship
+   from and when the Next Day cutoff is (1:00 PM Central), and CHECK that it works: ShipStation connected, a sample quote, and which orderable products still lack a weight in ShipStation or a box size on their bill of
+   materials (a cart with such a product is simply not offered express). Needs dealer-portal v1.30 or newer. Settings are saved as dealer_express. */
+function exCfg(){var v=S.settings&&S.settings.dealer_express;if(typeof v==='string'){try{v=JSON.parse(v);}catch(e){v=null;}}return (v&&typeof v==='object'&&!Array.isArray(v))?v:{};}
+function exState(){return S._ex||(S._ex={chk:null,loading:false,err:''});}
+function openExpressSettings(){
+  var old=document.getElementById('ex-ov');if(old)old.remove();
+  S._ex={chk:null,loading:false,err:''};
+  var ov=document.createElement('div');ov.id='ex-ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100002;display:flex;align-items:center;justify-content:center;padding:20px';
+  ov.innerHTML='<div id="ex-box" style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(860px,96vw);max-height:92vh;overflow:auto;padding:16px 20px">'+exFormHtml()+'<div id="ex-out"></div></div>';
+  ov.addEventListener('mousedown',function(e){if(e.target===ov)exClose();});
+  document.body.appendChild(ov);
+}
+function exClose(){var ov=document.getElementById('ex-ov');if(ov)ov.remove();}
+function exFormHtml(){
+  var c=exCfg(),adm=S.currentRole==='admin',dis=adm?'':' disabled',cut=Number(c.next_day_cutoff_hour)||13;
+  var hrs='';for(var h=9;h<=17;h++)hrs+='<option value="'+h+'"'+(h===cut?' selected':'')+'>'+((h%12)||12)+':00 '+(h>=12?'PM':'AM')+' Central</option>';
+  var chk=function(id,on,label){return '<label style="display:flex;gap:8px;align-items:center;font-size:var(--t-md)"><input type="checkbox" id="'+id+'"'+(on?' checked':'')+dis+'> '+label+'</label>';};
+  return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px"><div style="font-size:var(--t-lg);font-weight:700;flex:1">Express shipping for dealers</div><button class="btn btn-sm" onclick="exClose()">Close</button></div>'
+   +'<div class="t3s" style="line-height:1.55;margin-bottom:12px">Lets a dealer choose <b>UPS Next Day Air</b> or <b>2nd Day Air</b> at portal checkout. The price is what <b>ShipStation quotes</b> for their cart and address (no markup), instead of the dealer flat rate. US addresses only, never a PO box. Next Day is offered only before the cutoff on business days; 2nd Day always says when it ships. A cart with a product that has no weight in ShipStation or no box size on its bill of materials is not offered express (Standard still works).</div>'
+   +'<div style="display:grid;gap:12px">'+chk('ex-on',c.enabled===true,'<b>Offer express shipping</b> in the dealer portal')
+   +'<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end"><label style="font-size:var(--t-sm)">Ship from ZIP<br><input id="ex-zip" class="form-input" style="width:110px" maxlength="5" value="'+escHtml(String(c.from_zip||''))+'" placeholder="75201"'+dis+'></label>'
+   +'<label style="font-size:var(--t-sm)">Next Day cutoff<br><select id="ex-cut" class="form-input"'+dis+'>'+hrs+'</select></label>'
+   +'<label style="font-size:var(--t-sm)">Packaging added per box (oz)<br><input id="ex-pkg" type="number" min="0" step="1" class="form-input" style="width:110px" value="'+escHtml(String(c.pkg_oz!=null?c.pkg_oz:16))+'"'+dis+'></label></div>'
+   +'<div style="display:flex;gap:18px;flex-wrap:wrap">'+chk('ex-next',c.next_day!==false,'Offer Next Day Air')+chk('ex-second',c.second_day!==false,'Offer 2nd Day Air')+chk('ex-res',c.residential_dropship!==false,'Rate drop-ship orders as residential')+'</div></div>'
+   +'<div style="display:flex;gap:10px;margin:14px 0 6px;flex-wrap:wrap"><button class="btn btn-teal"'+dis+' onclick="exSave()">Save</button><button class="btn" onclick="exCheck()" title="Saves, then asks ShipStation for a sample quote and checks every orderable product">Check it works</button></div>'
+   +(adm?'':'<div class="t3xs">Only an admin can change these settings.</div>');
+}
+function exRead(){
+  var v=function(id){var e=document.getElementById(id);return e?e.value:'';},b=function(id){var e=document.getElementById(id);return !!(e&&e.checked);};
+  var pkg=parseFloat(v('ex-pkg'));
+  return {enabled:b('ex-on'),from_zip:String(v('ex-zip')).trim().slice(0,5),next_day_cutoff_hour:parseInt(v('ex-cut'),10)||13,pkg_oz:isFinite(pkg)&&pkg>=0?pkg:16,next_day:b('ex-next'),second_day:b('ex-second'),residential_dropship:b('ex-res')};
+}
+async function exSave(quiet){
+  if(S.currentRole!=='admin'){toast('Ask an admin to change this');return false;}
+  var c=exRead();
+  if(c.enabled&&!/^\d{5}$/.test(c.from_zip)){toast('Enter the 5-digit ZIP code your orders ship from');return false;}
+  if(c.enabled&&!c.next_day&&!c.second_day){toast('Offer at least one of Next Day Air and 2nd Day Air');return false;}
+  var ok=await promoPersist('dealer_express',c);
+  if(ok&&!quiet)toast('<span class="ic ic-check"></span>Express shipping '+(c.enabled?'is on':'is off')+'. Saved.',5000);
+  return ok;
+}
+async function exCheck(){
+  var st=exState();if(st.loading)return;
+  if(S.currentRole==='admin'&&!(await exSave(true)))return;
+  st.loading=true;st.err='';st.chk=null;exRedrawRes();
+  try{st.chk=await _dsFn({action:'express_check'});}
+  catch(e){var m=(e&&e.message)||String(e);st.err=/unknown action/i.test(m)?'The dealer-portal function is too old: update it to v1.30 or newer (Supabase, Edge Functions, dealer-portal).':m;}
+  st.loading=false;exRedrawRes();
+}
+function exRedrawRes(){var e=document.getElementById('ex-out');if(e)e.innerHTML=exResHtml();}
+function exResHtml(){
+  var st=exState(),c=st.chk;if(st.loading)return '<div class="t3s" style="padding:14px 0">Checking ShipStation&hellip; this reads every product&rsquo;s weight, so it can take a few seconds.</div>';
+  if(st.err)return '<div class="panel" style="padding:10px 12px;margin-top:10px;border-left:3px solid var(--red);font-size:var(--t-sm)">'+escHtml(st.err)+'</div>';
+  if(!c)return '';
+  var li=function(good,txt){return '<div style="display:flex;gap:8px;align-items:flex-start;font-size:var(--t-sm);margin:3px 0"><span style="color:var(--'+(good?'teal':'red')+');font-weight:800">'+(good?'&#10003;':'&#10007;')+'</span><span>'+txt+'</span></div>';};
+  var h='<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)"><div style="font-weight:700;margin-bottom:4px">Check (dealer-portal '+escHtml(String(c.build||''))+')</div>';
+  (c.problems||[]).forEach(function(p){h+=li(false,escHtml(p));});
+  if((c.carriers||[]).length)h+=li(true,'UPS in ShipStation: <span style="font-family:var(--mono)">'+(c.carriers||[]).map(escHtml).join(', ')+'</span>');
+  if((c.sample||[]).length){h+=li(c.sample.every(function(x){return x.amount!=null;}),(c.sample_note?escHtml(c.sample_note)+': ':'Sample: ')+c.sample.map(function(x){return escHtml(x.service)+' '+(x.amount!=null?'<b>'+rcMoney(x.amount)+'</b>':'<span style="color:var(--red)">'+escHtml(x.error||'no rate')+'</span>');}).join(' &middot; '));}
+  var cv=c.coverage;
+  if(cv){
+    h+=li(cv.ready===cv.total&&cv.total>0,'<b>'+cv.ready+' of '+cv.total+'</b> orderable products are ready for express (weight in ShipStation and a box size on the bill of materials).');
+    var chips=function(list,total){return '<div style="display:flex;flex-wrap:wrap;gap:4px;margin:4px 0 8px 22px">'+list.map(function(x){return '<span style="font-family:var(--mono);font-size:var(--t-xs);background:var(--bg3);padding:1px 6px;border-radius:var(--r-sm)">'+escHtml(x)+'</span>';}).join('')+(total>list.length?'<span class="t3xs">and '+(total-list.length)+' more</span>':'')+'</div>';};
+    if(cv.missing_weight)h+=li(false,'<b>'+cv.missing_weight+'</b> have no weight in ShipStation (ShipStation, Products, weight):')+chips(cv.no_weight||[],cv.missing_weight);
+    if(cv.missing_box)h+=li(false,'<b>'+cv.missing_box+'</b> have no box size on their bill of materials (a box part with length, width and height):')+chips(cv.no_box||[],cv.missing_box);
+  }
+  if(!c.problems||!c.problems.length)h+=li(c.enabled&&c.configured,c.enabled?(c.configured?'Express shipping is <b>on</b>: dealers will see it at checkout once their cart has only ready products.':'It is switched on but not complete (see above).'):'Express shipping is <b>off</b>: tick &ldquo;Offer express shipping&rdquo; and Save to turn it on.');
+  return h+'</div>';
+}
+window.openExpressSettings=openExpressSettings;window.exClose=exClose;window.exSave=exSave;window.exCheck=exCheck;
+// [v23.183] an order a dealer chose express shipping for (server v1.30+)
+function dsExpressChip(r){var sv=r&&r.shipping&&r.shipping.service;if(!sv)return '';var lab=sv.code==='ups_next_day_air'?'NEXT DAY':sv.code==='ups_2nd_day_air'?'2ND DAY':'EXPRESS';return ' <span class="pill pill-orange" title="'+escHtml(sv.name+' ('+dsMoney(r.shipping.amount)+'): ships '+(sv.ships||'')+', estimated arrival '+(sv.arrives||''))+'">'+lab+'</span>';}
 function dsOfferChip(r){
  var o=r&&r.totals&&r.totals.offer;if(!o)return '';
  return ' <span class="pill pill-orange" title="'+escHtml((o.kind==='stocking'?'Stocking order':'Promotion')+': '+o.pct+'% off MSRP. Saved the dealer '+dsMoney(o.saved_vs_normal)+' compared with their usual prices')+'">'+(o.kind==='stocking'?'STOCKING ORDER':'PROMO: '+escHtml(String(o.name||'').toUpperCase()))+' '+o.pct+'%</span>';
@@ -10710,6 +10784,7 @@ function dlShellHtml(tab,totalVisits){
   +(rcCardDealers().length?'<button class="btn btn-sm" id="dl-rc-btn" onclick="openReadyToCharge()" title="POs for card-on-file dealers whose last item has shipped and that are not marked paid yet">&#128179; Ready to charge'+(rcReadyOffline().ready.length?' <span class="pill pill-orange">'+rcReadyOffline().ready.length+'</span>':'')+'</button>':'')
   +'<button class="btn btn-sm" id="dl-bp-btn" onclick="openBulkPOs()" title="Mark every dealer PO that shipped before a date as paid or closed in one go (for example the old orders brought in by the history import)">&#9745; Mark old POs</button>'
   +'<button class="btn btn-sm" onclick="openPromos()" title="Dealer promotions and the stocking order discount">&#127991; Promotions</button>'
+  +'<button class="btn btn-sm" id="dl-ex-btn" onclick="openExpressSettings()" title="Let dealers choose UPS Next Day or 2nd Day at checkout, priced by ShipStation">&#128666; Express shipping'+(exCfg().enabled===true?' <span class="pill pill-green">on</span>':'')+'</button>'
   +'<button class="btn btn-sm btn-teal" onclick="openDealerBlast()" title="Email all active dealers (BCC)">&#9993; Email Dealers</button>'
   +'<button class="btn btn-sm btn-primary" onclick="dnOpen()" title="Fitment updates, pre-order, out of stock, stop sell - templates, send and log">&#128227; Dealer Notices</button>'
   +(totalVisits>0?'<button class="btn btn-sm" onclick="showAllVisitLog()" title="View all dealer visits"><span class="ic ic-chart"></span>All Visits ('+totalVisits+')</button>':'')
@@ -36476,13 +36551,13 @@ function dsReview(r){
     return '<tr><td class="pn" style="white-space:nowrap">'+escHtml(l.sku)+'</td><td>'+escHtml(l.desc||'')+(l.special?' <span class="pill pill-orange">special</span>':'')+'</td><td>'+(editable?'<input type="number" class="form-input" style="width:76px" min="1" value="'+(ed[l.sku]||l.qty)+'" onchange="dsEditQty(this.dataset.s,this.value)" data-s="'+escHtml(l.sku)+'">':l.qty)+'</td><td><b>'+dsMoney(l.unit)+'</b></td><td class="t3s">'+dsMoney(l.std)+'</td><td style="font-weight:800;color:'+(bad?'var(--red)':'var(--green)')+'">'+(mg===null?'&mdash;':mg+'%')+'</td><td style="color:'+(noStock?'var(--text3)':shN?'var(--red)':bdN?'var(--orange)':'var(--green)')+';font-weight:700">'+(noStock?'&mdash;':shN?shN+' short':bdN?'build needed':'in stock')+'</td>'+(editable?'<td><button type="button" class="action-btn del" data-s="'+escHtml(l.sku)+'" onclick="dsDelLine(this.dataset.s)" aria-label="Remove line">&times;</button></td>':'')+'</tr>';
   }).join('');
   var sh=r.ship_to||{},tt=r.totals||{},link=dsShopifyLink(r);
-  return '<div class="panel" style="padding:0;margin-bottom:12px;border-left:3px solid var(--teal);white-space:normal"><div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap"><div><b style="font-size:var(--t-lg,16px)">'+(r.po_number?'PO '+escHtml(r.po_number):'Order with no PO')+'</b> &middot; '+escHtml(r.dealer_name||'')+' '+dsStatusPillFor(r)+dsOfferChip(r)+dsStaffChip(r)+'</div><div class="t3s">Submitted '+escHtml(new Date(r.created_at).toLocaleString())+'</div></div>'
+  return '<div class="panel" style="padding:0;margin-bottom:12px;border-left:3px solid var(--teal);white-space:normal"><div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap"><div><b style="font-size:var(--t-lg,16px)">'+(r.po_number?'PO '+escHtml(r.po_number):'Order with no PO')+'</b> &middot; '+escHtml(r.dealer_name||'')+' '+dsStatusPillFor(r)+dsOfferChip(r)+dsStaffChip(r)+dsExpressChip(r)+'</div><div class="t3s">Submitted '+escHtml(new Date(r.created_at).toLocaleString())+'</div></div>'
    +(r.error?'<div style="padding:10px 16px;background:rgba(220,38,38,.07);color:var(--red);font-size:var(--t-sm);border-bottom:1px solid var(--border)"><b>Why it did not go through:</b> '+escHtml(r.error)+'</div>':'')
    +(r.status==='rejected'&&r.reject_reason?'<div style="padding:10px 16px" class="t3s">Rejected: '+escHtml(r.reject_reason)+'</div>':'')
    +'<div class="tbl-wrap"><table><thead><tr>'+dsTh([['SKU',130],['Item'],['Qty',90],['Dealer price',104],['Standard',90],['Margin',80],['Stock',90]].concat(editable?[['',36]]:[]))+'</tr></thead><tbody>'+rowsH+'</tbody></table></div>'
    +'<div style="padding:12px 16px;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px 24px;font-size:var(--t-sm);white-space:normal;overflow-wrap:anywhere;line-height:1.45"><div><b>Ship to</b>'+(r.drop_ship?' <span class="pill pill-muted" title="Ships to the dealer\'s customer, not to the dealer">drop-ship</span>':'')+'<br>'+[sh.name,sh.address1,sh.address2,[[sh.city,sh.province].filter(Boolean).join(', '),sh.zip].filter(Boolean).join(' '),sh.country].filter(Boolean).map(escHtml).join('<br>')+'</div>'
    +'<div><b>Payment</b><br>'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</div><div><b>Totals</b><br>'+dsMoney(tt.merchandise)+' merchandise &middot; shipping '+(tt.shipping===null||tt.shipping===undefined?'<b style="color:var(--red)">not set</b>':dsMoney(tt.shipping))+' &middot; <b>'+dsMoney(tt.total)+'</b></div>'
-   +'<div><b>Order code</b><br><span class="pn">'+escHtml(r.discount_code||((d.po_code_prefix||'')+(r.po_number?' '+r.po_number:'')))+'</span>'+(r.shopify_order_name?'<br>Shopify '+escHtml(r.shopify_order_name):'')+'</div>'+(ship&&ship.total?'<div><b>Shipment</b><br>'+ship.shipped+' of '+ship.total+' unit'+(ship.total!==1?'s':'')+' shipped'+(ship.tracking.length?'<br>'+dsTrackHtml(ship,10):'')+'</div>':'')+((r.totals&&r.totals.placed_by_staff)?'<div><b>Placed by</b><br>'+escHtml(r.totals.placed_by_staff)+' <span class="t3xs">(staff, for the dealer)</span></div>':'')+((r.notes&&String(r.notes).trim()!==String(r.po_number||'').trim())?'<div style="grid-column:1/-1"><b>Dealer note</b><br>'+escHtml(r.notes)+'</div>':'')+'</div>'
+   +'<div><b>Order code</b><br><span class="pn">'+escHtml(r.discount_code||((d.po_code_prefix||'')+(r.po_number?' '+r.po_number:'')))+'</span>'+(r.shopify_order_name?'<br>Shopify '+escHtml(r.shopify_order_name):'')+'</div>'+(ship&&ship.total?'<div><b>Shipment</b><br>'+ship.shipped+' of '+ship.total+' unit'+(ship.total!==1?'s':'')+' shipped'+(ship.tracking.length?'<br>'+dsTrackHtml(ship,10):'')+'</div>':'')+((r.shipping&&r.shipping.service)?'<div><b>Shipping</b><br>'+escHtml(r.shipping.service.name)+' &middot; '+dsMoney(r.shipping.amount)+'<br><span class="t3xs">ships '+escHtml(r.shipping.service.ships||'')+' &middot; est. arrival '+escHtml(r.shipping.service.arrives||'')+'</span></div>':'')+((r.totals&&r.totals.placed_by_staff)?'<div><b>Placed by</b><br>'+escHtml(r.totals.placed_by_staff)+' <span class="t3xs">(staff, for the dealer)</span></div>':'')+((r.notes&&String(r.notes).trim()!==String(r.po_number||'').trim())?'<div style="grid-column:1/-1"><b>Dealer note</b><br>'+escHtml(r.notes)+'</div>':'')+'</div>'
    +dsGapNote(dsCodeGap(r))
    +'<div style="padding:12px 16px;background:var(--bg3);border-top:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap">'
    +(editable?'<button type="button" class="btn btn-teal" onclick="dsSend(DS.sel)"'+(DS.busy?' disabled':'')+'>'+(DS.busy?'Sending&hellip;':(r.status==='attention'?'Retry: send to Shopify':'Send to Shopify'))+'</button>':'')
@@ -36522,7 +36597,7 @@ function dsTableHtml(){
   if(!rows.length)return note+'<div class="panel section-empty">'+(DS.loading?'Loading&hellip;':(q?'No dealer orders match that search.':(DS.showRemoved?'Nothing has been removed.':(DS.filter&&DS.filter!=='all'&&DS.reqs.length?(DS.filter==='active'?'Nothing active right now. Shipped orders are under Shipped and All.':'Nothing here.'):'No dealer orders yet. They appear here when a dealer submits a PO from their shop.'))))+'</div>';
   return note+bulk+'<div class="panel" style="padding:0;overflow:hidden"><div class="tbl-wrap"><table class="ds-tight"><thead><tr><th style="width:30px"><input type="checkbox" aria-label="Select all" '+(allOn?'checked ':'')+'onchange="dsPickAll(this.checked)"></th>'+dsTh([['PO',132],['Dealer',190],['Submitted',122],['Units',62],['Total',84],['Payment',122],['Stock',104],['Status']])+'<th style="width:36px"></th></tr></thead><tbody>'
     +rows.map(function(r){var ship=dsShip(r),sn=dsStockNow(r,ship),t=r.totals||{},on=String(DS.sel)===String(r.id),nl=(r.lines||[]).length;
-      return '<tr style="cursor:pointer'+(on?';background:var(--bg3)':'')+'" onclick="dsSelect(\''+escHtml(r.id)+'\')"><td onclick="dsStop(event)"><input type="checkbox" aria-label="Select this order" '+(DS.pick[String(r.id)]?'checked ':'')+'onchange="dsPick(\''+escHtml(r.id)+'\',this.checked)"></td><td><b>'+escHtml(r.po_number||'No PO')+'</b></td><td>'+escHtml(r.dealer_name||'')+'</td><td class="t3s">'+escHtml(new Date(r.created_at).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}))+'</td><td title="'+nl+' line'+(nl===1?'':'s')+'">'+(t.units||0)+(nl>1?' <span class="t3xs">/ '+nl+' lines</span>':'')+'</td><td><b>'+dsMoney(t.total)+'</b></td><td class="t3s">'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</td><td style="color:'+sn.c+';font-weight:700;font-size:var(--t-sm)">'+sn.t+'</td><td style="max-width:none">'+dsStatusPillFor(r)+dsOfferChip(r)+dsStaffChip(r)+(ship&&ship.tracking.length?'<span class="t3xs" style="margin-left:8px">'+dsTrackHtml(ship,1).replace(/<br>/g,' ')+'</span>':'')+'</td>'
+      return '<tr style="cursor:pointer'+(on?';background:var(--bg3)':'')+'" onclick="dsSelect(\''+escHtml(r.id)+'\')"><td onclick="dsStop(event)"><input type="checkbox" aria-label="Select this order" '+(DS.pick[String(r.id)]?'checked ':'')+'onchange="dsPick(\''+escHtml(r.id)+'\',this.checked)"></td><td><b>'+escHtml(r.po_number||'No PO')+'</b></td><td>'+escHtml(r.dealer_name||'')+'</td><td class="t3s">'+escHtml(new Date(r.created_at).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}))+'</td><td title="'+nl+' line'+(nl===1?'':'s')+'">'+(t.units||0)+(nl>1?' <span class="t3xs">/ '+nl+' lines</span>':'')+'</td><td><b>'+dsMoney(t.total)+'</b></td><td class="t3s">'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</td><td style="color:'+sn.c+';font-weight:700;font-size:var(--t-sm)">'+sn.t+'</td><td style="max-width:none">'+dsStatusPillFor(r)+dsOfferChip(r)+dsStaffChip(r)+dsExpressChip(r)+(ship&&ship.tracking.length?'<span class="t3xs" style="margin-left:8px">'+dsTrackHtml(ship,1).replace(/<br>/g,' ')+'</span>':'')+'</td>'
         +'<td onclick="dsStop(event)">'+(DS.showRemoved?'<button type="button" class="action-btn" title="Restore" aria-label="Restore this order" onclick="dsRestore([\''+escHtml(r.id)+'\'])">&#8634;</button>':'<button type="button" class="action-btn del" title="Remove this order" aria-label="Remove this order" onclick="dsRemove([\''+escHtml(r.id)+'\'])">&times;</button>')+'</td></tr>'
         +(on?'<tr class="ds-open"><td colspan="'+colN+'" style="padding:10px 12px;background:var(--bg3);height:auto;max-width:none">'+dsReview(r)+'</td></tr>':'');}).join('')+'</tbody></table></div></div>';
 }
