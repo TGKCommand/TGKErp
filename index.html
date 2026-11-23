@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.177';
+const TGK_ERP_VERSION = 'v23.178';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -10707,6 +10707,7 @@ function dlShellHtml(tab,totalVisits){
   +'<button class="btn btn-sm" onclick="openSignins()" title="Who has signed up to the dealer portal, and send sign-in invites">&#128273; Sign-ins</button>'
   +'<button class="btn btn-sm" onclick="openCodeLinker()" title="Dealers with no order code, and codes on orders that are not linked to any dealer yet">&#128279; Order codes'+(dlNoCodeCount()?' ('+dlNoCodeCount()+')':'')+'</button>'
   +'<button class="btn btn-sm" id="dl-slips-btn" onclick="openSlips()" title="Saved packing slips for the dealers you bill: reopen a copy and mark it invoiced">&#129534; Billing slips'+(S._slipCount?' ('+S._slipCount+')':'')+'</button>'
+  +(rcCardDealers().length?'<button class="btn btn-sm" id="dl-rc-btn" onclick="openReadyToCharge()" title="POs for card-on-file dealers whose last item has shipped and that are not marked paid yet">&#128179; Ready to charge'+(rcReadyOffline().ready.length?' <span class="pill pill-orange">'+rcReadyOffline().ready.length+'</span>':'')+'</button>':'')
   +'<button class="btn btn-sm" onclick="openPromos()" title="Dealer promotions and the stocking order discount">&#127991; Promotions</button>'
   +'<button class="btn btn-sm btn-teal" onclick="openDealerBlast()" title="Email all active dealers (BCC)">&#9993; Email Dealers</button>'
   +'<button class="btn btn-sm btn-primary" onclick="dnOpen()" title="Fitment updates, pre-order, out of stock, stop sell - templates, send and log">&#128227; Dealer Notices</button>'
@@ -45190,8 +45191,141 @@ function _poCloseLabel(r){for(var i=0;i<PO_CLOSE_REASONS.length;i++)if(PO_CLOSE_
 function _poPaidCell(po){
  var p=po.payment||{};
  if(p.closed)return '<td style="padding:10px 12px;font-size:var(--t-sm)"><span class="pill pill-muted">Closed</span><div class="t3xs">'+escHtml(p.auto?'All orders cancelled':_poCloseLabel(p.reason))+(p.note?' &middot; '+escHtml(p.note):'')+(p.closed_at?' &middot; '+escHtml(p.closed_at):'')+'</div></td>';
- return '<td style="padding:10px 12px;font-size:var(--t-sm);color:var(--teal)"><b>'+escHtml(p.paid_at||'')+'</b></td>';
+ return '<td style="padding:10px 12px;font-size:var(--t-sm);color:var(--teal)"><b>'+escHtml(p.paid_at||'')+'</b>'+(p.method==='card'?'<div class="t3xs" style="color:var(--text3)">Card charged'+(p.amount!=null?' '+rcMoney(p.amount):'')+(p.ref?' &middot; '+escHtml(p.ref):'')+'</div>':'')+'</td>';
 }
+/* ================= [v23.178] READY TO CHARGE =================
+   Dealers billed to a CARD ON FILE (Storefront: "Billed by us: card on file, processed in QuickBooks"). A PO is ready to charge the day its LAST item has shipped (the same rule as the statement and the portal: a PO
+   shipped in parts or across several orders waits for the final one, cancelled orders do not count). This lists every such PO that is not marked paid yet, with the amount to charge taken from the Shopify order
+   (merchandise, shipping and tax) through the dealer-portal function, so the card is run in QuickBooks for the right amount. "Mark charged" then records the payment on the PO exactly like Mark paid (the dealer
+   statement, the overdue list and the dealer's portal all agree), plus how much was charged and a reference. The ERP never holds card numbers and does not charge anything itself. */
+function rcNorm(n){return String(n==null?'':n).replace(/^#+/,'').trim().toLowerCase();}
+function rcR2(n){return Math.round((Number(n)+Number.EPSILON)*100)/100;}
+function rcMoney(n){return '$'+Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
+function rcCardDealers(){return (S.dealers||[]).filter(function(d){return d&&d.payment_mode==='billed_card';});}
+function rcReadyOffline(){
+  var sig=[(S.sales||[]).length,(S.dealers||[]).length,Object.keys(S.dealerPOPayments||{}).length,centralDateOnly()].join('|');
+  if(S._rcSig===sig&&S._rcOff)return S._rcOff;
+  var ready=[],waiting=0,untracked=[];
+  rcCardDealers().forEach(function(d){
+    if(!d.billing_required){untracked.push(d);return;}   // the ERP only works out POs for a dealer marked "We bill them"
+    _buildDealerPOs(d.id).open.forEach(function(po){
+      var b=po.billing||{};
+      if(b.fully)ready.push({dealer:d,po:po});else if(b.state!=='cancelled')waiting++;
+    });
+  });
+  ready.sort(function(a,b){return String(a.po.billing.billed_on).localeCompare(String(b.po.billing.billed_on));});   // waiting longest first
+  S._rcSig=sig;S._rcOff={ready:ready,waiting:waiting,untracked:untracked};return S._rcOff;
+}
+function rcState(){return S._rcUi||(S._rcUi={loading:false,amounts:{},at:0,form:null});}
+function openReadyToCharge(){
+  var ex=document.getElementById('rc-ov');if(ex)ex.remove();
+  S._rcUi={loading:false,amounts:{},at:0,form:null};
+  var ov=document.createElement('div');ov.id='rc-ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
+  ov.innerHTML='<div id="rc-box" style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(1120px,96vw);max-height:92vh;overflow:auto;padding:16px 20px"></div>';
+  ov.addEventListener('mousedown',function(e){if(e.target===ov)rcClose();});
+  document.body.appendChild(ov);rcRedraw();rcLoadAmounts();
+}
+function rcClose(){var ov=document.getElementById('rc-ov');if(ov)ov.remove();}
+function rcRedraw(){var b=document.getElementById('rc-box');if(b)b.innerHTML=rcHtml();}
+// the exact amounts, read from the Shopify orders by the dealer-portal function (the same numbers the dealer sees in My Orders)
+async function rcLoadAmounts(){
+  var st=rcState(),off=rcReadyOffline(),dealers={};
+  off.ready.forEach(function(x){dealers[x.dealer.id]=x.dealer;});
+  var ids=Object.keys(dealers);if(!ids.length){st.loading=false;rcRedraw();return;}
+  st.loading=true;rcRedraw();
+  var results={};
+  await Promise.all(ids.map(async function(id){
+    var d=dealers[id];
+    if(!d.price_list_token){results[id]={err:'this dealer has no portal link'};return;}
+    try{
+      var j=await _dsFn({action:'orders',token:d.price_list_token,days:365});
+      if((j.amounts_pending||0)>0){await new Promise(function(r){setTimeout(r,2000);});j=await _dsFn({action:'orders',token:d.price_list_token,days:365});}   // Shopify was still answering
+      results[id]={orders:j.orders||[]};
+    }catch(e){results[id]={err:(e&&e.message)||String(e)};}
+  }));
+  st.amounts=results;st.loading=false;st.at=Date.now();rcRedraw();
+}
+function rcAmountFor(x){
+  var st=rcState(),res=st.amounts[x.dealer.id],po=x.po;
+  var est={amount:rcR2(po.total),merch:rcR2(po.total),ship:null,tax:null,src:'estimate',why:''};
+  if(!res)return Object.assign(est,{why:st.loading?'reading Shopify':'not read'});
+  if(res.err)return Object.assign(est,{why:res.err});
+  var want={};po.orders.forEach(function(o){if(!o.cancelled)want[rcNorm(o.order_number)]=1;});
+  var names=Object.keys(want),got={};
+  (res.orders||[]).forEach(function(o){if(o.status!=='Cancelled'&&want[rcNorm(o.order_number)])got[rcNorm(o.order_number)]=o;});
+  if(!names.length||names.some(function(n){return !got[n]||!got[n].amounts||got[n].amounts.subtotal==null;}))return Object.assign(est,{why:'Shopify has no amount for every order yet'});
+  var sum=function(k){return names.reduce(function(t,n){return t+(Number(got[n].amounts[k])||0);},0);};
+  var full=names.every(function(n){return got[n].amounts.total!=null;});
+  if(full)return {amount:rcR2(sum('total')),merch:rcR2(sum('subtotal')),ship:rcR2(sum('shipping')),tax:rcR2(sum('tax')),src:'shopify',why:''};
+  return {amount:rcR2(sum('subtotal')),merch:rcR2(sum('subtotal')),ship:null,tax:null,src:'merchandise',why:'shipping and tax are not available for this order'};
+}
+function rcHtml(){
+  var st=rcState(),off=rcReadyOffline(),rows=off.ready,f=st.form;
+  var h='<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px"><div style="font-size:var(--t-lg);font-weight:700;flex:1">Ready to charge</div><button class="btn btn-sm" onclick="rcLoadAmounts()" title="Read the Shopify amounts again">Refresh</button><button class="btn btn-sm" onclick="rcClose()">Close</button></div>'
+   +'<div class="t3s" style="line-height:1.55;margin-bottom:12px">POs for dealers billed to a <b>card on file</b> whose <b>last item has shipped</b> and that are not marked paid. Run the card in QuickBooks for the amount shown, then press <b>Mark charged</b>. Marking it records the payment on the PO (the statement, the overdue list and the dealer\'s portal update); it does not charge anything.</div>';
+  if(off.untracked.length)h+='<div class="panel" style="padding:8px 12px;margin-bottom:10px;border-left:3px solid var(--orange);font-size:var(--t-sm);line-height:1.5"><b style="color:var(--orange)">Not tracked:</b> '+off.untracked.map(function(d){return escHtml(d.name||'');}).join(', ')+(off.untracked.length===1?' is':' are')+' set to card on file but not marked <b>We bill them</b>, so their POs are not worked out. Open the dealer, Edit details, and tick We bill them.</div>';
+  if(f){
+    var d0=(S.dealers||[]).find(function(x){return String(x.id)===String(f.dealerId);})||{};
+    h+='<div class="panel" style="padding:12px 14px;margin-bottom:12px;border-left:3px solid var(--teal)"><b>Mark PO '+escHtml(f.poNumber)+' for '+escHtml(d0.name||'')+' as charged</b><div class="t3xs" style="margin:3px 0 8px">Run the card in QuickBooks first. This only records that it was charged.</div>'
+     +'<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end"><label style="font-size:var(--t-sm)">Amount charged<br><input id="rc-amt" class="form-input" style="width:140px" value="'+escHtml(Number(f.amount).toFixed(2))+'"></label>'
+     +'<label style="font-size:var(--t-sm);flex:1;min-width:240px">Reference (optional)<br><input id="rc-ref" class="form-input" style="width:100%" maxlength="80" placeholder="QuickBooks receipt or transaction number"></label>'
+     +'<button class="btn btn-teal" onclick="rcSaveCharge()"'+(f.busy?' disabled':'')+'>'+(f.busy?'Saving&hellip;':'Mark charged')+'</button><button class="btn" onclick="rcCancelForm()">Cancel</button></div>'
+     +(f.src!=='shopify'?'<div class="t3xs" style="margin-top:6px;color:var(--orange)">The amount shown is not the full Shopify total ('+escHtml(f.why||f.src)+'). Type what you actually charged.</div>':'')+'</div>';
+  }
+  if(st.loading)h+='<div class="t3s" style="margin-bottom:8px">Reading the amounts from Shopify&hellip;</div>';
+  if(!rows.length){
+    h+='<div style="padding:36px;text-align:center;color:var(--text3)">Nothing to charge right now.'+(off.waiting?' '+off.waiting+' PO'+(off.waiting===1?' is':'s are')+' still shipping.':'')+'</div>';
+    return h;
+  }
+  var total=0,anyEst=false;
+  var th=function(t,r){return '<th style="padding:8px 12px;text-align:'+(r?'right':'left')+';font-size:var(--t-xs);text-transform:uppercase;letter-spacing:.07em;color:var(--text3)">'+t+'</th>';};
+  h+='<table style="width:100%;border-collapse:collapse;font-size:var(--t-md)"><thead><tr style="background:var(--bg3);border-bottom:2px solid var(--border)">'+th('Dealer')+th('PO')+th('Orders')+th('Last shipped')+th('Amount to charge',true)+th('')+'</tr></thead><tbody>';
+  rows.forEach(function(x){
+    var a=rcAmountFor(x),b=x.po.billing,ago=_poGap(centralDateOnly(),b.billed_on);total+=a.amount;if(a.src!=='shopify')anyEst=true;
+    var orders=Array.from(new Set(x.po.orders.filter(function(o){return !o.cancelled;}).map(function(o){return o.order_number;}))).map(function(n){return '<span style="font-family:var(--mono);font-size:var(--t-xs);background:var(--bg3);padding:1px 6px;border-radius:var(--r-sm)">'+escHtml(n||'')+'</span>';}).join(' ');
+    var note=a.src==='shopify'?'<div class="t3xs">merchandise '+rcMoney(a.merch)+' &middot; shipping '+rcMoney(a.ship)+' &middot; tax '+rcMoney(a.tax)+'</div>'
+      :a.src==='merchandise'?'<div class="t3xs" style="color:var(--orange)">merchandise only: '+escHtml(a.why)+'</div>'
+      :'<div class="t3xs" style="color:var(--red)">ERP estimate, not the invoice ('+escHtml(a.why||'no Shopify amount')+')</div>';
+    h+='<tr style="border-bottom:1px solid var(--border)"><td style="padding:10px 12px"><b>'+escHtml(x.dealer.name||'')+'</b></td>'
+      +'<td style="padding:10px 12px;font-family:var(--mono);font-weight:700">'+escHtml(x.po.poNumber)+'</td>'
+      +'<td style="padding:10px 12px">'+orders+'</td>'
+      +'<td style="padding:10px 12px;font-size:var(--t-sm)">'+escHtml(b.billed_on)+'<div class="t3xs">'+(ago<=0?'today':ago+' day'+(ago===1?'':'s')+' ago')+'</div></td>'
+      +'<td style="padding:10px 12px;text-align:right"><div style="font-family:var(--mono);font-weight:800;font-size:var(--t-lg)">'+rcMoney(a.amount)+'</div>'+note+'</td>'
+      +'<td style="padding:10px 12px;text-align:right;white-space:nowrap"><button class="btn btn-sm" data-a="'+escHtml(a.amount.toFixed(2))+'" onclick="rcCopy(this.dataset.a)" title="Copy the amount to paste into QuickBooks">Copy</button> <button class="btn btn-sm btn-teal" data-d="'+escHtml(String(x.dealer.id))+'" data-p="'+escHtml(String(x.po.poNumber))+'" onclick="rcCharge(this.dataset.d,this.dataset.p)">Mark charged</button></td></tr>';
+  });
+  h+='</tbody></table><div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-top:12px;font-size:var(--t-sm)"><b>'+rows.length+' PO'+(rows.length===1?'':'s')+' ready &middot; '+rcMoney(total)+(anyEst?'*':'')+'</b>'
+    +(off.waiting?'<span class="t3s">'+off.waiting+' more still shipping (not ready yet)</span>':'')+(anyEst?'<span class="t3xs" style="color:var(--orange)">* includes an amount that is not the full Shopify total</span>':'')+'</div>';
+  return h;
+}
+function rcCopy(v){try{navigator.clipboard.writeText(String(v));toast('Copied '+v);}catch(e){toast('Amount: '+v);}}
+function rcCharge(dealerId,poNumber){
+  var x=rcReadyOffline().ready.find(function(r){return String(r.dealer.id)===String(dealerId)&&String(r.po.poNumber)===String(poNumber);});if(!x)return;
+  var a=rcAmountFor(x);rcState().form={dealerId:x.dealer.id,poNumber:x.po.poNumber,amount:a.amount,expected:a.src==='shopify'?a.amount:null,src:a.src,why:a.why,busy:false};rcRedraw();
+  var i=document.getElementById('rc-ref');if(i)i.focus();
+}
+function rcCancelForm(){rcState().form=null;rcRedraw();}
+async function rcPersist(){var r=await db.from('settings').upsert({key:'dealer_po_payments',value:JSON.stringify(S.dealerPOPayments),updated_at:new Date().toISOString()},{onConflict:'key'});if(r&&r.error){toast('Not saved: '+r.error.message,8000);return false;}return true;}
+async function rcSaveCharge(){
+  var st=rcState(),f=st.form;if(!f||f.busy)return;
+  var amt=parseFloat(String((document.getElementById('rc-amt')||{}).value||'').replace(/[$,\s]/g,'')),ref=String((document.getElementById('rc-ref')||{}).value||'').trim().slice(0,80);
+  if(!isFinite(amt)||amt<0){toast('Enter the amount you charged');return;}
+  var d=(S.dealers||[]).find(function(x){return String(x.id)===String(f.dealerId);});if(!d)return;
+  var k=d.id+'_'+f.poNumber;f.busy=true;rcRedraw();
+  try{await loadDealerPOPayments();}catch(e){}   // the freshest copy: two people marking POs at the same time cannot overwrite each other
+  if(S.dealerPOPayments[k]){f.busy=false;st.form=null;S._rcSig=null;toast('PO '+f.poNumber+' was already marked '+(S.dealerPOPayments[k].closed?'closed':'paid')+' by '+(S.dealerPOPayments[k].paid_by||S.dealerPOPayments[k].closed_by||'someone else')+'. Nothing was changed.',7000);rcRedraw();return;}
+  var rec={paid_at:new Date().toISOString().slice(0,10),paid_by:S.currentUser||'',method:'card',amount:rcR2(amt)};if(ref)rec.ref=ref;if(f.expected!=null)rec.expected=f.expected;
+  S.dealerPOPayments[k]=rec;
+  var ok=await rcPersist();
+  if(!ok){delete S.dealerPOPayments[k];f.busy=false;rcRedraw();return;}
+  try{if(typeof dsPingDealer==='function')dsPingDealer(d.id,'orders');}catch(_e){}
+  try{logAction('Dealer PO charged to card: '+f.poNumber,'dealers',d.id,null,{poNumber:f.poNumber,amount:rec.amount,ref:ref||null}).catch(function(){});}catch(_e){}
+  st.form=null;S._rcSig=null;
+  toast('<span class="ic ic-check"></span>PO '+f.poNumber+' marked charged &middot; '+rcMoney(rec.amount)+' &middot; '+escHtml(d.name||''),6000);
+  var dd=document.getElementById('dd-ov');if(dd&&dd.firstElementChild){try{dd.firstElementChild.innerHTML=_renderDealerDetailContent(d.id);}catch(_e){}}
+  try{if(S.view==='dealers')render();}catch(_e){}
+  rcRedraw();
+}
+window.openReadyToCharge=openReadyToCharge;window.rcClose=rcClose;window.rcLoadAmounts=rcLoadAmounts;window.rcCopy=rcCopy;window.rcCharge=rcCharge;window.rcCancelForm=rcCancelForm;window.rcSaveCharge=rcSaveCharge;
 function closeDealerPO(dealerId,poNumber){
  var ex=document.getElementById('po-close-ov');if(ex)ex.remove();
  var ov=document.createElement('div');ov.id='po-close-ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:100000;display:flex;align-items:center;justify-content:center;padding:20px';
