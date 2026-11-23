@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.168';
+const TGK_ERP_VERSION = 'v23.170';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -2481,6 +2481,8 @@ window.startSupportPoll=startSupportPoll;
 
 function startRealtimeHealthCheck(){
   startSupportPoll();
+  startConnWatch();snapStart();   // [v23.169] connection warning and the outage snapshot
+  startDcxAuto();   // [v23.170] dealer codes keep in step while an admin has the ERP open, until the server schedule is installed
   startLiveBackup();   // [v23.161] backup sync for everything else
   if(_rtHealthTimer)clearInterval(_rtHealthTimer);
   _rtHealthTimer=setInterval(function(){
@@ -9123,16 +9125,16 @@ function dcxMatch(){
     var links=dcxLinks(),taken={};Object.keys(links).forEach(function(id){taken[String(links[id].code).toLowerCase()]=1;});
     var avail=x.codes.filter(function(c){return !taken[String(c.code).toLowerCase()];});
     var dealers=(S.dealers||[]).filter(function(d){return d.status==='Active'&&!links[d.id];}).sort(function(a,b){return String(a.name).localeCompare(String(b.name));});
-    var ms=[],none=[];
+    var ms=[];
+    // [v23.170] EVERY unlinked dealer is a row. A dealer whose name does not look like any code still gets the whole list to choose from (or the paste box), so nobody is linked one by one.
     dealers.forEach(function(d){
       var k=dcxKeys(d),dp=typeof stackDealerPct==='function'?stackDealerPct(d):20;
       var cands=avail.map(function(c){var sc=dcxScore(k,c.code);return sc.score>=70?{c:c,score:sc.score,why:sc.why}:null;}).filter(Boolean)
         .sort(function(a,b){return (b.score-a.score)||(Math.abs(a.c.percentage-dp)-Math.abs(b.c.percentage-dp));});
-      if(!cands.length){none.push(d);return;}
-      ms.push({d:d,dp:dp,cands:cands,pick:cands[0].c.code,checked:false,flag:''});
+      ms.push({d:d,dp:dp,cands:cands,pick:cands.length?cands[0].c.code:'',checked:false,flag:cands.length?'':'No code looks like theirs: choose one, or leave it'});
     });
     // one code can only belong to one dealer: the clearly better match keeps it, a close call leaves both for you to decide
-    var claim={};ms.forEach(function(m){var kk=m.pick.toLowerCase();(claim[kk]=claim[kk]||[]).push(m);});
+    var claim={};ms.forEach(function(m){if(!m.pick)return;var kk=m.pick.toLowerCase();(claim[kk]=claim[kk]||[]).push(m);});
     Object.keys(claim).forEach(function(kk){
       var g=claim[kk];if(g.length<2)return;
       g.sort(function(a,b){return b.cands[0].score-a.cands[0].score;});
@@ -9140,37 +9142,74 @@ function dcxMatch(){
       g.forEach(function(m,i){if(close){m.flag='Two dealers look like this code: choose';}else if(i>0){m.flag='This code fits '+g[0].d.name+' better';m.pick='';}});
     });
     ms.forEach(function(m){
+      if(!m.cands.length)return;
       var top=m.cands[0],second=m.cands[1];
       if(!m.flag&&second&&second.score>=top.score-5)m.flag='More than one code could be theirs: choose';
       var c=m.pick?(x.codes.find(function(y){return String(y.code).toLowerCase()===m.pick.toLowerCase();})||null):null;
       m.checked=!m.flag&&!!c&&top.score>=85&&Math.abs(c.percentage-m.dp)<0.01;
     });
-    ms.sort(function(a,b){return (b.checked-a.checked)||(b.cands[0].score-a.cands[0].score)||String(a.d.name).localeCompare(String(b.d.name));});
-    x.matches=ms;x.unmatched=none;x.review=true;
+    var sc=function(m){return m.cands.length?m.cands[0].score:0;};
+    ms.sort(function(a,b){return (b.checked-a.checked)||((b.pick?1:0)-(a.pick?1:0))||(sc(b)-sc(a))||String(a.d.name).localeCompare(String(b.d.name));});
+    x.matches=ms;x.review=true;x.pasteMsg='';
   });
 }
 function dcxMatchFind(id){return (dcxX().matches||[]).find(function(m){return String(m.d.id)===String(id);});}
 function dcxMTick(id,on){var m=dcxMatchFind(id);if(m){m.checked=!!on&&!!m.pick;}dcxMCount();}
-function dcxMPick(id,code){var m=dcxMatchFind(id);if(m){m.pick=code;m.flag='';if(!code)m.checked=false;}dcxRedraw();}
-function dcxMAll(on){(dcxX().matches||[]).forEach(function(m){if(m.pick)m.checked=on===true?(!m.flag&&m.cands[0].score>=85):false;});dcxRedraw();}
+function dcxMPick(id,code){var m=dcxMatchFind(id);if(m){m.pick=code||'';m.flag='';m.checked=!!code;}dcxRedraw();}   // choosing a code ticks the row: you made the choice
+function dcxMAll(mode){(dcxX().matches||[]).forEach(function(m){
+  if(mode==='chosen')m.checked=!!m.pick;
+  else if(mode===true)m.checked=!!m.pick&&!m.flag&&m.cands.length>0&&m.cands[0].score>=85;
+  else m.checked=false;});dcxRedraw();}
 function dcxMCount(){var n=(dcxX().matches||[]).filter(function(m){return m.checked&&m.pick;}).length,el=document.getElementById('dcx-nsel');if(el)el.textContent=n;var b=document.getElementById('dcx-linksel');if(b)b.disabled=!n;}
 function dcxMCancel(){var x=dcxX();x.review=false;x.matches=null;x.unmatched=null;dcxRedraw();}
+// Paste "Dealer name, CODE" lines (from a spreadsheet, tab / comma / = / -> / : between them) and the table is filled from them.
+function dcxPasteApply(){
+  var x=dcxX(),ms=x.matches||[],lines=String(x.pasteText||'').split(/\r?\n/).map(function(l){return l.trim();}).filter(Boolean),done=0,miss=[];
+  var idx={};(x.codes||[]).forEach(function(c){idx[String(c.code).toLowerCase()]=c;});
+  var L=dcxLinks(),used={};Object.keys(L).forEach(function(id){used[String(L[id].code).toLowerCase()]=dcxName(id);});
+  lines.forEach(function(line){
+    var parts=null;['\t','=>','->','=',',',';',' - ',':'].some(function(sep){if(line.indexOf(sep)>0){parts=line.split(sep);return true;}return false;});
+    var nm,cd;
+    if(parts&&parts.length>=2){nm=parts[0].trim();cd=parts[parts.length-1].trim();}
+    else{var mm=/^(.*\S)\s+(\S+)$/.exec(line);if(!mm){miss.push(line+' (not understood)');return;}nm=mm[1];cd=mm[2];}
+    cd=cd.replace(/^["']+|["']+$/g,'');
+    if(/^dealer/i.test(nm)&&/^code/i.test(cd))return;   // a header row
+    var n=dcxNorm(nm);if(!n){miss.push(line);return;}
+    var hits=ms.filter(function(m){return dcxNorm(m.d.name)===n;});
+    if(!hits.length&&n.length>=4)hits=ms.filter(function(m){var dn=dcxNorm(m.d.name);return dn.length>=4&&(dn.indexOf(n)>=0||n.indexOf(dn)>=0);});
+    if(hits.length!==1){miss.push(nm+(hits.length?' (fits '+hits.length+' dealers)':' (no unlinked dealer by that name)'));return;}
+    var c=idx[cd.toLowerCase()];
+    if(!c){miss.push(nm+': '+cd+' is not among the loaded Shopify codes');return;}
+    if(used[cd.toLowerCase()]){miss.push(nm+': '+cd+' is already linked to '+used[cd.toLowerCase()]);return;}
+    hits[0].pick=c.code;hits[0].flag='';hits[0].checked=true;done++;
+  });
+  x.pasteMsg='Filled '+done+' of '+lines.length+' line'+(lines.length===1?'':'s')+'.'+(miss.length?' Not filled: '+miss.slice(0,8).join('; ')+(miss.length>8?'; and '+(miss.length-8)+' more':''):'');
+  dcxRedraw();
+}
 function dcxReviewHtml(x){
-  var ms=x.matches||[],none=x.unmatched||[],sure=ms.filter(function(m){return m.checked;}).length;
-  var inp='padding:5px 7px;font-size:var(--t-sm);background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);color:var(--text)';
-  var h='<div style="border:1px solid var(--teal);border-radius:var(--r-md);padding:14px 16px;margin-bottom:14px;background:var(--bg1)"><div style="display:flex;align-items:center;gap:10px;margin-bottom:6px"><div style="font-weight:700;flex:1">Match dealers to their Shopify codes</div><button class="btn btn-sm" onclick="dcxMCancel()">Close</button></div>'
-   +'<div class="t3s" style="margin-bottom:10px;line-height:1.55">'+ms.length+' dealer'+(ms.length===1?'':'s')+' have a code that looks like theirs; <b>'+sure+'</b> are ticked because the name matches closely and the code\'s % is the same as the dealer\'s. Check the rest, change the code where needed, then link. <b>Linking changes nothing in Shopify.</b></div>'
-   +'<div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap"><button class="btn btn-sm" onclick="dcxMAll(true)">Tick the sure ones</button><button class="btn btn-sm" onclick="dcxMAll(false)">Untick all</button><button class="btn btn-sm btn-teal" id="dcx-linksel" onclick="dcxLinkSelected()" style="margin-left:auto">Link the <span id="dcx-nsel">'+ms.filter(function(m){return m.checked&&m.pick;}).length+'</span> ticked</button></div>';
+  var ms=x.matches||[],matched=ms.filter(function(m){return m.cands.length;}).length,sure=ms.filter(function(m){return m.checked;}).length,none=ms.length-matched;
+  var inp='padding:5px 7px;font-size:var(--t-sm);background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);color:var(--text);max-width:250px';
+  var L=dcxLinks(),taken={};Object.keys(L).forEach(function(id){taken[String(L[id].code).toLowerCase()]=1;});
+  var cnt={};ms.forEach(function(m){if(m.checked&&m.pick){var k=m.pick.toLowerCase();cnt[k]=(cnt[k]||0)+1;}});
+  var opt=function(c,sel){return '<option value="'+escHtml(c.code)+'"'+(sel?' selected':'')+'>'+escHtml(c.code)+' \u00b7 '+c.percentage+'%</option>';};
+  var h='<div style="border:1px solid var(--teal);border-radius:var(--r-md);padding:14px 16px;margin-bottom:14px;background:var(--bg1)"><div style="display:flex;align-items:center;gap:10px;margin-bottom:6px"><div style="font-weight:700;flex:1">Link all dealers to their Shopify codes</div><button class="btn btn-sm" onclick="dcxMCancel()">Close</button></div>'
+   +'<div class="t3s" style="margin-bottom:10px;line-height:1.55">All <b>'+ms.length+'</b> dealers not linked yet are below. <b>'+matched+'</b> have a code that looks like theirs (<b>'+sure+'</b> ticked: the name matches closely and the % is the same). For the other <b>'+none+'</b>, pick their code from the list, or paste a list underneath. Choosing a code ticks the row. Then press <b>Link</b> once. <b>Linking changes nothing in Shopify.</b></div>'
+   +'<div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap"><button class="btn btn-sm" onclick="dcxMAll(true)">Tick the sure ones</button><button class="btn btn-sm" onclick="dcxMAll(\'chosen\')">Tick every row that has a code</button><button class="btn btn-sm" onclick="dcxMAll(false)">Untick all</button><button class="btn btn-sm btn-teal" id="dcx-linksel" onclick="dcxLinkSelected()" style="margin-left:auto">Link the <span id="dcx-nsel">'+ms.filter(function(m){return m.checked&&m.pick;}).length+'</span> ticked</button></div>'
+   +'<details style="margin-bottom:10px"'+((x.pasteText||x.pasteMsg)?' open':'')+'><summary class="t3s" style="cursor:pointer">Paste a list (dealer, code) to fill the table</summary>'
+   +'<div style="margin-top:6px"><textarea id="dcx-paste" rows="5" style="width:100%;box-sizing:border-box;font-family:var(--mono);font-size:var(--t-sm);padding:8px;background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);color:var(--text)" placeholder="One dealer per line, then a tab, comma or = and the code&#10;AM Tuning, AMT20&#10;Auto Max Elite = AUTOMAX10" oninput="dcxX().pasteText=this.value">'+escHtml(x.pasteText||'')+'</textarea>'
+   +'<div style="display:flex;gap:10px;align-items:center;margin-top:6px;flex-wrap:wrap"><button class="btn btn-sm" onclick="dcxPasteApply()">Fill the table from this list</button><span class="t3xs" style="flex:1">'+escHtml(x.pasteMsg||'')+'</span></div></div></details>';
   if(ms.length){
-    h+='<table style="width:100%"><thead><tr><th></th><th style="text-align:left">Dealer</th><th style="text-align:left">Their Shopify code</th><th style="text-align:left">In Shopify</th><th style="text-align:left">How sure</th></tr></thead><tbody>'+ms.map(function(m){
+    h+='<table style="width:100%"><thead><tr><th></th><th style="text-align:left">Dealer</th><th style="text-align:left">Their Shopify code</th><th style="text-align:left">In Shopify</th><th style="text-align:left">Note</th></tr></thead><tbody>'+ms.map(function(m){
       var c=m.pick?(x.codes.find(function(y){return String(y.code).toLowerCase()===m.pick.toLowerCase();})||null):null,cand=m.cands.find(function(y){return String(y.c.code).toLowerCase()===String(m.pick).toLowerCase();});
       var warn=c&&Math.abs(c.percentage-m.dp)>=0.01?'<div style="color:var(--orange);font-size:var(--t-xs)">Shopify '+c.percentage+'% but the dealer is '+m.dp+'% here</div>':'';
+      var dup=(m.checked&&m.pick&&cnt[m.pick.toLowerCase()]>1)?'<div style="color:var(--orange);font-size:var(--t-xs)">Also chosen for another dealer: only one can have it</div>':'';
+      var top={},topHtml=m.cands.slice(0,8).map(function(y){top[String(y.c.code).toLowerCase()]=1;return opt(y.c,String(y.c.code).toLowerCase()===String(m.pick).toLowerCase());}).join('');
+      var restHtml=(x.codes||[]).filter(function(c2){var k=String(c2.code).toLowerCase();return !taken[k]&&!top[k];}).map(function(c2){return opt(c2,String(c2.code).toLowerCase()===String(m.pick).toLowerCase());}).join('');
       return '<tr><td><input type="checkbox" '+(m.checked&&m.pick?'checked ':'')+(m.pick?'':'disabled ')+'data-i="'+escHtml(m.d.id)+'" onchange="dcxMTick(this.dataset.i,this.checked)"></td><td><b>'+escHtml(m.d.name)+'</b> <span class="t3xs">'+m.dp+'%</span></td>'
-        +'<td><select data-i="'+escHtml(m.d.id)+'" onchange="dcxMPick(this.dataset.i,this.value)" style="'+inp+'"><option value="">(none)</option>'+m.cands.slice(0,8).map(function(y){return '<option value="'+escHtml(y.c.code)+'"'+(String(y.c.code).toLowerCase()===String(m.pick).toLowerCase()?' selected':'')+'>'+escHtml(y.c.code)+' \u00b7 '+y.c.percentage+'%</option>';}).join('')+'</select></td>'
+        +'<td><select data-i="'+escHtml(m.d.id)+'" onchange="dcxMPick(this.dataset.i,this.value)" style="'+inp+'"><option value="">(none)</option>'+(topHtml?'<optgroup label="Looks like theirs">'+topHtml+'</optgroup>':'')+'<optgroup label="All other codes">'+restHtml+'</optgroup></select></td>'
         +'<td class="t3s">'+(c?c.percentage+'%'+(c.minSubtotal?' \u00b7 $'+c.minSubtotal+' min':'')+'<div class="t3xs">'+escHtml(c.items||'')+'</div>':'')+warn+'</td>'
-        +'<td class="t3s">'+(m.flag?'<span style="color:var(--orange)">'+escHtml(m.flag)+'</span>':(cand?escHtml(cand.why):''))+'</td></tr>';}).join('')+'</tbody></table>';
+        +'<td class="t3s">'+(m.flag?'<span style="color:var(--orange)">'+escHtml(m.flag)+'</span>':(cand?escHtml(cand.why):(m.pick?'chosen by you':'')))+dup+'</td></tr>';}).join('')+'</tbody></table>';
   }
-  if(none.length)h+='<details style="margin-top:10px"><summary class="t3s" style="cursor:pointer">'+none.length+' dealer'+(none.length===1?'':'s')+' with no matching code (link by hand if they have one)</summary><div class="t3s" style="margin-top:6px;line-height:1.6">'+none.map(function(d){return escHtml(d.name);}).join(' &middot; ')+'</div></details>';
   return h+'</div>';
 }
 async function dcxLinkSelected(){
@@ -9311,17 +9350,34 @@ async function dcxJobCheck(){
   var x=dcxX();
   try{
     var r=await db.from('ops_jobs').select('*').eq('name','dealer_codes').maybeSingle();
-    if(r.error)x.job={state:'missing',why:/does not exist|schema cache|relation/i.test(r.error.message||'')?'The background-jobs tables are not set up yet.':r.error.message};
+    if(r.error)x.job={state:'missing',why:/does not exist|schema cache|relation/i.test(r.error.message||'')?'The background-jobs tables are not set up yet (ops_setup.sql).':r.error.message};
     else if(!r.data)x.job={state:'missing',why:'The dealer_codes job has not been added yet.'};
     else x.job={state:'ok',row:r.data};
   }catch(e){x.job={state:'missing',why:String((e&&e.message)||e)};}
+  // the two server functions the job depends on
+  try{var fr=await dcxFn({action:'version'});x.fnBuild=(fr&&(fr.build||fr.version))||'older';}catch(e){x.fnBuild=/Unknown action/i.test(String((e&&e.message)||e))?'v1.0':(/not deployed/i.test(String((e&&e.message)||e))?'not deployed':'unreachable');}
+  try{var rr=await fetch(SUPA_URL+'/functions/v1/ops-cron',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({action:'version'})});var tt=await rr.text(),jj=null;try{jj=JSON.parse(tt);}catch(_){}x.opsBuild=(jj&&(jj.build||jj.version))||(rr.status===404?'not deployed':'older');}catch(e){x.opsBuild='unreachable';}
   dcxRedraw();
 }
+function dcxStep(ok,label,detail,btn){
+  var c=ok===true?'var(--teal)':(ok===false?'var(--orange)':'var(--text3)');
+  return '<div style="display:flex;gap:8px;align-items:flex-start;margin:5px 0"><span style="font-weight:700;color:'+c+';width:14px">'+(ok===true?'&#10003;':(ok===false?'&#10007;':'&hellip;'))+'</span><span style="flex:1"><b>'+label+'</b> <span class="t3xs">'+detail+'</span></span>'+(btn||'')+'</div>';
+}
 function dcxJobLine(x){
-  var j=x.job;if(!j)return '';var auto=S.settings&&S.settings.dealer_codes_auto===true;
+  var j=x.job;if(!j)return '';var auto=S.settings&&S.settings.dealer_codes_auto===true,expect=EDGE_EXPECTED['ops-cron']||'v1.4';
   var box=function(color,html){return '<div style="margin:0 0 10px;padding:7px 10px;border-radius:var(--r-md);border:1px solid '+color+';font-size:var(--t-sm);line-height:1.5">'+html+'</div>';};
-  if(j.state==='missing')return box('rgba(234,88,12,.45)','<b style="color:var(--orange)">Schedule not installed.</b> Until it is, codes only change when you press Apply or save a promotion. '+escHtml(j.why||'')+' See &ldquo;Set up the function and the schedule&rdquo; below.');
+  if(j.state==='missing'){
+    var fnOk=x.fnBuild==null?null:(x.fnBuild!=='unreachable'&&x.fnBuild!=='not deployed'),opsOk=x.opsBuild==null?null:(x.opsBuild===expect);
+    var selfRun=auto?('Until it is, <b>this ERP keeps the codes in step itself every 10 minutes while an admin has it open</b>'+(S._dcxTickAt?' (last check '+new Date(S._dcxTickAt).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})+(S._dcxTickErr?', problem: '+escHtml(S._dcxTickErr):'')+')':'')+'. The schedule makes it happen all day even when nobody has the ERP open.'):'Automatic is off, so codes only change when you press Apply. Tick Automatic to let this ERP keep them in step.';
+    return box('rgba(234,88,12,.45)','<b style="color:var(--orange)">Schedule not installed.</b> '+selfRun
+      +'<div style="margin-top:6px"><b>To install it (3 steps, about 5 minutes):</b>'
+      +dcxStep(fnOk,'1. Shopify function','deployed: '+escHtml(x.fnBuild||'checking...'),'')
+      +dcxStep(opsOk,'2. Update ops-cron to '+expect,'deployed: '+escHtml(x.opsBuild||'checking...')+'. Supabase &rarr; Edge Functions &rarr; ops-cron &rarr; paste &rarr; Deploy',opsOk?'':'<button class="btn btn-sm" onclick="copyText(ERP_OPS_CRON_SRC,this)">Copy ops-cron code</button>')
+      +dcxStep(false,'3. Run the SQL once','Supabase &rarr; SQL Editor &rarr; paste &rarr; Run','<button class="btn btn-sm" onclick="copyText(ERP_DEALER_CODES_SQL,this)">Copy the SQL</button>')
+      +'<div style="margin-top:6px"><button class="btn btn-sm btn-teal" onclick="dcxJobCheck()">Check again</button> <span class="t3xs">'+escHtml(j.why||'')+'</span></div></div>');
+  }
   var r=j.row;
+  if(x.opsBuild&&x.opsBuild!==expect&&x.opsBuild!=='unreachable')return box('rgba(234,88,12,.45)','<b style="color:var(--orange)">The job is installed but ops-cron is '+escHtml(x.opsBuild)+'</b>, not '+expect+', so it will fail. Update it: <button class="btn btn-sm" onclick="copyText(ERP_OPS_CRON_SRC,this)">Copy ops-cron code</button> then Supabase &rarr; Edge Functions &rarr; ops-cron &rarr; paste &rarr; Deploy. <button class="btn btn-sm btn-teal" onclick="dcxJobCheck()">Check again</button>');
   if(r.enabled===false)return box('rgba(234,88,12,.45)','<b style="color:var(--orange)">The schedule is paused.</b> Resume the &ldquo;Dealer Shopify codes&rdquo; job in Integrations &rarr; Background Jobs.');
   if(!r.last_finished_at)return box('var(--border)','Schedule installed, waiting for its first run (it runs every 10 minutes).');
   var mins=Math.round((Date.now()-new Date(r.last_finished_at).getTime())/60000);
@@ -9329,6 +9385,34 @@ function dcxJobLine(x){
   if(mins>30)return box('rgba(220,38,38,.45)','<b style="color:var(--red)">The schedule has not run for '+mins+' minutes.</b> Check the job in Integrations &rarr; Background Jobs.');
   return box('rgba(13,148,136,.4)','<b style="color:var(--teal)">&#10003; Schedule running</b>, last ran '+mins+' min ago. '+(auto?'Codes switch on and off by the promotion dates.':'<span style="color:var(--orange)">Automatic is off, so it only reports: tick Automatic to let it change Shopify.</span>'));
 }
+// [v23.170] Until the server schedule is installed, an admin's open ERP keeps the dealer codes in step itself (the same sync the schedule runs). It steps aside once the schedule is running.
+var _dcxTimer=null;
+async function dcxTick(){
+  try{
+    if(S._offline||S.currentRole!=='admin'||S._dcxTickBusy)return;
+    if(!(S.settings&&S.settings.dealer_codes_auto===true)||!Object.keys(dcxLinks()).length)return;
+    S._dcxTickBusy=true;
+    try{
+      var jr=await db.from('ops_jobs').select('*').eq('name','dealer_codes').maybeSingle();
+      if(jr&&jr.data&&jr.data.enabled!==false&&jr.data.last_finished_at&&jr.data.last_status!=='error'&&Date.now()-new Date(jr.data.last_finished_at).getTime()<25*60000)return;   // the server schedule is doing it
+    }catch(e){}
+    var r=await dcxFn({action:'sync',dry_run:false});
+    S._dcxTickAt=Date.now();S._dcxTickErr='';
+    if(r.state)S.settings=Object.assign({},S.settings,{dealer_code_state:r.state});
+    if(r.log)S.settings=Object.assign({},S.settings,{dealer_code_log:r.log});
+    var done=(r.results||[]).filter(function(q){return q.ok&&!q.unchanged;}).length,bad=(r.results||[]).filter(function(q){return !q.ok;}).length;
+    if(done)try{toast('Shopify dealer codes updated automatically: '+done+' code'+(done===1?'':'s'),7000);}catch(e){}
+    if(bad)S._dcxTickErr=bad+' code'+(bad===1?'':'s')+' could not be updated';
+    dcxRedraw();
+  }catch(e){S._dcxTickAt=Date.now();S._dcxTickErr=String((e&&e.message)||e).slice(0,120);}
+  finally{S._dcxTickBusy=false;}
+}
+function startDcxAuto(){
+  if(_dcxTimer)return;
+  setTimeout(function(){dcxTick();},60000+Math.floor(Math.random()*60000));
+  _dcxTimer=setInterval(function(){if(!document.hidden)dcxTick();},10*60000+Math.floor(Math.random()*60000));
+}
+window.dcxPasteApply=dcxPasteApply;window.dcxTick=dcxTick;window.dcxMAll=dcxMAll;
 window.dcxPing=dcxPing;window.dcxLoadCodes=dcxLoadCodes;window.dcxSuggest=dcxSuggest;window.dcxLink=dcxLink;window.dcxUnlink=dcxUnlink;window.dcxPreview=dcxPreview;window.dcxApply=dcxApply;window.dcxAuto=dcxAuto;
 
 function promoRedraw(){var b=document.getElementById('promo-box');if(b)b.innerHTML=promoHtml();}
@@ -21680,6 +21764,7 @@ function showAuthGate(){
   const g=document.getElementById('auth-gate');if(g){g.style.display='flex';}
   const a=document.getElementById('tgk-app');if(a)a.style.display='none';
   const l=document.getElementById('tgk-loader');if(l)l.style.display='none';
+  try{snapOfferOnGate();}catch(e){}   // [v23.169] offered only when the database cannot be reached
 }
 function hideAuthGate(){const g=document.getElementById('auth-gate');if(g)g.style.display='none';}
 
@@ -22721,6 +22806,181 @@ async function redo() {
     S.redoStack.push(next);
     updateRedoBtn();
   }
+}
+
+/* ================= [v23.169] BACKUPS THAT WORK WHEN SUPABASE DOES NOT =================
+   1. OUTAGE SNAPSHOT: while the ERP is open it keeps a copy of its working data on this computer (IndexedDB). If the database cannot be reached the ERP offers to open that copy,
+      READ ONLY, so orders, stock, BOMs and pick lists can still be looked up and printed. Nothing opened from it can be saved.
+   2. CONNECTION WARNING: a banner when the database stops answering while you are working.
+   3. FULL BACKUP FILE: everything from the database downloaded to this computer as an Excel workbook (readable) and a JSON file (complete). */
+var SNAP_DB='tgk_erp_snapshot',SNAP_STORE='kv',SNAP_KEY='latest';
+function _snapIdb(){return new Promise(function(res,rej){try{var r=indexedDB.open(SNAP_DB,1);r.onupgradeneeded=function(){r.result.createObjectStore(SNAP_STORE);};r.onsuccess=function(){res(r.result);};r.onerror=function(){rej(r.error);};}catch(e){rej(e);}});}
+async function snapPut(rec){var d=await _snapIdb();return new Promise(function(res,rej){var tx=d.transaction(SNAP_STORE,'readwrite');tx.objectStore(SNAP_STORE).put(rec,SNAP_KEY);tx.oncomplete=function(){d.close();res(true);};tx.onerror=function(){d.close();rej(tx.error);};tx.onabort=function(){d.close();rej(tx.error||new Error('aborted'));};});}
+async function snapGet(){try{var d=await _snapIdb();return await new Promise(function(res){var rq=d.transaction(SNAP_STORE).objectStore(SNAP_STORE).get(SNAP_KEY);rq.onsuccess=function(){d.close();res(rq.result||null);};rq.onerror=function(){d.close();res(null);};});}catch(e){return null;}}
+function snapBuild(){
+  var c=function(a){return (a||[]).length;};
+  return {v:1,ts:new Date().toISOString(),ver:TGK_ERP_VERSION,user:{id:S.currentUserId,email:S.currentUser,role:S.currentRole},
+    counts:{parts:c(S.parts),assemblies:c(S.assemblies),sales:c(S.sales),purchases:c(S.purchases),boms:Object.keys(S.boms||{}).length},
+    data:{parts:S.parts,assemblies:S.assemblies,boms:S.boms,sales:S.sales,purchases:S.purchases,poLines:S.poLines,poTracking:S.poTracking,dealers:S.dealers,vendors:S.vendors,settings:S.settings,
+      pricingTiers:S.pricingTiers,customVendors:S.customVendors,currentBackorders:S.currentBackorders,corrections:(S.corrections||[]).slice(0,400),warrantyClaims:S.warrantyClaims,
+      shipmentErrors:S.shipmentErrors,cycleCounts:S.cycleCounts,labelFiles:S.labelFiles}};
+}
+async function snapSave(force){
+  try{
+    if(S._offline||!S.parts||!S.parts.length)return false;                  // never replace a good copy with an empty or snapshot-opened one
+    if(!force&&S._snapAt&&Date.now()-S._snapAt<8*60000)return false;
+    var rec=snapBuild();
+    try{await snapPut(rec);}catch(e){rec=JSON.parse(JSON.stringify(rec));await snapPut(rec);}   // a value that cannot be cloned directly goes in as plain JSON
+    S._snapAt=Date.now();S._snapInfo={ts:rec.ts,counts:rec.counts,ver:rec.ver};S._snapErr='';
+    if(S.view==='backups'&&typeof render==='function')try{render();}catch(e){}
+    return true;
+  }catch(e){S._snapErr=String((e&&e.message)||e);console.warn('[TGK] snapshot not saved:',S._snapErr);return false;}
+}
+var _snapStarted=false;
+function snapStart(){
+  if(_snapStarted)return;_snapStarted=true;
+  setTimeout(function(){snapSave(true);},20000);
+  setInterval(function(){if(!document.hidden)snapSave(false);},10*60000);
+  setTimeout(function(){   // a gentle reminder when no full backup file has been downloaded for a week
+    try{if(S.currentRole!=='admin')return;var last=localStorage.getItem('tgk_last_full_backup'),days=last?Math.floor((Date.now()-new Date(last).getTime())/864e5):null;
+      var today=new Date().toISOString().slice(0,10);if((days==null||days>7)&&localStorage.getItem('tgk_bk_nag')!==today){localStorage.setItem('tgk_bk_nag',today);toast('No full backup file downloaded '+(days==null?'yet':'for '+days+' days')+'. Backups page, Download full backup.',9000);}}catch(e){}
+  },45000);
+}
+/* ---- read only mode: nothing can be written, reads come from the snapshot only */
+function _offToast(){var t=Date.now();if(S._offToastAt&&t-S._offToastAt<4000)return;S._offToastAt=t;try{toast('Outage snapshot is read only: nothing was saved',5000);}catch(e){}}
+function _offBuilder(quiet){
+  var res={data:null,error:{message:'Outage snapshot (read only): nothing was saved or loaded',code:'OFFLINE'},status:0,count:null};
+  var p=new Proxy(function(){},{get:function(_,k){if(k==='then')return function(a,b){return Promise.resolve(res).then(a,b);};if(k==='catch')return function(b){return Promise.resolve(res).catch(b);};return function(){return p;};},apply:function(){return p;}});
+  if(!quiet)_offToast();return p;
+}
+function snapInstallGuard(){
+  if(db.__offlineGuard)return;db.__offlineGuard=true;
+  var from=db.from.bind(db);
+  db.from=function(t){var b=from(t);['insert','update','upsert','delete'].forEach(function(m){if(typeof b[m]==='function')b[m]=function(){return _offBuilder(false);};});if(typeof b.select==='function')b.select=function(){return _offBuilder(true);};return b;};
+  db.rpc=function(){return _offBuilder(false);};
+}
+function snapShowBar(){
+  var old=document.getElementById('tgk-offline-bar');if(old)old.remove();
+  var when=new Date(S._offlineTs).toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+  var b=document.createElement('div');b.id='tgk-offline-bar';
+  b.style.cssText='position:fixed;left:0;right:0;bottom:0;z-index:100001;background:#b42318;color:#fff;padding:8px 14px;font-size:13px;display:flex;gap:12px;align-items:center;justify-content:center;flex-wrap:wrap;box-shadow:0 -2px 10px rgba(0,0,0,.3)';
+  b.innerHTML='<b>OUTAGE SNAPSHOT &middot; READ ONLY</b><span>Data as of '+escHtml(when)+'. You can look things up and print. Nothing here is saved.</span><button style="background:#fff;color:#b42318;border:none;border-radius:4px;padding:4px 12px;font-weight:700;cursor:pointer" onclick="location.reload()">Try reconnecting</button>';
+  document.body.appendChild(b);document.body.classList.add('tgk-offline');
+  var _sl=document.getElementById('sync-label');if(_sl)_sl.textContent='Offline snapshot';var _sd=document.getElementById('sync-dot');if(_sd){_sd.className='sync-dot';_sd.style.background='#b42318';}
+  if(!document.getElementById('tgk-offline-css')){var st=document.createElement('style');st.id='tgk-offline-css';st.textContent='body.tgk-offline #tgk-app{padding-bottom:42px;box-sizing:border-box}';document.head.appendChild(st);}
+}
+function snapEnter(rec){
+  var d=rec.data||{};
+  try{if(window._tgkClearHard)window._tgkClearHard();}catch(e){}
+  S._offline=true;S._offlineTs=rec.ts;
+  if(rec.user){S.currentUserId=rec.user.id;S.currentUser=rec.user.email;S.currentRole=rec.user.role||'warehouse';}
+  S.parts=d.parts||[];S.assemblies=d.assemblies||[];
+  ['boms','sales','purchases','poLines','poTracking','dealers','vendors','settings','pricingTiers','customVendors','currentBackorders','corrections','warrantyClaims','shipmentErrors','cycleCounts','labelFiles'].forEach(function(k){if(d[k]!==undefined)S[k]=d[k];});
+  try{if(S.settings&&S.settings.custom_cats)Object.assign(S.customCats,S.settings.custom_cats);}catch(e){}
+  try{buildLookupMaps();}catch(e){}
+  snapInstallGuard();
+  var g=document.getElementById('auth-gate');if(g)g.style.display='none';
+  var l=document.getElementById('tgk-loader');if(l)l.style.display='none';
+  var a=document.getElementById('tgk-app');if(a)a.style.display='';
+  try{_updateAuthUI();}catch(e){}
+  try{computeDemand();}catch(e){}
+  snapShowBar();
+  try{render();}catch(e){console.error('snapshot render:',e);}
+}
+async function dbReachable(){
+  try{
+    var ctl=('AbortController' in window)?new AbortController():null,to=setTimeout(function(){if(ctl)ctl.abort();},6000);
+    var r=await fetch(SUPA_URL+'/auth/v1/health',{headers:{apikey:SUPA_KEY},cache:'no-store',signal:ctl&&ctl.signal});
+    clearTimeout(to);return r.status<500;
+  }catch(e){return false;}
+}
+async function snapOffer(host,abs){
+  var rec=await snapGet();if(!rec||!rec.data||!rec.data.parts||!rec.data.parts.length)return;
+  if(document.getElementById('tgk-snap-offer'))return;
+  var when=new Date(rec.ts).toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+  var d=document.createElement('div');d.id='tgk-snap-offer';
+  d.style.cssText=abs?'position:absolute;left:0;right:0;bottom:28px;text-align:center;padding:0 16px':'margin-top:16px;text-align:center;max-width:420px';
+  d.innerHTML='<div style="font-size:13px;color:var(--text3);margin-bottom:8px;line-height:1.5">Can\'t reach the database? Open the last saved copy to look things up and print pick lists. Read only.</div><button class="btn btn-teal" id="tgk-snap-open">Open snapshot from '+escHtml(when)+'</button>';
+  host.appendChild(d);document.getElementById('tgk-snap-open').onclick=function(){snapEnter(rec);};
+}
+function snapOfferOnLoader(){var r=document.getElementById('tgk-retry'),h=r&&r.parentNode;if(h)snapOffer(h,false);}
+async function snapOfferOnGate(){var g=document.getElementById('auth-gate');if(!g||g.style.display==='none')return;if(await dbReachable())return;g.style.position=g.style.position||'relative';snapOffer(g,true);}
+function snapDrill(){if(!S._snapInfo){toast('Take a snapshot first');return;}try{sessionStorage.setItem('tgk_snap_drill','1');}catch(e){}location.reload();}
+/* ---- the warning while you are working */
+var _conn={down:false,fails:0,since:null,timer:null};
+function connBar(show){
+  var b=document.getElementById('tgk-conn-bar');
+  if(!show){if(b)b.remove();return;}
+  var snap=S._snapInfo?'A snapshot from '+new Date(S._snapInfo.ts).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})+' is saved on this computer.':'';
+  if(!b){b=document.createElement('div');b.id='tgk-conn-bar';b.style.cssText='position:fixed;left:0;right:0;bottom:0;z-index:100000;background:#b54708;color:#fff;padding:8px 14px;font-size:13px;display:flex;gap:12px;align-items:center;justify-content:center;flex-wrap:wrap;box-shadow:0 -2px 10px rgba(0,0,0,.3)';document.body.appendChild(b);}
+  b.innerHTML='<b>CAN\'T REACH THE DATABASE</b><span>Since '+_conn.since.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})+'. Changes are NOT being saved: keep this page open and do not re-enter anything. '+escHtml(snap)+'</span><button style="background:#fff;color:#b54708;border:none;border-radius:4px;padding:4px 12px;font-weight:700;cursor:pointer" onclick="connProbe()">Check now</button>';
+}
+async function connProbe(){
+  if(S._offline)return;
+  var ok=await dbReachable();
+  if(ok){_conn.fails=0;if(_conn.down){_conn.down=false;connBar(false);try{toast('Back online. Catching up with changes made meanwhile.',6000);}catch(e){}try{liveSyncTick({force:true,full:true});}catch(e){}}}
+  else{_conn.fails++;if(_conn.fails>=2&&!_conn.down){_conn.down=true;_conn.since=new Date();}if(_conn.down)connBar(true);}
+}
+function startConnWatch(){
+  if(_conn.timer)return;_conn.timer=setInterval(connProbe,30000);
+  window.addEventListener('offline',function(){setTimeout(connProbe,500);});window.addEventListener('online',function(){setTimeout(connProbe,500);});
+}
+/* ---- the full backup file */
+var BK_TABLES=['parts','assemblies','bom_items','sales','purchases','po_lines','po_tracking','vendors','dealers','dealer_prices','dropship_vendors','inv_corrections','pack_log','settings','warranty_claims','shipment_errors','part_files','customs_sku_rules','cycle_counts','cycle_count_lines','variant_holds','team_members','profiles'];
+function _bkDownload(name,blob){var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();setTimeout(function(){a.remove();try{URL.revokeObjectURL(a.href);}catch(e){}},1500);}
+function _bkLoadXlsx(){return new Promise(function(res,rej){if(window.XLSX)return res(window.XLSX);var sc=document.createElement('script');sc.src='https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';sc.onload=function(){res(window.XLSX);};sc.onerror=function(){rej(new Error('Excel library could not be loaded'));};document.head.appendChild(sc);});}
+function _bkFlat(rows){
+  var cols=[],seen={};(rows||[]).slice(0,300).forEach(function(r){Object.keys(r||{}).forEach(function(k){if(!seen[k]&&cols.length<70){seen[k]=1;cols.push(k);}});});
+  return (rows||[]).map(function(r){var o={};cols.forEach(function(k){var v=r[k];o[k]=(v&&typeof v==='object')?JSON.stringify(v).slice(0,30000):(typeof v==='string'&&v.length>30000?v.slice(0,30000):v);});return o;});
+}
+function _bkStatus(msg){S._bkMsg=msg;var el=document.getElementById('bk-status');if(el)el.textContent=msg;}
+async function erpFullBackup(){
+  if(S._bkBusy)return;
+  if(S._offline){toast('Backups need the database, which is not reachable right now');return;}
+  S._bkBusy=true;
+  var day=new Date().toISOString().slice(0,10),out={meta:{app:'TGK ERP',version:TGK_ERP_VERSION,taken_at:new Date().toISOString(),by:S.currentUser||'',counts:{},errors:{}},tables:{}};
+  try{
+    for(var i=0;i<BK_TABLES.length;i++){
+      var t=BK_TABLES[i];_bkStatus('Reading '+t+' ('+(i+1)+' of '+BK_TABLES.length+')...');
+      try{out.tables[t]=await fetchAll(function(f,e){return db.from(t).select('*').range(f,e);});out.meta.counts[t]=out.tables[t].length;}
+      catch(e){out.meta.errors[t]=String((e&&e.message)||e);}
+    }
+    _bkStatus('Saving the files...');
+    _bkDownload('tgk-erp-backup-'+day+'.json',new Blob([JSON.stringify(out)],{type:'application/json'}));
+    var xlsxOk=true;
+    try{
+      var X=await _bkLoadXlsx(),wb=X.utils.book_new(),T=out.tables,done=(typeof SALES_DONE!=='undefined'&&SALES_DONE)||['Shipped','Delivered','Cancelled','Refunded'];
+      var sheets=[['Info',Object.keys(out.meta.counts).map(function(k){return {table:k,rows:out.meta.counts[k]};}).concat(Object.keys(out.meta.errors).map(function(k){return {table:k,rows:'NOT READ: '+out.meta.errors[k]};}))],
+        ['Parts',T.parts],['Assemblies',T.assemblies],['BOM',T.bom_items],['Open orders',(T.sales||[]).filter(function(r){return done.indexOf(r.fulfillment_status||'')<0;})],
+        ['Purchase orders',T.purchases],['PO lines',T.po_lines],['Dealers',T.dealers],['Vendors',T.vendors]];
+      sheets.forEach(function(sh){if(sh[1]&&sh[1].length)X.utils.book_append_sheet(wb,X.utils.json_to_sheet(_bkFlat(sh[1])),sh[0].slice(0,31));});
+      _bkStatus('Saving the Excel file...');setTimeout(function(){try{X.writeFile(wb,'tgk-erp-readable-'+day+'.xlsx');}catch(e){}},900);
+    }catch(e){xlsxOk=false;console.warn('[backup] Excel not made:',e&&e.message);}
+    localStorage.setItem('tgk_last_full_backup',out.meta.taken_at);
+    var nerr=Object.keys(out.meta.errors).length,total=Object.keys(out.meta.counts).reduce(function(n,k){return n+out.meta.counts[k];},0);
+    _bkStatus('Done: '+total.toLocaleString()+' rows from '+Object.keys(out.meta.counts).length+' tables'+(nerr?' ('+nerr+' could not be read)':'')+(xlsxOk?'. Check your downloads for the JSON and Excel files.':'. The JSON file was saved; the Excel file could not be made.'));
+    toast('Full backup saved to this computer: '+total.toLocaleString()+' rows'+(nerr?', '+nerr+' tables not readable':''),8000);
+  }catch(e){_bkStatus('Backup failed: '+((e&&e.message)||e));toast('Backup failed: '+((e&&e.message)||e),8000);}
+  finally{S._bkBusy=false;if(S.view==='backups')try{render();}catch(e){}}
+}
+function backupSafetyCard(){
+  if(S._snapInfo===undefined){S._snapInfo=null;snapGet().then(function(r){S._snapInfo=r?{ts:r.ts,counts:r.counts,ver:r.ver}:false;if(S.view==='backups')try{render();}catch(e){}});}
+  var si=S._snapInfo,last=null;try{last=localStorage.getItem('tgk_last_full_backup');}catch(e){}
+  var days=last?Math.floor((Date.now()-new Date(last).getTime())/864e5):null,stale=(days==null||days>7);
+  var snapTxt=si?('Taken '+new Date(si.ts).toLocaleString()+' &middot; '+(si.counts.parts||0).toLocaleString()+' parts, '+(si.counts.assemblies||0).toLocaleString()+' assemblies, '+(si.counts.sales||0).toLocaleString()+' orders'):(si===false?'<span style="color:var(--orange)">No snapshot on this computer yet</span>':'Checking...');
+  return '<div class="panel" style="margin-bottom:16px"><div class="panel-title"><span>Backups that work when Supabase does not</span></div>'
+    +'<div class="t3s" style="line-height:1.6;margin-bottom:12px">The backups below are stored <b>in</b> Supabase, so they are gone with it. These two live on your own computer.</div>'
+    +'<div class="grid-2"><div style="border:1px solid var(--border);border-radius:var(--r-md);padding:12px 14px">'
+      +'<div style="font-weight:700;margin-bottom:4px">Outage snapshot</div>'
+      +'<div class="t3s" style="line-height:1.55;margin-bottom:8px">Kept up to date on this computer while the ERP is open. If the database cannot be reached the ERP offers to open it read only, so orders, stock and BOMs can be looked up and pick lists, packing slips and BOMs printed.</div>'
+      +'<div class="t3xs" style="margin-bottom:8px">'+snapTxt+(S._snapErr?' <span style="color:var(--red)">('+escHtml(S._snapErr)+')</span>':'')+'</div>'
+      +'<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-sm btn-teal" onclick="snapSave(true).then(function(ok){toast(ok?\'Snapshot saved on this computer\':\'Snapshot not saved\');})">Take snapshot now</button><button class="btn btn-sm" onclick="snapDrill()" title="Reloads the ERP and opens the snapshot read only, so you can see what an outage looks like">Practice: open it read only</button></div>'
+    +'</div><div style="border:1px solid '+(stale?'var(--orange)':'var(--border)')+';border-radius:var(--r-md);padding:12px 14px">'
+      +'<div style="font-weight:700;margin-bottom:4px">Full backup file</div>'
+      +'<div class="t3s" style="line-height:1.55;margin-bottom:8px">Everything in the database downloaded to this computer: an Excel workbook you can read and a JSON file with every table. Keep a copy somewhere other than this computer (Dropbox).</div>'
+      +'<div class="t3xs" style="margin-bottom:8px;'+(stale?'color:var(--orange)':'')+'">Last downloaded: '+(last?new Date(last).toLocaleString()+' ('+days+' day'+(days===1?'':'s')+' ago)':'never')+'</div>'
+      +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button class="btn btn-sm btn-primary" onclick="erpFullBackup()">&#8595; Download full backup (Excel + JSON)</button><span class="t3xs" id="bk-status">'+escHtml(S._bkMsg||'')+'</span></div>'
+    +'</div></div></div>';
 }
 
 async function createBackup(label) {
@@ -23973,6 +24233,7 @@ function renderBackups() {
     });
   }
   return `
+  ${backupSafetyCard()}
   <div class="kpi-grid kpi-grid-3">
     <div class="kpi kpi-teal"><div class="kpi-label">Backups Stored</div><div class="kpi-value">${S.backups.length}</div></div>
     <div class="kpi"><div class="kpi-label">Last Auto-Backup</div><div class="kpi-value" style="font-size:var(--t-md);font-family:var(--mono)">${last}</div></div>
@@ -40532,6 +40793,7 @@ function printPriceList(){
   function showRetry(){if(retry)retry.style.display='';if(dots)dots.style.opacity='.25';}
 
   const tHard=setTimeout(()=>location.reload(),60000);
+  window._tgkClearHard=function(){clearTimeout(tHard);};   // [v23.169] opening the outage snapshot must not be reloaded away
 
   let sdkAttempts=0;
   function waitForSupabase(){
@@ -40552,6 +40814,8 @@ function printPriceList(){
     if(_dealerParam){startDealerPortal(_dealerParam);return;}
     const _prospectParam=new URLSearchParams(window.location.search).get('prospect');
     if(_prospectParam){window.location.replace('https://dealer.tgkmotorsport.com/?prospect=1');return;}
+    // [v23.169] "Practice: open it read only" on the Backups page reloads straight into the snapshot
+    try{if(sessionStorage.getItem('tgk_snap_drill')==='1'){sessionStorage.removeItem('tgk_snap_drill');snapGet().then(function(rec){if(rec&&rec.data&&rec.data.parts&&rec.data.parts.length){snapEnter(rec);}else{checkAuthAndConnect();}});return;}}catch(_d){}
     checkAuthAndConnect();
   }
 
@@ -40610,6 +40874,7 @@ try{history.replaceState(snapState(),'','#'+S.view);}catch(e){}
           clearTimeout(tHard);
           setMsg('Could not connect: '+err.message);
           showRetry();
+          try{snapOfferOnLoader();}catch(e){}   // [v23.169]
         }
       });
   }
@@ -44848,6 +45113,7 @@ const _chat={msgs:[],team:[],alerts:[],open:false,unread:0,tab:'msgs',_idx:-1,_r
 
 let _chatLiveChannel=null,_chatNotifChannel=null;
 async function initChat(){
+  if(S._offline)return;   // [v23.169] the read-only snapshot does not register chat presence (a write)
   if(!S.currentUser||_chat._ready)return;
   _chat._ready=true;
   try{
