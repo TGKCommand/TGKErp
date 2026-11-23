@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.171';
+const TGK_ERP_VERSION = 'v23.172';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -10323,6 +10323,7 @@ function dealerMenuHtml(d,visits,owes){
  var id=escHtml(String(d.id)),item=function(act,title,sub,cls){return '<button role="menuitem" class="dm-item'+(cls?' '+cls:'')+'" onclick="dealerMenuDo(\''+act+'\',\''+id+'\')"><span class="dm-t">'+title+'</span>'+(sub?'<span class="dm-s">'+sub+'</span>':'')+'</button>';};
  return item('edit','Edit details','Name, contact, discount, status')
   +item('hist','Order history','Every order placed with their order code')
+  +item('cust','Shopify customers','Link their Shopify account so every order counts')
   +item('store','Storefront','Special prices, how they pay, shipping')
   +(d.price_list_token?item('link','Copy price-list link','To send to the dealer'):'')
   +(owes>0?item('stmt','Email statement','What they owe, with a copy to orders@'):'')+item('log','Visit log',visits>0?visits+' visit'+(visits===1?'':'s'):'No visits yet')
@@ -10347,6 +10348,7 @@ function dealerMenuDo(act,id){
  else if(act==='store')openDealerStore(d.id);
  else if(act==='link')copyDealerLink(d.id);
  else if(act==='hist')openDealerHistory(d.id);
+ else if(act==='cust')openDealerCustomers(d.id);
  else if(act==='stmt')emailDealerStatement(d.id);
  else if(act==='log')showDealerLog(d.id,d.name);
  else if(act==='del')deleteDealer(d.id);
@@ -10360,6 +10362,136 @@ function dlLast(x){return x.st.tracked?dlAgo(x.st.last):'<span class="t3s" title
 function dlMoney(n){return n>0?'$'+Math.round(n).toLocaleString('en-US'):'<span class="t3s">&mdash;</span>';}
 // The dealer an order's discount code belongs to: the dealer's order code (PO prefix) followed by a separator or digit and a PO number; the LONGEST prefix wins, so 'ec' never claims 'ecs' orders.
 // This is the dealer portal server's own rule, and it covers every dealer (the ERP's PO-billing helper only recognises dealers we bill).
+/* ================= [v23.172] LINK A DEALER TO ITS SHOPIFY CUSTOMER(S) =================
+   A dealer's orders are matched to them by the DEALER CODE on the order. Orders placed another way (an old stocking code, a generic code, no code at all) carry no dealer code. The sales lines do hold
+   the buyer's email, so a dealer can also be linked to one or more Shopify customer emails: an order from those customers counts as the dealer's when no dealer code says otherwise.
+   The dealer list (last order, 12-month sales) and the dealer's order history use it. Billing, POs and overdue stay on the code, since a PO needs a PO number. The dealer's own My Orders finds orders by
+   code only, so "Show them in My Orders" adds the dealer's code to lines that have none. Stored as setting dealer_customer_links: {dealerId: [emails]}. */
+function dlCustLinks(){var v=S.settings&&S.settings.dealer_customer_links;return (v&&typeof v==='object'&&!Array.isArray(v))?v:{};}
+function dlEmailNorm(e){return String(e||'').trim().toLowerCase();}
+function dlCustIdx(){
+  var L=dlCustLinks(),sig=Object.keys(L).sort().map(function(k){return k+':'+(L[k]||[]).join(',');}).join('|');
+  if(S._dclSig===sig&&S._dclIdx)return S._dclIdx;
+  var ix={};Object.keys(L).forEach(function(id){(L[id]||[]).forEach(function(e){e=dlEmailNorm(e);if(e&&!ix[e])ix[e]=id;});});
+  S._dclSig=sig;S._dclIdx=ix;return ix;
+}
+// Who an order belongs to: the dealer code first (exactly as before), else the linked customer.
+function dlOwner(x){
+  var m=x.discount_code?dlMatchDealer(x.discount_code,S.dealers):null;
+  if(m)return {dealer:m.dealer,po:m.po||'',via:'code'};
+  var id=dlCustIdx()[dlEmailNorm(x.customer_email)];if(!id)return null;
+  var d=(S.dealers||[]).find(function(y){return String(y.id)===String(id);});
+  return d?{dealer:d,po:'',via:'customer'}:null;
+}
+// every buyer seen on the orders (email, name, how many orders, last order), so a dealer can be linked by picking the customer instead of typing an email
+function dclBuyers(){
+  var sig=(S.sales||[]).length;if(S._dclBuyerSig===sig&&S._dclBuyers)return S._dclBuyers;
+  var m={};(S.sales||[]).forEach(function(x){var e=dlEmailNorm(x.customer_email);if(!e)return;var b=m[e]||(m[e]={email:e,name:'',orders:{},last:''});if(!b.name&&x.customer_name)b.name=String(x.customer_name);b.orders[x.order_number||x.id]=1;var d=String(x.sale_date||'').slice(0,10);if(d>b.last)b.last=d;});
+  S._dclBuyers=Object.keys(m).map(function(k){var b=m[k];return {email:b.email,name:b.name,n:Object.keys(b.orders).length,last:b.last};});S._dclBuyerSig=sig;return S._dclBuyers;
+}
+function dclState(){return S._dcl||(S._dcl={id:null,q:'',msg:''});}
+function openDealerCustomers(id){
+  var d=(S.dealers||[]).find(function(x){return String(x.id)===String(id);});if(!d)return;
+  var ex=document.getElementById('dcl-ov');if(ex)ex.remove();
+  S._dcl={id:d.id,q:'',msg:''};
+  var ov=document.createElement('div');ov.id='dcl-ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
+  ov.innerHTML='<div id="dcl-box" style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(820px,96vw);max-height:92vh;overflow:auto;padding:16px 20px"></div>';
+  ov.addEventListener('mousedown',function(e){if(e.target===ov)dclClose();});
+  document.body.appendChild(ov);dclRedraw();
+}
+function dclClose(){var ov=document.getElementById('dcl-ov');if(ov)ov.remove();S._dcl=null;}
+function dclRedraw(){var b=document.getElementById('dcl-box');if(b)b.innerHTML=dclHtml();}
+function dclAnalysis(d){
+  var L=(dlCustLinks()[d.id]||[]).map(dlEmailNorm),mine={},byOrder={};
+  L.forEach(function(e){mine[e]=1;});
+  (S.sales||[]).forEach(function(x){
+    if(!mine[dlEmailNorm(x.customer_email)])return;
+    var ow=dlOwner(x);if(!ow||String(ow.dealer.id)!==String(d.id))return;   // an order that carries ANOTHER dealer's code stays with that dealer
+    var k=x.order_number||x.id,o=byOrder[k]||(byOrder[k]={no:x.order_number,date:String(x.sale_date||'').slice(0,10),code:'',lines:0,viaCust:false,empty:0,other:0});
+    o.lines++;if(ow.via==='customer'){o.viaCust=true;if(String(x.discount_code||'').trim()){o.other++;o.code=String(x.discount_code);}else o.empty++;}
+  });
+  var list=Object.keys(byOrder).map(function(k){return byOrder[k];}).sort(function(a,b){return String(b.date).localeCompare(String(a.date));});
+  var via=list.filter(function(o){return o.viaCust;});
+  return {total:list.length,via:via,empty:via.reduce(function(n,o){return n+o.empty;},0),other:via.reduce(function(n,o){return n+o.other;},0)};
+}
+function dclHtml(){
+  var st=dclState(),d=(S.dealers||[]).find(function(x){return String(x.id)===String(st.id);});if(!d)return '';
+  var adm=S.currentRole==='admin',links=dlCustLinks()[d.id]||[],inp='padding:6px 8px;font-size:var(--t-sm);background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-md);color:var(--text)';
+  var sug=[d.email,d.orders_email].map(dlEmailNorm).filter(function(e,i,a){return e&&a.indexOf(e)===i&&links.map(dlEmailNorm).indexOf(e)<0;});
+  var q=dlEmailNorm(st.q),hits=q.length>=2?dclBuyers().filter(function(b){return (b.email.indexOf(q)>=0||String(b.name||'').toLowerCase().indexOf(q)>=0)&&links.map(dlEmailNorm).indexOf(b.email)<0;}).sort(function(a,b){return b.n-a.n;}).slice(0,10):[];
+  var an=dclAnalysis(d),code=dlCode(d);
+  var h='<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px"><div style="font-size:var(--t-lg);font-weight:700;flex:1">Shopify customers for '+escHtml(d.name||'')+'</div><button class="btn btn-sm" onclick="dclClose()">Close</button></div>'
+   +'<div class="t3s" style="line-height:1.55;margin-bottom:12px">Orders are matched to a dealer by the dealer code on the order'+(code?' (<b style="font-family:var(--mono)">'+escHtml(code)+'</b>)':'')+'. An order placed another way, such as an old stocking code or no code, has no dealer code. Link the dealer\'s Shopify customer here and any order from that customer counts as theirs, unless it carries another dealer\'s code.</div>';
+  h+='<div style="font-weight:700;margin-bottom:6px">Linked customers</div>';
+  h+=links.length?'<div style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px">'+links.map(function(e){var b=dclBuyers().find(function(x){return x.email===dlEmailNorm(e);});return '<div style="display:flex;align-items:center;gap:10px;border:1px solid var(--border);border-radius:var(--r-md);padding:6px 10px"><b style="font-family:var(--mono)">'+escHtml(e)+'</b><span class="t3s" style="flex:1">'+(b?escHtml(b.name||'')+' &middot; '+b.n+' order'+(b.n===1?'':'s')+', last '+escHtml(b.last):'no orders from this email in the last 12 months')+'</span>'+(adm?'<button class="btn btn-sm" data-e="'+escHtml(e)+'" onclick="dclRemove(this.dataset.e)">Remove</button>':'')+'</div>';}).join('')+'</div>':'<div class="t3s" style="margin-bottom:10px">None yet.</div>';
+  if(adm){
+    h+='<div style="font-weight:700;margin:12px 0 6px">Find the customer</div>'
+      +'<input id="dcl-q" class="form-input" style="width:100%;box-sizing:border-box;'+inp+'" placeholder="Type a name or email from their orders (2 or more letters)" value="'+escHtml(st.q||'')+'" oninput="dclSearch(this.value)" autocomplete="off">'
+      +(q.length>=2?(hits.length?'<div style="margin-top:6px;display:flex;flex-direction:column;gap:4px">'+hits.map(function(b){var other=dlCustIdx()[b.email];return '<div style="display:flex;align-items:center;gap:10px;padding:4px 8px;border:1px solid var(--border);border-radius:var(--r-md)"><b style="font-family:var(--mono)">'+escHtml(b.email)+'</b><span class="t3s" style="flex:1">'+escHtml(b.name||'')+' &middot; '+b.n+' order'+(b.n===1?'':'s')+', last '+escHtml(b.last)+(other?' &middot; <span style="color:var(--orange)">already linked to '+escHtml(dcxName(other))+'</span>':'')+'</span>'+(other?'':'<button class="btn btn-sm btn-teal" data-e="'+escHtml(b.email)+'" onclick="dclAdd(this.dataset.e)">Link</button>')+'</div>';}).join('')+'</div>':'<div class="t3s" style="margin-top:6px">No customer on your orders matches that.</div>'):'')
+      +'<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center"><input id="dcl-add" class="form-input" style="flex:1;min-width:240px;'+inp+'" placeholder="Or type an email (several can be separated by commas)"><button class="btn btn-sm btn-teal" onclick="dclAdd(document.getElementById(\'dcl-add\').value)">Add</button>'
+      +sug.map(function(e){return '<button class="btn btn-sm" data-e="'+escHtml(e)+'" onclick="dclAdd(this.dataset.e)" title="The dealer\'s own email on file">+ '+escHtml(e)+'</button>';}).join('')+'</div>';
+  }else h+='<div class="t3xs">Only an admin can change these links.</div>';
+  if(st.msg)h+='<div class="t3s" style="margin-top:8px;color:var(--orange)">'+escHtml(st.msg)+'</div>';
+  if(links.length){
+    h+='<div style="font-weight:700;margin:16px 0 6px">What this changes</div><div class="t3s" style="line-height:1.55">'+an.total+' order'+(an.total===1?'':'s')+' from these customers in the last 12 months count for this dealer; <b>'+an.via.length+'</b> of them carry no code of the dealer\'s own and are matched by the customer link.</div>';
+    if(an.via.length)h+='<table style="width:100%;margin-top:6px"><thead><tr><th style="text-align:left">Order</th><th style="text-align:left">Date</th><th style="text-align:left">Code on the order</th></tr></thead><tbody>'+an.via.slice(0,8).map(function(o){return '<tr><td>'+escHtml(String(o.no||''))+'</td><td class="t3s">'+escHtml(o.date)+'</td><td class="t3s">'+(o.code?escHtml(o.code):'<i>none</i>')+'</td></tr>';}).join('')+'</tbody></table>'+(an.via.length>8?'<div class="t3xs">and '+(an.via.length-8)+' more</div>':'');
+    if(an.via.length){
+      h+='<div style="margin-top:12px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--r-md);font-size:var(--t-sm);line-height:1.55"><b>Show them in the dealer\'s My Orders</b><br>The dealer\'s My Orders page finds orders by the dealer code. '
+        +(an.empty?'Adding <b>'+escHtml(code||'(no code set)')+'</b> to the <b>'+an.empty+'</b> line'+(an.empty===1?' that has':'s that have')+' no code makes '+(an.empty===1?'it':'them')+' appear there. ':'')
+        +(an.other?'<b>'+an.other+'</b> line'+(an.other===1?' carries':'s carry')+' another code (for example an old stocking code); '+(an.other===1?'that one is':'those are')+' counted for this dealer in the ERP but My Orders cannot show them until the dealer-portal function matches by customer. ':'')
+        +(adm&&an.empty&&code?'<div style="margin-top:6px"><button class="btn btn-sm btn-teal" onclick="dclStamp()">Add the code to '+an.empty+' line'+(an.empty===1?'':'s')+'</button></div>':(an.empty&&!code?'<span style="color:var(--orange)">This dealer has no order code yet: set one first (Dealers, Order codes).</span>':''))+'</div>';
+    }
+  }
+  return h;
+}
+function dclSearch(v){var st=dclState();st.q=v;var b=document.getElementById('dcl-box');if(!b)return;var sc=b.scrollTop;dclRedraw();var i=document.getElementById('dcl-q');if(i){i.focus();try{i.setSelectionRange(v.length,v.length);}catch(e){}}b.scrollTop=sc;}
+async function dclSave(id,list){
+  var L=Object.assign({},dlCustLinks());if(list.length)L[id]=list;else delete L[id];
+  return await promoPersist('dealer_customer_links',L);
+}
+async function dclAdd(raw){
+  if(S.currentRole!=='admin'){toast('Ask an admin to do this');return;}
+  var st=dclState(),d=(S.dealers||[]).find(function(x){return String(x.id)===String(st.id);});if(!d)return;
+  var cur=(dlCustLinks()[d.id]||[]).slice(),parts=String(raw||'').split(/[,;\s]+/).map(dlEmailNorm).filter(Boolean),bad=[],dup=[],add=[];
+  parts.forEach(function(e){
+    if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)){bad.push(e);return;}
+    if(cur.map(dlEmailNorm).indexOf(e)>=0||add.indexOf(e)>=0)return;
+    var other=dlCustIdx()[e];if(other&&String(other)!==String(d.id)){dup.push(e+' (already linked to '+dcxName(other)+')');return;}
+    add.push(e);
+  });
+  st.msg=(bad.length?'Not an email: '+bad.join(', ')+'. ':'')+(dup.length?'Not added: '+dup.join(', ')+'.':'');
+  if(add.length){if(!(await dclSave(d.id,cur.concat(add)))){dclRedraw();return;}S._dlSig=null;toast('Linked '+add.length+' customer'+(add.length===1?'':'s')+' to '+d.name);}
+  var i=document.getElementById('dcl-add');if(i)i.value='';
+  dclRedraw();
+}
+async function dclRemove(email){
+  if(S.currentRole!=='admin'){toast('Ask an admin to do this');return;}
+  var st=dclState(),d=(S.dealers||[]).find(function(x){return String(x.id)===String(st.id);});if(!d)return;
+  var cur=(dlCustLinks()[d.id]||[]).filter(function(e){return dlEmailNorm(e)!==dlEmailNorm(email);});
+  if(await dclSave(d.id,cur)){S._dlSig=null;toast('Unlinked '+email);}
+  dclRedraw();
+}
+async function dclStamp(){
+  if(S.currentRole!=='admin'){toast('Ask an admin to do this');return;}
+  var st=dclState(),d=(S.dealers||[]).find(function(x){return String(x.id)===String(st.id);});if(!d)return;
+  var code=dlCode(d);if(!code){toast('Set this dealer\'s order code first (Dealers, Order codes)');return;}
+  var mine={};(dlCustLinks()[d.id]||[]).forEach(function(e){mine[dlEmailNorm(e)]=1;});
+  var rows=(S.sales||[]).filter(function(x){if(!mine[dlEmailNorm(x.customer_email)]||String(x.discount_code||'').trim())return false;var ow=dlOwner(x);return ow&&ow.via==='customer'&&String(ow.dealer.id)===String(d.id);});
+  if(!rows.length){toast('Nothing to add');return;}
+  if(!confirm('Add the code "'+code+'" to '+rows.length+' sales line'+(rows.length===1?'':'s')+' from '+d.name+'\'s linked customers that have no code?\n\nThey will then show in the dealer\'s My Orders. Lines that carry another code are left alone.'))return;
+  var n=0;
+  try{
+    var ids=rows.map(function(x){return x.id;});
+    for(var i=0;i<ids.length;i+=100){
+      var r=await db.from('sales').update({discount_code:code}).in('id',ids.slice(i,i+100)).is('discount_code',null).select('id');
+      if(r.error)throw new Error(r.error.message);n+=(r.data||[]).length;
+    }
+    rows.forEach(function(x){x.discount_code=code;});S._dlSig=null;
+    toast('Code '+code+' added to '+n+' line'+(n===1?'':'s')+'. They now show in the dealer\'s My Orders.',7000);
+  }catch(e){toast('Could not add the code: '+(e&&e.message||e),8000);}
+  dclRedraw();
+}
+window.openDealerCustomers=openDealerCustomers;window.dclClose=dclClose;window.dclSearch=dclSearch;window.dclAdd=dclAdd;window.dclRemove=dclRemove;window.dclStamp=dclStamp;
 function dlMatchDealer(code,dealers){
  var c=String(code||'').trim();if(!c)return null;var lc=c.toLowerCase(),i,p,d,best=null;
  for(i=0;i<dealers.length;i++){d=dealers[i];p=String(d.po_code_prefix||'').trim().toLowerCase();if(p&&lc===p)return {dealer:d,po:''};}
@@ -10368,16 +10500,17 @@ function dlMatchDealer(code,dealers){
 }
 // One pass over the sales gives every dealer's last order, 12-month sales (merchandise at their prices) and what they owe (billed, unpaid POs, the same rule as the statement).
 function dlStats(){
- var sig=[(S.sales||[]).length,(S.dealers||[]).length,Object.keys(S.dealerPOPayments||{}).length,centralDateOnly()].join('|');
+ var sig=[(S.sales||[]).length,(S.dealers||[]).length,Object.keys(S.dealerPOPayments||{}).length,centralDateOnly(),(dlCustIdx(),S._dclSig)].join('|');
  if(S._dlSig===sig&&S._dlStats)return S._dlStats;
  var by={},cut=new Date(Date.now()-365*864e5).toISOString().slice(0,10),fa={};
- (S.dealers||[]).forEach(function(d){by[d.id]={last:'',sales12:0,owes:0,overdueDays:0,overdueCount:0,tracked:!!String(d.po_code_prefix||'').trim(),pos:{}};});
+ (S.dealers||[]).forEach(function(d){by[d.id]={last:'',sales12:0,owes:0,overdueDays:0,overdueCount:0,tracked:!!String(d.po_code_prefix||'').trim()||!!((dlCustLinks()[d.id]||[]).length),pos:{}};});
  (S.sales||[]).forEach(function(s){
-  if(!s.discount_code)return;var p=dlMatchDealer(s.discount_code,S.dealers);if(!p)return;var e=by[p.dealer.id];if(!e)return;
+  var ow=dlOwner(s);if(!ow)return;var p={dealer:ow.dealer,po:ow.po},viaCust=ow.via==='customer';var e=by[p.dealer.id];if(!e)return;   // [v23.172] by code, else by linked customer
   var disc=typeof p.dealer.discount_pct==='number'?p.dealer.discount_pct:0.20,msrp=s.msrp||0;
   if(!msrp){var k=String(s.pn||'');if(!(k in fa)){var a=findAsm(k);fa[k]=a?(a.sales_price!=null?parseFloat(a.sales_price)||0:a.msrp||0):0;}msrp=fa[k];}
   var cancelled=s.fulfillment_status==='Cancelled',line=cancelled?0:msrp*(1-disc)*(s.qty||1),day=String(s.sale_date||'').slice(0,10);
   if(!cancelled){if(day>e.last)e.last=day;if(day>=cut)e.sales12+=line;}
+  if(viaCust)return;   // a PO needs a PO number: customer-linked orders count for last order and sales, not for billing
   var pk=p.po||'(no PO)',po=e.pos[pk]||(e.pos[pk]={rows:[],total:0});po.rows.push(s);po.total+=line;
  });
  (S.dealers||[]).forEach(function(d){var e=by[d.id];Object.keys(e.pos).forEach(function(k){
@@ -10398,7 +10531,7 @@ function dlFlags(d,st,sg){
  var f=[];if(d.status!=='Active')return f;
  if(st.overdueCount)f.push('overdue');
  if(d.billing_required&&dealerTermsDays(d)===null)f.push('noterms');
- if(!dlCode(d))f.push('nocode');   // no order code: none of their orders can be matched to them
+ if(!dlCode(d)&&!((dlCustLinks()[d.id]||[]).length))f.push('nocode');   // no order code: none of their orders can be matched to them
  if(!dlHasEmail(d))f.push('noemail');else if(sg&&sg.has_email&&!sg.has_password)f.push('notsigned');
  var n=dlSince(st.last),covered=!!(S._sales12||S._salesAll);if(st.tracked&&((st.last===''&&covered)||(n!==null&&n>90&&covered)))f.push('noorder');   // [v23.171] not until the full year is loaded   // a dealer with no order code cannot be matched to orders, so no verdict
  return f;
@@ -10545,7 +10678,7 @@ function dlOpenDrawer(id){
   +'<div class="dl-kv"><span>Order code</span><span>'+(dlCode(d)?'<b style="font-family:var(--mono)">'+escHtml(dlCode(d))+'</b>':'<b style="color:var(--red)">None</b> <a style="color:var(--teal);cursor:pointer" onclick="dlCloseDrawer();openCodeLinker()">set one</a>')+'</span><span>Orders email</span><span>'+dlOrdersEmailHtml(d)+'</span><span>Contact</span><span>'+(d.contact_name?escHtml(d.contact_name):'&mdash;')+'</span><span>Email</span><span>'+(dlHasEmail(d)?escHtml(d.email):'<b style="color:var(--red)">None on file</b>')+'</span><span>Portal</span><span>'+dlPortalCell(x||{})+'</span><span>Last order</span><span>'+(x?dlLast(x):'')+'</span><span>Sales, 12 months</span><span>'+(x?dlMoney(x.st.sales12):'')+'</span><span>Owes</span><span>'+(x?dlMoney(x.st.owes):'')+'</span><span>Payment terms</span><span>'+terms+'</span></div>'
   +'<div class="dl-dbtn"><button class="btn btn-primary" onclick="dealerMenuDo(\'edit\',\''+e+'\')">Edit details</button>'
   +(tok?'<a class="btn btn-teal" style="text-decoration:none;text-align:center" target="_blank" href="'+escHtml('https://dealer.tgkmotorsport.com/?d='+tok+'&staff=1')+'" onclick="return openDealerStaffView(event,this.href)">View portal</a>':'<span></span>')
-  +'<button class="btn" onclick="dealerMenuDo(\'hist\',\''+e+'\')">Order history</button><button class="btn" onclick="dealerMenuDo(\'store\',\''+e+'\')">Storefront</button>'+(tok?'<button class="btn" onclick="dealerMenuDo(\'link\',\''+e+'\')">Copy link</button>':'<span></span>')
+  +'<button class="btn" onclick="dealerMenuDo(\'hist\',\''+e+'\')">Order history</button><button class="btn" onclick="dealerMenuDo(\'cust\',\''+e+'\')" title="Link this dealer to its Shopify customer(s), so orders placed with another code or no code still count">Shopify customers</button><button class="btn" onclick="dealerMenuDo(\'store\',\''+e+'\')">Storefront</button>'+(tok?'<button class="btn" onclick="dealerMenuDo(\'link\',\''+e+'\')">Copy link</button>':'<span></span>')
   +(x&&x.st.owes>0?'<button class="btn" onclick="dealerMenuDo(\'stmt\',\''+e+'\')">Email statement</button>':'')+'<button class="btn" onclick="dealerMenuDo(\'log\',\''+e+'\')">Visit log</button>'
   +'<button class="btn" style="grid-column:1/3" onclick="dlCloseDrawer();openDealerDetail(\''+e+'\')">Full details and POs</button></div></div>';
  document.body.appendChild(o);document.addEventListener('keydown',_dlDrawerKey,true);document.addEventListener('mousedown',_dlDrawerOut,true);
@@ -10672,7 +10805,7 @@ function dhOrders(rows,d){
  var disc=typeof d.discount_pct==='number'?d.discount_pct:0.2,by={},list=[],fa={};
  (rows||[]).forEach(function(s){
   var k=String(s.order_number||('id'+s.id)),o=by[k];if(!o){o=by[k]={no:s.order_number||'',date:'9999',po:'',lines:[],total:0,units:0,tracking:'',shipped:''};list.push(o);}
-  var m=dlMatchDealer(s.discount_code,[d]);if(m&&m.po&&!o.po)o.po=m.po;
+  var m=dlMatchDealer(s.discount_code,[d]);if(m&&m.po&&!o.po)o.po=m.po;if(!m)o.viaCust=true;   // [v23.172] matched by the linked customer, not by a code
   var day=String(s.sale_date||'').slice(0,10);if(day&&day<o.date)o.date=day;
   var msrp=Number(s.msrp)||0;if(!msrp){var pk=String(s.pn||'');if(!(pk in fa)){var a=findAsm(pk);fa[pk]=a?(a.sales_price!=null?parseFloat(a.sales_price)||0:a.msrp||0):0;}msrp=fa[pk];}
   var q=Number(s.qty)||1,unit=msrp*(1-disc),line=Object.assign({},s,{_unit:Math.round(unit*100)/100,_total:Math.round(unit*q*100)/100,_live:_poLive(s)});
@@ -10704,7 +10837,7 @@ function dhListHtml(){
  if(!vis.length)return '<tr><td colspan="7" style="padding:22px;text-align:center;color:var(--text3)">No orders match.</td></tr>';
  return vis.map(function(o){
   var open=!!(st.open||{})[o.no],no=escHtml(String(o.no).replace(/\'/g,"\\'"));
-  var row='<tr style="cursor:pointer" onclick="dhToggle(\''+no+'\')"><td>'+(open?'&#9662;':'&#9656;')+' '+escHtml(o.date||'')+'</td><td><b>'+escHtml(o.no)+'</b></td><td class="t2s">'+escHtml(o.po||'')+'</td><td style="text-align:right">'+o.lines.length+' line'+(o.lines.length===1?'':'s')+' &middot; '+o.units+' unit'+(o.units===1?'':'s')+'</td><td style="text-align:right;font-family:var(--mono)">'+(o.status==='Cancelled'?'<span class="t3s">&mdash;</span>':'$'+o.total.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}))+'</td><td><span class="pill '+(DH_PILL[o.status]||'pill-muted')+'">'+escHtml(o.status)+'</span></td><td class="t2s">'+(o.tracking?escHtml(o.tracking):'')+'</td></tr>';
+  var row='<tr style="cursor:pointer" onclick="dhToggle(\''+no+'\')"><td>'+(open?'&#9662;':'&#9656;')+' '+escHtml(o.date||'')+'</td><td><b>'+escHtml(o.no)+'</b>'+(o.viaCust?' <span class="t3xs" title="Matched by the linked Shopify customer, not by a dealer code">by customer</span>':'')+'</td><td class="t2s">'+escHtml(o.po||'')+'</td><td style="text-align:right">'+o.lines.length+' line'+(o.lines.length===1?'':'s')+' &middot; '+o.units+' unit'+(o.units===1?'':'s')+'</td><td style="text-align:right;font-family:var(--mono)">'+(o.status==='Cancelled'?'<span class="t3s">&mdash;</span>':'$'+o.total.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}))+'</td><td><span class="pill '+(DH_PILL[o.status]||'pill-muted')+'">'+escHtml(o.status)+'</span></td><td class="t2s">'+(o.tracking?escHtml(o.tracking):'')+'</td></tr>';
   if(!open)return row;
   return row+'<tr><td colspan="7" style="padding:0;background:var(--bg3)"><table style="width:100%">'+o.lines.map(function(l){return '<tr><td style="padding:4px 12px 4px 34px;font-family:var(--mono)">'+escHtml(dispSku(l.pn)||String(l.pn||''))+'</td><td>'+escHtml(l.description||'')+'</td><td style="text-align:right">&times;'+(l.qty||1)+'</td><td style="text-align:right;font-family:var(--mono)">'+(l._live?'$'+l._unit.toFixed(2):'')+'</td><td style="text-align:right;font-family:var(--mono)">'+(l._live?'$'+l._total.toFixed(2):'')+'</td><td class="t2s">'+escHtml(l.fulfillment_status||'Open')+(l.tracking_number?' &middot; '+escHtml(l.tracking_number):'')+'</td></tr>';}).join('')+'</table></td></tr>';
  }).join('');
@@ -10729,19 +10862,28 @@ function dhHtml(){
 async function openDealerHistory(id){
  var ex=document.getElementById('dh-ov');if(ex)ex.remove();
  var d=(S.dealers||[]).find(function(x){return String(x.id)===String(id);});if(!d)return;
- S._dh={id:d.id,loading:!!dlCode(d),err:'',orders:[],q:'',status:'all',range:'12',open:{}};
+ S._dh={id:d.id,loading:!!(dlCode(d)||(dlCustLinks()[d.id]||[]).length),err:'',orders:[],q:'',status:'all',range:'12',open:{}};
  var ov=document.createElement('div');ov.id='dh-ov';ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
  ov.innerHTML='<div id="dh-box" style="background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);width:min(1100px,96vw);max-height:92vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.25)"></div>';
  ov.addEventListener('mousedown',function(e){if(e.target===ov)dhClose();});
  document.body.appendChild(ov);dhRedraw();
- if(dlCode(d))await dhLoad();
+ if(dlCode(d)||(dlCustLinks()[d.id]||[]).length)await dhLoad();
 }
 async function dhLoad(){
  var st=S._dh;if(!st)return;var d=(S.dealers||[]).find(function(x){return String(x.id)===String(st.id);});if(!d)return;
  try{
-  var like=dlCode(d).replace(/[\\%_]/g,'\\$&')+'%';
-  var rows=await fetchAll(function(a,b){return db.from('sales').select('*').ilike('discount_code',like).order('sale_date',{ascending:false}).range(a,b);});
-  rows=(rows||[]).filter(function(s){var m=dlMatchDealer(s.discount_code,S.dealers);return m&&String(m.dealer.id)===String(d.id);});   // the same rule as everywhere: the longest code wins, so "ec" never gets "ecs" orders
+   var rows=[],seenId={};
+   if(dlCode(d)){
+     var like=dlCode(d).replace(/[\\%_]/g,'\\$&')+'%';
+     rows=await fetchAll(function(a,b){return db.from('sales').select('*').ilike('discount_code',like).order('sale_date',{ascending:false}).range(a,b);});
+   }
+   var emails=(dlCustLinks()[d.id]||[]).map(dlEmailNorm).filter(function(e){return /^[^@\s,()"]+@[^@\s,()"]+\.[^@\s,()"]+$/.test(e);});
+   if(emails.length){   // [v23.172] the linked customers' orders too, whatever code they used
+     var orf=emails.map(function(e){return 'customer_email.ilike."'+e+'"';}).join(',');
+     var more=await fetchAll(function(a,b){return db.from('sales').select('*').or(orf).order('sale_date',{ascending:false}).range(a,b);});
+     rows=rows.concat(more||[]);
+   }
+   rows=rows.filter(function(s){if(seenId[s.id])return false;seenId[s.id]=1;var ow=dlOwner(s);return ow&&String(ow.dealer.id)===String(d.id);});   // the same rule as everywhere: the longest code wins, so "ec" never gets "ecs" orders
   if(S._dh!==st)return;st.orders=dhOrders(rows,d);st.loading=false;st.err='';
  }catch(e){if(S._dh===st){st.loading=false;st.err=(e&&e.message)||String(e);}}
  dhRedraw();
@@ -35912,6 +36054,78 @@ function dsStatusPill(st){var x=DS_STATUS[st]||[st,'pill-muted'];return '<span c
 var DS_SHIP={packed:['Packed','pill-yellow'],partial:['Partly shipped','pill-yellow'],shipped:['Shipped','pill-teal'],delivered:['Delivered','pill-green'],hold:['On hold','pill-muted'],cancelled:['Cancelled','pill-muted']};
 function dsNormOrd(x){return String(x==null?'':x).replace(/^#+/,'').trim().toLowerCase();}
 function dsLineShipped(s){var q=Number(s.qty)||0,st=String(s.fulfillment_status||'').toLowerCase();if(/^(shipped|delivered|fulfilled)$/.test(st))return q;if(st==='partial')return Math.max(0,Math.min(q,Number(s.qty_shipped)||0));if(s.shipped_at&&String(s.tracking_number||'').trim())return q;return 0;}
+// [v23.172] A dealer's My Orders finds their orders by the DEALER CODE on the sales lines. A portal order is a Shopify draft order, so the code only reaches the sales lines when the order
+// importer reads it from the order's attributes (shopify-orders v23.86 or newer). This screen finds the shipment by order NUMBER, so such an order looks fine here and is missing there.
+function dsSalesIdx(){
+  var sig=(S.sales||[]).length+'|'+(DS.reqs||[]).length;
+  if(DS._idxSig===sig&&DS._idx)return DS._idx;
+  var by={},byId={};
+  (S.sales||[]).forEach(function(x){var n=dsNormOrd(x.order_number);if(n)(by[n]=by[n]||[]).push(x);var id=String(x.shopify_order_id||'');if(id)(byId[id]=byId[id]||[]).push(x);});
+  DS._idxSig=sig;DS._idx={by:by,byId:byId};DS._gaps=null;return DS._idx;
+}
+function dsCodeGap(r){
+  if(!r||r.status!=='sent'||r.archived_at)return null;
+  var nm=dsNormOrd(r.shopify_order_name),id=String(r.shopify_order_id||'');if(!nm&&!id)return null;
+  var d=(S.dealers||[]).find(function(x){return String(x.id)===String(r.dealer_id);});if(!d)return null;
+  var ix=dsSalesIdx(),rows=((id&&ix.byId[id])||[]).concat(nm?(ix.by[nm]||[]).filter(function(x){return !(id&&String(x.shopify_order_id||'')===id);}):[]);
+  if(!rows.length)return null;   // the order has not reached the ERP's sales yet
+  var code=String(r.discount_code||((d.po_code_prefix||'')+(r.po_number?' '+r.po_number:''))).trim();if(!code)return null;
+  var bad=rows.filter(function(x){var m=dlMatchDealer(x.discount_code,S.dealers);return !(m&&String(m.dealer.id)===String(d.id));});
+  if(!bad.length)return null;
+  var m2=dlMatchDealer(code,S.dealers),fixable=!!(m2&&String(m2.dealer.id)===String(d.id));
+  return {req:r,dealer:d,code:code,fixable:fixable,fix:bad.filter(function(x){return !String(x.discount_code||'').trim();}),other:bad.filter(function(x){return String(x.discount_code||'').trim();}),total:rows.length};
+}
+function dsCodeGaps(){
+  dsSalesIdx();if(DS._gaps)return DS._gaps;
+  DS._gaps=(DS.reqs||[]).map(dsCodeGap).filter(Boolean);return DS._gaps;
+}
+async function _dsWriteCode(list){
+  var n=0;
+  for(var i=0;i<list.length;i++){
+    var g=list[i],ids=g.fix.map(function(x){return x.id;});
+    for(var j=0;j<ids.length;j+=100){
+      var r=await db.from('sales').update({discount_code:g.code}).in('id',ids.slice(j,j+100)).is('discount_code',null).select('id');
+      if(r.error)throw new Error(r.error.message);
+      n+=(r.data||[]).length;
+    }
+    g.fix.forEach(function(x){x.discount_code=g.code;});
+  }
+  S._dlSig=null;DS._gaps=null;DS._idxSig=null;
+  return n;
+}
+async function dsFixCode(id){
+  if(S.currentRole!=='admin'){toast('Ask an admin to do this');return;}
+  var r=(DS.reqs||[]).find(function(x){return String(x.id)===String(id);}),g=r&&dsCodeGap(r);
+  if(!g||!g.fixable||!g.fix.length){toast('Nothing to fix on this order');return;}
+  try{var n=await _dsWriteCode([g]);toast('Code '+g.code+' added to '+n+' line'+(n===1?'':'s')+'. This order now shows in '+(g.dealer.name||'the dealer')+'\'s My Orders.',7000);}
+  catch(e){toast('Could not add the code: '+(e&&e.message||e),8000);}
+  render();
+}
+async function dsFixAllCodes(){
+  if(S.currentRole!=='admin'){toast('Ask an admin to do this');return;}
+  var list=dsCodeGaps().filter(function(g){return g.fixable&&g.fix.length;});
+  if(!list.length){toast('Nothing to fix');return;}
+  if(!confirm('Add the dealer code to the sales lines of '+list.length+' shipped dealer order'+(list.length===1?'':'s')+'?\n\n'+list.slice(0,10).map(function(g){return '  \u2022 '+(g.req.shopify_order_name||g.req.po_number||'order')+'  ('+g.dealer.name+')  \u2192  '+g.code;}).join('\n')+(list.length>10?'\n  \u2026 and '+(list.length-10)+' more':'')+'\n\nOnly lines with no code are filled in. Nothing else changes.'))return;
+  try{var n=await _dsWriteCode(list);toast('Dealer code added to '+n+' line'+(n===1?'':'s')+' on '+list.length+' order'+(list.length===1?'':'s')+'. They now show in the dealers\' My Orders.',8000);}
+  catch(e){toast('Could not add the codes: '+(e&&e.message||e),8000);}
+  render();
+}
+function dsGapNote(g){
+  if(!g)return '';
+  var other=g.other.length?' '+g.other.length+' line'+(g.other.length===1?'':'s')+' carry'+(g.other.length===1?'s':'')+' a different code ('+escHtml(String(g.other[0].discount_code))+') and will be left alone.':'';
+  if(!g.fixable)return '<div style="padding:10px 16px;border-top:1px solid var(--border);background:rgba(234,88,12,.06);font-size:var(--t-sm);line-height:1.5"><b style="color:var(--orange)">Not showing in the dealer\'s My Orders.</b> This order\'s code <b>'+escHtml(g.code)+'</b> does not match '+escHtml(g.dealer.name||'this dealer')+'\'s order code ('+escHtml(String(g.dealer.po_code_prefix||'none set'))+'). Fix the dealer\'s order code (Dealers, Manage) and this will clear.'+other+'</div>';
+  return '<div style="padding:10px 16px;border-top:1px solid var(--border);background:rgba(234,88,12,.06);font-size:var(--t-sm);line-height:1.5;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span style="flex:1;min-width:260px"><b style="color:var(--orange)">Not showing in the dealer\'s My Orders.</b> This order is in the ERP, but its sales lines have no dealer code, and My Orders finds a dealer\'s orders by that code.'+other+'</span>'
+    +(g.fix.length?'<button type="button" class="btn btn-sm btn-teal" onclick="dsFixCode(\''+escHtml(String(g.req.id))+'\')">Add code '+escHtml(g.code)+' to '+g.fix.length+' line'+(g.fix.length===1?'':'s')+'</button>':'')+'</div>';
+}
+function dsGapBanner(){
+  var gs=dsCodeGaps();if(!gs.length)return '';
+  var fixable=gs.filter(function(g){return g.fixable&&g.fix.length;}).length,stuck=gs.length-fixable;
+  if(!S._edgeVers)setTimeout(function(){try{checkEdgeVersions();}catch(e){}},0);
+  var so=S._edgeVers&&S._edgeVers['shopify-orders'],old=so&&so.build&&so.build!==EDGE_EXPECTED['shopify-orders'];
+  return '<div class="panel" style="padding:8px 12px;margin-bottom:8px;border-left:3px solid var(--orange);font-size:var(--t-sm);line-height:1.5;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span style="flex:1;min-width:300px"><b style="color:var(--orange)">'+gs.length+' dealer order'+(gs.length===1?' is':'s are')+' not showing in the dealers\' My Orders.</b> Their sales lines have no dealer code'+(stuck?' ('+stuck+' with a code that does not match the dealer, open it to see)':'')+'.'
+    +(old?' <b>The deployed shopify-orders function is '+escHtml(so.build)+', not '+EDGE_EXPECTED['shopify-orders']+'</b>, so every new portal order will miss its code until it is updated (Integrations).':(so&&!so.build?'':''))+'</span>'
+    +(fixable?'<button type="button" class="btn btn-sm btn-teal" onclick="dsFixAllCodes()">Fix '+fixable+' now</button>':'')+'</div>';
+}
 function dsShip(r){
   if(!r||r.status!=='sent')return null;
   var nm=dsNormOrd(r.shopify_order_name),id=String(r.shopify_order_id||'');if(!nm&&!id)return null;
@@ -36129,6 +36343,7 @@ function dsReview(r){
    +'<div style="padding:12px 16px;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px 24px;font-size:var(--t-sm);white-space:normal;overflow-wrap:anywhere;line-height:1.45"><div><b>Ship to</b>'+(r.drop_ship?' <span class="pill pill-muted" title="Ships to the dealer\'s customer, not to the dealer">drop-ship</span>':'')+'<br>'+[sh.name,sh.address1,sh.address2,[[sh.city,sh.province].filter(Boolean).join(', '),sh.zip].filter(Boolean).join(' '),sh.country].filter(Boolean).map(escHtml).join('<br>')+'</div>'
    +'<div><b>Payment</b><br>'+escHtml(DS_PAYSHORT[r.payment_mode]||'Pays up front')+'</div><div><b>Totals</b><br>'+dsMoney(tt.merchandise)+' merchandise &middot; shipping '+(tt.shipping===null||tt.shipping===undefined?'<b style="color:var(--red)">not set</b>':dsMoney(tt.shipping))+' &middot; <b>'+dsMoney(tt.total)+'</b></div>'
    +'<div><b>Order code</b><br><span class="pn">'+escHtml(r.discount_code||((d.po_code_prefix||'')+(r.po_number?' '+r.po_number:'')))+'</span>'+(r.shopify_order_name?'<br>Shopify '+escHtml(r.shopify_order_name):'')+'</div>'+(ship&&ship.total?'<div><b>Shipment</b><br>'+ship.shipped+' of '+ship.total+' unit'+(ship.total!==1?'s':'')+' shipped'+(ship.tracking.length?'<br>'+dsTrackHtml(ship,10):'')+'</div>':'')+((r.notes&&String(r.notes).trim()!==String(r.po_number||'').trim())?'<div style="grid-column:1/-1"><b>Dealer note</b><br>'+escHtml(r.notes)+'</div>':'')+'</div>'
+   +dsGapNote(dsCodeGap(r))
    +'<div style="padding:12px 16px;background:var(--bg3);border-top:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap">'
    +(editable?'<button type="button" class="btn btn-teal" onclick="dsSend(DS.sel)"'+(DS.busy?' disabled':'')+'>'+(DS.busy?'Sending&hellip;':(r.status==='attention'?'Retry: send to Shopify':'Send to Shopify'))+'</button>':'')
    +(editable&&DS.edit?'<button type="button" class="btn" onclick="dsSaveLines(DS.sel)">Save quantity changes</button>':'')
@@ -36185,6 +36400,7 @@ function renderDealerOrders(){
    +(dsSettings().autoSend?'':'<div class="panel" style="padding:6px 12px;margin-bottom:8px;border-left:3px solid var(--orange);font-size:var(--t-sm)"><b style="color:var(--orange)">Automatic sending is OFF: every order waits for you.</b></div>')
    +(DS.showRemoved?'<div class="panel" style="padding:6px 12px;margin-bottom:8px;border-left:3px solid var(--orange);font-size:var(--t-sm)"><b>Removed orders.</b> Dealers cannot see these. Restore one to bring it back, or delete it for good (not possible for orders that exist in Shopify).</div>':'')
    +(DS.err?'<div class="panel" style="padding:8px 12px;border-left:3px solid var(--red);color:var(--red);margin-bottom:8px;font-size:var(--t-sm)">'+escHtml(DS.err)+'</div>':'')
+   +dsGapBanner()
    +'<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px">'+pill('active','Active',c.active)+pill('attention','Needs attention',c.attention,'var(--red)')+pill('awaiting','Awaiting payment',c.awaiting,'var(--yellow)')+pill('build','Build needed',c.build,'var(--orange)')+pill('shipped','Shipped',c.shipped)+pill('all','All',c.all)+'</div>'
    +'<div id="ds-tbl">'+dsTableHtml()+'</div>'
    +'<div style="margin-top:12px">'+dsSettingsHtml()+'</div>';
