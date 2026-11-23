@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.170';
+const TGK_ERP_VERSION = 'v23.171';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -1797,6 +1797,20 @@ async function fetchAll(query){
 // it with ensureSalesSince(); searches fall back to the database.
 var SALES_WINDOW_DAYS=180;
 var SALES_DONE=['Shipped','Delivered','Cancelled','Refunded','Returned'];
+// [v23.171] The quick start-up load stays at 180 days, then the rest of the year follows in the background and is kept: refreshes keep what was pulled in (S._salesExtra), and a check every few minutes
+// tops it up again if anything shrank it. Screens that work out "last order", "12-month sales" or "no order in 90 days" therefore always see a full 12 months.
+var SALES_KEEP_DAYS=372;
+async function salesTopUp(){
+  if(S._salesTopBusy)return;
+  var from=daysAgo(SALES_KEEP_DAYS),covered=function(){return !!(S._salesAll||(S._salesFrom&&S._salesFrom<=from));};
+  if(covered()){if(!S._sales12){S._sales12=true;try{render();}catch(e){}}return;}
+  S._salesTopBusy=true;S._sales12=false;
+  try{await ensureSalesSince(from);}catch(e){}
+  S._salesTopBusy=false;
+  S._sales12=covered();
+  if(!S._sales12)setTimeout(salesTopUp,60000);   // the load failed: try again in a minute
+}
+window.salesTopUp=salesTopUp;
 // [v23.49] Sales Orders sorts every order, then shows the first page. Click a header: ascending, descending, then back to newest first.
 function _salesSortList(list,key,dir,stockKey){
   var sign=dir==='desc'?-1:1,RANK=['Open','On Hold','Partial','Packed','Shipped','Delivered','Cancelled','Refunded'];
@@ -2330,6 +2344,7 @@ async function liveReloadTable(t){
 var _liveSleep=function(ms){return new Promise(function(r){setTimeout(r,ms);});};
 async function liveSyncTick(opts){
   opts=opts||{};
+  try{if(!S._sales12Chk||Date.now()-S._sales12Chk>5*60000){S._sales12Chk=Date.now();salesTopUp();}}catch(e){}   // [v23.171] keep 12 months loaded
   if(!opts.force&&document.hidden)return null;
   if(S._liveBusy)return null;
   if(typeof db==='undefined'||!(S.currentUserId||S.currentUser||opts.force))return null;
@@ -10385,10 +10400,10 @@ function dlFlags(d,st,sg){
  if(d.billing_required&&dealerTermsDays(d)===null)f.push('noterms');
  if(!dlCode(d))f.push('nocode');   // no order code: none of their orders can be matched to them
  if(!dlHasEmail(d))f.push('noemail');else if(sg&&sg.has_email&&!sg.has_password)f.push('notsigned');
- var n=dlSince(st.last);if(st.tracked&&(st.last===''||(n!==null&&n>90)))f.push('noorder');   // a dealer with no order code cannot be matched to orders, so no verdict
+ var n=dlSince(st.last),covered=!!(S._sales12||S._salesAll);if(st.tracked&&((st.last===''&&covered)||(n!==null&&n>90&&covered)))f.push('noorder');   // [v23.171] not until the full year is loaded   // a dealer with no order code cannot be matched to orders, so no verdict
  return f;
 }
-var DL_TAG={overdue:['red',function(x){return 'Overdue '+x.st.overdueDays+' day'+(x.st.overdueDays===1?'':'s');}],noterms:['red',function(){return 'No payment terms';}],nocode:['amb',function(){return 'No order code';}],noemail:['red',function(){return 'No email';}],notsigned:['amb',function(){return 'Not signed in';}],noorder:['amb',function(x){return x.st.last===''?'Never ordered':'No order in 90 days';}]};
+var DL_TAG={overdue:['red',function(x){return 'Overdue '+x.st.overdueDays+' day'+(x.st.overdueDays===1?'':'s');}],noterms:['red',function(){return 'No payment terms';}],nocode:['amb',function(){return 'No order code';}],noemail:['red',function(){return 'No email';}],notsigned:['amb',function(){return 'Not signed in';}],noorder:['amb',function(x){return x.st.last===''?(S._salesAll?'Never ordered':'No order in 12 months'):'No order in 90 days';}]};
 var DL_CHIPS=[['all','All'],['att','Needs attention'],['overdue','Overdue'],['notsigned','Not signed in'],['noorder','No order in 90 days'],['nocode','No order code'],['billing','Billing'],['inactive','Inactive']];
 function dlItems(){
  var st=dlStats().by,sg=S._dlSignins,items=(S.dealers||[]).map(function(d){var s=st[d.id]||{last:'',sales12:0,owes:0,overdueDays:0,overdueCount:0,tracked:false},g=sg?sg[String(d.id)]:null;return {d:d,st:s,sg:g,flags:dlFlags(d,s,g)};});
@@ -10427,12 +10442,24 @@ function dlRowHtml(x){
   +'<td>'+dlPortalCell(x)+'</td><td>'+tags+'</td>'
   +'<td class="r" onclick="event.stopPropagation()"><span class="dl-acts">'+view+'<button class="btn btn-sm" onclick="openDealerMenu(event,\''+id+'\')" aria-haspopup="menu" title="Edit, Storefront, copy link, visit log, delete">Manage &#9662;</button></span></td></tr>';
 }
+function dlCoverageNote(){
+ var c=S._hpCov;if(c===undefined||c===null){if(!S._hpCovBusy){S._hpCovBusy=true;hpCoverage(false).then(function(){S._hpCovBusy=false;if(typeof dlRedraw==='function')dlRedraw();});}}
+ var h='',cut=new Date(Date.now()-350*864e5).toISOString().slice(0,10);
+ if(!S._sales12&&!S._salesAll)h+='<div class="t3xs" style="margin:0 0 8px;color:var(--text3)">Loading the rest of the last 12 months of orders&hellip; Last order and 12-month sales fill in when it finishes.</div>';
+ if(c&&c.earliest){
+   if(c.earliestCode&&c.earliest<c.earliestCode&&(new Date(c.earliestCode)-new Date(c.earliest))/864e5>45)
+     h+='<div style="margin:0 0 10px;padding:8px 12px;border:1px solid rgba(234,88,12,.45);border-radius:var(--r-md);font-size:var(--t-sm);line-height:1.5"><b style="color:var(--orange)">Dealer POs only go back to '+escHtml(c.earliestCode)+'.</b> Orders in the ERP go back to '+escHtml(c.earliest)+', but PO codes were only saved from '+escHtml(c.earliestCode)+', so earlier dealer orders cannot be matched to a dealer. <button class="btn btn-sm btn-teal" onclick="hpOpenImporter()">Fill in the PO codes</button></div>';
+   else if(c.earliest>cut)
+     h+='<div style="margin:0 0 10px;padding:8px 12px;border:1px solid rgba(234,88,12,.45);border-radius:var(--r-md);font-size:var(--t-sm);line-height:1.5"><b style="color:var(--orange)">Order history starts '+escHtml(c.earliest)+'.</b> Twelve months of dealer history needs the older orders imported. <button class="btn btn-sm btn-teal" onclick="hpOpenImporter()">Import history</button></div>';
+ }
+ return h;
+}
 function dlListInner(){
  var s=dlState(),all=dlItems(),vis=dlVisible(),n=Object.keys(s.sel).filter(function(k){return s.sel[k];}).length;
  var chips='<div class="dl-chips">'+DL_CHIPS.map(function(c){var cnt=all.filter(function(x){return dlMatch(c[0],x);}).length;return '<span class="dl-chip'+(s.filter===c[0]?' on':'')+(c[0]==='overdue'&&cnt?' warn':'')+'" onclick="dlFilter(\''+c[0]+'\')">'+c[1]+' <b>'+cnt+'</b></span>';}).join('')+'</div>';
  var bulk=n?'<div class="dl-bulk"><b>'+n+' selected</b><button class="btn btn-sm btn-teal" onclick="dlBulkEmail()">Email them</button><button class="btn btn-sm" onclick="dlBulkInvite()">Send sign-in invites</button><button class="btn btn-sm" onclick="dlTierMenu(event)">Set tier &#9662;</button><button class="btn btn-sm" onclick="dlClearSel()">Clear</button></div>':'';
  var allOn=vis.length&&vis.every(function(x){return s.sel[x.d.id];});
- return chips+bulk+'<div class="dl-tw"><table class="dl-t"><colgroup><col style="width:38px"><col style="width:19%"><col style="width:15%"><col style="width:7%"><col style="width:8%"><col style="width:6%"><col style="width:7%"><col><col style="width:218px"></colgroup>'
+ return dlCoverageNote()+chips+bulk+'<div class="dl-tw"><table class="dl-t"><colgroup><col style="width:38px"><col style="width:19%"><col style="width:15%"><col style="width:7%"><col style="width:8%"><col style="width:6%"><col style="width:7%"><col><col style="width:218px"></colgroup>'
   +'<thead><tr><th><input type="checkbox" '+(allOn?'checked ':'')+'onchange="dlTickAll(this.checked)" title="Select everyone shown"></th><th>Dealer</th><th>Contact</th><th>Last order</th><th class="r">Sales, 12 mo</th><th class="r">Owes</th><th>Portal</th><th>Needs attention</th><th class="r">Actions</th></tr></thead><tbody>'
   +(vis.length?vis.map(dlRowHtml).join(''):'<tr><td colspan="9" style="height:90px;text-align:center;color:var(--text3)">No dealers match.</td></tr>')+'</tbody></table></div>'
   +'<div class="dl-foot">Showing '+vis.length+' of '+all.length+(S._dlSignErr?' &middot; <span style="color:var(--red)">Sign-in status unavailable: '+escHtml(S._dlSignErr)+'</span>':'')+'</div>';
@@ -40840,6 +40867,7 @@ function printPriceList(){
         try{loadBackups();}catch(e){console.error('loadBackups:',e);}
         try{startAutoBackup();}catch(e){console.error('startAutoBackup:',e);}
         try{startAutoRefresh();}catch(e){console.error('startAutoRefresh:',e);}
+        try{setTimeout(salesTopUp,2500);}catch(e){}   // [v23.171] the rest of the 12 months, in the background
         try{maybeDailyStockCheck();}catch(e){console.warn('stock check:',e);}
         try{setTimeout(function(){buildForecasts();},9000);}catch(e){}
         try{setTimeout(function(){if(evTargetsOn()&&typeof hpLoadHistory==='function'&&!S._hpHist)hpLoadHistory(false);},12000);}catch(e){}
@@ -43349,7 +43377,7 @@ function hpMapApiOrder(o,st){
   var status=_hpHistStatus(o.financial_status,o.fulfillment_status);
   return Object.keys(agg).map(function(sku){
     var row={order_number:o.name,pn:sku,qty:agg[sku].qty,sale_date:created,source:'Shopify History',fulfillment_status:status,
-      financial_status:o.financial_status||null,customer_name:cname,customer_email:(o.email||(o.customer&&o.customer.email)||null)};
+      financial_status:o.financial_status||null,customer_name:cname,customer_email:(o.email||(o.customer&&o.customer.email)||null),discount_code:hpPoCode(o)};   // [v23.171] a dealer's PO IS this code
     if(typeof salesHavePrice==='function'&&salesHavePrice()){var up=shopifyLineUnitPrice(agg[sku].li);if(up!=null){row.unit_price=up;row.price_source='shopify';}}
     return row;
   });
@@ -43443,12 +43471,12 @@ async function hpImportCSV(input){
     var H=rows[0].map(function(h){return String(h).trim().toLowerCase();}),ix=function(n){return H.indexOf(n.toLowerCase());};
     var cName=ix('Name'),cCreated=ix('Created at'),cQty=ix('Lineitem quantity'),cSku=ix('Lineitem sku');
     if(cName<0||cCreated<0||cQty<0||cSku<0)throw new Error('this does not look like a Shopify orders export (needs Name, Created at, Lineitem quantity, Lineitem sku)');
-    var cFin=ix('Financial Status'),cFul=ix('Fulfillment Status'),cCan=ix('Cancelled at'),cEmail=ix('Email'),cShip=ix('Shipping Name'),cBill=ix('Billing Name');
+    var cFin=ix('Financial Status'),cFul=ix('Fulfillment Status'),cCan=ix('Cancelled at'),cEmail=ix('Email'),cShip=ix('Shipping Name'),cBill=ix('Billing Name'),cDisc=ix('Discount Code'),cAttr=ix('Note Attributes');
     var orders={},order=[];
     rows.slice(1).forEach(function(r){
       var name=(r[cName]||'').trim();if(!name)return;
       var o=orders[name];
-      if(!o){o=orders[name]={name:name,created:'',fin:'',ful:'',cancelled:'',email:'',cname:'',lines:{}};order.push(name);}
+      if(!o){o=orders[name]={name:name,created:'',fin:'',ful:'',cancelled:'',email:'',cname:'',code:'',lines:{}};order.push(name);}
       // order-level columns are only filled on an order's first row
       if(!o.created&&r[cCreated])o.created=String(r[cCreated]).trim().slice(0,10);
       if(cFin>=0&&!o.fin&&r[cFin])o.fin=String(r[cFin]).trim().toLowerCase();
@@ -43456,6 +43484,7 @@ async function hpImportCSV(input){
       if(cCan>=0&&!o.cancelled&&r[cCan])o.cancelled=String(r[cCan]).trim();
       if(cEmail>=0&&!o.email&&r[cEmail])o.email=String(r[cEmail]).trim();
       if(!o.cname)o.cname=String((cShip>=0&&r[cShip])||(cBill>=0&&r[cBill])||'').trim();
+      if(!o.code)o.code=hpCsvPoCode(cDisc>=0?r[cDisc]:'',cAttr>=0?r[cAttr]:'');   // [v23.171]
       var sku=String(r[cSku]||'').trim().toUpperCase(),q=parseInt(r[cQty],10)||0;
       if(sku&&q>0)o.lines[sku]=(o.lines[sku]||0)+q;
     });
@@ -43471,7 +43500,7 @@ async function hpImportCSV(input){
       var status=_hpHistStatus(o.fin,o.ful);
       Object.keys(o.lines).forEach(function(sku){
         out.push({order_number:name,pn:sku,qty:o.lines[sku],sale_date:d,source:'Shopify History',fulfillment_status:status,
-          financial_status:o.fin||null,customer_name:o.cname||null,customer_email:o.email||null});
+          financial_status:o.fin||null,customer_name:o.cname||null,customer_email:o.email||null,discount_code:o.code||null});
       });
     });
     st.pages=1;
@@ -43484,6 +43513,97 @@ async function hpImportCSV(input){
   toast('CSV history import: '+st.inserted+' line'+(st.inserted!==1?'s':'')+' added'+(st.error?' - '+st.error:''),st.error?9000:5000);
   render();
 }
+// [v23.171] The code that ties an order to a dealer and PO. Same rule as the live order import (orderPoCode): the first discount code, else the dealer_po_code order attribute.
+function hpPoCode(o){
+  var dc=o&&o.discount_codes&&o.discount_codes.length?o.discount_codes[0].code:null;if(dc)return String(dc).trim()||null;
+  var a=((o&&o.note_attributes)||[]).find(function(x){return x&&(x.name==='dealer_po_code'||x.key==='dealer_po_code');});
+  return a&&a.value?String(a.value).trim():null;
+}
+function hpCsvPoCode(disc,attrs){
+  var d=String(disc||'').split(',')[0].trim();if(d)return d;
+  var m=/dealer_po_code\s*:\s*([^\r\n]+)/i.exec(String(attrs||''));return m?m[1].trim():'';
+}
+async function hpNoCodeCount(){try{var r=await db.from('sales').select('id',{count:'exact',head:true}).eq('source','Shopify History').is('discount_code',null);S._hpNoCode=(!r.error&&typeof r.count==='number')?r.count:null;}catch(e){S._hpNoCode=null;}return S._hpNoCode;}
+// where the orders start, and where PO codes start: a gap between the two is exactly "dealer POs only go back to <date>"
+async function hpCoverage(force){
+  if(S._hpCov&&!force)return S._hpCov;
+  var cov={earliest:null,earliestCode:null};
+  try{
+    var a=await db.from('sales').select('sale_date').not('sale_date','is',null).order('sale_date',{ascending:true}).limit(1);
+    var b=await db.from('sales').select('sale_date').not('sale_date','is',null).not('discount_code','is',null).order('sale_date',{ascending:true}).limit(1);
+    if(!a.error&&a.data&&a.data[0])cov.earliest=String(a.data[0].sale_date).slice(0,10);
+    if(!b.error&&b.data&&b.data[0])cov.earliestCode=String(b.data[0].sale_date).slice(0,10);
+  }catch(e){}
+  S._hpCov=cov;return cov;
+}
+async function _hpFillApply(byCode,st){
+  var codes=Object.keys(byCode);
+  for(var i=0;i<codes.length;i++){
+    var names=byCode[codes[i]];
+    for(var j=0;j<names.length;j+=40){
+      var r=await db.from('sales').update({discount_code:codes[i]}).in('order_number',names.slice(j,j+40)).is('discount_code',null).select('id');
+      if(r.error)throw new Error('update failed: '+r.error.message);
+      st.updated+=(r.data||[]).length;
+    }
+  }
+}
+function _hpFillState(){return S._hpFill={running:true,pages:0,orders:0,withCode:0,updated:0,error:'',cancel:false};}
+async function hpFillCodes(){
+  if(S._hpFill&&S._hpFill.running)return;
+  var rg=_hpImpRange();
+  if(!confirm('Fill in the PO / discount codes on orders already imported, for Shopify orders created from '+rg.from+' to today?\n\nOnly lines that have no code yet are touched, and only the code is added. Nothing else changes.'))return;
+  var st=_hpFillState();render();
+  var page_info='',fromIso=new Date(hpD(rg.from)).toISOString(),tries=0;
+  try{
+    for(;;){
+      if(st.cancel){st.error='Stopped by you - everything filled in so far is kept';break;}
+      var r=await fetch(SUPA_URL+'/functions/v1/shopify-orders',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SUPA_KEY},body:JSON.stringify({action:'sync',since:fromIso,created_min:fromIso,page_info:page_info,store:S.shopify&&S.shopify.store,key:S.shopify&&S.shopify.key})});
+      var j=await r.json().catch(function(){return {};});
+      if(r.status===429||/429/.test(String(j.error||''))){if(++tries>6)throw new Error('Shopify rate limit - try again in a minute');await new Promise(function(res){setTimeout(res,2500);});continue;}
+      tries=0;if(!r.ok||j.error)throw new Error(j.error||('HTTP '+r.status));
+      var byCode={};st.pages++;
+      (j.orders||[]).forEach(function(o){st.orders++;var c=hpPoCode(o);if(!c||o.cancelled_at)return;st.withCode++;(byCode[c]=byCode[c]||[]).push(o.name);});
+      await _hpFillApply(byCode,st);render();
+      page_info=j.next_page_info||'';if(!page_info)break;
+    }
+  }catch(e){st.error=e.message||String(e);}
+  st.running=false;S._hpNoCode=undefined;S._hpCov=null;
+  toast('PO codes filled in on '+st.updated+' line'+(st.updated===1?'':'s')+(st.error?' - '+st.error:''),st.error?9000:6000);
+  try{await ensureSalesSince(daysAgo(372));}catch(e){}
+  render();
+}
+async function hpFillCodesCSV(input){
+  var file=input&&input.files&&input.files[0];if(!file)return;
+  if(S._hpFill&&S._hpFill.running){input.value='';return;}
+  var st=_hpFillState();render();
+  try{
+    var rows=hpParseCSV(await file.text());if(rows.length<2)throw new Error('the file is empty');
+    var H=rows[0].map(function(h){return String(h).trim().toLowerCase();}),ix=function(n){return H.indexOf(n.toLowerCase());};
+    var cName=ix('Name'),cDisc=ix('Discount Code'),cAttr=ix('Note Attributes'),cCan=ix('Cancelled at');
+    if(cName<0||(cDisc<0&&cAttr<0))throw new Error('this does not look like a Shopify orders export (needs Name and Discount Code columns)');
+    var seen={},byCode={};
+    rows.slice(1).forEach(function(r){
+      var name=(r[cName]||'').trim();if(!name||seen[name])return;
+      var c=hpCsvPoCode(cDisc>=0?r[cDisc]:'',cAttr>=0?r[cAttr]:'');
+      if(!c&&!(cCan>=0&&r[cCan]))return;   // order-level columns sit on the first row of an order
+      seen[name]=1;st.orders++;if(!c||(cCan>=0&&r[cCan]))return;st.withCode++;(byCode[c]=byCode[c]||[]).push(name);
+    });
+    await _hpFillApply(byCode,st);
+  }catch(e){st.error=e.message||String(e);}
+  st.running=false;input.value='';S._hpNoCode=undefined;S._hpCov=null;
+  toast('PO codes filled in on '+st.updated+' line'+(st.updated===1?'':'s')+(st.error?' - '+st.error:''),st.error?9000:6000);
+  try{await ensureSalesSince(daysAgo(372));}catch(e){}
+  render();
+}
+function hpFillBlock(){
+  var f=S._hpFill,n=S._hpNoCode;if(n===undefined){S._hpNoCode=null;hpNoCodeCount().then(function(){render();});}
+  var busy=f&&f.running?' disabled':'';
+  return '<div style="padding:10px 14px;border-top:1px solid var(--border);font-size:var(--t-sm)"><b>Dealer PO codes on imported history</b>'
+    +'<div class="t3xs" style="color:var(--text3);margin:4px 0 8px;line-height:1.5">A dealer\'s PO is the code on its order. Earlier history imports did not save it, so those orders could not be matched to a dealer: dealer history and 12-month sales stopped where the live sync began. This reads the codes from Shopify and fills them in on lines already imported (only lines with no code yet; nothing else changes).'+(n>0?' <span style="color:var(--text3)">'+n.toLocaleString()+' imported history lines currently have no code (normal for ordinary customer orders).</span>':'')+'</div>'
+    +'<button class="btn btn-sm btn-primary" onclick="hpFillCodes()"'+busy+'>Fill in from Shopify</button> <label class="btn btn-sm" style="cursor:pointer'+(busy?';opacity:.5;pointer-events:none':'')+'">Fill in from a CSV<input type="file" accept=".csv,text/csv" style="display:none" onchange="hpFillCodesCSV(this)"></label>'
+    +(f?'<div style="margin-top:8px">'+(f.running?'<b>Working&hellip;</b> ':'<b>Last run:</b> ')+f.orders+' orders read, '+f.withCode+' with a code, <b>'+f.updated+' lines updated</b>'+(f.running?' <button class="btn btn-sm" onclick="S._hpFill.cancel=true">Stop</button>':'')+(f.error?'<div style="color:var(--red);margin-top:4px">'+escHtml(f.error)+'</div>':'')+'</div>':'')+'</div>';
+}
+window.hpFillCodes=hpFillCodes;window.hpFillCodesCSV=hpFillCodesCSV;
 window.hpImportFromShopify=hpImportFromShopify;window.hpImportCSV=hpImportCSV;window.hpEarliestSale=hpEarliestSale;
 // The old "Import All Shopify Orders" called Shopify straight from the browser (blocked by CORS) with
 // page-number paging Shopify no longer supports, and imported old unfulfilled orders as Open work.
@@ -44120,7 +44240,7 @@ function hpImportPanel(P){
       +'<div class="t3xs" style="color:var(--text3);margin-top:2px">Shopify admin &rarr; Orders &rarr; Export &rarr; All orders, CSV</div></div>'
     +'</div>'
     +'<div class="t3xs" style="padding:0 14px 10px;color:var(--text3);line-height:1.5">Imported lines are history only: marked Delivered or Refunded, source "Shopify History". They never change stock, never create open orders and never reach ShipStation. Cancelled orders are skipped; refunded lines count (same rule as the forecast); orders already in the ERP are skipped, matching SKU aliases. They also appear in sales reports.</div>'
-    +prog+'</details>';
+    +hpFillBlock()+prog+'</details>';
 }
 
 
