@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.181';
+const TGK_ERP_VERSION = 'v23.182';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -43952,13 +43952,32 @@ async function _hpFillIds(orders,need,st){
 }
 async function hpNoIdCount(){try{var r=await db.from('sales').select('id',{count:'exact',head:true}).is('shopify_order_id',null).gte('sale_date',hpISO(hpToday()-450*HP_DAY));S._hpNoId=(!r.error&&typeof r.count==='number')?r.count:null;}catch(e){S._hpNoId=null;}return S._hpNoId;}
 async function hpNoPriceCount(){try{var r=await db.from('sales').select('id',{count:'exact',head:true}).is('unit_price',null).is('price_source',null).gte('sale_date',hpISO(hpToday()-450*HP_DAY));S._hpNoPrice=(!r.error&&typeof r.count==='number')?r.count:null;}catch(e){S._hpNoPrice=null;}return S._hpNoPrice;}
-function _hpFillState(){return S._hpFill={running:true,pages:0,orders:0,withCode:0,updated:0,ids:0,prices:0,error:'',cancel:false};}
+// [v23.182] The REAL ship date, from the Shopify order's fulfillments (the last one: a PO is billed the day its last item ships), put on shipped lines that have none. Only lines with no ship date, only that date.
+async function _hpNeedShip(from){
+  var set={};
+  try{var rows=await fetchAll(function(a,b){return db.from('sales').select('order_number').is('shipped_at',null).in('fulfillment_status',['Shipped','Delivered']).gte('sale_date',from).range(a,b);});(rows||[]).forEach(function(r){if(r.order_number)set[_hpBare(r.order_number)]=1;});}catch(e){}
+  return set;
+}
+async function _hpFillShip(orders,need,st){
+  var todo=(orders||[]).filter(function(o){return o&&!o.cancelled_at&&need[_hpBare(o.name)];});
+  for(var i=0;i<todo.length;i+=8){
+    var rs=await Promise.all(todo.slice(i,i+8).map(function(o){
+      var f=(o.fulfillments||[]).filter(function(x){return x&&x.created_at&&!/^(cancelled|error|failure)$/i.test(String(x.status||''));});
+      if(!f.length)return Promise.resolve({data:[],error:null});
+      var when=f.map(function(x){return String(x.created_at);}).sort().pop();
+      return db.from('sales').update({shipped_at:when}).in('order_number',_hpBothSpellings([o.name])).is('shipped_at',null).in('fulfillment_status',['Shipped','Delivered']).select('id');
+    }));
+    rs.forEach(function(r){if(r.error)throw new Error('update failed: '+r.error.message);st.ships+=(r.data||[]).length;});
+  }
+}
+async function hpNoShipCount(){try{var r=await db.from('sales').select('id',{count:'exact',head:true}).is('shipped_at',null).in('fulfillment_status',['Shipped','Delivered']).gte('sale_date',hpISO(hpToday()-450*HP_DAY));S._hpNoShip=(!r.error&&typeof r.count==='number')?r.count:null;}catch(e){S._hpNoShip=null;}return S._hpNoShip;}
+function _hpFillState(){return S._hpFill={running:true,pages:0,orders:0,withCode:0,updated:0,ids:0,prices:0,ships:0,error:'',cancel:false};}
 async function hpFillCodes(){
   if(S._hpFill&&S._hpFill.running)return;
   var rg=_hpImpRange();
   if(!confirm('Fill in the PO / discount codes, the Shopify order ids and the prices actually paid on orders already imported (whatever way they were imported), for Shopify orders created from '+rg.from+' to today?\n\nOnly lines that have no code, no order id or no price yet are touched, and only those are added. Nothing else changes.'))return;
   var st=_hpFillState();render();
-  var need=await _hpNeedIds(rg.from),needP=await _hpNeedPrices(rg.from);   // order numbers that still have no Shopify order id / no recorded price
+  var need=await _hpNeedIds(rg.from),needP=await _hpNeedPrices(rg.from),needS=await _hpNeedShip(rg.from);   // order numbers that still have no Shopify order id / no recorded price
   var page_info='',fromIso=new Date(hpD(rg.from)).toISOString(),tries=0;
   try{
     for(;;){
@@ -43969,12 +43988,12 @@ async function hpFillCodes(){
       tries=0;if(!r.ok||j.error)throw new Error(j.error||('HTTP '+r.status));
       var byCode={};st.pages++;
       (j.orders||[]).forEach(function(o){st.orders++;var c=hpPoCode(o);if(!c||o.cancelled_at)return;st.withCode++;(byCode[c]=byCode[c]||[]).push(o.name);});
-      await _hpFillApply(byCode,st);await _hpFillIds(j.orders,need,st);await _hpFillPrices(j.orders,needP,st);render();
+      await _hpFillApply(byCode,st);await _hpFillIds(j.orders,need,st);await _hpFillPrices(j.orders,needP,st);await _hpFillShip(j.orders,needS,st);render();
       page_info=j.next_page_info||'';if(!page_info)break;
     }
   }catch(e){st.error=e.message||String(e);}
-  st.running=false;S._hpNoCode=undefined;S._hpNoId=undefined;S._hpNoPrice=undefined;S._hpCov=null;
-  toast('Filled in: PO codes on '+st.updated+' line'+(st.updated===1?'':'s')+', Shopify order ids on '+st.ids+' line'+(st.ids===1?'':'s')+', prices paid on '+st.prices+' line'+(st.prices===1?'':'s')+(st.error?' - '+st.error:''),st.error?9000:6000);
+  st.running=false;S._hpNoCode=undefined;S._hpNoId=undefined;S._hpNoPrice=undefined;S._hpNoShip=undefined;S._hpCov=null;
+  toast('Filled in: PO codes on '+st.updated+' line'+(st.updated===1?'':'s')+', Shopify order ids on '+st.ids+' line'+(st.ids===1?'':'s')+', prices paid on '+st.prices+' line'+(st.prices===1?'':'s')+', ship dates on '+st.ships+' line'+(st.ships===1?'':'s')+(st.error?' - '+st.error:''),st.error?9000:6000);
   try{await ensureSalesSince(daysAgo(372));}catch(e){}
   render();
 }
@@ -44002,16 +44021,17 @@ async function hpFillCodesCSV(input){
   render();
 }
 function hpFillBlock(){
-  var f=S._hpFill,n=S._hpNoCode,ni=S._hpNoId,np=S._hpNoPrice;if(n===undefined){S._hpNoCode=null;hpNoCodeCount().then(function(){render();});}
+  var f=S._hpFill,n=S._hpNoCode,ni=S._hpNoId,np=S._hpNoPrice,ns=S._hpNoShip;if(n===undefined){S._hpNoCode=null;hpNoCodeCount().then(function(){render();});}
   if(ni===undefined){S._hpNoId=null;hpNoIdCount().then(function(){render();});}
   if(np===undefined){S._hpNoPrice=null;hpNoPriceCount().then(function(){render();});}
+  if(ns===undefined){S._hpNoShip=null;hpNoShipCount().then(function(){render();});}
   var busy=f&&f.running?' disabled':'';
   return '<div style="padding:10px 14px;border-top:1px solid var(--border);font-size:var(--t-sm)"><b>Dealer PO codes on imported history</b>'
-    +'<div class="t3xs" style="color:var(--text3);margin:4px 0 8px;line-height:1.5">A dealer\'s PO is the code on its order. Earlier history imports did not save it, so those orders could not be matched to a dealer: dealer history and 12-month sales stopped where the live sync began. This reads the codes from Shopify and fills them in on lines already imported (only lines with no code yet; nothing else changes). It also saves each order\'s <b>Shopify order id</b> and the <b>price actually paid</b> per unit, on any imported line that lacks them (however it was imported). The dealer portal needs one of the two to show what a dealer was charged: an order with neither can only say &ldquo;pricing&hellip;&rdquo; or show a dash.'+(ni>0?' <span style="color:var(--orange)">'+ni.toLocaleString()+' order lines in the last 15 months have no Shopify order id.</span>':'')+(np>0?' <span style="color:var(--orange)">'+np.toLocaleString()+' have no recorded price.</span>':'')+(n>0?' <span style="color:var(--text3)">'+n.toLocaleString()+' imported history lines currently have no code (normal for ordinary customer orders).</span>':'')+'</div>'
+    +'<div class="t3xs" style="color:var(--text3);margin:4px 0 8px;line-height:1.5">A dealer\'s PO is the code on its order. Earlier history imports did not save it, so those orders could not be matched to a dealer: dealer history and 12-month sales stopped where the live sync began. This reads the codes from Shopify and fills them in on lines already imported (only lines with no code yet; nothing else changes). It also saves each order\'s <b>Shopify order id</b> the <b>price actually paid</b> per unit and the <b>real ship date</b>, on any imported line that lacks them (however it was imported). The dealer portal needs one of the two to show what a dealer was charged: an order with neither can only say &ldquo;pricing&hellip;&rdquo; or show a dash.'+(ni>0?' <span style="color:var(--orange)">'+ni.toLocaleString()+' order lines in the last 15 months have no Shopify order id.</span>':'')+(np>0?' <span style="color:var(--orange)">'+np.toLocaleString()+' have no recorded price.</span>':'')+(ns>0?' <span style="color:var(--orange)">'+ns.toLocaleString()+' shipped lines have no ship date (a PO\'s billed and due dates come from it).</span>':'')+(n>0?' <span style="color:var(--text3)">'+n.toLocaleString()+' imported history lines currently have no code (normal for ordinary customer orders).</span>':'')+'</div>'
     +'<button class="btn btn-sm btn-primary" onclick="hpFillCodes()"'+busy+'>Fill in from Shopify</button> <label class="btn btn-sm" style="cursor:pointer'+(busy?';opacity:.5;pointer-events:none':'')+'">Fill in from a CSV<input type="file" accept=".csv,text/csv" style="display:none" onchange="hpFillCodesCSV(this)"></label>'
-    +(f?'<div style="margin-top:8px">'+(f.running?'<b>Working&hellip;</b> ':'<b>Last run:</b> ')+f.orders+' orders read, '+f.withCode+' with a code, <b>'+f.updated+' lines updated</b>'+(f.ids!==undefined?', <b>'+f.ids+' order ids</b>'+(f.prices!==undefined?', <b>'+f.prices+' prices</b>':'')+' filled in':'')+(f.running?' <button class="btn btn-sm" onclick="S._hpFill.cancel=true">Stop</button>':'')+(f.error?'<div style="color:var(--red);margin-top:4px">'+escHtml(f.error)+'</div>':'')+'</div>':'')+'</div>';
+    +(f?'<div style="margin-top:8px">'+(f.running?'<b>Working&hellip;</b> ':'<b>Last run:</b> ')+f.orders+' orders read, '+f.withCode+' with a code, <b>'+f.updated+' lines updated</b>'+(f.ids!==undefined?', <b>'+f.ids+' order ids</b>'+(f.prices!==undefined?', <b>'+f.prices+' prices</b>':'')+(f.ships!==undefined?', <b>'+f.ships+' ship dates</b>':'')+' filled in':'')+(f.running?' <button class="btn btn-sm" onclick="S._hpFill.cancel=true">Stop</button>':'')+(f.error?'<div style="color:var(--red);margin-top:4px">'+escHtml(f.error)+'</div>':'')+'</div>':'')+'</div>';
 }
-window.hpFillCodes=hpFillCodes;window.hpNoIdCount=hpNoIdCount;window.hpNoPriceCount=hpNoPriceCount;window.hpFillCodesCSV=hpFillCodesCSV;
+window.hpFillCodes=hpFillCodes;window.hpNoShipCount=hpNoShipCount;window.hpNoIdCount=hpNoIdCount;window.hpNoPriceCount=hpNoPriceCount;window.hpFillCodesCSV=hpFillCodesCSV;
 window.hpImportFromShopify=hpImportFromShopify;window.hpImportCSV=hpImportCSV;window.hpEarliestSale=hpEarliestSale;
 // The old "Import All Shopify Orders" called Shopify straight from the browser (blocked by CORS) with
 // page-number paging Shopify no longer supports, and imported old unfulfilled orders as Open work.
@@ -45045,6 +45065,13 @@ function dealerTermsLabel(d){var n=dealerTermsDays(d);return n===null?'':(n===0?
 function _poShippedQty(s){var q=Number(s.qty)||0,st=String(s.fulfillment_status||'').toLowerCase();if(/^(shipped|delivered|fulfilled)$/.test(st))return q;if(st==='partial')return Math.max(0,Math.min(q,Number(s.qty_shipped)||0));if(s.shipped_at&&String(s.tracking_number||'').trim())return q;return 0;}
 function _poLive(s){return !s.cancelled_at&&!/^(cancelled|canceled|refunded|returned)$/i.test(String(s.fulfillment_status||''));}
 function _poDay(v){var x=String(v||'');if(/^\d{4}-\d{2}-\d{2}( 00:00:00(\+00(:00)?)?)?$/.test(x))return x.slice(0,10);try{return centralDateOnly(x);}catch(e){return x.slice(0,10);}}
+// [v23.182] The day a line shipped. An order BROUGHT IN by an import (the Shopify history import, a CSV, a ShipStation import) has no ship date, and its updated_at is the day the import ran, NOT the day it shipped:
+// that made a PO from last November read "billed 18 days ago, overdue". For those, the order date is the best date known (until the repair fills in the real one from Shopify).
+function _poShipDay(s){
+  if(s.shipped_at)return _poDay(s.shipped_at);
+  if(/history|csv|import/i.test(String(s.source||'')))return _poDay(s.sale_date||s.updated_at);
+  return _poDay(s.updated_at||s.sale_date);
+}
 function _poAdd(d,n){return new Date(Date.parse(d+'T00:00:00Z')+n*86400000).toISOString().slice(0,10);}
 function _poGap(a,b){return Math.round((Date.parse(a+'T00:00:00Z')-Date.parse(b+'T00:00:00Z'))/86400000);}
 function dealerPOBilling(rows,dealer){
@@ -45053,7 +45080,7 @@ function dealerPOBilling(rows,dealer){
   var left=live.filter(function(s){return _poShippedQty(s)<(Number(s.qty)||0);});
   var out={fully:live.length>0&&!left.length,billed_on:null,due_on:null,state:'unbilled',days_over:0,days_to_due:null,unshipped:left.length,terms:n};
   if(!out.fully)return out;
-  var days=live.map(function(s){return _poDay(s.shipped_at||s.updated_at||s.sale_date);}).sort();
+  var days=live.map(_poShipDay).sort();
   out.billed_on=days[days.length-1];
   if(n===null){out.state='unpaid';return out;}
   out.due_on=_poAdd(out.billed_on,n);out.state=today>out.due_on?'overdue':'due';
