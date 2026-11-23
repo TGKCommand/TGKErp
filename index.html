@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.178';
+const TGK_ERP_VERSION = 'v23.180';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -24658,14 +24658,12 @@ function sortOrder(texts,dir,now){ // the new row order for one column, as a lis
   });
   return idx;
 }
-document.addEventListener('click',function(e){
-  const th=e.target.closest('thead th');
-  if(!th||th.dataset.nosort)return; // a header that sorts the whole list itself (Sales Orders) opts out
-  if(e.target.closest('button,input,select,a'))return;
-  const table=th.closest('table');const tbody=table&&table.querySelector('tbody');
-  if(!tbody||tbody.rows.length<2)return;
+// [v23.179] The sorting itself is a function so a sort you chose can be PUT BACK after a table is redrawn (Mark paid redraws the dealer PO window). A dealer PO table remembers its sort by what its column
+// headers say, so the sort also stays when you switch between Open and Paid / closed and back, and when you open another dealer.
+function _sortSig(table){return Array.from(table.querySelectorAll('thead th')).map(function(h){return h.textContent.trim();}).join('|');}
+function _applyTableSort(table,th,dir){
+  const tbody=table&&table.querySelector('tbody');if(!tbody||tbody.rows.length<2)return false;
   const idx=Array.from(th.parentNode.children).indexOf(th);
-  const dir=th.dataset.sortDir==='asc'?'desc':'asc';
   table.querySelectorAll('thead th').forEach(h=>{h.dataset.sortDir='';h.classList.remove('sorted-asc','sorted-desc');});
   th.dataset.sortDir=dir;th.classList.add(dir==='asc'?'sorted-asc':'sorted-desc');
   // a row that is just an expanded detail of the row above it travels with that row
@@ -24676,6 +24674,47 @@ document.addEventListener('click',function(e){
   });
   const texts=groups.map(g=>{const c=g.main.cells[idx];if(!c)return '';const ds=c.getAttribute&&c.getAttribute('data-sort');return ds!=null?ds:(c.textContent||'');});
   sortOrder(texts,dir).forEach(i=>groups[i].rows.forEach(r=>tbody.appendChild(r)));
+  return true;
+}
+function _rememberSort(table,th,dir){
+  if(!table.closest('#dd-ov'))return;   // the dealer PO window
+  (S._ddSort=S._ddSort||{})[_sortSig(table)]={label:th.textContent.trim(),dir:dir};table.dataset.ddSorted='1';
+}
+function _ddReapply(root){
+  root.querySelectorAll('table').forEach(function(table){
+    if(table.dataset.ddSorted)return;   // already sorted (by you, or put back already)
+    var saved=S._ddSort&&S._ddSort[_sortSig(table)];if(!saved)return;
+    var th=Array.from(table.querySelectorAll('thead th')).find(function(h){return h.textContent.trim()===saved.label;});if(!th)return;
+    table.dataset.ddSorted='1';_applyTableSort(table,th,saved.dir);
+  });
+}
+// the dealer PO window: put the sort back whenever its content is drawn again (Mark paid, Mark All Paid, Reopen, Close PO, Mark charged, switching tab)
+function _ddWatch(ov){
+  var busy=false,mo=new MutationObserver(function(){
+    if(busy)return;busy=true;
+    try{_ddReapply(ov);}catch(e){}
+    mo.takeRecords();   // our own reordering is not a change to react to
+    busy=false;
+  });
+  mo.observe(ov,{childList:true,subtree:true});ov._ddMo=mo;
+  try{_ddReapply(ov);}catch(e){}
+}
+// redraw the whole dealer PO window and keep your place in the list
+function _ddRedraw(dealerId){
+  var dd=document.getElementById('dd-ov');if(!dd||!dd.firstElementChild)return false;
+  var sc=document.getElementById('dd-content'),top=sc?sc.scrollTop:0;
+  dd.firstElementChild.innerHTML=_renderDealerDetailContent(dealerId);
+  var sc2=document.getElementById('dd-content');if(sc2)sc2.scrollTop=top;
+  return true;
+}
+document.addEventListener('click',function(e){
+  const th=e.target.closest('thead th');
+  if(!th||th.dataset.nosort)return; // a header that sorts the whole list itself (Sales Orders) opts out
+  if(e.target.closest('button,input,select,a'))return;
+  const table=th.closest('table');const tbody=table&&table.querySelector('tbody');
+  if(!tbody||tbody.rows.length<2)return;
+  const dir=th.dataset.sortDir==='asc'?'desc':'asc';
+  _applyTableSort(table,th,dir);_rememberSort(table,th,dir);
 });
 // [/v23.49 SORTING]
 
@@ -45173,7 +45212,7 @@ function openDealerDetail(dealerId){
   ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9000;display:flex;align-items:center;justify-content:center;padding:16px';
   ov.innerHTML='<div style="background:var(--bg);border-radius:var(--r-md);width:min(860px,96vw);max-height:88vh;display:flex;flex-direction:column;box-shadow:0 24px 64px rgba(0,0,0,.35)">'
     +_renderDealerDetailContent(dealerId)+'</div>';
-  document.body.appendChild(ov);
+  document.body.appendChild(ov);_ddWatch(ov);
   ov.addEventListener('click',function(e){if(e.target===ov)ov.remove();});
 }
 
@@ -45198,6 +45237,7 @@ function _poPaidCell(po){
    shipped in parts or across several orders waits for the final one, cancelled orders do not count). This lists every such PO that is not marked paid yet, with the amount to charge taken from the Shopify order
    (merchandise, shipping and tax) through the dealer-portal function, so the card is run in QuickBooks for the right amount. "Mark charged" then records the payment on the PO exactly like Mark paid (the dealer
    statement, the overdue list and the dealer's portal all agree), plus how much was charged and a reference. The ERP never holds card numbers and does not charge anything itself. */
+function rcPo(po){var x=String(po==null?'':po).replace(/^[^A-Za-z0-9]+/,'');return x||String(po==null?'':po);}   // display only: the PO's stored key is never changed
 function rcNorm(n){return String(n==null?'':n).replace(/^#+/,'').trim().toLowerCase();}
 function rcR2(n){return Math.round((Number(n)+Number.EPSILON)*100)/100;}
 function rcMoney(n){return '$'+Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
@@ -45229,19 +45269,29 @@ function rcClose(){var ov=document.getElementById('rc-ov');if(ov)ov.remove();}
 function rcRedraw(){var b=document.getElementById('rc-box');if(b)b.innerHTML=rcHtml();}
 // the exact amounts, read from the Shopify orders by the dealer-portal function (the same numbers the dealer sees in My Orders)
 async function rcLoadAmounts(){
-  var st=rcState(),off=rcReadyOffline(),dealers={};
-  off.ready.forEach(function(x){dealers[x.dealer.id]=x.dealer;});
+  var st=rcState(),off=rcReadyOffline(),dealers={},oldest={};
+  off.ready.forEach(function(x){dealers[x.dealer.id]=x.dealer;x.po.orders.forEach(function(o){var dt=String(o.sale_date||'').slice(0,10);if(dt&&(!oldest[x.dealer.id]||dt<oldest[x.dealer.id]))oldest[x.dealer.id]=dt;});});
   var ids=Object.keys(dealers);if(!ids.length){st.loading=false;rcRedraw();return;}
-  st.loading=true;rcRedraw();
+  st.loading=true;st.left={};rcRedraw();
   var results={};
   await Promise.all(ids.map(async function(id){
     var d=dealers[id];
     if(!d.price_list_token){results[id]={err:'this dealer has no portal link'};return;}
+    // only as far back as this dealer's oldest ready PO (fewer orders to price)
+    var days=oldest[id]?Math.min(3650,Math.max(30,_poGap(centralDateOnly(),oldest[id])+5)):365;
     try{
-      var j=await _dsFn({action:'orders',token:d.price_list_token,days:365});
-      if((j.amounts_pending||0)>0){await new Promise(function(r){setTimeout(r,2000);});j=await _dsFn({action:'orders',token:d.price_list_token,days:365});}   // Shopify was still answering
+      var j=await _dsFn({action:'orders',token:d.price_list_token,days:days}),tries=0;
+      // The function prices up to 80 orders per call and remembers them. A dealer with many orders needs it asked again: keep going while it is still pricing, and stop when a call makes no progress
+      // (an order Shopify cannot return stays unpriced, and waiting will not change that).
+      while((j.amounts_pending||0)>0&&tries<12){
+        st.left[id]=j.amounts_pending;rcRedraw();
+        var before=j.amounts_pending;await new Promise(function(r){setTimeout(r,900);});
+        j=await _dsFn({action:'orders',token:d.price_list_token,days:days});tries++;
+        if((j.amounts_pending||0)>=before)break;
+      }
+      delete st.left[id];
       results[id]={orders:j.orders||[]};
-    }catch(e){results[id]={err:(e&&e.message)||String(e)};}
+    }catch(e){delete st.left[id];results[id]={err:(e&&e.message)||String(e)};}
   }));
   st.amounts=results;st.loading=false;st.at=Date.now();rcRedraw();
 }
@@ -45266,13 +45316,13 @@ function rcHtml(){
   if(off.untracked.length)h+='<div class="panel" style="padding:8px 12px;margin-bottom:10px;border-left:3px solid var(--orange);font-size:var(--t-sm);line-height:1.5"><b style="color:var(--orange)">Not tracked:</b> '+off.untracked.map(function(d){return escHtml(d.name||'');}).join(', ')+(off.untracked.length===1?' is':' are')+' set to card on file but not marked <b>We bill them</b>, so their POs are not worked out. Open the dealer, Edit details, and tick We bill them.</div>';
   if(f){
     var d0=(S.dealers||[]).find(function(x){return String(x.id)===String(f.dealerId);})||{};
-    h+='<div class="panel" style="padding:12px 14px;margin-bottom:12px;border-left:3px solid var(--teal)"><b>Mark PO '+escHtml(f.poNumber)+' for '+escHtml(d0.name||'')+' as charged</b><div class="t3xs" style="margin:3px 0 8px">Run the card in QuickBooks first. This only records that it was charged.</div>'
+    h+='<div class="panel" style="padding:12px 14px;margin-bottom:12px;border-left:3px solid var(--teal)"><b>Mark PO '+escHtml(rcPo(f.poNumber))+' for '+escHtml(d0.name||'')+' as charged</b><div class="t3xs" style="margin:3px 0 8px">Run the card in QuickBooks first. This only records that it was charged.</div>'
      +'<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end"><label style="font-size:var(--t-sm)">Amount charged<br><input id="rc-amt" class="form-input" style="width:140px" value="'+escHtml(Number(f.amount).toFixed(2))+'"></label>'
      +'<label style="font-size:var(--t-sm);flex:1;min-width:240px">Reference (optional)<br><input id="rc-ref" class="form-input" style="width:100%" maxlength="80" placeholder="QuickBooks receipt or transaction number"></label>'
      +'<button class="btn btn-teal" onclick="rcSaveCharge()"'+(f.busy?' disabled':'')+'>'+(f.busy?'Saving&hellip;':'Mark charged')+'</button><button class="btn" onclick="rcCancelForm()">Cancel</button></div>'
      +(f.src!=='shopify'?'<div class="t3xs" style="margin-top:6px;color:var(--orange)">The amount shown is not the full Shopify total ('+escHtml(f.why||f.src)+'). Type what you actually charged.</div>':'')+'</div>';
   }
-  if(st.loading)h+='<div class="t3s" style="margin-bottom:8px">Reading the amounts from Shopify&hellip;</div>';
+  if(st.loading){var left=Object.keys(st.left||{}).reduce(function(n,k){return n+(st.left[k]||0);},0);h+='<div class="t3s" style="margin-bottom:8px">Reading the amounts from Shopify&hellip;'+(left?' ('+left+' order'+(left===1?'':'s')+' left)':'')+'</div>';}
   if(!rows.length){
     h+='<div style="padding:36px;text-align:center;color:var(--text3)">Nothing to charge right now.'+(off.waiting?' '+off.waiting+' PO'+(off.waiting===1?' is':'s are')+' still shipping.':'')+'</div>';
     return h;
@@ -45287,7 +45337,7 @@ function rcHtml(){
       :a.src==='merchandise'?'<div class="t3xs" style="color:var(--orange)">merchandise only: '+escHtml(a.why)+'</div>'
       :'<div class="t3xs" style="color:var(--red)">ERP estimate, not the invoice ('+escHtml(a.why||'no Shopify amount')+')</div>';
     h+='<tr style="border-bottom:1px solid var(--border)"><td style="padding:10px 12px"><b>'+escHtml(x.dealer.name||'')+'</b></td>'
-      +'<td style="padding:10px 12px;font-family:var(--mono);font-weight:700">'+escHtml(x.po.poNumber)+'</td>'
+      +'<td style="padding:10px 12px;font-family:var(--mono);font-weight:700">'+escHtml(rcPo(x.po.poNumber))+'</td>'
       +'<td style="padding:10px 12px">'+orders+'</td>'
       +'<td style="padding:10px 12px;font-size:var(--t-sm)">'+escHtml(b.billed_on)+'<div class="t3xs">'+(ago<=0?'today':ago+' day'+(ago===1?'':'s')+' ago')+'</div></td>'
       +'<td style="padding:10px 12px;text-align:right"><div style="font-family:var(--mono);font-weight:800;font-size:var(--t-lg)">'+rcMoney(a.amount)+'</div>'+note+'</td>'
@@ -45312,7 +45362,7 @@ async function rcSaveCharge(){
   var d=(S.dealers||[]).find(function(x){return String(x.id)===String(f.dealerId);});if(!d)return;
   var k=d.id+'_'+f.poNumber;f.busy=true;rcRedraw();
   try{await loadDealerPOPayments();}catch(e){}   // the freshest copy: two people marking POs at the same time cannot overwrite each other
-  if(S.dealerPOPayments[k]){f.busy=false;st.form=null;S._rcSig=null;toast('PO '+f.poNumber+' was already marked '+(S.dealerPOPayments[k].closed?'closed':'paid')+' by '+(S.dealerPOPayments[k].paid_by||S.dealerPOPayments[k].closed_by||'someone else')+'. Nothing was changed.',7000);rcRedraw();return;}
+  if(S.dealerPOPayments[k]){f.busy=false;st.form=null;S._rcSig=null;toast('PO '+rcPo(f.poNumber)+' was already marked '+(S.dealerPOPayments[k].closed?'closed':'paid')+' by '+(S.dealerPOPayments[k].paid_by||S.dealerPOPayments[k].closed_by||'someone else')+'. Nothing was changed.',7000);rcRedraw();return;}
   var rec={paid_at:new Date().toISOString().slice(0,10),paid_by:S.currentUser||'',method:'card',amount:rcR2(amt)};if(ref)rec.ref=ref;if(f.expected!=null)rec.expected=f.expected;
   S.dealerPOPayments[k]=rec;
   var ok=await rcPersist();
@@ -45320,8 +45370,8 @@ async function rcSaveCharge(){
   try{if(typeof dsPingDealer==='function')dsPingDealer(d.id,'orders');}catch(_e){}
   try{logAction('Dealer PO charged to card: '+f.poNumber,'dealers',d.id,null,{poNumber:f.poNumber,amount:rec.amount,ref:ref||null}).catch(function(){});}catch(_e){}
   st.form=null;S._rcSig=null;
-  toast('<span class="ic ic-check"></span>PO '+f.poNumber+' marked charged &middot; '+rcMoney(rec.amount)+' &middot; '+escHtml(d.name||''),6000);
-  var dd=document.getElementById('dd-ov');if(dd&&dd.firstElementChild){try{dd.firstElementChild.innerHTML=_renderDealerDetailContent(d.id);}catch(_e){}}
+  toast('<span class="ic ic-check"></span>PO '+rcPo(f.poNumber)+' marked charged \u00b7 '+rcMoney(rec.amount)+' \u00b7 '+(d.name||''),6000);
+  if(document.getElementById('dd-ov')){try{_ddRedraw(d.id);}catch(_e){}}
   try{if(S.view==='dealers')render();}catch(_e){}
   rcRedraw();
 }
@@ -45347,7 +45397,7 @@ async function confirmCloseDealerPO(dealerId,poNumber){
  logAction('Dealer PO closed without payment: '+poNumber,'dealers',dealerId,null,{poNumber:poNumber,reason:reason,note:note}).catch(function(){});
  var ov=document.getElementById('po-close-ov');if(ov)ov.remove();
  var dd=document.getElementById('dd-ov');
- if(dd&&dd.firstElementChild)dd.firstElementChild.innerHTML=_renderDealerDetailContent(dealerId);else _updateDDTabs('open');
+ if(dd)_ddRedraw(dealerId);else _updateDDTabs('open');
  toast('PO '+poNumber+' closed ('+_poCloseLabel(reason).toLowerCase()+')');
 }
 // ---- (v23.78) A dealer order that was sent to Shopify and then CANCELLED there is marked Cancelled here by itself (and frees its PO number).
@@ -45373,8 +45423,7 @@ async function markDealerPOPaid(dealerId,poNumber){
   await saveDealerPOPayments();try{if(typeof dsPingDealer==='function')dsPingDealer(dealerId,'orders');}catch(_e){}
   logAction('Dealer PO paid: '+poNumber,'dealers',dealerId,null,{poNumber,paid_at:S.dealerPOPayments[k].paid_at}).catch(function(){});
   var dd=document.getElementById('dd-ov');
-  if(dd&&dd.firstElementChild)dd.firstElementChild.innerHTML=_renderDealerDetailContent(dealerId);
-  else _updateDDTabs('open');
+  if(!_ddRedraw(dealerId))_updateDDTabs('open');
   toast('<span class="ic ic-check"></span>PO #'+poNumber+' marked paid');
 }
 
@@ -45383,7 +45432,7 @@ async function unmarkDealerPO(dealerId,poNumber){
   delete S.dealerPOPayments[k];
   await saveDealerPOPayments();try{if(typeof dsPingDealer==='function')dsPingDealer(dealerId,'orders');}catch(_e){}
   var dd=document.getElementById('dd-ov');
-  if(dd&&dd.firstElementChild)dd.firstElementChild.innerHTML=_renderDealerDetailContent(dealerId);
+  if(dd)_ddRedraw(dealerId);
   else _updateDDTabs('paid');
   toast('PO #'+poNumber+' reopened');
 }
@@ -45402,7 +45451,7 @@ async function markAllDealerPOsPaid(dealerId){
   logAction('Dealer bulk paid: '+data.open.map(function(p){return p.poNumber;}).join(', '),'dealers',dealerId,null,{count:data.open.length,total:total.toFixed(2)}).catch(function(){});
   toast('<span class="ic ic-check"></span>'+data.open.length+' PO'+(data.open.length!==1?'s':'')+' marked paid — $'+total.toFixed(2));
   var dd=document.getElementById('dd-ov');
-  if(dd&&dd.firstElementChild)dd.firstElementChild.innerHTML=_renderDealerDetailContent(dealerId);
+  if(dd)_ddRedraw(dealerId);
 }
 
 function printDealerBulkInvoice(dealerId){
