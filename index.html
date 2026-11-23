@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.174';
+const TGK_ERP_VERSION = 'v23.175';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -43672,7 +43672,7 @@ function hpMapApiOrder(o,st){
   var cname=((o.shipping_address&&o.shipping_address.name)||(o.billing_address&&o.billing_address.name)||(o.customer?((o.customer.first_name||'')+' '+(o.customer.last_name||'')):'')||'').trim()||null;
   var status=_hpHistStatus(o.financial_status,o.fulfillment_status);
   return Object.keys(agg).map(function(sku){
-    var row={order_number:o.name,pn:sku,qty:agg[sku].qty,sale_date:created,source:'Shopify History',fulfillment_status:status,
+    var row={order_number:o.name,shopify_order_id:(o.id!=null?String(o.id):null),pn:sku,qty:agg[sku].qty,sale_date:created,source:'Shopify History',fulfillment_status:status,
       financial_status:o.financial_status||null,customer_name:cname,customer_email:(o.email||(o.customer&&o.customer.email)||null),discount_code:hpPoCode(o)};   // [v23.171] a dealer's PO IS this code
     if(typeof salesHavePrice==='function'&&salesHavePrice()){var up=shopifyLineUnitPrice(agg[sku].li);if(up!=null){row.unit_price=up;row.price_source='shopify';}}
     return row;
@@ -43843,12 +43843,28 @@ async function _hpFillApply(byCode,st){
     }
   }
 }
-function _hpFillState(){return S._hpFill={running:true,pages:0,orders:0,withCode:0,updated:0,error:'',cancel:false};}
+// [v23.175] The dealer portal shows what a dealer was charged by reading the Shopify order, which it finds by the order's Shopify order id. History imports used to save the order number but not that id,
+// so those orders could only say "pricing...". New imports save it, and this repair (Fill in from Shopify) now fills it in on lines already imported: only history lines with NO id are touched, and only the id is added.
+async function _hpNeedIds(){
+  var set={};
+  try{var rows=await fetchAll(function(a,b){return db.from('sales').select('order_number').eq('source','Shopify History').is('shopify_order_id',null).range(a,b);});(rows||[]).forEach(function(r){if(r.order_number)set[r.order_number]=1;});}catch(e){}
+  return set;
+}
+async function _hpFillIds(orders,need,st){
+  var todo=(orders||[]).filter(function(o){return o&&o.id!=null&&!o.cancelled_at&&need[o.name];});
+  for(var i=0;i<todo.length;i+=8){
+    var rs=await Promise.all(todo.slice(i,i+8).map(function(o){return db.from('sales').update({shopify_order_id:String(o.id)}).eq('order_number',o.name).is('shopify_order_id',null).select('id');}));
+    rs.forEach(function(r){if(r.error)throw new Error('update failed: '+r.error.message);st.ids+=(r.data||[]).length;});
+  }
+}
+async function hpNoIdCount(){try{var r=await db.from('sales').select('id',{count:'exact',head:true}).eq('source','Shopify History').is('shopify_order_id',null);S._hpNoId=(!r.error&&typeof r.count==='number')?r.count:null;}catch(e){S._hpNoId=null;}return S._hpNoId;}
+function _hpFillState(){return S._hpFill={running:true,pages:0,orders:0,withCode:0,updated:0,ids:0,error:'',cancel:false};}
 async function hpFillCodes(){
   if(S._hpFill&&S._hpFill.running)return;
   var rg=_hpImpRange();
-  if(!confirm('Fill in the PO / discount codes on orders already imported, for Shopify orders created from '+rg.from+' to today?\n\nOnly lines that have no code yet are touched, and only the code is added. Nothing else changes.'))return;
+  if(!confirm('Fill in the PO / discount codes and the Shopify order ids on orders already imported, for Shopify orders created from '+rg.from+' to today?\n\nOnly lines that have no code (or no order id) yet are touched, and only those are added. Nothing else changes.'))return;
   var st=_hpFillState();render();
+  var need=await _hpNeedIds();   // history order numbers that still have no Shopify order id
   var page_info='',fromIso=new Date(hpD(rg.from)).toISOString(),tries=0;
   try{
     for(;;){
@@ -43859,12 +43875,12 @@ async function hpFillCodes(){
       tries=0;if(!r.ok||j.error)throw new Error(j.error||('HTTP '+r.status));
       var byCode={};st.pages++;
       (j.orders||[]).forEach(function(o){st.orders++;var c=hpPoCode(o);if(!c||o.cancelled_at)return;st.withCode++;(byCode[c]=byCode[c]||[]).push(o.name);});
-      await _hpFillApply(byCode,st);render();
+      await _hpFillApply(byCode,st);await _hpFillIds(j.orders,need,st);render();
       page_info=j.next_page_info||'';if(!page_info)break;
     }
   }catch(e){st.error=e.message||String(e);}
-  st.running=false;S._hpNoCode=undefined;S._hpCov=null;
-  toast('PO codes filled in on '+st.updated+' line'+(st.updated===1?'':'s')+(st.error?' - '+st.error:''),st.error?9000:6000);
+  st.running=false;S._hpNoCode=undefined;S._hpNoId=undefined;S._hpCov=null;
+  toast('Filled in: PO codes on '+st.updated+' line'+(st.updated===1?'':'s')+', Shopify order ids on '+st.ids+' line'+(st.ids===1?'':'s')+(st.error?' - '+st.error:''),st.error?9000:6000);
   try{await ensureSalesSince(daysAgo(372));}catch(e){}
   render();
 }
@@ -43892,14 +43908,15 @@ async function hpFillCodesCSV(input){
   render();
 }
 function hpFillBlock(){
-  var f=S._hpFill,n=S._hpNoCode;if(n===undefined){S._hpNoCode=null;hpNoCodeCount().then(function(){render();});}
+  var f=S._hpFill,n=S._hpNoCode,ni=S._hpNoId;if(n===undefined){S._hpNoCode=null;hpNoCodeCount().then(function(){render();});}
+  if(ni===undefined){S._hpNoId=null;hpNoIdCount().then(function(){render();});}
   var busy=f&&f.running?' disabled':'';
   return '<div style="padding:10px 14px;border-top:1px solid var(--border);font-size:var(--t-sm)"><b>Dealer PO codes on imported history</b>'
-    +'<div class="t3xs" style="color:var(--text3);margin:4px 0 8px;line-height:1.5">A dealer\'s PO is the code on its order. Earlier history imports did not save it, so those orders could not be matched to a dealer: dealer history and 12-month sales stopped where the live sync began. This reads the codes from Shopify and fills them in on lines already imported (only lines with no code yet; nothing else changes).'+(n>0?' <span style="color:var(--text3)">'+n.toLocaleString()+' imported history lines currently have no code (normal for ordinary customer orders).</span>':'')+'</div>'
+    +'<div class="t3xs" style="color:var(--text3);margin:4px 0 8px;line-height:1.5">A dealer\'s PO is the code on its order. Earlier history imports did not save it, so those orders could not be matched to a dealer: dealer history and 12-month sales stopped where the live sync began. This reads the codes from Shopify and fills them in on lines already imported (only lines with no code yet; nothing else changes). It also saves each order\'s <b>Shopify order id</b>, which the dealer portal needs to show what a dealer was charged (an order without one can only say &ldquo;pricing&hellip;&rdquo;).'+(ni>0?' <span style="color:var(--orange)">'+ni.toLocaleString()+' imported history lines have no Shopify order id yet.</span>':'')+(n>0?' <span style="color:var(--text3)">'+n.toLocaleString()+' imported history lines currently have no code (normal for ordinary customer orders).</span>':'')+'</div>'
     +'<button class="btn btn-sm btn-primary" onclick="hpFillCodes()"'+busy+'>Fill in from Shopify</button> <label class="btn btn-sm" style="cursor:pointer'+(busy?';opacity:.5;pointer-events:none':'')+'">Fill in from a CSV<input type="file" accept=".csv,text/csv" style="display:none" onchange="hpFillCodesCSV(this)"></label>'
-    +(f?'<div style="margin-top:8px">'+(f.running?'<b>Working&hellip;</b> ':'<b>Last run:</b> ')+f.orders+' orders read, '+f.withCode+' with a code, <b>'+f.updated+' lines updated</b>'+(f.running?' <button class="btn btn-sm" onclick="S._hpFill.cancel=true">Stop</button>':'')+(f.error?'<div style="color:var(--red);margin-top:4px">'+escHtml(f.error)+'</div>':'')+'</div>':'')+'</div>';
+    +(f?'<div style="margin-top:8px">'+(f.running?'<b>Working&hellip;</b> ':'<b>Last run:</b> ')+f.orders+' orders read, '+f.withCode+' with a code, <b>'+f.updated+' lines updated</b>'+(f.ids!==undefined?', <b>'+f.ids+' order ids filled in</b>':'')+(f.running?' <button class="btn btn-sm" onclick="S._hpFill.cancel=true">Stop</button>':'')+(f.error?'<div style="color:var(--red);margin-top:4px">'+escHtml(f.error)+'</div>':'')+'</div>':'')+'</div>';
 }
-window.hpFillCodes=hpFillCodes;window.hpFillCodesCSV=hpFillCodesCSV;
+window.hpFillCodes=hpFillCodes;window.hpNoIdCount=hpNoIdCount;window.hpFillCodesCSV=hpFillCodesCSV;
 window.hpImportFromShopify=hpImportFromShopify;window.hpImportCSV=hpImportCSV;window.hpEarliestSale=hpEarliestSale;
 // The old "Import All Shopify Orders" called Shopify straight from the browser (blocked by CORS) with
 // page-number paging Shopify no longer supports, and imported old unfulfilled orders as Open work.
