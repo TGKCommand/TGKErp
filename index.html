@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.191';
+const TGK_ERP_VERSION = 'v23.192';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -24025,7 +24025,7 @@ function renderReports(){
       </div>
 
 
-      ${def.id==='sku_lookup'?rptSkuDetailHtml(rows):''}${!hasRows?(def.id==='sku_lookup'?'':`<div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-md);padding:48px;text-align:center;color:var(--text3)">No data for this report with the current filters</div>`):canChart&&S.rptState.chartView?`<div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-md);padding:24px"><canvas id="rpt-chart-canvas" style="max-height:460px;width:100%"></canvas></div>` :`
+      ${def.id==='sku_lookup'?rptSkuDetailHtml(rows):''}${def.id==='sku_lookup'?'':!hasRows?(def.id==='sku_lookup'?'':`<div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-md);padding:48px;text-align:center;color:var(--text3)">No data for this report with the current filters</div>`):canChart&&S.rptState.chartView?`<div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-md);padding:24px"><canvas id="rpt-chart-canvas" style="max-height:460px;width:100%"></canvas></div>` :`
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden">
         <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-wrap:wrap">
           <input type="text" id="rpt-search-input" placeholder="Search this report\u2026" value="${escHtml(rs.search||'')}"
@@ -24425,7 +24425,12 @@ function rptSkuModel(q,from,to){
   else if(idx.packFallback)notes.push('The pack log could not be read, so built counts come from the stock-movement log (packs only), which may be incomplete.');
   else if(from&&idx.packEarliest&&from<idx.packEarliest)notes.push('The pack log starts '+idx.packEarliest+': builds before that day are not counted.');
   if(sold.lines&&sold.estLines)notes.push(sold.estLines+' of '+sold.lines+' sales lines have no recorded price paid, so their revenue is an estimate at list price (dealer orders at the dealer rate).');
-  return {query:q,found:true,kind:r.kind,type:rptTypeLabel(r),it:it,canon:canon,disp:dispPn(it),isAsm:isAsm,rows:rows,top:top,msrp:msrp,sold:sold,built:built,ordered:pd0,used:idx.consumed[canon]||0,
+  // parts across the whole tree, added up once each: what is needed per unit, bought, used
+  var flat={};rows.forEach(function(x){if(x.type!=='Part')return;var a=flat[x.key]||(flat[x.key]={key:x.key,sku:x.sku,desc:x.desc,need:0,unit:x.unit,avg:x.avg,last:x.last,ordered:x.ordered,spent:x.spent,used:x.used,onHand:x.onHand});a.need+=x.qty;});
+  var partsList=Object.keys(flat).map(function(k){return flat[k];}).sort(function(a,b){return (b.spent-a.spent)||(b.need*b.unit-a.need*a.unit);});
+  var movers=partsList.filter(function(x){return x.avg!=null&&x.avg>0;}).map(function(x){return {sku:x.sku,unit:x.unit,avg:x.avg,pct:(x.unit-x.avg)/x.avg*100,impact:(x.unit-x.avg)*x.need};}).filter(function(x){return Math.abs(x.pct)>=3&&Math.abs(x.impact)>=0.5;}).sort(function(a,b){return Math.abs(b.impact)-Math.abs(a.impact);}).slice(0,3);
+  var driftPct=(isAsm&&top.costAvg>0)?(top.cost-top.costAvg)/top.costAvg*100:null;
+  return {query:q,found:true,kind:r.kind,type:rptTypeLabel(r),it:it,canon:canon,disp:dispPn(it),isAsm:isAsm,rows:rows,top:top,msrp:msrp,sold:sold,built:built,ordered:pd0,used:idx.consumed[canon]||0,partsList:partsList,movers:movers,driftPct:driftPct,rangeLabel:rptRangeLabel(from,to),packSince:idx.packEarliest||'',
     months:perMonth,hist:hist,breaks:breaks,notes:notes,days:days,from:from,to:to,weeks:days?days/7:null};
 }
 function rptSkuTableRows(m){
@@ -24441,57 +24446,129 @@ function rptSkuTableRows(m){
   return data;
 }
 // ---- the screen ----
+function rptFmtDay(d){if(!d)return '';var x=new Date(d+'T12:00:00Z');return isNaN(x)?d:x.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric',timeZone:'UTC'});}
+function rptRangeLabel(from,to){return (!from&&!to)?'all time':(rptFmtDay(from||'')+' to '+rptFmtDay(to||rptToday()));}
+// finding a SKU: as you type, matches are listed under the box; Enter or a click looks it up
+function rptSkuMatches(q,limit){
+  q=String(q||'').trim().toUpperCase();if(q.length<1)return [];
+  var out=[],add=function(kind,x){
+    var f=[x.pn,x.new_sku,x.description].map(function(v){return String(v||'').toUpperCase();}),sc=null;
+    if(f[0]===q||f[1]===q||f[2]===q)sc=0;else if(f[0].indexOf(q)===0||f[1].indexOf(q)===0)sc=1;else if(f[0].indexOf(q)>=0||f[1].indexOf(q)>=0)sc=2;else if(f[2].indexOf(q)>=0)sc=3;
+    if(sc!=null)out.push({sc:sc,kind:kind,it:x});
+  };
+  (S.assemblies||[]).forEach(function(x){add('asm',x);});(S.parts||[]).forEach(function(x){add('part',x);});
+  out.sort(function(a,b){return a.sc-b.sc||(a.kind===b.kind?0:(a.kind==='asm'?-1:1))||dispPn(a.it).localeCompare(dispPn(b.it));});
+  return out.slice(0,limit||10);
+}
 function rptSkuSet(v){
-  v=String(v||'').trim();var rs=S.rptState||{};var rec=(rs.skuRecent||[]).filter(function(x){return x!==v;});if(v)rec.unshift(v);
-  S.rptState=Object.assign({},rs,{sku:v,preview:null,skuRecent:rec.slice(0,8)});render();
+  v=String(v||'').trim();var rs=S.rptState||{},rec=(rs.skuRecent||[]).filter(function(x){return x!==v;});if(v)rec.unshift(v);
+  S.rptState=Object.assign({},rs,{sku:v,skuDraft:v,preview:null,skuRecent:rec.slice(0,8)});render();
 }
-function rptSkuOptionsHtml(){
-  var key=(S.parts||[]).length+'|'+(S.assemblies||[]).length;
-  if(S._rptSkuOptsKey===key&&S._rptSkuOpts)return S._rptSkuOpts;
-  var o=[];(S.assemblies||[]).forEach(function(a){o.push('<option value="'+escHtml(dispPn(a))+'">'+escHtml((a.is_subassembly?'Sub-assembly: ':'Finished good: ')+(a.description||''))+'</option>');});
-  (S.parts||[]).forEach(function(p){o.push('<option value="'+escHtml(dispPn(p)||p.pn)+'">'+escHtml('Part: '+(p.description||''))+'</option>');});
-  S._rptSkuOptsKey=key;S._rptSkuOpts=o.slice(0,6000).join('');return S._rptSkuOpts;
+function rptSkuSuggestPaint(q){
+  var box=document.getElementById('rpt-sku-sug');if(!box)return;
+  var m=String(q||'').trim().length>=2?rptSkuMatches(q,10):[];
+  if(!m.length){box.style.display='none';box.innerHTML='';return;}
+  box.innerHTML=m.map(function(x){return '<div class="rpt-sku-opt" style="padding:7px 12px;cursor:pointer;border-bottom:1px solid var(--border);display:flex;gap:10px;align-items:baseline" data-v="'+escHtml(dispPn(x.it)||x.it.pn)+'" onmousedown="rptSkuSet(this.dataset.v)"><b style="font-family:var(--mono);white-space:nowrap">'+escHtml(dispPn(x.it)||x.it.pn)+'</b><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(x.it.description||'')+'</span><span class="t3xs" style="white-space:nowrap">'+(x.kind==='asm'?(x.it.is_subassembly?'Sub-assembly':'Finished good'):'Part')+'</span></div>';}).join('');
+  box.style.display='block';
 }
+function rptSkuTyping(v){
+  if(S.rptState)S.rptState.skuDraft=v;rptSkuSuggestPaint(v);
+  clearTimeout(window._rptSkuT);   // a complete SKU is looked up by itself a moment after you stop typing
+  var t=String(v||'').trim();if(t&&rptResolveSku(t).it)window._rptSkuT=setTimeout(function(){if(String((S.rptState&&S.rptState.skuDraft)||'').trim()===t&&t!==(S.rptState&&S.rptState.sku))rptSkuSet(t);},600);
+}
+function rptSkuGo(){
+  var el=document.getElementById('rpt-sku-input'),v=String((el&&el.value)||'').trim();if(!v)return;
+  clearTimeout(window._rptSkuT);
+  if(rptResolveSku(v).it){rptSkuSet(v);return;}
+  var m=rptSkuMatches(v,12);
+  if(m.length===1){rptSkuSet(dispPn(m[0].it)||m[0].it.pn);return;}
+  if(m.length>1){rptSkuSuggestPaint(v);toast('Pick one from the list');return;}
+  rptSkuSet(v);   // nothing matches: the screen says so
+}
+function rptSkuKey(e){if(e.key==='Enter'){e.preventDefault();rptSkuGo();}else if(e.key==='Escape'){var b=document.getElementById('rpt-sku-sug');if(b)b.style.display='none';}}
 function rptSkuControlsHtml(){
-  var rs=S.rptState||{},rec=(rs.skuRecent||[]);
-  return '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 12px"><input id="rpt-sku-input" list="rpt-sku-list" class="form-input" style="flex:1;min-width:280px" autocomplete="off" placeholder="Type or pick any SKU, part number or description" value="'+escHtml(rs.sku||'')+'" onchange="rptSkuSet(this.value)" onkeydown="if(event.key===\'Enter\'){rptSkuSet(this.value);}">'
-    +'<button class="btn btn-teal" onclick="rptSkuSet(document.getElementById(\'rpt-sku-input\').value)">Look up</button><datalist id="rpt-sku-list">'+rptSkuOptionsHtml()+'</datalist></div>'
+  var rs=S.rptState||{},rec=(rs.skuRecent||[]),val=(rs.skuDraft!=null?rs.skuDraft:(rs.sku||''));
+  // the page redraws itself when older orders or the build log finish loading: keep what is being typed, and the cursor
+  setTimeout(function(){var e=document.getElementById('rpt-sku-input');if(e&&S._rptSkuFocus&&document.activeElement!==e){e.focus();try{e.setSelectionRange(e.value.length,e.value.length);}catch(_e){}}},0);
+  return '<div style="position:relative;margin:0 0 12px"><div style="display:flex;gap:8px;align-items:center"><input id="rpt-sku-input" class="form-input" style="flex:1;min-width:240px" autocomplete="off" placeholder="Type a SKU, part number or name (for example TGK-0313-01)" value="'+escHtml(val)+'" oninput="rptSkuTyping(this.value)" onfocus="S._rptSkuFocus=true" onblur="setTimeout(function(){S._rptSkuFocus=false;var b=document.getElementById(\'rpt-sku-sug\');if(b)b.style.display=\'none\';},200)" onkeydown="rptSkuKey(event)">'
+    +'<button class="btn btn-teal" onclick="rptSkuGo()">Look up</button></div>'
+    +'<div id="rpt-sku-sug" style="display:none;position:absolute;left:0;right:90px;top:100%;z-index:30;background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-md);box-shadow:0 8px 24px rgba(0,0,0,.18);max-height:340px;overflow:auto"></div></div>'
     +(rec.length?'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px;align-items:center"><span class="t3s">Recent:</span>'+rec.map(function(x){return '<button class="filter-chip" onclick="rptSkuSet(this.dataset.v)" data-v="'+escHtml(x)+'">'+escHtml(x)+'</button>';}).join('')+'</div>':'');
 }
-function rptKpi(label,value,sub,cls){return '<div class="panel" style="padding:12px 14px;min-width:0"><div class="t3s" style="font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px">'+label+'</div><div style="font-size:var(--t-xl);font-weight:700;'+(cls==='kpi-green'?'color:var(--green);':'')+'">'+value+'</div>'+(sub?'<div class="t3s" style="margin-top:2px">'+sub+'</div>':'')+'</div>';}
+function rptKpi(label,value,sub,cls){return '<div class="panel" style="padding:12px 14px;min-width:0"><div class="t3s" style="font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">'+label+'</div><div style="font-size:var(--t-xl);font-weight:700;'+(cls==='good'?'color:var(--green);':(cls==='bad'?'color:var(--red);':''))+'">'+value+'</div>'+(sub?'<div class="t3s" style="margin-top:2px">'+sub+'</div>':'')+'</div>';}
+// the answer in plain words, before any table
+function rptSkuSummaryHtml(m){
+  var it=m.it,b=function(x){return '<b>'+x+'</b>';},cost=m.top.cost,msrp=m.msrp.val,range=m.rangeLabel,s=[];
+  var pct=function(a,c){return c>0?((a-c)/a*100).toFixed(1)+'%':'';};
+  var months=m.days?m.days/30.4375:null,soldTxt=m.sold.units>0?(b(fn(m.sold.units))+' ('+fc(m.sold.rev)+' from '+fn(m.sold.orders)+' order'+(m.sold.orders===1?'':'s')+')'):'none';
+  if(m.isAsm){
+    s.push(b(escHtml(m.disp))+' is a '+m.type.toLowerCase()+(m.top.lines?' made of '+m.top.lines+' item'+(m.top.lines===1?'':'s'):'')+'. At today\'s part prices it costs '+b(fc(cost))+' to build'+(msrp>0?(m.msrp.entered?' and its list price (MSRP) is ':' and a suggested list price (cost x 1.6) would be ')+b(fc(msrp))+', so you keep '+b(fc(msrp-cost))+' ('+pct(msrp,cost)+') on each one before shipping and fees.':'. It has no MSRP set.'));
+    if(m.sold.actualAvg!=null)s.push('Customers actually paid '+b(fc(m.sold.actualAvg))+' on average'+(msrp>0?' ('+Math.abs(((msrp-m.sold.actualAvg)/msrp*100)).toFixed(1)+'% '+(m.sold.actualAvg<msrp?'under':'over')+' list)':'')+', so you really keep '+b(fc(m.sold.actualAvg-cost))+' ('+pct(m.sold.actualAvg,cost)+') on each.');
+    s.push('From '+escHtml(range)+': you sold '+soldTxt+' and built '+b(fn(m.built.units))+(m.built.runs?' in '+m.built.runs+' pack run'+(m.built.runs===1?'':'s'):'')+'.'+(m.packSince&&m.from&&m.from<m.packSince?' (Builds were only logged from '+escHtml(rptFmtDay(m.packSince))+', so the built number is for that part of the period.)':''));
+  }else{
+    var avg=m.ordered.avg;
+    s.push(b(escHtml(m.disp))+' is a raw part'+(it.vendor?' from '+escHtml(it.vendor):'')+'. Its cost on file is '+b(fc(cost,4))+' each'+(m.ordered.units>0?'. From '+escHtml(range)+' you bought '+b(fn(m.ordered.units))+' ('+fc(m.ordered.spend)+'), paying '+b(fc(avg,4))+' each on average (lowest '+fc(m.ordered.min,4)+', highest '+fc(m.ordered.max,4)+', last '+fc(m.ordered.last,4)+(m.ordered.lastDate?' on '+escHtml(rptFmtDay(m.ordered.lastDate)):'')+').':'. You did not buy any in '+escHtml(range)+'.'));
+    s.push('It went into '+b(fn(m.used))+' unit'+(m.used===1?'':'s')+' of builds and you sold '+b(fn(m.sold.units))+' on their own in that time'+(months&&(m.used+m.sold.units)>0?', about '+((m.used+m.sold.units)/months).toFixed(1)+' a month. You have '+b(fn(it.total_unpckgd||0))+' on hand, enough for about '+b(((it.total_unpckgd||0)/((m.used+m.sold.units)/months)).toFixed(1))+' months at that rate.':'. You have '+b(fn(it.total_unpckgd||0))+' on hand.'));
+  }
+  if(m.isAsm&&m.driftPct!=null&&Math.abs(m.driftPct)>=2){
+    s.push('Compared with what you actually paid for its parts in '+escHtml(range)+', today\'s part prices are '+b(Math.abs(m.driftPct).toFixed(1)+'% '+(m.driftPct>0?'higher':'lower'))+'.'+(m.movers.length?' Biggest changes: '+m.movers.map(function(x){return escHtml(x.sku)+' ('+(x.pct>0?'+':'')+x.pct.toFixed(0)+'%, now '+fc(x.unit)+' vs '+fc(x.avg)+' average)';}).join('; ')+'.':''));
+  }
+  return '<div style="margin:0 0 12px;padding:12px 16px;background:var(--bg2);border:1px solid var(--border);border-left:4px solid var(--teal);border-radius:var(--r-md);line-height:1.6;font-size:var(--t-md)">'+s.join('<br><br>')+'</div>';
+}
 function rptSkuDetailHtml(rows){
   var m=rows&&rows.model,box=function(c,x){return '<div style="margin:0 0 10px;padding:8px 12px;border-left:3px solid '+c+';background:var(--bg1);font-size:var(--t-sm);color:var(--text2);line-height:1.5">'+x+'</div>';};
-  if(!m)return box('var(--teal)','Type or pick a SKU above. A raw part shows just itself; an assembly shows every item in its bill of materials, with costs, averages, and how many were ordered, built and sold in the range you choose.');
-  if(!m.found)return box('var(--orange)','No part, assembly or finished good matches <b>'+escHtml(m.query)+'</b>.'+((m.suggest||[]).length?' Did you mean: '+m.suggest.map(function(x){return '<button class="filter-chip" data-v="'+escHtml(dispPn(x.it))+'" onclick="rptSkuSet(this.dataset.v)">'+escHtml(dispPn(x.it))+'</button>';}).join(' ')+'?':''));
-  var it=m.it,g=function(v){return v==null?'&mdash;':fc(v);},pct=function(v){return v==null?'':(v>=0?'+':'')+v.toFixed(1)+'%';};
-  var cost=m.top.cost,marginAt=function(p){return p>0?(p-cost)/p*100:null;},msrp=m.msrp.val;
-  var perWk=function(n){return m.weeks?(n/m.weeks).toFixed(1)+' / week':'';};
-  var avg=m.isAsm?m.top.costAvg:m.ordered.avg,drift=(avg>0)?(cost-avg)/avg*100:null;
-  var h='<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 12px"><span style="font-size:var(--t-xl);font-weight:700;font-family:var(--mono)">'+escHtml(m.disp)+'</span><span class="pill pill-teal">'+escHtml(m.type)+'</span>'+(it.discontinued?'<span class="pill pill-red">Discontinued</span>':'')+'<span style="color:var(--text2)">'+escHtml(it.description||'')+'</span>'
-    +'<span class="t3s">'+(m.isAsm?'':escHtml(it.vendor||'no vendor')+' &middot; ')+'On hand <b>'+fn(m.isAsm?(it.total_on_hand||0):(it.total_unpckgd||0))+'</b>'+(it.location?' &middot; Bin '+escHtml(it.location):'')+'</span></div>';
-  h+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin:0 0 10px">'
-    +rptKpi('Cost now',fc(cost),m.isAsm?m.top.lines+' item'+(m.top.lines===1?'':'s')+' on the BOM':'unit cost on file')
-    +rptKpi('Cost at average paid',avg>0?fc(avg):'&mdash;',avg>0?(drift==null?'':'now is '+pct(drift)+' vs the range average'):'no purchases in this range')
-    +rptKpi((m.msrp.entered?'MSRP':'Suggested MSRP (cost x1.6)'),g(msrp),m.sold.actualAvg!=null&&msrp>0?'avg price paid '+fc(m.sold.actualAvg)+' ('+pct((m.sold.actualAvg-msrp)/msrp*100)+')':'')
-    +rptKpi('Margin at MSRP',msrp>0?fc(msrp-cost)+' &middot; '+marginAt(msrp).toFixed(1)+'%':'&mdash;','at the cost now','kpi-green')
-    +(m.sold.actualAvg!=null?rptKpi('Margin at price paid',fc(m.sold.actualAvg-cost)+' &middot; '+marginAt(m.sold.actualAvg).toFixed(1)+'%','average price actually paid, at the cost now'):'')
-    +'</div>';
-  h+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:10px;margin:0 0 10px">'
-    +'<div class="panel" style="padding:12px 14px"><div class="t3s" style="font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px">Built</div>'
-      +(m.isAsm?'<div style="font-size:var(--t-xl);font-weight:700">'+fn(m.built.units)+' <span class="t3s">units</span></div><div class="t3s">'+m.built.runs+' pack run'+(m.built.runs===1?'':'s')+(m.weeks?' &middot; '+perWk(m.built.units):'')+'</div>':'<div style="font-size:var(--t-xl);font-weight:700">'+fn(m.used)+' <span class="t3s">used in builds</span></div><div class="t3s">units consumed by assemblies built in this range'+(m.weeks?' &middot; '+perWk(m.used):'')+'</div>')+'</div>'
-    +'<div class="panel" style="padding:12px 14px"><div class="t3s" style="font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px">Sold</div><div style="font-size:var(--t-xl);font-weight:700">'+fn(m.sold.units)+' <span class="t3s">units</span> &middot; '+fc(m.sold.rev)+'</div><div class="t3s">'+m.sold.orders+' order'+(m.sold.orders===1?'':'s')+(m.sold.avg!=null?' &middot; avg '+fc(m.sold.avg):'')+(m.weeks?' &middot; '+perWk(m.sold.units):'')+'</div></div>'
-    +'<div class="panel" style="padding:12px 14px"><div class="t3s" style="font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px">Ordered</div>'
-      +(m.ordered.units>0?'<div style="font-size:var(--t-xl);font-weight:700">'+fn(m.ordered.units)+' <span class="t3s">units</span> &middot; '+fc(m.ordered.spend)+'</div><div class="t3s">avg '+fc(m.ordered.avg,4)+' &middot; range '+fc(m.ordered.min,4)+' to '+fc(m.ordered.max,4)+' &middot; last '+fc(m.ordered.last,4)+(m.ordered.lastDate?' on '+escHtml(m.ordered.lastDate):'')+'</div>':'<div style="font-size:var(--t-lg);color:var(--text3)">'+(m.isAsm?'Assemblies are built, not ordered: see the parts below.':'No purchase orders in this range.')+'</div>')+'</div></div>';
+  if(!m)return '<div style="margin:0 0 12px;padding:16px 18px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-md);line-height:1.7">Type a SKU above. The report then tells you, in plain words and in two short tables:<br>&bull; <b>what it costs to build</b> and what you keep when it sells (an assembly lists every part in it, sub-assemblies opened out)<br>&bull; <b>how many were built, sold and ordered</b> in the time range you pick<br>&bull; <b>what you paid</b> for each part, on average and last time, and whether prices have moved.<br>A raw part shows just itself.</div>';
+  if(!m.found)return box('var(--orange)','Nothing matches <b>'+escHtml(m.query)+'</b>.'+((m.suggest||[]).length?' Did you mean: '+m.suggest.map(function(x){return '<button class="filter-chip" data-v="'+escHtml(dispPn(x.it))+'" onclick="rptSkuSet(this.dataset.v)">'+escHtml(dispPn(x.it))+'</button>';}).join(' ')+'?':''));
+  var it=m.it,g=function(v){return v==null?'&mdash;':fc(v);},cost=m.top.cost,msrp=m.msrp.val;
+  var h='<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:4px 0 12px"><span style="font-size:var(--t-xl);font-weight:700;font-family:var(--mono)">'+escHtml(m.disp)+'</span><span class="pill pill-teal">'+escHtml(m.type)+'</span>'+(it.discontinued?'<span class="pill pill-red">Discontinued</span>':'')+'<span style="color:var(--text2)">'+escHtml(it.description||'')+'</span><span class="t3s">On hand <b>'+fn(m.isAsm?(it.total_on_hand||0):(it.total_unpckgd||0))+'</b>'+(it.location?' &middot; Bin '+escHtml(it.location):'')+'</span></div>';
+  h+=rptSkuSummaryHtml(m);
+  // the main numbers
+  if(m.isAsm){
+    var keep=msrp>0?msrp-cost:null,real=m.sold.actualAvg!=null?m.sold.actualAvg-cost:null;
+    h+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin:0 0 12px">'
+      +rptKpi('Costs to build',fc(cost),'at today\'s part prices')
+      +rptKpi(m.msrp.entered?'List price (MSRP)':'Suggested list price',g(msrp),m.msrp.entered?'':'no MSRP set: cost x 1.6')
+      +rptKpi('You keep at list price',keep==null?'&mdash;':fc(keep),keep==null?'':((keep/msrp*100).toFixed(1)+'% of the price'),keep!=null&&keep>0?'good':(keep!=null?'bad':''))
+      +rptKpi('Customers actually paid',g(m.sold.actualAvg),m.sold.actualAvg!=null&&msrp>0?(Math.abs((msrp-m.sold.actualAvg)/msrp*100).toFixed(1)+'% '+(m.sold.actualAvg<msrp?'under':'over')+' list, average'):'no sales with a recorded price')
+      +rptKpi('You really keep per unit',real==null?'&mdash;':fc(real),real==null?'':((real/m.sold.actualAvg*100).toFixed(1)+'% of what they paid'),real!=null&&real>0?'good':(real!=null?'bad':''))+'</div>';
+  }else{
+    var use=(m.used+m.sold.units),mo=m.days?m.days/30.4375:null,onh=it.total_unpckgd||0;
+    h+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin:0 0 12px">'
+      +rptKpi('Cost on file',fc(cost,4),'each')+rptKpi('You paid on average',g(m.ordered.avg),m.ordered.units>0?'for '+fn(m.ordered.units)+' bought in this range':'nothing bought in this range')
+      +rptKpi('You paid last time',g(m.ordered.last),m.ordered.lastDate?escHtml(rptFmtDay(m.ordered.lastDate)):'')
+      +rptKpi('In stock',fn(onh),(mo&&use>0)?'about '+(onh/(use/mo)).toFixed(1)+' months at the rate you use it':'')+'</div>';
+  }
+  h+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin:0 0 12px">'
+    +rptKpi('Built','<span>'+fn(m.isAsm?m.built.units:m.used)+'</span> <span class="t3s" style="font-weight:400">'+(m.isAsm?'units':'used in builds')+'</span>',(m.isAsm?(m.built.runs+' pack run'+(m.built.runs===1?'':'s')):'consumed by assemblies built in this range')+(m.weeks?' &middot; about '+((m.isAsm?m.built.units:m.used)/m.weeks*(52/12)).toFixed(1)+' a month':''))
+    +rptKpi('Sold','<span>'+fn(m.sold.units)+'</span> <span class="t3s" style="font-weight:400">units &middot; '+fc(m.sold.rev)+'</span>',fn(m.sold.orders)+' order'+(m.sold.orders===1?'':'s')+(m.weeks?' &middot; about '+(m.sold.units/m.weeks*(52/12)).toFixed(1)+' a month':''))
+    +rptKpi('Ordered',m.isAsm?'<span class="t3s" style="font-weight:400">Parts are ordered, not assemblies: see the second table</span>':('<span>'+fn(m.ordered.units)+'</span> <span class="t3s" style="font-weight:400">units &middot; '+fc(m.ordered.spend)+'</span>'),m.isAsm?'':((m.ordered.units>0?'average '+fc(m.ordered.avg,4)+' each':'none in this range')))+'</div>';
   if(m.breaks.length){
     var typical=(function(){var q=(m.hist||[]).slice(0,5).map(function(l){return l.qty;}).filter(function(x){return x>0;}).sort(function(a,b){return a-b;});return q.length?q[Math.floor(q.length/2)]:(it.moq||0);})();
-    h+='<div class="panel" style="padding:10px 14px;margin:0 0 10px"><div class="t3s" style="font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px">Vendor price breaks'+(typical?' <span style="text-transform:none;letter-spacing:0;font-weight:400">(your usual order: '+fn(typical)+')</span>':'')+'</div><div style="display:flex;gap:8px;flex-wrap:wrap">'
-      +m.breaks.map(function(b,i){var on=typical&&costForQty(it,typical)===b.price;return '<div style="padding:6px 12px;border:2px solid '+(on?'var(--teal)':'var(--border2)')+';border-radius:var(--r-md);text-align:center"><div class="t3xs">'+fn(b.qty)+'+ units</div><div style="font-weight:700">'+fc(b.price,4)+'</div>'+(on?'<div class="t3xs" style="color:var(--teal)">you buy here</div>':'')+'</div>';}).join('')+'</div></div>';
+    h+='<div class="panel" style="padding:10px 14px;margin:0 0 12px"><div style="font-weight:700;margin-bottom:6px">Vendor price breaks <span class="t3s" style="font-weight:400">'+(typical?'(you usually order '+fn(typical)+')':'')+'</span></div><div style="display:flex;gap:8px;flex-wrap:wrap">'
+      +m.breaks.map(function(x){var on=typical&&costForQty(it,typical)===x.price;return '<div style="padding:6px 12px;border:2px solid '+(on?'var(--teal)':'var(--border2)')+';border-radius:var(--r-md);text-align:center"><div class="t3xs">buy '+fn(x.qty)+'+</div><div style="font-weight:700">'+fc(x.price,4)+' each</div>'+(on?'<div class="t3xs" style="color:var(--teal)">you buy here</div>':'')+'</div>';}).join('')+'</div></div>';
   }
-  h+='<details class="panel" style="padding:0;margin:0 0 10px"><summary style="padding:8px 14px;font-weight:700;cursor:pointer">By month <span class="t3s" style="font-weight:400">('+m.months.length+' month'+(m.months.length===1?'':'s')+')</span></summary><div style="overflow:auto;border-top:1px solid var(--border)"><table style="width:100%;font-size:var(--t-sm)"><thead><tr><th style="text-align:left">Month</th><th style="text-align:right">'+(m.isAsm?'Built':'Used in builds')+'</th><th style="text-align:right">Sold</th><th style="text-align:right">Revenue</th><th style="text-align:right">Ordered</th><th style="text-align:right">Spent</th></tr></thead><tbody>'
+  // table 1: what it is made of and what each part costs
+  if(m.isAsm){
+    var anyBuilt=m.rows.some(function(x){return x.type==='Sub-assembly';});
+    h+='<div class="panel" style="padding:0;margin:0 0 12px;overflow:auto"><div style="padding:10px 14px;border-bottom:1px solid var(--border)"><div style="font-weight:700;font-size:var(--t-lg)">What it is made of, and what each part costs</div><div class="t3s">Cost each is today\'s price. "Price vs your average" compares it with what you actually paid for that part in '+escHtml(m.rangeLabel)+'. Sub-assemblies are opened out (the arrow marks the parts inside).</div></div>'
+      +'<table id="rpt-sku-cost" style="width:100%;font-size:var(--t-sm)"><thead><tr><th style="text-align:left">Part</th><th style="text-align:left">Description</th><th style="text-align:right">How many</th><th style="text-align:right">Cost each</th><th style="text-align:right">Cost in this item</th><th style="text-align:left;min-width:120px">Share of the cost</th><th style="text-align:left">Price vs your average</th>'+(anyBuilt?'<th style="text-align:right">Built in range</th>':'')+'</tr></thead><tbody>'
+      +m.rows.map(function(x){
+        var badge=x.avg==null?'<span class="t3s">no purchases in range</span>':(x.drift>3?'<span style="color:var(--red);font-weight:600">&#9650; '+x.drift.toFixed(0)+'% more than you paid on average</span>':(x.drift<-3?'<span style="color:var(--green);font-weight:600">&#9660; '+Math.abs(x.drift).toFixed(0)+'% less than you paid on average</span>':'<span class="t3s">about your average ('+fc(x.avg,2)+')</span>'));
+        var sub=x.type==='Sub-assembly';
+        return '<tr><td style="padding-left:'+(10+x.level*20)+'px;white-space:nowrap;font-family:var(--mono);'+(sub?'font-weight:700':'')+'">'+(x.level?'&#8627; ':'')+escHtml(x.sku)+'</td><td'+(sub?' style="font-weight:600"':'')+'>'+escHtml(x.desc)+(sub?' <span class="t3xs">sub-assembly</span>':'')+'</td><td style="text-align:right">'+rptRound(x.qty,3)+'</td><td style="text-align:right">'+fc(x.unit,2)+'</td><td style="text-align:right;font-weight:600">'+fc(x.ext,2)+'</td>'
+          +'<td>'+(x.level===0&&x.share!=null?'<div style="display:flex;align-items:center;gap:6px"><div style="flex:1;height:7px;background:var(--bg3);border-radius:4px"><div style="width:'+Math.min(100,x.share).toFixed(1)+'%;height:7px;background:var(--teal);border-radius:4px"></div></div><span style="width:42px;text-align:right">'+x.share.toFixed(1)+'%</span></div>':'<span class="t3xs">inside the line above</span>')+'</td><td>'+badge+'</td>'+(anyBuilt?'<td style="text-align:right">'+(sub?fn(x.built):'')+'</td>':'')+'</tr>';}).join('')
+      +'<tr style="font-weight:700;border-top:2px solid var(--border2)"><td colspan="4" style="text-align:right">Total to build one</td><td style="text-align:right">'+fc(cost,2)+'</td><td colspan="'+(anyBuilt?3:2)+'"></td></tr></tbody></table></div>';
+    // table 2: per part, what was bought and used
+    h+='<div class="panel" style="padding:0;margin:0 0 12px;overflow:auto"><div style="padding:10px 14px;border-bottom:1px solid var(--border)"><div style="font-weight:700;font-size:var(--t-lg)">What you bought and used, part by part</div><div class="t3s">'+escHtml(m.rangeLabel)+'. A part used in more than one place is added up once. "Bought" counts every purchase order for that part (not only ones for this item).</div></div>'
+      +'<table id="rpt-sku-parts" style="width:100%;font-size:var(--t-sm)"><thead><tr><th style="text-align:left">Part</th><th style="text-align:left">Description</th><th style="text-align:right">Needed per unit</th><th style="text-align:right">Bought</th><th style="text-align:right">Spent</th><th style="text-align:right">Average paid each</th><th style="text-align:right">Last paid each</th><th style="text-align:right">Used in builds</th><th style="text-align:right">In stock</th></tr></thead><tbody>'
+      +(m.partsList.length?m.partsList.map(function(x){return '<tr><td style="font-family:var(--mono);white-space:nowrap">'+escHtml(x.sku)+'</td><td>'+escHtml(x.desc)+'</td><td style="text-align:right">'+rptRound(x.need,3)+'</td><td style="text-align:right">'+(x.ordered?fn(x.ordered):'<span class="t3s">none</span>')+'</td><td style="text-align:right">'+(x.spent?fc(x.spent,2):'<span class="t3s">&mdash;</span>')+'</td><td style="text-align:right">'+(x.avg!=null?fc(x.avg,2):'<span class="t3s">&mdash;</span>')+'</td><td style="text-align:right">'+(x.last!=null?fc(x.last,2):'<span class="t3s">&mdash;</span>')+'</td><td style="text-align:right">'+fn(x.used)+'</td><td style="text-align:right">'+fn(x.onHand)+'</td></tr>';}).join(''):'<tr><td colspan="9" class="t3s">This assembly has no parts on its bill of materials.</td></tr>')+'</tbody></table></div>';
+  }
+  h+='<details class="panel" style="padding:0;margin:0 0 12px"><summary style="padding:10px 14px;font-weight:700;cursor:pointer">Month by month <span class="t3s" style="font-weight:400">('+m.months.length+' month'+(m.months.length===1?'':'s')+')</span></summary><div style="overflow:auto;border-top:1px solid var(--border)"><table style="width:100%;font-size:var(--t-sm)"><thead><tr><th style="text-align:left">Month</th><th style="text-align:right">'+(m.isAsm?'Built':'Used in builds')+'</th><th style="text-align:right">Sold</th><th style="text-align:right">Sales</th><th style="text-align:right">Ordered</th><th style="text-align:right">Spent</th></tr></thead><tbody>'
     +(m.months.length?m.months.map(function(x){return '<tr><td>'+x.month+'</td><td style="text-align:right">'+fn(m.isAsm?x.built:x.used)+'</td><td style="text-align:right">'+fn(x.sold)+'</td><td style="text-align:right">'+fc(x.rev)+'</td><td style="text-align:right">'+fn(x.ordered)+'</td><td style="text-align:right">'+fc(x.spend)+'</td></tr>';}).join(''):'<tr><td colspan="6" class="t3s">Nothing in this range.</td></tr>')+'</tbody></table></div></details>';
-  if(m.hist.length&&!m.isAsm)h+='<details open class="panel" style="padding:0;margin:0 0 10px"><summary style="padding:8px 14px;font-weight:700;cursor:pointer">Latest purchases <span class="t3s" style="font-weight:400">(any date)</span></summary><div style="overflow:auto;border-top:1px solid var(--border)"><table style="width:100%;font-size:var(--t-sm)"><thead><tr><th style="text-align:left">Date</th><th style="text-align:left">Vendor</th><th style="text-align:left">PO</th><th style="text-align:right">Ordered</th><th style="text-align:right">Received</th><th style="text-align:right">Unit cost</th></tr></thead><tbody>'
+  if(m.hist.length&&!m.isAsm)h+='<details open class="panel" style="padding:0;margin:0 0 12px"><summary style="padding:10px 14px;font-weight:700;cursor:pointer">Latest purchases <span class="t3s" style="font-weight:400">(any date)</span></summary><div style="overflow:auto;border-top:1px solid var(--border)"><table style="width:100%;font-size:var(--t-sm)"><thead><tr><th style="text-align:left">Date</th><th style="text-align:left">Vendor</th><th style="text-align:left">PO</th><th style="text-align:right">Ordered</th><th style="text-align:right">Received</th><th style="text-align:right">Cost each</th></tr></thead><tbody>'
     +m.hist.map(function(l){return '<tr><td>'+escHtml(l.date)+'</td><td>'+escHtml(l.vendor)+'</td><td>'+escHtml(String(l.po))+'</td><td style="text-align:right">'+fn(l.qty)+'</td><td style="text-align:right">'+fn(l.rcv)+'</td><td style="text-align:right">'+fc(l.cost,4)+'</td></tr>';}).join('')+'</tbody></table></div></details>';
   if(m.notes.length)h+=box('var(--orange)',m.notes.map(escHtml).join(' '));
+  h+='<details style="margin:0 0 14px"><summary class="t3s" style="cursor:pointer">How these numbers are worked out</summary><div class="t3s" style="line-height:1.7;padding:6px 2px"><b>Sold</b>: order lines in the range that kept their money (not cancelled, refunded or returned), at the price the customer actually paid where it is recorded. <b>Ordered / bought</b>: purchase order lines in the range (not drafts, cancelled or lost; shipping lines left out). Average paid = money spent / units bought, so a big cheap order counts for more than a small dear one. <b>Built</b>: the pack log (a pack adds, an unpack takes away). <b>Used in builds</b>: units built x how many of the part each one needs. <b>Cost</b>: your cost on file for the part, added up through the bill of materials. The CSV and Excel buttons give the full detail, one row per line.</div></details>';
   return h;
 }
 // ---- settings the two review reports remember (per browser) ----
