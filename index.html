@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.185';
+const TGK_ERP_VERSION = 'v23.187';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -9052,7 +9052,9 @@ function exFormHtml(){
    +'<label style="font-size:var(--t-sm)">Next Day cutoff<br><select id="ex-cut" class="form-input"'+dis+'>'+hrs+'</select></label>'
    +'<label style="font-size:var(--t-sm)">Packaging added per box (oz)<br><input id="ex-pkg" type="number" min="0" step="1" class="form-input" style="width:110px" value="'+escHtml(String(c.pkg_oz!=null?c.pkg_oz:16))+'"'+dis+'></label></div>'
    +'<div style="display:flex;gap:18px;flex-wrap:wrap">'+chk('ex-next',c.next_day!==false,'Offer Next Day Air')+chk('ex-second',c.second_day!==false,'Offer 2nd Day Air')+chk('ex-res',c.residential_dropship!==false,'Rate drop-ship orders as residential')+'</div></div>'
-   +'<div style="display:flex;gap:10px;margin:14px 0 6px;flex-wrap:wrap"><button class="btn btn-teal"'+dis+' onclick="exSave()">Save</button><button class="btn" onclick="exCheck()" title="Saves, then asks ShipStation for a sample quote and checks every orderable product">Check it works</button></div>'
+   +'<div style="display:flex;gap:10px;margin:14px 0 6px;flex-wrap:wrap"><button class="btn btn-teal"'+dis+' onclick="exSave()">Save</button><button class="btn" onclick="exCheck()" title="Saves, then asks ShipStation for a sample quote and checks every orderable product">Check it works</button>'
+   +'<span style="margin-left:auto;display:inline-flex;gap:6px;align-items:center"><select id="ex-exp" class="form-input" style="width:auto" title="Which products to put in the file"><option value="missing">Products missing a weight</option><option value="all">All orderable products</option></select><button class="btn" onclick="exExport()" title="A CSV with one row per product: its SKU, name, the box size from its bill of materials, and a Weight (oz) column to fill in, ready to import into ShipStation">Export CSV</button></span></div>'
+   +'<div class="t3xs" style="line-height:1.5;margin-bottom:4px"><b>Export CSV</b> is in ShipStation&rsquo;s product-import layout: one row per orderable product with its <b>box size</b> (from the bill of materials) in Length, Width and Height (inches) and an empty <b>Weight</b> column to fill in, in <b>ounces</b> (1 lb = 16 oz). What ShipStation already holds for a product is written back unchanged. Import it in ShipStation (Products), then press Check it works again. Fill in the product&rsquo;s own weight here (the packaging above is added on top), or its packed weight and set Packaging to 0.</div>'
    +(adm?'':'<div class="t3xs">Only an admin can change these settings.</div>');
 }
 function exRead(){
@@ -9077,6 +9079,27 @@ async function exCheck(){
   catch(e){var m=(e&&e.message)||String(e);st.err=/unknown action/i.test(m)?'The dealer-portal function is too old: update it to v1.30 or newer (Supabase, Edge Functions, dealer-portal).':m;}
   st.loading=false;exRedrawRes();
 }
+// [v23.187] The export is ShipStation's own product-import layout (its ProductImportExample.csv: 36 columns, this order). In it Weight is the product's weight in OUNCES and Length / Width / Height are the PACKAGE size in
+// inches, so the box size from the bill of materials goes there (the product's own size would be the Item columns, left blank). Whatever ShipStation already holds for a product (name, location, category, tags, customs,
+// fulfillment SKU, active, price, cost) is written back as it is, so importing the file changes only the weight and box size and does not blank anything this screen can read.
+var EX_SS_HEADER=['SKU','Name','ProductDescription','WarehouseLocation','Weight','Category','Tag1','Tag2','Tag3','Tag4','Tag5','CustomsDescription','CustomsValue','CustomsTariffNo','CustomsMIDCode','CustomsCountry','ThumbnailUrl','Barcode','FillSKU','Length','Width','Height','UseProductName','Active','ParentSKU','SerialNumberRequired','IsReturnable','ShouldTrackInventory','ItemWeight','ItemWeightUnit','ItemLength','ItemWidth','ItemHeight','ItemDimensionUnit','Price','Cost'];
+function exSsRow(i){
+  var ss=i.ss||{},b=i.box,tg=ss.tags||[],nz=function(v){return v==null?'':v;};
+  var L=b?b.l:(ss.l>0?ss.l:''),W=b?b.w:(ss.w>0?ss.w:''),H=b?b.h:(ss.h>0?ss.h:'');   // the box on its bill of materials wins; with none, ShipStation's own package size is kept
+  return [i.sku,ss.name||i.name||'','',ss.warehouse||'',i.weight_oz>0?i.weight_oz:'',ss.category||'',tg[0]||'',tg[1]||'',tg[2]||'',tg[3]||'',tg[4]||'',ss.cdesc||'',nz(ss.cvalue),ss.ctariff||'','',ss.ccountry||'','','',ss.fill||'',L,W,H,'',ss.active===false?'FALSE':'TRUE','','','','','','','','','','',nz(ss.price),nz(ss.cost)];
+}
+async function exExport(){
+  var st=exState(),sel=document.getElementById('ex-exp'),mode=sel?sel.value:'missing';
+  if(!st.chk||!st.chk.coverage){await exCheck();}
+  var c=st.chk;if(!c||!c.coverage){if(!st.err)toast('Could not read the products: fix the settings above first');return;}
+  var items=c.coverage.items;if(!items){toast('Update the dealer-portal function to v1.32 or newer to export the products',7000);return;}
+  var rows=items.filter(function(i){return mode==='all'||!(i.weight_oz>0);});
+  if(!rows.length){toast('Every orderable product already has a weight in ShipStation',6000);return;}
+  var out=[EX_SS_HEADER].concat(rows.map(exSsRow)),noBox=rows.filter(function(i){return !i.box&&!(i.ss&&i.ss.l>0);}).length;
+  dnDownload('tgk-shipstation-products-'+new Date().toISOString().slice(0,10)+'.csv',out.map(function(r){return r.map(dnCsvCell).join(',');}).join('\n')+'\n');
+  toast('<span class="ic ic-check"></span>Exported '+rows.length+' product'+(rows.length===1?'':'s')+(mode==='all'?'':' missing a weight')+' in ShipStation\'s import layout. Fill in the <b>Weight</b> column in ounces (1 lb = 16 oz), then import it in ShipStation (Products).'+(noBox?' '+noBox+' ha'+(noBox===1?'s':'ve')+' no box size yet (Length, Width, Height are blank).':''),12000);
+}
+window.exExport=exExport;
 function exRedrawRes(){var e=document.getElementById('ex-out');if(e)e.innerHTML=exResHtml();}
 function exResHtml(){
   var st=exState(),c=st.chk;if(st.loading)return '<div class="t3s" style="padding:14px 0">Checking ShipStation&hellip; this reads every product&rsquo;s weight, so it can take a few seconds.</div>';
