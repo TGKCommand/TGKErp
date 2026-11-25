@@ -710,7 +710,7 @@ body.tgk-search-open .search-wrap input{width:100%}
 <script>
 const SUPA_URL = 'https://piamamighqiielfztgic.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpYW1hbWlnaHFpaWVsZnp0Z2ljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4NjkxMzUsImV4cCI6MjA5MzQ0NTEzNX0.YwLflTw6F4cRzmY78QoAY6Zud2IHGVP5xL_yvMFxheA';
-const TGK_ERP_VERSION = 'v23.192';
+const TGK_ERP_VERSION = 'v23.193';
 const TGK_ERP_BUILD_DATE = '2026-11-18';
 let db = null;
 // [v23.77 #1] Every call this app makes to its own edge functions carries the signed-in user's login, so the
@@ -14278,11 +14278,22 @@ function centralDateOnly(d?: string): string {
   return new Date(dt.getTime() - 6 * 60 * 60 * 1000).toISOString().slice(0, 10)
 }
 
+// [v23.111] PART-SHIPPED LINES AND HOLDS. A line some of whose goods have shipped reads Partial. When ShipStation holds the REST of it (the second half of a split shipment) the line must read On Hold:
+// it used to stay Partial, because the 5-minute sweep only put Open and Packed lines on hold, so it stayed in the open orders while it was held. And when the hold is released it must go back to
+// Partial, not Open: qty_shipped and is_split_shipment are left untouched while it is on hold and say what it was.
+const HOLDABLE = ['Open', 'Packed', 'Partial', 'partial']
+const wasPartShipped = (l: any): boolean =&gt; Number(l?.qty_shipped) &gt; 0 || l?.is_split_shipment === true
+async function releaseHeld(rows: any[]): Promise&lt;void&gt; {
+  const back = rows.filter(wasPartShipped).map((l: any) =&gt; l.id as string), open = rows.filter((l: any) =&gt; !wasPartShipped(l)).map((l: any) =&gt; l.id as string)
+  if (back.length) await db.from('sales').update({ fulfillment_status: 'Partial' }).in('id', back)
+  if (open.length) await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', open)
+}
 async function buildOrderMap() {
   const _bomSel = async (cols: string) =&gt; await db.from('sales').select(cols)
     .in('fulfillment_status', ['Open', 'Packed', 'Partial', 'partial', 'On Hold', 'Pre-Order', 'Pre-order'])
     .limit(100000)
-  let { data, error: _omErr } = await _bomSel('id,order_number,pn,fulfillment_status,qty,shopify_line_item_id,qty_shipped,tracking_number')
+  let { data, error: _omErr } = await _bomSel('id,order_number,pn,fulfillment_status,qty,shopify_line_item_id,qty_shipped,tracking_number,is_split_shipment')
+  if (_omErr) ({ data, error: _omErr } = await _bomSel('id,order_number,pn,fulfillment_status,qty,shopify_line_item_id,qty_shipped,tracking_number'))
   if (_omErr) ({ data, error: _omErr } = await _bomSel('id,order_number,pn,fulfillment_status,qty,shopify_line_item_id'))
   if (_omErr) ({ data } = await _bomSel('id,order_number,pn,fulfillment_status,qty')) // [v23.97] column missing: fall back to SKU-only matching
   const map: any = {}
@@ -15007,7 +15018,7 @@ async function voidSweep(): Promise&lt;any&gt; {
 // [v23.77 #1] Who may call this function's ACTIONS (webhooks are separate and never gated). Mode comes from
 // the EDGE_AUTH_MODE secret: 'log' (default - allow, but record every call without an ERP login in error_log
 // so you can see which tool still needs updating), 'enforce' (refuse them), 'off'.
-const EDGE_BUILD = 'v23.110'
+const EDGE_BUILD = 'v23.111'
 const _gateLogged: Record&lt;string, number&gt; = {}
 async function authGate(req: Request, fn: string, action: string): Promise&lt;Response | null&gt; {
   const mode = (Deno.env.get('EDGE_AUTH_MODE') || 'log').toLowerCase()
@@ -15106,7 +15117,8 @@ async function holdSyncCore(): Promise&lt;Response&gt; {
     for (const o of allOrders) for (const i of (o.items || [])) { const k = String(i?.lineItemKey ?? '').trim(); if (k.length &gt;= 8) _keys.add(k) }
     const _keyList = [..._keys]
     for (let i = 0; i &lt; _keyList.length; i += 150) {
-      const { data: kl, error: kerr } = await db.from('sales').select('id,order_number,pn,fulfillment_status,shopify_line_item_id').in('shopify_line_item_id', _keyList.slice(i, i + 150))
+      let { data: kl, error: kerr } = await db.from('sales').select('id,order_number,pn,fulfillment_status,shopify_line_item_id,qty_shipped,is_split_shipment').in('shopify_line_item_id', _keyList.slice(i, i + 150))
+      if (kerr) ({ data: kl, error: kerr } = await db.from('sales').select('id,order_number,pn,fulfillment_status,shopify_line_item_id').in('shopify_line_item_id', _keyList.slice(i, i + 150)))
       if (kerr) break
       for (const l of (kl || []) as any[]) if (l.shopify_line_item_id != null) byKey.set(String(l.shopify_line_item_id).trim(), l)
     }
@@ -15122,7 +15134,7 @@ async function holdSyncCore(): Promise&lt;Response&gt; {
       // Every line an on-hold record contains is protected, whatever its current status; only the
       // WRITE is limited to lines that are not already held.
       lines.filter((l: any) =&gt; heldCanonSkus.has(canon(l.pn || ''))).forEach((l: any) =&gt; stillOnHoldLineIds.add(l.id as string))
-      const ids = lines.filter((l: any) =&gt; ['Open','Packed'].includes(l.fulfillment_status) &amp;&amp; heldCanonSkus.has(canon(l.pn || ''))).map((l: any) =&gt; l.id as string)
+      const ids = lines.filter((l: any) =&gt; HOLDABLE.includes(l.fulfillment_status) &amp;&amp; heldCanonSkus.has(canon(l.pn || ''))).map((l: any) =&gt; l.id as string)   // [v23.111] Partial lines too
       if (ids.length) {
         await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', ids)
         markedHold += ids.length
@@ -15130,26 +15142,30 @@ async function holdSyncCore(): Promise&lt;Response&gt; {
       // [v23.104] lines of other ERP orders that were merged into this record
       const keyed = linesByKey(order).filter((l: any) =&gt; !ids.includes(l.id))
       keyed.forEach((l: any) =&gt; stillOnHoldLineIds.add(l.id))
-      const kids = keyed.filter((l: any) =&gt; ['Open', 'Packed'].includes(l.fulfillment_status)).map((l: any) =&gt; l.id as string)
+      const kids = keyed.filter((l: any) =&gt; HOLDABLE.includes(l.fulfillment_status)).map((l: any) =&gt; l.id as string)
       if (kids.length) { await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', kids); markedHold += kids.length }
     }
-    const { data: heldLines } = await db.from('sales').select('id,order_number,pn').eq('fulfillment_status', 'On Hold').limit(5000)
+    let heldRes: any = await db.from('sales').select('id,order_number,pn,qty_shipped,is_split_shipment').eq('fulfillment_status', 'On Hold').limit(5000)
+    if (heldRes.error) heldRes = await db.from('sales').select('id,order_number,pn').eq('fulfillment_status', 'On Hold').limit(5000)   // columns not migrated: release to Open, as before
+    const heldLines = heldRes.data
     if (heldLines?.length) {
       for (const order of awaitingOrders) {
         const rawNum = stripHash(order.orderNumber || '')
         const readyCanonSkus = new Set((order.items || []).map((i: any) =&gt; canon((i.sku || i.name || '').trim())).filter(Boolean))
-        const toRelease = (heldLines || []).filter((l: any) =&gt;
+        const toReleaseRows = (heldLines || []).filter((l: any) =&gt;
           stripHash(l.order_number || '') === rawNum
           &amp;&amp; !stillOnHoldLineIds.has(l.id)
           &amp;&amp; readyCanonSkus.has(canon(l.pn || ''))
-        ).map((l: any) =&gt; l.id as string)
+        )
+        const toRelease = toReleaseRows.map((l: any) =&gt; l.id as string)
         if (toRelease.length) {
-          await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', toRelease)
+          await releaseHeld(toReleaseRows)   // [v23.111] a part-shipped line goes back to Partial, not Open
           markedOpen += toRelease.length
         }
         // [v23.104] release lines of merged-in orders that this record now has ready to ship
-        const kRel = linesByKey(order).filter((l: any) =&gt; l.fulfillment_status === 'On Hold' &amp;&amp; !stillOnHoldLineIds.has(l.id) &amp;&amp; !toRelease.includes(l.id)).map((l: any) =&gt; l.id as string)
-        if (kRel.length) { await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', kRel); markedOpen += kRel.length }
+        const kRelRows = linesByKey(order).filter((l: any) =&gt; l.fulfillment_status === 'On Hold' &amp;&amp; !stillOnHoldLineIds.has(l.id) &amp;&amp; !toRelease.includes(l.id))
+        const kRel = kRelRows.map((l: any) =&gt; l.id as string)
+        if (kRel.length) { await releaseHeld(kRelRows); markedOpen += kRel.length }
       }
     }
     return json({ markedHold, markedOpen, message: markedHold + ' marked On Hold, ' + markedOpen + ' released to Open' })
@@ -16263,8 +16279,9 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
       // its own orderId, orderStatus, and item list. Selecting pn alongside id/fulfillment_status
       // so both branches below can match against THIS webhook's specific order.items instead of
       // touching every ERP line sharing the order number.
-      const { data: erpLinesRaw } = await db.from('sales')
-        .select('id,pn,fulfillment_status').eq('order_number', resolvedNum)
+      let { data: erpLinesRaw, error: _elErr } = await db.from('sales')
+        .select('id,pn,fulfillment_status,qty_shipped,is_split_shipment').eq('order_number', resolvedNum)
+      if (_elErr) ({ data: erpLinesRaw } = await db.from('sales').select('id,pn,fulfillment_status').eq('order_number', resolvedNum))   // [v23.111] split columns not migrated
       const erpLines = erpLinesRaw ?? []
       if (!erpLines.length) continue
       const rawSkus = (order.items || []).map((i: any) =&gt; (i.sku || i.name || '').trim()).filter(Boolean)
@@ -16279,7 +16296,7 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
       const _merged = order.orderStatus === 'cancelled' ? [] : await foreignLinesFor(order.items || [], new Set(erpLines.map((l: any) =&gt; l.id)))
       if (_merged.length) {
         const _ids = _merged.filter((l: any) =&gt; order.orderStatus === 'on_hold' ? ['Open', 'Packed', 'Partial'].includes(l.fulfillment_status) : (order.orderStatus === 'awaiting_shipment' &amp;&amp; l.fulfillment_status === 'On Hold')).map((l: any) =&gt; l.id)
-        if (_ids.length) await db.from('sales').update({ fulfillment_status: order.orderStatus === 'on_hold' ? 'On Hold' : 'Open' }).in('id', _ids)
+        if (_ids.length) { if (order.orderStatus === 'on_hold') await db.from('sales').update({ fulfillment_status: 'On Hold' }).in('id', _ids); else await releaseHeld(_merged.filter((l: any) =&gt; _ids.includes(l.id))) }   // [v23.111]
       }
       if (order.orderStatus === 'cancelled' &amp;&amp; order?.advancedOptions?.mergedOrSplit === true) {
         // a record that was merged away reads as cancelled; the customer's order is not. Shopify's own cancel webhook is the authority.
@@ -16344,7 +16361,7 @@ async function handleRequest(req: Request): Promise&lt;Response&gt; {
             if (live) { stillOnHold = (live.orderStatus === 'on_hold'); checkSucceeded = true }
           }
           if (checkSucceeded &amp;&amp; !stillOnHold) {
-            await db.from('sales').update({ fulfillment_status: 'Open' }).in('id', ids)
+            await releaseHeld(erpLines.filter((l: any) =&gt; ids.includes(l.id)))   // [v23.111] a part-shipped line goes back to Partial
             console.log('[SS] ORDER_NOTIFY -&gt; Released hold:', resolvedNum, ids.length, 'line(s)')
           } else if (!checkSucceeded) {
             console.log('[SS] ORDER_NOTIFY -&gt; could not verify hold status for', resolvedNum, '(orderId', order.orderId, ') - release skipped this time, hold_sync will catch it on the next pass if appropriate')
@@ -33565,7 +33582,7 @@ window.renderDataGapsPanel=renderDataGapsPanel;window.dataGapRows=dataGapRows;
 // version ships, so a missed redeploy shows up instead of hiding.
 // ===================================================================================================
 var EDGE_EXPECTED_BUILD='v23.79';
-var EDGE_EXPECTED={'shopify-orders':'v23.88','shipstation-ship':'v23.110','ops-cron':'v1.5','flagged-orders':'v1.0','customs-sync':'v1.0','customs-fill':'v1.5','po-email':'v1.3'}; // per function: each is redeployed only when it changes
+var EDGE_EXPECTED={'shopify-orders':'v23.88','shipstation-ship':'v23.111','ops-cron':'v1.5','flagged-orders':'v1.1','customs-sync':'v1.0','customs-fill':'v1.5','po-email':'v1.3'}; // per function: each is redeployed only when it changes
 async function checkEdgeVersions(){
   S._edgeVers={checking:true};render();
   var out={};
